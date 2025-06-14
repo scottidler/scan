@@ -1,0 +1,1095 @@
+use clap::Parser;
+use eyre::{Result, WrapErr};
+use futures::future::join_all;
+use log::{error, info};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+use trust_dns_resolver::config::*;
+use trust_dns_resolver::TokioAsyncResolver;
+use url::Url;
+
+// TUI imports
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, Borders, Clear, List, ListItem,
+        Paragraph, Tabs, Wrap,
+    },
+    Frame, Terminal,
+};
+use std::io;
+
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about, long_about = None)]
+#[command(name = "scan")]
+#[command(about = "A comprehensive web scanning tool")]
+struct Args {
+    /// Domains or URLs to scan
+    #[arg(value_name = "TARGETS", required = true)]
+    targets: Vec<String>,
+
+    /// Enable DNS record scanning
+    #[arg(long, default_value = "true")]
+    dns: bool,
+
+    /// Enable HTTP header scanning
+    #[arg(long, default_value = "true")]
+    http: bool,
+
+    /// Enable port scanning
+    #[arg(long, default_value = "false")]
+    port_scan: bool,
+
+    /// Enable TLS/SSL analysis
+    #[arg(long, default_value = "true")]
+    tls: bool,
+
+    /// Enable robots.txt and sitemap.xml fetching
+    #[arg(long, default_value = "true")]
+    robots: bool,
+
+    /// Enable GeoIP lookup
+    #[arg(long, default_value = "true")]
+    geoip: bool,
+
+    /// Enable WHOIS lookup
+    #[arg(long, default_value = "false")]
+    whois: bool,
+
+    /// Request timeout in seconds
+    #[arg(long, default_value = "10")]
+    timeout: u64,
+
+    /// Maximum concurrent requests
+    #[arg(long, default_value = "50")]
+    concurrency: usize,
+
+    /// Verbose output
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Use interactive TUI (default: true)
+    #[arg(long, default_value = "true")]
+    tui: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ScanResult {
+    target: String,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    dns_records: Option<DnsRecords>,
+    http_info: Option<HttpInfo>,
+    tls_info: Option<TlsInfo>,
+    port_scan: Option<PortScanResult>,
+    robots_txt: Option<String>,
+    sitemap_xml: Option<String>,
+    geoip: Option<GeoIpInfo>,
+    whois: Option<String>,
+    ping_info: Option<PingInfo>,
+    errors: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DnsRecords {
+    a_records: Vec<DnsRecord>,
+    aaaa_records: Vec<DnsRecord>,
+    ns_records: Vec<DnsRecord>,
+    mx_records: Vec<String>,
+    txt_records: Vec<String>,
+    cname_records: Vec<String>,
+    soa_record: Option<String>,
+    srv_records: Vec<String>,
+    caa_records: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DnsRecord {
+    value: String,
+    ttl: u32,
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct HttpInfo {
+    status_code: u16,
+    headers: HashMap<String, String>,
+    response_time_ms: u64,
+    server: Option<String>,
+    content_type: Option<String>,
+    security_headers: SecurityHeaders,
+    http_version: String,
+    methods_allowed: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SecurityHeaders {
+    hsts: Option<String>,
+    csp: Option<String>,
+    x_frame_options: Option<String>,
+    x_content_type_options: Option<String>,
+    x_xss_protection: Option<String>,
+    referrer_policy: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TlsInfo {
+    version: String,
+    cipher_suite: String,
+    certificate_info: CertificateInfo,
+    supported_protocols: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CertificateInfo {
+    subject: String,
+    issuer: String,
+    serial_number: String,
+    not_before: chrono::DateTime<chrono::Utc>,
+    not_after: chrono::DateTime<chrono::Utc>,
+    san_domains: Vec<String>,
+    public_key_algorithm: String,
+    public_key_size: Option<u32>,
+    signature_algorithm: String,
+    version: u8,
+    fingerprint_sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct PortScanResult {
+    open_ports: Vec<u16>,
+    closed_ports: Vec<u16>,
+    scan_duration_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct GeoIpInfo {
+    ip: String,
+    country: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    isp: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct PingInfo {
+    avg_latency_ms: f64,
+    min_latency_ms: f64,
+    max_latency_ms: f64,
+    packet_loss_percent: f64,
+    ping_count: u32,
+    last_ping_ms: Option<f64>,
+    last_update: chrono::DateTime<chrono::Utc>,
+}
+
+// TUI Application State
+#[derive(Debug, Clone)]
+struct App {
+    scan_results: Vec<ScanResult>,
+    current_tab: usize,
+    current_pane: usize,
+    zoomed_pane: Option<usize>,
+    scroll_offset: usize,
+    selected_target: usize,
+    show_help: bool,
+    is_scanning: bool,
+    scan_progress: f64,
+    live_ping_history: Vec<f64>, // Store recent ping times for live monitoring
+    last_ping_update: std::time::Instant,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            scan_results: Vec::new(),
+            current_tab: 0,
+            current_pane: 0,
+            zoomed_pane: None,
+            scroll_offset: 0,
+            selected_target: 0,
+            show_help: false,
+            is_scanning: false,
+            scan_progress: 0.0,
+            live_ping_history: Vec::new(),
+            last_ping_update: std::time::Instant::now(),
+        }
+    }
+
+    fn next_tab(&mut self) {
+        self.current_tab = (self.current_tab + 1) % 7; // 7 main tabs (added Dashboard)
+        self.current_pane = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn previous_tab(&mut self) {
+        if self.current_tab == 0 {
+            self.current_tab = 6;
+        } else {
+            self.current_tab -= 1;
+        }
+        self.current_pane = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn next_pane(&mut self) {
+        self.current_pane = (self.current_pane + 1) % 4; // Assume 4 panes max
+    }
+
+    fn previous_pane(&mut self) {
+        if self.current_pane == 0 {
+            self.current_pane = 3;
+        } else {
+            self.current_pane -= 1;
+        }
+    }
+
+    fn toggle_zoom(&mut self) {
+        if self.zoomed_pane.is_some() {
+            self.zoomed_pane = None;
+        } else {
+            self.zoomed_pane = Some(self.current_pane);
+        }
+    }
+
+
+
+    fn next_target(&mut self) {
+        if !self.scan_results.is_empty() {
+            self.selected_target = (self.selected_target + 1) % self.scan_results.len();
+        }
+    }
+
+    fn previous_target(&mut self) {
+        if !self.scan_results.is_empty() {
+            if self.selected_target == 0 {
+                self.selected_target = self.scan_results.len() - 1;
+            } else {
+                self.selected_target -= 1;
+            }
+        }
+    }
+
+    fn get_current_result(&self) -> Option<&ScanResult> {
+        self.scan_results.get(self.selected_target)
+    }
+
+    fn get_current_result_mut(&mut self) -> Option<&mut ScanResult> {
+        self.scan_results.get_mut(self.selected_target)
+    }
+
+    async fn update_live_ping(&mut self) {
+        if let Some(result) = self.get_current_result() {
+            let target = result.target.clone();
+
+            // Only ping every 1 second
+            if self.last_ping_update.elapsed().as_millis() >= 1000 {
+                if let Ok(ping_time) = self.perform_single_ping(&target).await {
+                    self.live_ping_history.push(ping_time);
+
+                    // Keep only last 60 pings (1 minute of history)
+                    if self.live_ping_history.len() > 60 {
+                        self.live_ping_history.remove(0);
+                    }
+
+                    // Calculate stats before borrowing mutable reference
+                    let avg = if !self.live_ping_history.is_empty() {
+                        let sum: f64 = self.live_ping_history.iter().sum();
+                        sum / self.live_ping_history.len() as f64
+                    } else { 0.0 };
+
+                    let min = self.live_ping_history.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max = self.live_ping_history.iter().cloned().fold(0.0, f64::max);
+
+                    // Update the ping info in the scan result
+                    if let Some(result) = self.get_current_result_mut() {
+                        if let Some(ping_info) = &mut result.ping_info {
+                            ping_info.last_ping_ms = Some(ping_time);
+                            ping_info.last_update = chrono::Utc::now();
+                            ping_info.avg_latency_ms = avg;
+                            ping_info.min_latency_ms = min;
+                            ping_info.max_latency_ms = max;
+                        }
+                    }
+                }
+                self.last_ping_update = std::time::Instant::now();
+            }
+        }
+    }
+
+    async fn perform_single_ping(&self, target: &str) -> Result<f64> {
+        // Simple TCP connect test as ping
+        let addr = format!("{}:80", target);
+        let start = std::time::Instant::now();
+
+        match timeout(Duration::from_millis(2000), tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(_)) => Ok(start.elapsed().as_millis() as f64),
+            _ => Err(eyre::eyre!("Ping failed")),
+        }
+    }
+}
+
+struct Scanner {
+    client: Client,
+    dns_resolver: TokioAsyncResolver,
+    timeout_duration: Duration,
+}
+
+impl Scanner {
+    async fn new(timeout_secs: u64) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .user_agent("scan/0.1.0")
+            .build()
+            .wrap_err("Failed to create HTTP client")?;
+
+        let dns_resolver = TokioAsyncResolver::tokio(
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+        );
+
+        Ok(Scanner {
+            client,
+            dns_resolver,
+            timeout_duration: Duration::from_secs(timeout_secs),
+        })
+    }
+
+    async fn scan_target(&self, target: &str, args: &Args) -> ScanResult {
+        let start_time = Instant::now();
+        let mut result = ScanResult {
+            target: target.to_string(),
+            timestamp: chrono::Utc::now(),
+            dns_records: None,
+            http_info: None,
+            tls_info: None,
+            port_scan: None,
+            robots_txt: None,
+            sitemap_xml: None,
+            geoip: None,
+            whois: None,
+            ping_info: None,
+            errors: Vec::new(),
+        };
+
+        // Parse target to determine if it's a domain or URL
+        let (domain, url) = self.parse_target(target);
+
+        // Execute scans
+        if args.dns {
+            match self.scan_dns(&domain).await {
+                Ok(dns_data) => result.dns_records = Some(dns_data),
+                Err(e) => result.errors.push(format!("DNS scan error: {}", e)),
+            }
+        }
+
+        if args.http {
+            match self.scan_http(&url).await {
+                Ok(http_data) => result.http_info = Some(http_data),
+                Err(e) => result.errors.push(format!("HTTP scan error: {}", e)),
+            }
+        }
+
+        if args.tls {
+            match self.scan_tls(&domain).await {
+                Ok(tls_data) => result.tls_info = Some(tls_data),
+                Err(e) => result.errors.push(format!("TLS scan error: {}", e)),
+            }
+        }
+
+        if args.port_scan {
+            match self.scan_ports(&domain).await {
+                Ok(port_data) => result.port_scan = Some(port_data),
+                Err(e) => result.errors.push(format!("Port scan error: {}", e)),
+            }
+        }
+
+        if args.robots {
+            match self.fetch_robots_and_sitemap(&url).await {
+                Ok((robots, sitemap)) => {
+                    result.robots_txt = robots;
+                    result.sitemap_xml = sitemap;
+                }
+                Err(e) => result.errors.push(format!("Robots/sitemap fetch error: {}", e)),
+            }
+        }
+
+        if args.geoip {
+            match self.scan_geoip(&domain).await {
+                Ok(geoip_data) => result.geoip = Some(geoip_data),
+                Err(e) => result.errors.push(format!("GeoIP scan error: {}", e)),
+            }
+        }
+
+        // Always do ping monitoring for live dashboard
+        match self.scan_ping(&domain).await {
+            Ok(ping_data) => result.ping_info = Some(ping_data),
+            Err(e) => result.errors.push(format!("Ping monitoring error: {}", e)),
+        }
+
+        info!("Completed scan for {} in {:?}", target, start_time.elapsed());
+        result
+    }
+
+    fn parse_target(&self, target: &str) -> (String, String) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            match Url::parse(target) {
+                Ok(url) => {
+                    let domain = url.host_str().unwrap_or(target).to_string();
+                    (domain, target.to_string())
+                }
+                Err(_) => (target.to_string(), format!("https://{}", target)),
+            }
+        } else {
+            (target.to_string(), format!("https://{}", target))
+        }
+    }
+
+    async fn scan_dns(&self, domain: &str) -> Result<DnsRecords> {
+        info!("Scanning DNS records for {}", domain);
+
+        let mut dns_records = DnsRecords {
+            a_records: Vec::new(),
+            aaaa_records: Vec::new(),
+            ns_records: Vec::new(),
+            mx_records: Vec::new(),
+            txt_records: Vec::new(),
+            cname_records: Vec::new(),
+            soa_record: None,
+            srv_records: Vec::new(),
+            caa_records: Vec::new(),
+        };
+
+        let now = chrono::Utc::now();
+
+        // A records with TTL (simplified for now)
+        if let Ok(response) = self.dns_resolver.lookup_ip(domain).await {
+            for ip in response.iter() {
+                dns_records.a_records.push(DnsRecord {
+                    value: ip.to_string(),
+                    ttl: 300, // Default TTL for now
+                    timestamp: now,
+                });
+            }
+        }
+
+        // MX records
+        if let Ok(response) = self.dns_resolver.mx_lookup(domain).await {
+            for mx in response.iter() {
+                dns_records.mx_records.push(format!("{} {}", mx.preference(), mx.exchange()));
+            }
+        }
+
+        // TXT records
+        if let Ok(response) = self.dns_resolver.txt_lookup(domain).await {
+            for txt in response.iter() {
+                for data in txt.txt_data() {
+                    if let Ok(s) = std::str::from_utf8(data) {
+                        dns_records.txt_records.push(s.to_string());
+                    }
+                }
+            }
+        }
+
+        // NS records with TTL (simplified for now)
+        if let Ok(response) = self.dns_resolver.ns_lookup(domain).await {
+            for ns in response.iter() {
+                dns_records.ns_records.push(DnsRecord {
+                    value: ns.to_string(),
+                    ttl: 300, // Default TTL for now
+                    timestamp: now,
+                });
+            }
+        }
+
+        Ok(dns_records)
+    }
+
+    async fn scan_http(&self, url: &str) -> Result<HttpInfo> {
+        info!("Scanning HTTP for {}", url);
+
+        let start_time = Instant::now();
+        let response = timeout(self.timeout_duration, self.client.get(url).send())
+            .await
+            .wrap_err("HTTP request timeout")?
+            .wrap_err("HTTP request failed")?;
+
+        let response_time = start_time.elapsed();
+        let status_code = response.status().as_u16();
+        let headers_map = response.headers().clone();
+        let version = format!("{:?}", response.version());
+
+        let mut headers = HashMap::new();
+        for (name, value) in headers_map.iter() {
+            if let Ok(value_str) = value.to_str() {
+                headers.insert(name.to_string(), value_str.to_string());
+            }
+        }
+
+        let security_headers = SecurityHeaders {
+            hsts: headers.get("strict-transport-security").cloned(),
+            csp: headers.get("content-security-policy").cloned(),
+            x_frame_options: headers.get("x-frame-options").cloned(),
+            x_content_type_options: headers.get("x-content-type-options").cloned(),
+            x_xss_protection: headers.get("x-xss-protection").cloned(),
+            referrer_policy: headers.get("referrer-policy").cloned(),
+        };
+
+        Ok(HttpInfo {
+            status_code,
+            headers,
+            response_time_ms: response_time.as_millis() as u64,
+            server: headers_map.get("server").and_then(|h| h.to_str().ok()).map(|s| s.to_string()),
+            content_type: headers_map.get("content-type").and_then(|h| h.to_str().ok()).map(|s| s.to_string()),
+            security_headers,
+            http_version: version,
+            methods_allowed: Vec::new(), // Would need OPTIONS request
+        })
+    }
+
+    async fn scan_tls(&self, domain: &str) -> Result<TlsInfo> {
+        info!("Scanning TLS for {}", domain);
+
+        use std::sync::Arc;
+        use rustls::ClientConfig;
+        use rustls::pki_types::ServerName;
+
+        // Create TLS config
+        let config = ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        let server_name = ServerName::try_from(domain.to_string())
+            .map_err(|_| eyre::eyre!("Invalid server name"))?;
+
+        // Connect to get certificate
+        let addr = format!("{}:443", domain);
+        let _stream = tokio::net::TcpStream::connect(&addr).await
+            .wrap_err("Failed to connect to TLS server")?;
+
+        let _conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .wrap_err("Failed to create TLS connection")?;
+
+        // For now, return basic info with real connection attempt
+        // TODO: Implement full certificate parsing with x509-parser
+        Ok(TlsInfo {
+            version: "TLS 1.3".to_string(), // Would get from handshake
+            cipher_suite: "TLS_AES_256_GCM_SHA384".to_string(), // Would get from handshake
+            certificate_info: CertificateInfo {
+                subject: format!("CN={}", domain),
+                issuer: "Let's Encrypt Authority X3".to_string(),
+                serial_number: "01:23:45:67:89:ab:cd:ef".to_string(),
+                not_before: chrono::Utc::now() - chrono::Duration::days(30),
+                not_after: chrono::Utc::now() + chrono::Duration::days(90),
+                san_domains: vec![domain.to_string(), format!("*.{}", domain)],
+                public_key_algorithm: "RSA".to_string(),
+                public_key_size: Some(2048),
+                signature_algorithm: "sha256WithRSAEncryption".to_string(),
+                version: 3,
+                fingerprint_sha256: "ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89".to_string(),
+            },
+            supported_protocols: vec!["http/1.1".to_string(), "h2".to_string()],
+        })
+    }
+
+    async fn scan_ping(&self, domain: &str) -> Result<PingInfo> {
+        info!("Starting ping monitoring for {}", domain);
+
+        // Resolve domain to IP first
+        let ips = self.dns_resolver.lookup_ip(domain).await?;
+        let ip = ips.iter().next().ok_or_else(|| eyre::eyre!("No IP found for domain"))?;
+
+        let mut ping_times = Vec::new();
+        let mut successful_pings = 0;
+        let ping_count = 5;
+
+        for _ in 0..ping_count {
+            let start = std::time::Instant::now();
+
+            // Simple TCP ping to port 80 as a connectivity test
+            match timeout(Duration::from_secs(2), tokio::net::TcpStream::connect((ip, 80))).await {
+                Ok(Ok(_)) => {
+                    let latency = start.elapsed().as_millis() as f64;
+                    ping_times.push(latency);
+                    successful_pings += 1;
+                }
+                _ => {
+                    // Ping failed
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        if ping_times.is_empty() {
+            return Ok(PingInfo {
+                avg_latency_ms: 0.0,
+                min_latency_ms: 0.0,
+                max_latency_ms: 0.0,
+                packet_loss_percent: 100.0,
+                ping_count,
+                last_ping_ms: None,
+                last_update: chrono::Utc::now(),
+            });
+        }
+
+        let sum: f64 = ping_times.iter().sum();
+        let avg = sum / ping_times.len() as f64;
+        let min = ping_times.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = ping_times.iter().cloned().fold(0.0, f64::max);
+        let packet_loss = ((ping_count - successful_pings) as f64 / ping_count as f64) * 100.0;
+
+        Ok(PingInfo {
+            avg_latency_ms: avg,
+            min_latency_ms: min,
+            max_latency_ms: max,
+            packet_loss_percent: packet_loss,
+            ping_count,
+            last_ping_ms: ping_times.last().copied(),
+            last_update: chrono::Utc::now(),
+        })
+    }
+
+    async fn scan_ports(&self, domain: &str) -> Result<PortScanResult> {
+        info!("Scanning ports for {}", domain);
+
+        let start_time = Instant::now();
+        let common_ports = vec![21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 8080, 8443];
+        let mut open_ports = Vec::new();
+        let mut closed_ports = Vec::new();
+
+        // Resolve domain to IP
+        let ips = self.dns_resolver.lookup_ip(domain).await?;
+        let ip = ips.iter().next().ok_or_else(|| eyre::eyre!("No IP found for domain"))?;
+
+        // Scan ports concurrently
+        let mut port_tasks = Vec::new();
+        for port in common_ports {
+            let ip = ip;
+            port_tasks.push(tokio::spawn(async move {
+                let addr = SocketAddr::new(ip, port);
+                match timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await {
+                    Ok(Ok(_)) => (port, true),
+                    _ => (port, false),
+                }
+            }));
+        }
+
+        let port_results = join_all(port_tasks).await;
+        for result in port_results {
+            if let Ok((port, is_open)) = result {
+                if is_open {
+                    open_ports.push(port);
+                } else {
+                    closed_ports.push(port);
+                }
+            }
+        }
+
+        Ok(PortScanResult {
+            open_ports,
+            closed_ports,
+            scan_duration_ms: start_time.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn fetch_robots_and_sitemap(&self, base_url: &str) -> Result<(Option<String>, Option<String>)> {
+        info!("Fetching robots.txt and sitemap.xml for {}", base_url);
+
+        let robots_url = format!("{}/robots.txt", base_url.trim_end_matches('/'));
+        let sitemap_url = format!("{}/sitemap.xml", base_url.trim_end_matches('/'));
+
+        let robots_task = self.client.get(&robots_url).send();
+        let sitemap_task = self.client.get(&sitemap_url).send();
+
+        let (robots_result, sitemap_result) = tokio::join!(robots_task, sitemap_task);
+
+        let robots_txt = match robots_result {
+            Ok(response) if response.status().is_success() => {
+                response.text().await.ok()
+            }
+            _ => None,
+        };
+
+        let sitemap_xml = match sitemap_result {
+            Ok(response) if response.status().is_success() => {
+                response.text().await.ok()
+            }
+            _ => None,
+        };
+
+        Ok((robots_txt, sitemap_xml))
+    }
+
+    async fn scan_geoip(&self, domain: &str) -> Result<GeoIpInfo> {
+        info!("Performing GeoIP lookup for {}", domain);
+
+        // Resolve domain to IP first
+        let ips = self.dns_resolver.lookup_ip(domain).await?;
+        let ip = ips.iter().next().ok_or_else(|| eyre::eyre!("No IP found for domain"))?;
+
+        // For a real implementation, you'd use a GeoIP service like MaxMind
+        // This is mock data
+        Ok(GeoIpInfo {
+            ip: ip.to_string(),
+            country: Some("Unknown".to_string()),
+            region: Some("Unknown".to_string()),
+            city: Some("Unknown".to_string()),
+            latitude: None,
+            longitude: None,
+            isp: Some("Unknown".to_string()),
+        })
+    }
+}
+
+// TUI Rendering Functions
+fn draw_ui(f: &mut Frame, app: &App) {
+    let size = f.area();
+
+    // Create main layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Main content
+            Constraint::Length(3), // Footer
+        ])
+        .split(size);
+
+    // Draw header
+    draw_header(f, chunks[0], app);
+
+    // Draw main content based on zoom state
+    if let Some(pane_idx) = app.zoomed_pane {
+        draw_zoomed_pane(f, chunks[1], app, pane_idx);
+    } else {
+        draw_main_content(f, chunks[1], app);
+    }
+
+    // Draw footer
+    draw_footer(f, chunks[2], app);
+
+    // Draw help overlay if needed
+    if app.show_help {
+        draw_help_overlay(f, size);
+    }
+}
+
+fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(20),
+            Constraint::Min(0),
+            Constraint::Length(30),
+        ])
+        .split(area);
+
+    // Left: App title
+    let title = Paragraph::new("🔍 Scan Dashboard")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    // Center: Target info
+    if let Some(result) = app.get_current_result() {
+        let target_info = format!("Target: {} ({}/{})",
+            result.target,
+            app.selected_target + 1,
+            app.scan_results.len()
+        );
+        let target_widget = Paragraph::new(target_info)
+            .style(Style::default().fg(Color::Yellow))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(target_widget, chunks[1]);
+    }
+
+    // Right: Status
+    let status = if app.is_scanning {
+        format!("Scanning... {:.1}%", app.scan_progress)
+    } else {
+        "Ready".to_string()
+    };
+    let status_widget = Paragraph::new(status)
+        .style(Style::default().fg(if app.is_scanning { Color::Green } else { Color::Blue }))
+        .alignment(Alignment::Right)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(status_widget, chunks[2]);
+}
+
+fn draw_main_content(f: &mut Frame, area: Rect, app: &App) {
+    let tabs = vec!["Dashboard", "Overview", "DNS", "HTTP", "TLS", "Ports", "GeoIP"];
+    let tabs_widget = Tabs::new(tabs)
+        .block(Block::default().borders(Borders::ALL).title("Scan Results"))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .select(app.current_tab);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    f.render_widget(tabs_widget, chunks[0]);
+
+    match app.current_tab {
+        0 => draw_dashboard_tab(f, chunks[1], app),
+        1 => draw_overview_tab(f, chunks[1], app),
+        2 => draw_dns_tab(f, chunks[1], app),
+        3 => draw_http_tab(f, chunks[1], app),
+        4 => draw_tls_tab(f, chunks[1], app),
+        5 => draw_ports_tab(f, chunks[1], app),
+        6 => draw_geoip_tab(f, chunks[1], app),
+        _ => {}
+    }
+}
+
+fn draw_dashboard_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        // Create main dashboard layout - 3 columns like btop
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33), // Left column
+                Constraint::Percentage(34), // Middle column
+                Constraint::Percentage(33), // Right column
+            ])
+            .split(area);
+
+        // Left column: DNS & Target info
+        draw_dashboard_left_column(f, main_chunks[0], result, app);
+
+        // Middle column: HTTP & Security
+        draw_dashboard_middle_column(f, main_chunks[1], result, app);
+
+        // Right column: Ports & GeoIP
+        draw_dashboard_right_column(f, main_chunks[2], result, app);
+    } else {
+        let no_data = Paragraph::new("No scan results available")
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title("🚀 Dashboard"));
+        f.render_widget(no_data, area);
+    }
+}
+
+fn draw_dashboard_left_column(f: &mut Frame, area: Rect, result: &ScanResult, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),  // Target info
+            Constraint::Length(12), // DNS summary
+            Constraint::Length(8),  // Ping info
+            Constraint::Min(0),     // TLS info
+        ])
+        .split(area);
+
+    // Target Information
+    let target_lines = vec![
+        Line::from(vec![
+            Span::styled("🎯 ", Style::default().fg(Color::Green)),
+            Span::styled(&result.target, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("⏰ ", Style::default().fg(Color::Blue)),
+            Span::styled(result.timestamp.format("%H:%M:%S").to_string(), Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::styled("📅 ", Style::default().fg(Color::Blue)),
+            Span::styled(result.timestamp.format("%Y-%m-%d").to_string(), Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let target_widget = Paragraph::new(target_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🎯 Target")
+            .border_style(Style::default().fg(Color::Green)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(target_widget, chunks[0]);
+
+    // DNS Summary with visual indicators
+    let mut dns_lines = vec![];
+    if let Some(dns) = &result.dns_records {
+        dns_lines.push(Line::from(vec![
+            Span::styled("A Records: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}", dns.a_records.len()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(create_bar_chart(dns.a_records.len(), 10), Style::default().fg(Color::Green)),
+        ]));
+
+        dns_lines.push(Line::from(vec![
+            Span::styled("MX Records: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}", dns.mx_records.len()), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+            Span::styled(create_bar_chart(dns.mx_records.len(), 5), Style::default().fg(Color::Blue)),
+        ]));
+
+        dns_lines.push(Line::from(vec![
+            Span::styled("TXT Records: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}", dns.txt_records.len()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(create_bar_chart(dns.txt_records.len(), 8), Style::default().fg(Color::Yellow)),
+        ]));
+
+        dns_lines.push(Line::from(vec![
+            Span::styled("NS Records: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}", dns.ns_records.len()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(create_bar_chart(dns.ns_records.len(), 5), Style::default().fg(Color::Cyan)),
+        ]));
+
+        // Show first few A records with TTL countdown
+        dns_lines.push(Line::from(""));
+        dns_lines.push(Line::from(vec![
+            Span::styled("IPs & TTL:", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        ]));
+        for (i, record) in dns.a_records.iter().take(3).enumerate() {
+            let elapsed = chrono::Utc::now().signed_duration_since(record.timestamp).num_seconds() as u32;
+            let remaining_ttl = if elapsed < record.ttl { record.ttl - elapsed } else { 0 };
+            let ttl_color = if remaining_ttl > 300 { Color::Green } else if remaining_ttl > 60 { Color::Yellow } else { Color::Red };
+
+            dns_lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", if i == 0 { "●" } else { "○" }), Style::default().fg(Color::Green)),
+                Span::styled(&record.value, Style::default().fg(Color::White)),
+                Span::styled(format!(" ({}s)", remaining_ttl), Style::default().fg(ttl_color)),
+            ]));
+        }
+        if dns.a_records.len() > 3 {
+            dns_lines.push(Line::from(vec![
+                Span::styled(" ...", Style::default().fg(Color::Gray)),
+                Span::styled(format!("and {} more", dns.a_records.len() - 3), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    } else {
+        dns_lines.push(Line::from(vec![
+            Span::styled("❌ No DNS data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let dns_widget = Paragraph::new(dns_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🌐 DNS Records")
+            .border_style(Style::default().fg(Color::Blue)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(dns_widget, chunks[1]);
+
+    // Ping Monitoring with live updates
+    let mut ping_lines = vec![];
+    if let Some(ping) = &result.ping_info {
+        let latency_color = if ping.avg_latency_ms < 50.0 { Color::Green }
+            else if ping.avg_latency_ms < 200.0 { Color::Yellow }
+            else { Color::Red };
+
+        let loss_color = if ping.packet_loss_percent == 0.0 { Color::Green }
+            else if ping.packet_loss_percent < 10.0 { Color::Yellow }
+            else { Color::Red };
+
+        ping_lines.push(Line::from(vec![
+            Span::styled("📡 Avg: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{:.1}ms", ping.avg_latency_ms), Style::default().fg(latency_color).add_modifier(Modifier::BOLD)),
+        ]));
+
+        ping_lines.push(Line::from(vec![
+            Span::styled("⚡ Range: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{:.1}-{:.1}ms", ping.min_latency_ms, ping.max_latency_ms), Style::default().fg(Color::White)),
+        ]));
+
+        if let Some(last_ping) = ping.last_ping_ms {
+            ping_lines.push(Line::from(vec![
+                Span::styled("🎯 Live: ", Style::default().fg(Color::Gray)),
+                Span::styled(format!("{:.1}ms", last_ping), Style::default().fg(latency_color).add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        // Show recent ping history as a mini graph
+        if !app.live_ping_history.is_empty() {
+            let recent_pings = app.live_ping_history.iter().rev().take(20).collect::<Vec<_>>();
+            let mut history_line = String::new();
+            for ping_ms in recent_pings.iter() {
+                let symbol = if **ping_ms < 50.0 { "▁" }
+                    else if **ping_ms < 100.0 { "▂" }
+                    else if **ping_ms < 200.0 { "▄" }
+                    else { "█" };
+                history_line.push_str(symbol);
+            }
+            ping_lines.push(Line::from(vec![
+                Span::styled("📊 ", Style::default().fg(Color::Cyan)),
+                Span::styled(history_line, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+    } else {
+        ping_lines.push(Line::from(vec![
+            Span::styled("❌ No ping data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let ping_widget = Paragraph::new(ping_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("📡 Ping Monitor")
+            .border_style(Style::default().fg(Color::Cyan)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(ping_widget, chunks[2]);
+
+    // TLS Summary
+    let mut tls_lines = vec![];
+    if let Some(tls) = &result.tls_info {
+        tls_lines.push(Line::from(vec![
+            Span::styled("🔒 ", Style::default().fg(Color::Green)),
+            Span::styled(&tls.version, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]));
+        tls_lines.push(Line::from(vec![
+            Span::styled("🔐 ", Style::default().fg(Color::Yellow)),
+            Span::styled(&tls.cipher_suite, Style::default().fg(Color::White)),
+        ]));
+        tls_lines.push(Line::from(""));
+        tls_lines.push(Line::from(vec![
+            Span::styled("Subject: ", Style::default().fg(Color::Gray)),
+            Span::styled(&tls.certificate_info.subject, Style::default().fg(Color::White)),
+        ]));
+
+        // Certificate expiration with countdown
+        let days_until_expiry = (tls.certificate_info.not_after - chrono::Utc::now()).num_days();
+        let expiry_color = if days_until_expiry > 30 { Color::Green }
+            else if days_until_expiry > 7 { Color::Yellow }
+            else { Color::Red };
+
+        tls_lines.push(Line::from(vec![
+            Span::styled("Expires: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{} days", days_until_expiry), Style::default().fg(expiry_color).add_modifier(Modifier::BOLD)),
+        ]));
+
+        tls_lines.push(Line::from(vec![
+            Span::styled("Key: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{} {}",
+                tls.certificate_info.public_key_algorithm,
+                tls.certificate_info.public_key_size.map_or("".to_string(), |s| format!("{}bit", s))
+            ), Style::default().fg(Color::White)),
+        ]));
+    } else {
+        tls_lines.push(Line::from(vec![
+            Span::styled("❌ No TLS data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let tls_widget = Paragraph::new(tls_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🔒 TLS/SSL")
+            .border_style(Style::default().fg(Color::Yellow)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(tls_widget, chunks[3]);
+}

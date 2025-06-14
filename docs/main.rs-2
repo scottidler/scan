@@ -1,0 +1,1117 @@
+fn draw_dashboard_middle_column(f: &mut Frame, area: Rect, result: &ScanResult, _app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(10), // HTTP status
+            Constraint::Length(12), // Security headers
+            Constraint::Min(0),     // Performance metrics
+        ])
+        .split(area);
+
+    // HTTP Status with visual indicators
+    let mut http_lines = vec![];
+    if let Some(http) = &result.http_info {
+        let status_color = match http.status_code {
+            200..=299 => Color::Green,
+            300..=399 => Color::Yellow,
+            400..=499 => Color::Red,
+            500..=599 => Color::Magenta,
+            _ => Color::Gray,
+        };
+
+        let status_icon = match http.status_code {
+            200..=299 => "✅",
+            300..=399 => "🔀",
+            400..=499 => "❌",
+            500..=599 => "💥",
+            _ => "❓",
+        };
+
+        http_lines.push(Line::from(vec![
+            Span::styled(format!("{} ", status_icon), Style::default()),
+            Span::styled(format!("{}", http.status_code), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(" HTTP", Style::default().fg(Color::Gray)),
+        ]));
+
+        // Response time with visual bar
+        let response_time = http.response_time_ms;
+        let time_color = if response_time < 200 { Color::Green } else if response_time < 1000 { Color::Yellow } else { Color::Red };
+        let time_bar = create_response_time_bar(response_time);
+
+        http_lines.push(Line::from(vec![
+            Span::styled("⚡ ", Style::default().fg(time_color)),
+            Span::styled(format!("{}ms", response_time), Style::default().fg(time_color).add_modifier(Modifier::BOLD)),
+            Span::styled(time_bar, Style::default().fg(time_color)),
+        ]));
+
+        http_lines.push(Line::from(""));
+
+        if let Some(server) = &http.server {
+            http_lines.push(Line::from(vec![
+                Span::styled("🖥️  ", Style::default().fg(Color::Blue)),
+                Span::styled(server, Style::default().fg(Color::White)),
+            ]));
+        }
+
+        http_lines.push(Line::from(vec![
+            Span::styled("📡 ", Style::default().fg(Color::Cyan)),
+            Span::styled(&http.http_version, Style::default().fg(Color::White)),
+        ]));
+    } else {
+        http_lines.push(Line::from(vec![
+            Span::styled("❌ No HTTP data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let http_widget = Paragraph::new(http_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🌐 HTTP Status")
+            .border_style(Style::default().fg(Color::Green)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(http_widget, chunks[0]);
+
+    // Security Headers Dashboard
+    let mut security_lines = vec![];
+    if let Some(http) = &result.http_info {
+        let security = &http.security_headers;
+
+        let headers = [
+            ("HSTS", &security.hsts),
+            ("CSP", &security.csp),
+            ("Frame", &security.x_frame_options),
+            ("Content-Type", &security.x_content_type_options),
+            ("XSS", &security.x_xss_protection),
+            ("Referrer", &security.referrer_policy),
+        ];
+
+        let mut present_count = 0;
+        for (name, value) in &headers {
+            let (icon, color) = if value.is_some() {
+                present_count += 1;
+                ("✅", Color::Green)
+            } else {
+                ("❌", Color::Red)
+            };
+
+            security_lines.push(Line::from(vec![
+                Span::styled(format!("{} ", icon), Style::default()),
+                Span::styled(format!("{:<12}", name), Style::default().fg(color)),
+            ]));
+        }
+
+        // Security score
+        let score = (present_count as f32 / headers.len() as f32 * 100.0) as u8;
+        let score_color = if score >= 80 { Color::Green } else if score >= 60 { Color::Yellow } else { Color::Red };
+
+        security_lines.push(Line::from(""));
+        security_lines.push(Line::from(vec![
+            Span::styled("🛡️  Score: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}%", score), Style::default().fg(score_color).add_modifier(Modifier::BOLD)),
+            Span::styled(create_bar_chart(score as usize, 100), Style::default().fg(score_color)),
+        ]));
+    } else {
+        security_lines.push(Line::from(vec![
+            Span::styled("❌ No security data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let security_widget = Paragraph::new(security_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🛡️ Security")
+            .border_style(Style::default().fg(Color::Red)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(security_widget, chunks[1]);
+
+    // Performance & Errors
+    let mut perf_lines = vec![];
+
+    // Error count
+    if !result.errors.is_empty() {
+        perf_lines.push(Line::from(vec![
+            Span::styled("⚠️  Errors: ", Style::default().fg(Color::Red)),
+            Span::styled(format!("{}", result.errors.len()), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+        perf_lines.push(Line::from(""));
+
+        for error in result.errors.iter().take(5) {
+            let truncated = if error.len() > 30 {
+                format!("{}...", &error[..27])
+            } else {
+                error.clone()
+            };
+            perf_lines.push(Line::from(vec![
+                Span::styled("• ", Style::default().fg(Color::Red)),
+                Span::styled(truncated, Style::default().fg(Color::White)),
+            ]));
+        }
+        if result.errors.len() > 5 {
+            perf_lines.push(Line::from(vec![
+                Span::styled(format!("... and {} more", result.errors.len() - 5), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    } else {
+        perf_lines.push(Line::from(vec![
+            Span::styled("✅ No errors", Style::default().fg(Color::Green)),
+        ]));
+    }
+
+    let perf_widget = Paragraph::new(perf_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("📊 Status")
+            .border_style(Style::default().fg(Color::Magenta)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(perf_widget, chunks[2]);
+}
+
+fn draw_dashboard_right_column(f: &mut Frame, area: Rect, result: &ScanResult, _app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(14), // Port scan
+            Constraint::Min(0),     // GeoIP
+        ])
+        .split(area);
+
+    // Port Scan Results
+    let mut port_lines = vec![];
+    if let Some(ports) = &result.port_scan {
+
+
+
+        port_lines.push(Line::from(vec![
+            Span::styled("🟢 Open: ", Style::default().fg(Color::Green)),
+            Span::styled(format!("{}", ports.open_ports.len()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(create_bar_chart(ports.open_ports.len(), 20), Style::default().fg(Color::Green)),
+        ]));
+
+        port_lines.push(Line::from(vec![
+            Span::styled("🔴 Closed: ", Style::default().fg(Color::Red)),
+            Span::styled(format!("{}", ports.closed_ports.len()), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+
+        port_lines.push(Line::from(vec![
+            Span::styled("⏱️  Scan: ", Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{}ms", ports.scan_duration_ms), Style::default().fg(Color::Yellow)),
+        ]));
+
+        port_lines.push(Line::from(""));
+        port_lines.push(Line::from(vec![
+            Span::styled("Open Ports:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]));
+
+        for port in ports.open_ports.iter().take(6) {
+            let service = match *port {
+                22 => "SSH", 80 => "HTTP", 443 => "HTTPS", 25 => "SMTP",
+                53 => "DNS", 21 => "FTP", 8080 => "HTTP-Alt", _ => "Unknown",
+            };
+            port_lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Green)),
+                Span::styled(format!("{}/tcp", port), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ({})", service), Style::default().fg(Color::Gray)),
+            ]));
+        }
+
+        if ports.open_ports.len() > 6 {
+            port_lines.push(Line::from(vec![
+                Span::styled(format!("... +{} more", ports.open_ports.len() - 6), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    } else {
+        port_lines.push(Line::from(vec![
+            Span::styled("❌ No port scan data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let ports_widget = Paragraph::new(port_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🔍 Ports")
+            .border_style(Style::default().fg(Color::Cyan)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(ports_widget, chunks[0]);
+
+    // GeoIP Information
+    let mut geo_lines = vec![];
+    if let Some(geoip) = &result.geoip {
+        geo_lines.push(Line::from(vec![
+            Span::styled("🌍 ", Style::default().fg(Color::Blue)),
+            Span::styled(&geoip.ip, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]));
+        geo_lines.push(Line::from(""));
+
+        if let Some(country) = &geoip.country {
+            geo_lines.push(Line::from(vec![
+                Span::styled("🏳️  ", Style::default()),
+                Span::styled(country, Style::default().fg(Color::Green)),
+            ]));
+        }
+
+        if let Some(city) = &geoip.city {
+            geo_lines.push(Line::from(vec![
+                Span::styled("🏙️  ", Style::default()),
+                Span::styled(city, Style::default().fg(Color::Yellow)),
+            ]));
+        }
+
+        if let Some(isp) = &geoip.isp {
+            geo_lines.push(Line::from(""));
+            geo_lines.push(Line::from(vec![
+                Span::styled("🏢 ", Style::default().fg(Color::Magenta)),
+                Span::styled(isp, Style::default().fg(Color::White)),
+            ]));
+        }
+
+        if let (Some(lat), Some(lon)) = (geoip.latitude, geoip.longitude) {
+            geo_lines.push(Line::from(""));
+            geo_lines.push(Line::from(vec![
+                Span::styled("📍 ", Style::default().fg(Color::Red)),
+                Span::styled(format!("{:.2}, {:.2}", lat, lon), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+    } else {
+        geo_lines.push(Line::from(vec![
+            Span::styled("❌ No GeoIP data", Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    let geo_widget = Paragraph::new(geo_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("🌍 Location")
+            .border_style(Style::default().fg(Color::Magenta)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(geo_widget, chunks[1]);
+}
+
+// Helper functions for visual elements
+fn create_bar_chart(value: usize, max_value: usize) -> String {
+    let bar_width = 8;
+    let filled = if max_value > 0 { (value * bar_width) / max_value } else { 0 };
+    let filled = filled.min(bar_width);
+
+    format!(" [{}{}]",
+        "█".repeat(filled),
+        "░".repeat(bar_width - filled)
+    )
+}
+
+fn create_response_time_bar(ms: u64) -> String {
+    let bar_width = 10;
+    let max_ms = 2000; // 2 seconds max
+    let filled = ((ms.min(max_ms) * bar_width as u64) / max_ms) as usize;
+
+    format!(" [{}{}]",
+        "█".repeat(filled),
+        "░".repeat(bar_width - filled)
+    )
+}
+
+fn draw_overview_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8),  // Summary
+                Constraint::Min(0),     // Details
+            ])
+            .split(area);
+
+        // Summary section
+        let mut summary_lines = vec![
+            Line::from(vec![
+                Span::styled("Target: ", Style::default().fg(Color::Gray)),
+                Span::styled(&result.target, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("Scan Time: ", Style::default().fg(Color::Gray)),
+                Span::styled(result.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string(), Style::default().fg(Color::Yellow)),
+            ]),
+        ];
+
+        // Add status indicators
+        let dns_status = if result.dns_records.is_some() { "✓" } else { "✗" };
+        let http_status = if result.http_info.is_some() { "✓" } else { "✗" };
+        let tls_status = if result.tls_info.is_some() { "✓" } else { "✗" };
+        let ports_status = if result.port_scan.is_some() { "✓" } else { "✗" };
+
+        summary_lines.push(Line::from(""));
+        summary_lines.push(Line::from(vec![
+            Span::styled("DNS: ", Style::default().fg(Color::Gray)),
+            Span::styled(dns_status, Style::default().fg(if result.dns_records.is_some() { Color::Green } else { Color::Red })),
+            Span::styled("  HTTP: ", Style::default().fg(Color::Gray)),
+            Span::styled(http_status, Style::default().fg(if result.http_info.is_some() { Color::Green } else { Color::Red })),
+            Span::styled("  TLS: ", Style::default().fg(Color::Gray)),
+            Span::styled(tls_status, Style::default().fg(if result.tls_info.is_some() { Color::Green } else { Color::Red })),
+            Span::styled("  Ports: ", Style::default().fg(Color::Gray)),
+            Span::styled(ports_status, Style::default().fg(if result.port_scan.is_some() { Color::Green } else { Color::Red })),
+        ]));
+
+        // Add error count
+        if !result.errors.is_empty() {
+            summary_lines.push(Line::from(vec![
+                Span::styled("Errors: ", Style::default().fg(Color::Gray)),
+                Span::styled(result.errors.len().to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        let summary = Paragraph::new(summary_lines)
+            .block(Block::default().borders(Borders::ALL).title("Summary"))
+            .wrap(Wrap { trim: true });
+        f.render_widget(summary, chunks[0]);
+
+        // Errors section
+        let error_items: Vec<ListItem> = result.errors.iter()
+            .map(|error| ListItem::new(Line::from(vec![
+                Span::styled("• ", Style::default().fg(Color::Red)),
+                Span::styled(error, Style::default().fg(Color::White)),
+            ])))
+            .collect();
+
+        let errors_list = List::new(error_items)
+            .block(Block::default().borders(Borders::ALL).title("Errors"))
+            .style(Style::default().fg(Color::White));
+        f.render_widget(errors_list, chunks[1]);
+    } else {
+        let no_data = Paragraph::new("No scan results available")
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title("Overview"));
+        f.render_widget(no_data, area);
+    }
+}
+
+fn draw_dns_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        if let Some(dns) = &result.dns_records {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+
+            // Left column: A, AAAA, NS records
+            let mut left_items = Vec::new();
+
+            if !dns.a_records.is_empty() {
+                left_items.push(ListItem::new(Line::from(vec![
+                    Span::styled("A Records:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ])));
+                for record in &dns.a_records {
+                    left_items.push(ListItem::new(format!("  {}", record.value)));
+                }
+                left_items.push(ListItem::new(""));
+            }
+
+            if !dns.aaaa_records.is_empty() {
+                left_items.push(ListItem::new(Line::from(vec![
+                    Span::styled("AAAA Records:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ])));
+                for record in &dns.aaaa_records {
+                    left_items.push(ListItem::new(format!("  {}", record.value)));
+                }
+                left_items.push(ListItem::new(""));
+            }
+
+            if !dns.ns_records.is_empty() {
+                left_items.push(ListItem::new(Line::from(vec![
+                    Span::styled("NS Records:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ])));
+                for record in &dns.ns_records {
+                    left_items.push(ListItem::new(format!("  {}", record.value)));
+                }
+            }
+
+            let left_list = List::new(left_items)
+                .block(Block::default().borders(Borders::ALL).title("Basic Records"))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(left_list, chunks[0]);
+
+            // Right column: MX, TXT, other records
+            let mut right_items = Vec::new();
+
+            if !dns.mx_records.is_empty() {
+                right_items.push(ListItem::new(Line::from(vec![
+                    Span::styled("MX Records:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                ])));
+                for record in &dns.mx_records {
+                    right_items.push(ListItem::new(format!("  {}", record)));
+                }
+                right_items.push(ListItem::new(""));
+            }
+
+            if !dns.txt_records.is_empty() {
+                right_items.push(ListItem::new(Line::from(vec![
+                    Span::styled("TXT Records:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                ])));
+                for record in &dns.txt_records {
+                    let truncated = if record.len() > 50 {
+                        format!("{}...", &record[..47])
+                    } else {
+                        record.clone()
+                    };
+                    right_items.push(ListItem::new(format!("  {}", truncated)));
+                }
+            }
+
+            let right_list = List::new(right_items)
+                .block(Block::default().borders(Borders::ALL).title("Mail & Text Records"))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(right_list, chunks[1]);
+        } else {
+            let no_data = Paragraph::new("No DNS data available")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("DNS Records"));
+            f.render_widget(no_data, area);
+        }
+    }
+}
+
+fn draw_http_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        if let Some(http) = &result.http_info {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(8),  // Status and timing
+                    Constraint::Min(0),     // Headers and security
+                ])
+                .split(area);
+
+            // Status section
+            let status_color = match http.status_code {
+                200..=299 => Color::Green,
+                300..=399 => Color::Yellow,
+                400..=499 => Color::Red,
+                500..=599 => Color::Magenta,
+                _ => Color::Gray,
+            };
+
+            let status_lines = vec![
+                Line::from(vec![
+                    Span::styled("Status Code: ", Style::default().fg(Color::Gray)),
+                    Span::styled(http.status_code.to_string(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Response Time: ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{}ms", http.response_time_ms), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("HTTP Version: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&http.http_version, Style::default().fg(Color::Yellow)),
+                ]),
+            ];
+
+            let status = Paragraph::new(status_lines)
+                .block(Block::default().borders(Borders::ALL).title("HTTP Status"))
+                .wrap(Wrap { trim: true });
+            f.render_widget(status, chunks[0]);
+
+            // Split bottom area for headers and security
+            let bottom_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(chunks[1]);
+
+            // Headers
+            let mut header_items = Vec::new();
+            let important_headers = ["server", "content-type", "content-length", "cache-control", "date"];
+
+            for header_name in &important_headers {
+                if let Some(value) = http.headers.get(*header_name) {
+                    header_items.push(ListItem::new(Line::from(vec![
+                        Span::styled(format!("{}:", header_name), Style::default().fg(Color::Cyan)),
+                        Span::styled(format!(" {}", value), Style::default().fg(Color::White)),
+                    ])));
+                }
+            }
+
+            let headers_list = List::new(header_items)
+                .block(Block::default().borders(Borders::ALL).title("Key Headers"))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(headers_list, bottom_chunks[0]);
+
+            // Security headers
+            let mut security_items = Vec::new();
+            let security = &http.security_headers;
+
+            let sec_headers = [
+                ("HSTS", &security.hsts, Color::Green),
+                ("CSP", &security.csp, Color::Blue),
+                ("X-Frame-Options", &security.x_frame_options, Color::Yellow),
+                ("X-Content-Type-Options", &security.x_content_type_options, Color::Cyan),
+                ("X-XSS-Protection", &security.x_xss_protection, Color::Magenta),
+                ("Referrer-Policy", &security.referrer_policy, Color::Red),
+            ];
+
+            for (name, value, color) in &sec_headers {
+                let status = if value.is_some() { "✓" } else { "✗" };
+                let status_color = if value.is_some() { Color::Green } else { Color::Red };
+
+                security_items.push(ListItem::new(Line::from(vec![
+                    Span::styled(format!("{}: ", name), Style::default().fg(*color)),
+                    Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                ])));
+            }
+
+            let security_list = List::new(security_items)
+                .block(Block::default().borders(Borders::ALL).title("Security Headers"))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(security_list, bottom_chunks[1]);
+        } else {
+            let no_data = Paragraph::new("No HTTP data available")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("HTTP Information"));
+            f.render_widget(no_data, area);
+        }
+    }
+}
+
+fn draw_tls_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        if let Some(tls) = &result.tls_info {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(6),  // TLS info
+                    Constraint::Min(0),     // Certificate info
+                ])
+                .split(area);
+
+            // TLS information
+            let tls_lines = vec![
+                Line::from(vec![
+                    Span::styled("TLS Version: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&tls.version, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Cipher Suite: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&tls.cipher_suite, Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Protocols: ", Style::default().fg(Color::Gray)),
+                    Span::styled(tls.supported_protocols.join(", "), Style::default().fg(Color::Cyan)),
+                ]),
+            ];
+
+            let tls_info = Paragraph::new(tls_lines)
+                .block(Block::default().borders(Borders::ALL).title("TLS Information"))
+                .wrap(Wrap { trim: true });
+            f.render_widget(tls_info, chunks[0]);
+
+            // Certificate information
+            let cert = &tls.certificate_info;
+            let cert_lines = vec![
+                Line::from(vec![
+                    Span::styled("Subject: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&cert.subject, Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Issuer: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&cert.issuer, Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Serial: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&cert.serial_number, Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Valid From: ", Style::default().fg(Color::Gray)),
+                    Span::styled(cert.not_before.format("%Y-%m-%d").to_string(), Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Valid Until: ", Style::default().fg(Color::Gray)),
+                    Span::styled(cert.not_after.format("%Y-%m-%d").to_string(), Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("SAN Domains:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ]),
+            ];
+
+            let mut all_lines = cert_lines;
+            for domain in &cert.san_domains {
+                all_lines.push(Line::from(format!("  • {}", domain)));
+            }
+
+            let cert_info = Paragraph::new(all_lines)
+                .block(Block::default().borders(Borders::ALL).title("Certificate Details"))
+                .wrap(Wrap { trim: true });
+            f.render_widget(cert_info, chunks[1]);
+        } else {
+            let no_data = Paragraph::new("No TLS data available")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("TLS Information"));
+            f.render_widget(no_data, area);
+        }
+    }
+}
+
+fn draw_ports_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        if let Some(ports) = &result.port_scan {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+
+            // Open ports
+            let mut open_items = Vec::new();
+            open_items.push(ListItem::new(Line::from(vec![
+                Span::styled("Open Ports", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ({})", ports.open_ports.len()), Style::default().fg(Color::Gray)),
+            ])));
+            open_items.push(ListItem::new(""));
+
+            for port in &ports.open_ports {
+                let service = match *port {
+                    21 => "FTP",
+                    22 => "SSH",
+                    23 => "Telnet",
+                    25 => "SMTP",
+                    53 => "DNS",
+                    80 => "HTTP",
+                    110 => "POP3",
+                    143 => "IMAP",
+                    443 => "HTTPS",
+                    993 => "IMAPS",
+                    995 => "POP3S",
+                    8080 => "HTTP-Alt",
+                    8443 => "HTTPS-Alt",
+                    _ => "Unknown",
+                };
+
+                open_items.push(ListItem::new(Line::from(vec![
+                    Span::styled(format!("{}/tcp", port), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" ({})", service), Style::default().fg(Color::Gray)),
+                ])));
+            }
+
+            let open_list = List::new(open_items)
+                .block(Block::default().borders(Borders::ALL).title("Port Scan Results"))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(open_list, chunks[0]);
+
+            // Scan statistics and closed ports info
+            let mut stats_lines = vec![
+                Line::from(vec![
+                    Span::styled("Scan Duration: ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{}ms", ports.scan_duration_ms), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Total Ports Scanned: ", Style::default().fg(Color::Gray)),
+                    Span::styled((ports.open_ports.len() + ports.closed_ports.len()).to_string(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Open Ports: ", Style::default().fg(Color::Gray)),
+                    Span::styled(ports.open_ports.len().to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Closed Ports: ", Style::default().fg(Color::Gray)),
+                    Span::styled(ports.closed_ports.len().to_string(), Style::default().fg(Color::Red)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Recently Closed:", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                ]),
+            ];
+
+            // Show first few closed ports
+            for (i, port) in ports.closed_ports.iter().take(10).enumerate() {
+                if i < 10 {
+                    stats_lines.push(Line::from(format!("  {}/tcp", port)));
+                }
+            }
+
+            if ports.closed_ports.len() > 10 {
+                stats_lines.push(Line::from(format!("  ... and {} more", ports.closed_ports.len() - 10)));
+            }
+
+            let stats = Paragraph::new(stats_lines)
+                .block(Block::default().borders(Borders::ALL).title("Scan Statistics"))
+                .wrap(Wrap { trim: true });
+            f.render_widget(stats, chunks[1]);
+        } else {
+            let no_data = Paragraph::new("No port scan data available")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("Port Scan"));
+            f.render_widget(no_data, area);
+        }
+    }
+}
+
+fn draw_geoip_tab(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(result) = app.get_current_result() {
+        if let Some(geoip) = &result.geoip {
+            let geoip_lines = vec![
+                Line::from(vec![
+                    Span::styled("IP Address: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&geoip.ip, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Country: ", Style::default().fg(Color::Gray)),
+                    Span::styled(geoip.country.as_deref().unwrap_or("Unknown"), Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Region: ", Style::default().fg(Color::Gray)),
+                    Span::styled(geoip.region.as_deref().unwrap_or("Unknown"), Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("City: ", Style::default().fg(Color::Gray)),
+                    Span::styled(geoip.city.as_deref().unwrap_or("Unknown"), Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("ISP: ", Style::default().fg(Color::Gray)),
+                    Span::styled(geoip.isp.as_deref().unwrap_or("Unknown"), Style::default().fg(Color::Magenta)),
+                ]),
+            ];
+
+            let mut final_lines = geoip_lines;
+            if let (Some(lat), Some(lon)) = (geoip.latitude, geoip.longitude) {
+                final_lines.push(Line::from(""));
+                final_lines.push(Line::from(vec![
+                    Span::styled("Coordinates: ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{}, {}", lat, lon), Style::default().fg(Color::Cyan)),
+                ]));
+            }
+
+            let geoip_info = Paragraph::new(final_lines)
+                .block(Block::default().borders(Borders::ALL).title("Geographic Information"))
+                .wrap(Wrap { trim: true });
+            f.render_widget(geoip_info, area);
+        } else {
+            let no_data = Paragraph::new("No GeoIP data available")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("Geographic Information"));
+            f.render_widget(no_data, area);
+        }
+    }
+}
+
+fn draw_zoomed_pane(f: &mut Frame, area: Rect, app: &App, pane_idx: usize) {
+    // Add zoom indicator
+    let zoomed_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+
+    let zoom_indicator = Paragraph::new("Press 'z' to exit zoom mode")
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(zoom_indicator, zoomed_area[0]);
+
+    // Render the specific tab content in the zoomed area
+    match pane_idx {
+        0 => draw_dashboard_tab(f, zoomed_area[1], app),
+        1 => draw_overview_tab(f, zoomed_area[1], app),
+        2 => draw_dns_tab(f, zoomed_area[1], app),
+        3 => draw_http_tab(f, zoomed_area[1], app),
+        4 => draw_tls_tab(f, zoomed_area[1], app),
+        5 => draw_ports_tab(f, zoomed_area[1], app),
+        6 => draw_geoip_tab(f, zoomed_area[1], app),
+        _ => {}
+    }
+}
+
+fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let help_text = if app.zoomed_pane.is_some() {
+        "z: Exit Zoom | q: Quit | ?: Help"
+    } else {
+        "Tab/Shift+Tab: Switch Tabs | ←/→: Navigate Panes | z: Zoom | ↑/↓: Next/Prev Target | q: Quit | ?: Help"
+    };
+
+    let footer = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, area);
+}
+
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let help_text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("Scan Dashboard - Help", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from("Navigation:"),
+        Line::from("  Tab / Shift+Tab    - Switch between tabs"),
+        Line::from("  ← / →              - Navigate between panes"),
+        Line::from("  ↑ / ↓              - Switch between targets"),
+        Line::from("  z                  - Toggle zoom on current pane"),
+        Line::from("  ? / h              - Toggle this help"),
+        Line::from("  q / Esc            - Quit application"),
+        Line::from(""),
+        Line::from("Tabs:"),
+        Line::from("  Dashboard  - Consolidated visual overview"),
+        Line::from("  Overview   - Summary of all scan results"),
+        Line::from("  DNS        - DNS record information"),
+        Line::from("  HTTP       - HTTP response and headers"),
+        Line::from("  TLS        - TLS/SSL certificate details"),
+        Line::from("  Ports      - Port scan results"),
+        Line::from("  GeoIP      - Geographic and ISP information"),
+        Line::from(""),
+        Line::from("Press any key to close this help..."),
+    ];
+
+    let help_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(100)])
+        .split(area)[0];
+
+    let popup_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Percentage(60),
+            Constraint::Percentage(20),
+        ])
+        .split(help_area)[1];
+
+    let popup_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Percentage(80),
+            Constraint::Percentage(10),
+        ])
+        .split(popup_area)[1];
+
+    f.render_widget(Clear, popup_area);
+    let help_widget = Paragraph::new(help_text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Help")
+            .border_style(Style::default().fg(Color::Yellow)))
+        .style(Style::default().fg(Color::White))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    f.render_widget(help_widget, popup_area);
+}
+
+async fn run_tui(scan_results: Vec<ScanResult>) -> Result<()> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app state
+    let mut app = App::new();
+    app.scan_results = scan_results;
+
+    let result = run_app(&mut terminal, &mut app).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    let mut last_refresh = std::time::Instant::now();
+
+    loop {
+        // Update live ping monitoring
+        app.update_live_ping().await;
+
+        // Draw the UI
+        terminal.draw(|f| draw_ui(f, app))?;
+
+        // Handle events with timeout to allow periodic refreshes
+        match tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::task::spawn_blocking(|| event::read()).await
+        }).await {
+            Ok(Ok(Ok(Event::Key(key)))) => {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = !app.show_help,
+                        KeyCode::Tab => {
+                            if !app.show_help {
+                                app.next_tab();
+                            }
+                        }
+                        KeyCode::BackTab => {
+                            if !app.show_help {
+                                app.previous_tab();
+                            }
+                        }
+                        KeyCode::Left => {
+                            if !app.show_help && app.zoomed_pane.is_none() {
+                                app.previous_pane();
+                            }
+                        }
+                        KeyCode::Right => {
+                            if !app.show_help && app.zoomed_pane.is_none() {
+                                app.next_pane();
+                            }
+                        }
+                        KeyCode::Up => {
+                            if !app.show_help {
+                                app.previous_target();
+                            }
+                        }
+                        KeyCode::Down => {
+                            if !app.show_help {
+                                app.next_target();
+                            }
+                        }
+                        KeyCode::Char('z') => {
+                            if !app.show_help {
+                                app.toggle_zoom();
+                            }
+                        }
+                        _ => {
+                            if app.show_help {
+                                app.show_help = false;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Timeout or other event - continue to refresh
+            }
+        }
+
+        // Force refresh every second even without events
+        if last_refresh.elapsed().as_millis() >= 1000 {
+            last_refresh = std::time::Instant::now();
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Initialize logging
+    if args.verbose {
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Debug)
+            .init();
+    } else {
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Info)
+            .init();
+    }
+
+    info!("Starting scan of {} targets", args.targets.len());
+
+    // Create scanner
+    let scanner = Arc::new(Scanner::new(args.timeout).await?);
+
+    // Create semaphore for concurrency control
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+
+    // Scan all targets concurrently
+    let mut scan_tasks = Vec::new();
+    for target in &args.targets {
+        let target = target.clone();
+        let scanner = Arc::clone(&scanner);
+        let args = args.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        scan_tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.expect("Failed to acquire semaphore");
+            scanner.scan_target(&target, &args).await
+        }));
+    }
+
+    // Wait for all scans to complete
+    let results = join_all(scan_tasks).await;
+
+    // Collect successful results
+    let mut scan_results = Vec::new();
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(scan_result) => {
+                scan_results.push(scan_result);
+            }
+            Err(e) => {
+                error!("Failed to scan target #{}: {}", i + 1, e);
+            }
+        }
+    }
+
+    if scan_results.is_empty() {
+        error!("No successful scan results to display");
+        return Ok(());
+    }
+
+    // Output results based on mode
+    if args.tui {
+        info!("Launching interactive dashboard...");
+        run_tui(scan_results).await?;
+    } else {
+        // Traditional console output
+        for (i, scan_result) in scan_results.iter().enumerate() {
+            println!("=== Scan Result #{} ===", i + 1);
+            println!("Target: {}", scan_result.target);
+            println!("Timestamp: {}", scan_result.timestamp);
+
+            if let Some(dns) = &scan_result.dns_records {
+                println!("DNS Records:");
+                if !dns.a_records.is_empty() {
+                    println!("  A: {:?}", dns.a_records);
+                }
+                if !dns.mx_records.is_empty() {
+                    println!("  MX: {:?}", dns.mx_records);
+                }
+                if !dns.txt_records.is_empty() {
+                    println!("  TXT: {:?}", dns.txt_records);
+                }
+                if !dns.ns_records.is_empty() {
+                    println!("  NS: {:?}", dns.ns_records);
+                }
+            }
+
+            if let Some(http) = &scan_result.http_info {
+                println!("HTTP Info:");
+                println!("  Status: {}", http.status_code);
+                println!("  Response Time: {}ms", http.response_time_ms);
+                if let Some(server) = &http.server {
+                    println!("  Server: {}", server);
+                }
+                println!("  Security Headers:");
+                if let Some(hsts) = &http.security_headers.hsts {
+                    println!("    HSTS: {}", hsts);
+                }
+                if let Some(csp) = &http.security_headers.csp {
+                    println!("    CSP: {}", csp);
+                }
+            }
+
+            if let Some(ports) = &scan_result.port_scan {
+                println!("Port Scan:");
+                println!("  Open Ports: {:?}", ports.open_ports);
+                println!("  Scan Duration: {}ms", ports.scan_duration_ms);
+            }
+
+            if !scan_result.errors.is_empty() {
+                println!("Errors:");
+                for error in &scan_result.errors {
+                    println!("  - {}", error);
+                }
+            }
+
+            println!();
+        }
+    }
+
+    info!("Scan completed successfully");
+    Ok(())
+}
