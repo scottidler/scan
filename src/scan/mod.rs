@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
     vec![
         Box::new(PingScanner::default()),
-        Box::new(DnsScanner::default()),
+        Box::new(DnsScanner::new()),
         // TODO: Add other scanners as they're implemented
         // Box::new(HttpScanner::default()),
     ]

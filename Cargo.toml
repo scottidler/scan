@@ -10,7 +10,7 @@ colored = "3.0.0"
 dashmap = "6.1.0"
 env_logger = "0.11.8"
 eyre = "0.6.12"
-hickory-resolver = "0.24.1"
+hickory-resolver = "0.25.2"
 ratatui = "0.29.0"
 tokio = { version = "1.45.1", features = ["full"] }
 url = "2.5.4"
