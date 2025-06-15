@@ -3,6 +3,7 @@ pub mod ping;
 pub use ping::{PingScanner, PingResult};
 
 use crate::scanner::Scanner;
+use crate::target::Target;
 use std::sync::Arc;
 
 pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
@@ -16,7 +17,7 @@ pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
 
 pub async fn spawn_scanner_tasks(
     scanners: Vec<Box<dyn Scanner + Send + Sync>>,
-    target: String,
+    target: Target,
     state: Arc<crate::types::AppState>,
 ) {
     for scanner in scanners {

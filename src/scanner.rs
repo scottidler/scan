@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::types::{AppState, ScanResult, ScanState, ScanStatus, TimestampedResult};
+use crate::target::Target;
 
 #[async_trait]
 pub trait Scanner {
@@ -15,10 +16,10 @@ pub trait Scanner {
     fn interval(&self) -> Duration;
     
     /// Perform the actual scan operation
-    async fn scan(&self, target: &str) -> Result<ScanResult, eyre::Error>;
+    async fn scan(&self, target: &Target) -> Result<ScanResult, eyre::Error>;
     
     /// Default implementation of the scanner loop
-    async fn run(&self, target: String, state: Arc<AppState>) {
+    async fn run(&self, target: Target, state: Arc<AppState>) {
         let mut ticker = tokio::time::interval(self.interval());
         
         loop {

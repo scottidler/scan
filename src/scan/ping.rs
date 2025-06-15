@@ -1,5 +1,6 @@
 use crate::scanner::Scanner;
 use crate::types::ScanResult;
+use crate::target::Target;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use std::time::Duration;
@@ -50,9 +51,10 @@ impl Scanner for PingScanner {
         self.interval
     }
     
-    async fn scan(&self, target: &str) -> Result<ScanResult, eyre::Error> {
-        let result = self.do_ping(target).await
-            .wrap_err_with(|| format!("Failed to ping target: {}", target))?;
+    async fn scan(&self, target: &Target) -> Result<ScanResult, eyre::Error> {
+        let ping_target = target.network_target();
+        let result = self.do_ping(&ping_target).await
+            .wrap_err_with(|| format!("Failed to ping target: {}", target.display_name()))?;
         Ok(ScanResult::Ping(result))
     }
 }
