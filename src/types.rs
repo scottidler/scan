@@ -43,7 +43,7 @@ pub enum ScanResult {
     Dns(crate::scan::dns::DnsResult),
     Tls(crate::scan::tls::TlsResult),
     Http(crate::scan::http::HttpResult),
+    Whois(crate::scan::whois::WhoisResult),
     // TODO: Add other scanner result types
     // Port(crate::scan::port::PortResult),
-    // Whois(crate::scan::whois::WhoisResult),
 } 
