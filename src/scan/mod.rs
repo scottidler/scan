@@ -1,8 +1,10 @@
 pub mod ping;
 pub mod dns;
+pub mod tls;
 
 pub use ping::{PingScanner, PingResult};
 pub use dns::{DnsScanner, DnsResult};
+pub use tls::{TlsScanner, TlsResult};
 
 use crate::scanner::Scanner;
 use crate::target::Target;
@@ -12,6 +14,7 @@ pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
     vec![
         Box::new(PingScanner::default()),
         Box::new(DnsScanner::new()),
+        Box::new(TlsScanner::new()),
         // TODO: Add other scanners as they're implemented
         // Box::new(HttpScanner::default()),
     ]
