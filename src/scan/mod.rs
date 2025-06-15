@@ -1,6 +1,8 @@
 pub mod ping;
+pub mod dns;
 
 pub use ping::{PingScanner, PingResult};
+pub use dns::{DnsScanner, DnsResult};
 
 use crate::scanner::Scanner;
 use crate::target::Target;
@@ -9,8 +11,8 @@ use std::sync::Arc;
 pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
     vec![
         Box::new(PingScanner::default()),
+        Box::new(DnsScanner::default()),
         // TODO: Add other scanners as they're implemented
-        // Box::new(DnsScanner::default()),
         // Box::new(HttpScanner::default()),
     ]
 }

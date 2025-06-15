@@ -40,8 +40,8 @@ pub struct TimestampedResult {
 #[derive(Debug, Clone)]
 pub enum ScanResult {
     Ping(crate::scan::ping::PingResult),
+    Dns(crate::scan::dns::DnsResult),
     // TODO: Add other scanner result types
-    // Dns(crate::scan::dns::DnsResult),
     // Http(crate::scan::http::HttpResult),
     // Tls(crate::scan::tls::TlsResult),
     // Port(crate::scan::port::PortResult),

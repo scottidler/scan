@@ -111,6 +111,19 @@ impl Target {
         }
     }
     
+    /// Update resolved IPs from DNS scanner results
+    pub fn update_resolved_ips(&mut self, ips: Vec<IpAddr>) {
+        self.resolved_ips = ips;
+    }
+    
+    /// Add additional resolved IPs
+    pub fn add_resolved_ips(&mut self, mut ips: Vec<IpAddr>) {
+        self.resolved_ips.append(&mut ips);
+        // Remove duplicates
+        self.resolved_ips.sort();
+        self.resolved_ips.dedup();
+    }
+    
     async fn resolve_domain(&self) -> Result<Vec<IpAddr>> {
         let domain = self.domain.as_ref()
             .ok_or_else(|| eyre::eyre!("No domain to resolve"))?;
