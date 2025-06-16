@@ -14,6 +14,14 @@ pub struct Cli {
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+    
+    /// Enable debug output (pretty print scan results to stdout)
+    #[arg(short, long)]
+    pub debug: bool,
+    
+    /// Disable TUI mode (run in debug mode instead)
+    #[arg(long)]
+    pub no_tui: bool,
 }
 
 pub fn parse() -> Cli {

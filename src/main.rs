@@ -7,6 +7,7 @@ mod types;
 mod scanner;
 mod scan;
 mod target;
+mod pretty;
 // mod tui; // TODO: Implement TUI module
 
 use types::AppState;
@@ -42,36 +43,53 @@ async fn main() -> Result<()> {
     let scanners = scan::create_default_scanners();
     scan::spawn_scanner_tasks(scanners, target.clone(), state.clone()).await;
     
-    // TODO: Run the TUI application
-    // let mut app = tui::App::new(state, Duration::from_millis(cli.refresh_rate));
-    // app.run().await?;
-    
-    // For now, just run indefinitely to test scanners
-    println!("Scanning target: {}", cli.target);
-    println!("Press Ctrl+C to exit");
-    
-    // Keep the application running and print scanner state periodically
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-    loop {
-        interval.tick().await;
+    if !cli.no_tui && !cli.debug {
+        // TODO: Run the TUI application
+        // let mut app = tui::App::new(state, Duration::from_millis(cli.refresh_rate));
+        // app.run().await?;
         
-        // Print current scanner states
-        for entry in state.scanners.iter() {
-            let (scanner_name, scan_state) = entry.pair();
-            println!("{}: {:?} - Last updated: {:?}", 
-                scanner_name, 
-                scan_state.status,
-                scan_state.last_updated
-            );
+        // For now, just run indefinitely until TUI is implemented
+        println!("TUI mode not yet implemented. Use --debug for debug output or --no-tui for debug mode.");
+        println!("Press Ctrl+C to exit");
+        
+        // Keep the application running silently
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+        }
+    } else {
+        // Debug mode: pretty print scan results to stdout
+        pretty::print_header(&cli.target);
+        println!("Debug mode enabled. Press Ctrl+C to exit");
+        pretty::print_separator();
+        
+        // Keep the application running and print scanner state periodically
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
             
-            if let Some(result) = &scan_state.result {
-                println!("  Result: {:?}", result);
+            // Clear screen for better readability (optional)
+            if cli.debug {
+                print!("\x1B[2J\x1B[1;1H"); // ANSI escape codes to clear screen
+                pretty::print_header(&cli.target);
             }
             
-            if let Some(error) = &scan_state.error {
-                println!("  Error: {}", error);
+            // Print current scanner states using pretty printing
+            let mut scanner_names: Vec<String> = state.scanners.iter()
+                .map(|entry| entry.key().clone())
+                .collect();
+            scanner_names.sort();
+            
+            for scanner_name in scanner_names {
+                if let Some(scan_state) = state.scanners.get(&scanner_name) {
+                    pretty::print_scan_state(&scanner_name, &scan_state);
+                }
+            }
+            
+            if cli.debug {
+                pretty::print_separator();
+                println!("Refreshing every 5 seconds...");
             }
         }
-        println!("---");
     }
 }
