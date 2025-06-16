@@ -115,13 +115,8 @@ impl Pane for TargetPane {
             ),
         ]));
         
-        // Individual scanner status (show first few)
-        let mut scanner_count = 0;
+        // Show all scanner statuses
         for scanner in state.scanners.iter() {
-            if scanner_count >= 3 { // Limit to 3 scanners to fit in pane
-                break;
-            }
-            
             let (icon, color) = Self::status_icon_and_color(&scanner.status);
             let elapsed = scanner.last_updated.elapsed();
             
@@ -133,19 +128,6 @@ impl Pane for TargetPane {
                 ),
                 Span::styled(
                     Self::format_elapsed(elapsed),
-                    Style::default().fg(Color::Gray)
-                ),
-            ]));
-            
-            scanner_count += 1;
-        }
-        
-        // Show "and X more" if there are more scanners
-        if state.scanners.len() > 3 {
-            let remaining = state.scanners.len() - 3;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("   ... and {} more", remaining),
                     Style::default().fg(Color::Gray)
                 ),
             ]));
@@ -167,7 +149,7 @@ impl Pane for TargetPane {
     }
     
     fn min_size(&self) -> (u16, u16) {
-        (25, 8) // Slightly larger to accommodate content
+        (25, 12) // Larger to show all scanners
     }
 }
 

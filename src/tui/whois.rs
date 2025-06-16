@@ -109,55 +109,50 @@ impl Pane for WhoisPane {
                     ]));
                 }
                 
-                // Name servers (show first 2)
+                // Name servers (show all)
                 if !whois_result.nameservers.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("🔗 NS: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            whois_result.nameservers[0].clone(),
-                            Style::default().fg(Color::Magenta)
-                        ),
-                    ]));
-                    
-                    if whois_result.nameservers.len() > 1 {
+                    for (i, nameserver) in whois_result.nameservers.iter().enumerate() {
+                        let prefix = if i == 0 {
+                            "🔗 NS: "
+                        } else {
+                            "     "
+                        };
+                        
                         lines.push(Line::from(vec![
-                            Span::styled("     ", Style::default()),
+                            Span::styled(prefix, Style::default().fg(Color::White)),
                             Span::styled(
-                                whois_result.nameservers[1].clone(),
+                                nameserver.clone(),
                                 Style::default().fg(Color::Magenta)
-                            ),
-                        ]));
-                    }
-                    
-                    if whois_result.nameservers.len() > 2 {
-                        let remaining = whois_result.nameservers.len() - 2;
-                        lines.push(Line::from(vec![
-                            Span::styled("     ", Style::default()),
-                            Span::styled(
-                                format!("... +{} more", remaining),
-                                Style::default().fg(Color::Gray)
                             ),
                         ]));
                     }
                 }
                 
-                // Status
+                // Status - show all status items
                 if !whois_result.status.is_empty() {
-                    let status_color = if whois_result.status.iter().any(|s| s.to_lowercase().contains("ok")) {
-                        Color::Green
-                    } else if whois_result.status.iter().any(|s| s.to_lowercase().contains("pending")) {
-                        Color::Yellow
-                    } else {
-                        Color::Red
-                    };
-                    
-                    lines.push(Line::from(vec![
-                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            whois_result.status[0].clone(),
-                            Style::default().fg(status_color)
-                        ),
-                    ]));
+                    for (i, status) in whois_result.status.iter().enumerate() {
+                        let status_color = if status.to_lowercase().contains("ok") {
+                            Color::Green
+                        } else if status.to_lowercase().contains("pending") {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        };
+                        
+                        let prefix = if i == 0 {
+                            "📊 Status: "
+                        } else {
+                            "         "
+                        };
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::White)),
+                            Span::styled(
+                                status.clone(),
+                                Style::default().fg(status_color)
+                            ),
+                        ]));
+                    }
                 }
                 
                 // Privacy level
@@ -176,7 +171,7 @@ impl Pane for WhoisPane {
                     ),
                 ]));
                 
-                // Risk indicators
+                // Risk indicators - show all risks
                 if !whois_result.risk_indicators.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled("⚠️  Risks: ", Style::default().fg(Color::White)),
@@ -186,6 +181,27 @@ impl Pane for WhoisPane {
                         ),
                         Span::styled(" indicators", Style::default().fg(Color::Red)),
                     ]));
+                    
+                    // Show each risk indicator
+                    for risk in &whois_result.risk_indicators {
+                        let risk_text = match risk {
+                            crate::scan::whois::RiskIndicator::RecentRegistration => "Recent Registration (<30 days)",
+                            crate::scan::whois::RiskIndicator::NearExpiry => "Near Expiry (<30 days)",
+                            crate::scan::whois::RiskIndicator::FrequentUpdates => "Frequent Updates",
+                            crate::scan::whois::RiskIndicator::SuspiciousRegistrar => "Suspicious Registrar",
+                            crate::scan::whois::RiskIndicator::NoAbuseContact => "No Abuse Contact",
+                            crate::scan::whois::RiskIndicator::WeakDnssec => "Weak DNSSEC",
+                            crate::scan::whois::RiskIndicator::QueryFailed => "Query Failed",
+                        };
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled("     • ", Style::default().fg(Color::Red)),
+                            Span::styled(
+                                risk_text,
+                                Style::default().fg(Color::Red)
+                            ),
+                        ]));
+                    }
                 }
                 
                 // Data source
@@ -253,7 +269,7 @@ impl Pane for WhoisPane {
     }
     
     fn min_size(&self) -> (u16, u16) {
-        (30, 12) // Minimum width and height for WHOIS information
+        (35, 16) // Larger to show all nameservers and details
     }
 }
 

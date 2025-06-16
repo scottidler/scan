@@ -70,12 +70,17 @@ impl PaneLayout {
         }
     }
     
-    /// Create the grid layout areas
+    /// Create the grid layout areas with custom proportions
     fn create_grid_layout(&self, area: Rect) -> Vec<Vec<Rect>> {
-        // Create row constraints (equal height)
-        let row_constraints: Vec<Constraint> = (0..self.grid_rows)
-            .map(|_| Constraint::Percentage(100 / self.grid_rows as u16))
-            .collect();
+        // Create custom row constraints for better space allocation
+        // Row 0: Smaller for summary info (target, connectivity, security)
+        // Row 1: Medium for DNS, HTTP, Ports
+        // Row 2: Larger for detailed info (whois, traceroute, geoip)
+        let row_constraints = vec![
+            Constraint::Percentage(25), // Top row - 25%
+            Constraint::Percentage(35), // Middle row - 35%
+            Constraint::Percentage(40), // Bottom row - 40%
+        ];
         
         // Split into rows
         let rows = Layout::default()
@@ -83,12 +88,32 @@ impl PaneLayout {
             .constraints(row_constraints)
             .split(area);
         
-        // Split each row into columns
+        // Split each row into columns with custom proportions
         let mut grid_areas = Vec::new();
-        for row_area in rows.iter() {
-            let col_constraints: Vec<Constraint> = (0..self.grid_cols)
-                .map(|_| Constraint::Percentage(100 / self.grid_cols as u16))
-                .collect();
+        
+        for (row_idx, row_area) in rows.iter().enumerate() {
+            let col_constraints = match row_idx {
+                0 => vec![
+                    Constraint::Percentage(30), // target - compact
+                    Constraint::Percentage(35), // connectivity - medium
+                    Constraint::Percentage(35), // security - medium
+                ],
+                1 => vec![
+                    Constraint::Percentage(35), // dns - needs more space
+                    Constraint::Percentage(30), // http - medium
+                    Constraint::Percentage(35), // ports - needs more space
+                ],
+                2 => vec![
+                    Constraint::Percentage(40), // whois - needs more space
+                    Constraint::Percentage(35), // traceroute - needs lots of space
+                    Constraint::Percentage(25), // geoip - compact
+                ],
+                _ => vec![
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(34),
+                ],
+            };
             
             let cols = Layout::default()
                 .direction(Direction::Horizontal)

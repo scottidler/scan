@@ -78,11 +78,8 @@ impl Pane for TraceroutePane {
                     },
                 ]));
                 
-                // Show first few hops
-                let hops_to_show = std::cmp::min(traceroute_result.hops.len(), 3);
-                for i in 0..hops_to_show {
-                    let hop = &traceroute_result.hops[i];
-                    
+                // Show all hops
+                for hop in &traceroute_result.hops {
                     // Get first responding IP and best RTT
                     let (ip_display, rtt_display, hop_color) = if let Some(response) = hop.responses.iter().find(|r| !r.timeout) {
                         let ip_str = response.ip_address.as_ref()
@@ -96,22 +93,19 @@ impl Pane for TraceroutePane {
                         ("*".to_string(), "timeout".to_string(), Color::Gray)
                     };
                     
+                    // Color code hop number based on position
+                    let hop_num_color = if hop.hop_number <= 3 {
+                        Color::Green // Local/ISP hops
+                    } else if hop.hop_number <= 10 {
+                        Color::Yellow // Mid-network
+                    } else {
+                        Color::Red // Far hops
+                    };
+                    
                     lines.push(Line::from(vec![
-                        Span::styled(format!("   {}: ", hop.hop_number), Style::default().fg(Color::White)),
+                        Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(hop_num_color)),
                         Span::styled(ip_display, Style::default().fg(hop_color)),
                         Span::styled(format!(" ({})", rtt_display), Style::default().fg(Color::Gray)),
-                    ]));
-                }
-                
-                // Show "more" indicator if there are additional hops
-                if traceroute_result.hops.len() > 3 {
-                    let remaining = traceroute_result.hops.len() - 3;
-                    lines.push(Line::from(vec![
-                        Span::styled("   ", Style::default()),
-                        Span::styled(
-                            format!("... +{} more hops", remaining),
-                            Style::default().fg(Color::Gray)
-                        ),
                     ]));
                 }
                 
@@ -165,7 +159,7 @@ impl Pane for TraceroutePane {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (30, 10) // Minimum width and height for traceroute information
+        (35, 20) // Much larger to show all hops (up to ~30 hops)
     }
 }
 
