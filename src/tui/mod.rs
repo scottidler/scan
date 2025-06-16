@@ -4,6 +4,11 @@ pub mod target;
 pub mod connectivity;
 pub mod security;
 pub mod whois;
+pub mod dns;
+pub mod http;
+pub mod ports;
+pub mod traceroute;
+pub mod geoip;
 
 pub use pane::{Pane, PaneConfig, PanePosition};
 pub use layout::PaneLayout;
@@ -11,6 +16,11 @@ pub use target::TargetPane;
 pub use connectivity::ConnectivityPane;
 pub use security::SecurityPane;
 pub use whois::WhoisPane;
+pub use dns::DnsPane;
+pub use http::HttpPane;
+pub use ports::PortsPane;
+pub use traceroute::TraceroutePane;
+pub use geoip::GeoIpPane;
 
 use crate::types::AppState;
 use crossterm::{
@@ -39,28 +49,52 @@ impl TuiApp {
     pub fn new() -> Self {
         let mut layout = PaneLayout::default_dashboard();
         
-        // Add the TARGET pane to position (0, 0) - top-left
+        // Row 0: TARGET, CONNECTIVITY, SECURITY
         layout.add_pane(
             Box::new(TargetPane::new()),
             PaneConfig::new(0, 0)
         );
         
-        // Add the CONNECTIVITY pane to position (0, 1) - top-middle
         layout.add_pane(
             Box::new(ConnectivityPane::new()),
             PaneConfig::new(0, 1)
         );
         
-        // Add the SECURITY pane to position (0, 2) - top-right
         layout.add_pane(
             Box::new(SecurityPane::new()),
             PaneConfig::new(0, 2)
         );
         
-        // Add the WHOIS pane to position (1, 0) - bottom-left
+        // Row 1: DNS, HTTP, PORTS
+        layout.add_pane(
+            Box::new(DnsPane::new()),
+            PaneConfig::new(1, 0)
+        );
+        
+        layout.add_pane(
+            Box::new(HttpPane::new()),
+            PaneConfig::new(1, 1)
+        );
+        
+        layout.add_pane(
+            Box::new(PortsPane::new()),
+            PaneConfig::new(1, 2)
+        );
+        
+        // Row 2: WHOIS, TRACEROUTE, GEOIP
         layout.add_pane(
             Box::new(WhoisPane::new()),
-            PaneConfig::new(1, 0)
+            PaneConfig::new(2, 0)
+        );
+        
+        layout.add_pane(
+            Box::new(TraceroutePane::new()),
+            PaneConfig::new(2, 1)
+        );
+        
+        layout.add_pane(
+            Box::new(GeoIpPane::new()),
+            PaneConfig::new(2, 2)
         );
         
         Self {
@@ -180,7 +214,6 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -
 pub fn create_default_layout() -> PaneLayout {
     let mut layout = PaneLayout::default_dashboard();
     
-    // Add panes to their positions
     // Row 0: TARGET, CONNECTIVITY, SECURITY
     layout.add_pane(
         Box::new(TargetPane::new()),
@@ -197,12 +230,37 @@ pub fn create_default_layout() -> PaneLayout {
         PaneConfig::new(0, 2)
     );
     
+    // Row 1: DNS, HTTP, PORTS
     layout.add_pane(
-        Box::new(WhoisPane::new()),
+        Box::new(DnsPane::new()),
         PaneConfig::new(1, 0)
     );
     
-    // TODO: Add other panes as they're implemented
+    layout.add_pane(
+        Box::new(HttpPane::new()),
+        PaneConfig::new(1, 1)
+    );
+    
+    layout.add_pane(
+        Box::new(PortsPane::new()),
+        PaneConfig::new(1, 2)
+    );
+    
+    // Row 2: WHOIS, TRACEROUTE, GEOIP
+    layout.add_pane(
+        Box::new(WhoisPane::new()),
+        PaneConfig::new(2, 0)
+    );
+    
+    layout.add_pane(
+        Box::new(TraceroutePane::new()),
+        PaneConfig::new(2, 1)
+    );
+    
+    layout.add_pane(
+        Box::new(GeoIpPane::new()),
+        PaneConfig::new(2, 2)
+    );
     
     layout
 }
@@ -223,6 +281,11 @@ mod tests {
         assert!(pane_ids.contains(&"connectivity".to_string()));
         assert!(pane_ids.contains(&"security".to_string()));
         assert!(pane_ids.contains(&"whois".to_string()));
+        assert!(pane_ids.contains(&"dns".to_string()));
+        assert!(pane_ids.contains(&"http".to_string()));
+        assert!(pane_ids.contains(&"ports".to_string()));
+        assert!(pane_ids.contains(&"traceroute".to_string()));
+        assert!(pane_ids.contains(&"geoip".to_string()));
     }
     
     #[test]
@@ -245,6 +308,11 @@ mod tests {
         assert!(pane_ids.contains(&"connectivity".to_string()));
         assert!(pane_ids.contains(&"security".to_string()));
         assert!(pane_ids.contains(&"whois".to_string()));
+        assert!(pane_ids.contains(&"dns".to_string()));
+        assert!(pane_ids.contains(&"http".to_string()));
+        assert!(pane_ids.contains(&"ports".to_string()));
+        assert!(pane_ids.contains(&"traceroute".to_string()));
+        assert!(pane_ids.contains(&"geoip".to_string()));
     }
     
     #[test]
