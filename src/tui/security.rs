@@ -1,5 +1,5 @@
 use crate::tui::pane::{create_block, Pane};
-use crate::types::{AppState, ScanResult};
+use crate::types::AppState;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
