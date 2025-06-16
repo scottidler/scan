@@ -88,12 +88,62 @@ impl Pane for TargetPane {
             Span::styled(&state.target, Style::default().fg(Color::White)),
         ]));
         
-        // TODO: Add resolved IP when available from DNS scanner
-        // For now, show placeholder
-        lines.push(Line::from(vec![
-            Span::styled("📍 ", Style::default().fg(Color::Blue)),
-            Span::styled("Resolving...", Style::default().fg(Color::Gray)),
-        ]));
+        // Show resolved IP information from DNS scanner
+        match state.scanners.get("dns") {
+            Some(dns_state) => {
+                match &dns_state.result {
+                    Some(crate::types::ScanResult::Dns(dns_result)) => {
+                        if !dns_result.A.is_empty() {
+                            let ip = &dns_result.A[0].value;
+                            lines.push(Line::from(vec![
+                                Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                                Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                                Span::styled("resolved (no A records)", Style::default().fg(Color::Yellow)),
+                            ]));
+                        }
+                    }
+                    None => {
+                        match dns_state.status {
+                            ScanStatus::Running => {
+                                lines.push(Line::from(vec![
+                                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                                    Span::styled("resolving...", Style::default().fg(Color::Yellow)),
+                                ]));
+                            }
+                            ScanStatus::Failed => {
+                                lines.push(Line::from(vec![
+                                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                                    Span::styled("resolution failed", Style::default().fg(Color::Red)),
+                                ]));
+                            }
+                            _ => {
+                                lines.push(Line::from(vec![
+                                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                                    Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
+                                ]));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        // Non-DNS result (shouldn't happen)
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                            Span::styled("error", Style::default().fg(Color::Red)),
+                        ]));
+                    }
+                }
+            }
+            None => {
+                lines.push(Line::from(vec![
+                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
+                    Span::styled("DNS scanner not available", Style::default().fg(Color::Red)),
+                ]));
+            }
+        }
         
         // Empty line for spacing
         lines.push(Line::from(""));

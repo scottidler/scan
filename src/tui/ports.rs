@@ -333,11 +333,11 @@ impl Pane for PortsPane {
                                     ]),
                                     Line::from(vec![
                                         Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
-                                        Span::styled("detecting...", Style::default().fg(Color::Gray)),
+                                        Span::styled("detecting...", Style::default().fg(Color::Yellow)),
                                     ]),
                                     Line::from(vec![
                                         Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
-                                        Span::styled("checking...", Style::default().fg(Color::Gray)),
+                                        Span::styled("checking...", Style::default().fg(Color::Yellow)),
                                     ]),
                                 ]
                             }

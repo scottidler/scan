@@ -54,6 +54,23 @@ impl Pane for TraceroutePane {
         
         // Get traceroute results and render them
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
+            // Update header with current status
+            lines[0] = Line::from(vec![
+                Span::styled("🗺️  ROUTE: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    match traceroute_state.status {
+                        crate::types::ScanStatus::Running => "tracing...",
+                        crate::types::ScanStatus::Complete => "traced",
+                        crate::types::ScanStatus::Failed => "failed",
+                    },
+                    Style::default().fg(match traceroute_state.status {
+                        crate::types::ScanStatus::Running => Color::Yellow,
+                        crate::types::ScanStatus::Complete => Color::Green,
+                        crate::types::ScanStatus::Failed => Color::Red,
+                    })
+                ),
+            ]);
+            
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
                 // Basic traceroute info
                 let hop_count = traceroute_result.hops.len();
@@ -120,27 +137,43 @@ impl Pane for TraceroutePane {
                 ]));
                 
             } else {
-                // No traceroute data available yet
-                lines.push(Line::from(vec![
-                    Span::styled("📍 IPv4: ", Style::default().fg(Color::White)),
-                    Span::styled("tracing...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("📍 IPv6: ", Style::default().fg(Color::White)),
-                    Span::styled("tracing...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("⏱️  Total: ", Style::default().fg(Color::White)),
-                    Span::styled("measuring...", Style::default().fg(Color::Gray)),
-                ]));
+                // No traceroute data available yet - check scanner status
+                match traceroute_state.status {
+                    crate::types::ScanStatus::Running => {
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 IPv4: ", Style::default().fg(Color::White)),
+                            Span::styled("tracing...", Style::default().fg(Color::Yellow)),
+                        ]));
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 IPv6: ", Style::default().fg(Color::White)),
+                            Span::styled("tracing...", Style::default().fg(Color::Yellow)),
+                        ]));
+                    }
+                    crate::types::ScanStatus::Failed => {
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                            Span::styled("trace failed", Style::default().fg(Color::Red)),
+                        ]));
+                    }
+                    _ => {
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                            Span::styled("waiting to trace...", Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
             }
         } else {
             // No traceroute scanner available
+            lines[0] = Line::from(vec![
+                Span::styled("🗺️  ROUTE: ", Style::default().fg(Color::Cyan)),
+                Span::styled("unavailable", Style::default().fg(Color::Red)),
+            ]);
+            
             lines.push(Line::from(vec![
-                Span::styled("TRACEROUTE: ", Style::default().fg(Color::White)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                Span::styled("Traceroute scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
         

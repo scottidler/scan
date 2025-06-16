@@ -54,6 +54,23 @@ impl Pane for SecurityPane {
         
         // Get TLS results and render them
         if let Some(tls_state) = state.scanners.get("tls") {
+            // Update header with current status
+            lines[0] = Line::from(vec![
+                Span::styled("🔒 TLS: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    match tls_state.status {
+                        crate::types::ScanStatus::Running => "scanning...",
+                        crate::types::ScanStatus::Complete => "analyzed",
+                        crate::types::ScanStatus::Failed => "failed",
+                    },
+                    Style::default().fg(match tls_state.status {
+                        crate::types::ScanStatus::Running => Color::Yellow,
+                        crate::types::ScanStatus::Complete => Color::Green,
+                        crate::types::ScanStatus::Failed => Color::Red,
+                    })
+                ),
+            ]);
+            
             if let Some(ScanResult::Tls(tls_result)) = &tls_state.result {
                 // Connection status
                 let (status_text, status_color) = if tls_result.connection_successful {
@@ -166,14 +183,14 @@ impl Pane for SecurityPane {
             }
         } else {
             // No TLS scanner available
-            lines.push(Line::from(vec![
-                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
-                Span::styled("checking...", Style::default().fg(Color::Gray)),
-            ]));
+            lines[0] = Line::from(vec![
+                Span::styled("🔒 TLS: ", Style::default().fg(Color::Cyan)),
+                Span::styled("unavailable", Style::default().fg(Color::Red)),
+            ]);
             
             lines.push(Line::from(vec![
-                Span::styled("🔐 Version: ", Style::default().fg(Color::White)),
-                Span::styled("detecting...", Style::default().fg(Color::Gray)),
+                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
+                Span::styled("TLS scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
         

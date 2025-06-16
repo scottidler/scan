@@ -160,7 +160,7 @@ impl Pane for ConnectivityPane {
                         } else {
                             lines.push(Line::from(vec![
                                 Span::styled("  HTTP: ", Style::default().fg(Color::White)),
-                                Span::styled("checking...", Style::default().fg(Color::Gray)),
+                                Span::styled("checking...", Style::default().fg(Color::Yellow)),
                             ]));
                         }
                     }
@@ -192,7 +192,7 @@ impl Pane for ConnectivityPane {
                         } else {
                             lines.push(Line::from(vec![
                                 Span::styled("  TLS: ", Style::default().fg(Color::White)),
-                                Span::styled("checking...", Style::default().fg(Color::Gray)),
+                                Span::styled("checking...", Style::default().fg(Color::Yellow)),
                             ]));
                         }
                     }
@@ -216,12 +216,12 @@ impl Pane for ConnectivityPane {
                             lines.push(Line::from(""));
                             lines.push(Line::from(vec![
                                 Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
-                                Span::styled("measuring...", Style::default().fg(Color::Gray)),
+                                Span::styled("measuring...", Style::default().fg(Color::Yellow)),
                             ]));
                             
                             lines.push(Line::from(vec![
                                 Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
-                                Span::styled("measuring...", Style::default().fg(Color::Gray)),
+                                Span::styled("measuring...", Style::default().fg(Color::Yellow)),
                             ]));
                         }
                         crate::types::ScanStatus::Failed => {

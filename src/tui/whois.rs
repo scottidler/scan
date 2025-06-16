@@ -54,6 +54,23 @@ impl Pane for WhoisPane {
         
         // Get WHOIS results and render them
         if let Some(whois_state) = state.scanners.get("whois") {
+            // Update header with current status
+            lines[0] = Line::from(vec![
+                Span::styled("📋 WHOIS: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    match whois_state.status {
+                        crate::types::ScanStatus::Running => "querying...",
+                        crate::types::ScanStatus::Complete => "retrieved",
+                        crate::types::ScanStatus::Failed => "failed",
+                    },
+                    Style::default().fg(match whois_state.status {
+                        crate::types::ScanStatus::Running => Color::Yellow,
+                        crate::types::ScanStatus::Complete => Color::Green,
+                        crate::types::ScanStatus::Failed => Color::Red,
+                    })
+                ),
+            ]);
+            
             if let Some(ScanResult::Whois(whois_result)) = &whois_state.result {
                 // Domain name
                 lines.push(Line::from(vec![
@@ -220,37 +237,43 @@ impl Pane for WhoisPane {
                 ]));
 
             } else {
-                // No WHOIS data available yet
-                lines.push(Line::from(vec![
-                    Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                    Span::styled("querying...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("🏢 Registrar: ", Style::default().fg(Color::White)),
-                    Span::styled("looking up...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("📅 Created: ", Style::default().fg(Color::White)),
-                    Span::styled("checking...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("⏰ Expires: ", Style::default().fg(Color::White)),
-                    Span::styled("verifying...", Style::default().fg(Color::Gray)),
-                ]));
+                // No WHOIS data available yet - check scanner status
+                match whois_state.status {
+                    crate::types::ScanStatus::Running => {
+                        lines.push(Line::from(vec![
+                            Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
+                            Span::styled("querying...", Style::default().fg(Color::Yellow)),
+                        ]));
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled("🏢 Registrar: ", Style::default().fg(Color::White)),
+                            Span::styled("looking up...", Style::default().fg(Color::Yellow)),
+                        ]));
+                    }
+                    crate::types::ScanStatus::Failed => {
+                        lines.push(Line::from(vec![
+                            Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
+                            Span::styled("query failed", Style::default().fg(Color::Red)),
+                        ]));
+                    }
+                    _ => {
+                        lines.push(Line::from(vec![
+                            Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
+                            Span::styled("waiting to query...", Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
             }
         } else {
             // No WHOIS scanner available
-            lines.push(Line::from(vec![
-                Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                Span::styled("querying...", Style::default().fg(Color::Gray)),
-            ]));
+            lines[0] = Line::from(vec![
+                Span::styled("📋 WHOIS: ", Style::default().fg(Color::Cyan)),
+                Span::styled("unavailable", Style::default().fg(Color::Red)),
+            ]);
             
             lines.push(Line::from(vec![
-                Span::styled("🏢 Registrar: ", Style::default().fg(Color::White)),
-                Span::styled("looking up...", Style::default().fg(Color::Gray)),
+                Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
+                Span::styled("WHOIS scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
         

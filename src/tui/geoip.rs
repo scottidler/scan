@@ -54,6 +54,23 @@ impl Pane for GeoIpPane {
         
         // Get GeoIP results and render them
         if let Some(geoip_state) = state.scanners.get("geoip") {
+            // Update header with current status
+            lines[0] = Line::from(vec![
+                Span::styled("🌍 GEOIP: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    match geoip_state.status {
+                        crate::types::ScanStatus::Running => "locating...",
+                        crate::types::ScanStatus::Complete => "located",
+                        crate::types::ScanStatus::Failed => "failed",
+                    },
+                    Style::default().fg(match geoip_state.status {
+                        crate::types::ScanStatus::Running => Color::Yellow,
+                        crate::types::ScanStatus::Complete => Color::Green,
+                        crate::types::ScanStatus::Failed => Color::Red,
+                    })
+                ),
+            ]);
+            
             if let Some(ScanResult::GeoIp(geoip_result)) = &geoip_state.result {
                 // Location
                 if let Some(location) = &geoip_result.location {
@@ -136,27 +153,43 @@ impl Pane for GeoIpPane {
                 ]));
                 
             } else {
-                // No GeoIP data available yet
-                lines.push(Line::from(vec![
-                    Span::styled("📍 Location: ", Style::default().fg(Color::White)),
-                    Span::styled("locating...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
-                    Span::styled("identifying...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("🔗 ASN: ", Style::default().fg(Color::White)),
-                    Span::styled("looking up...", Style::default().fg(Color::Gray)),
-                ]));
+                // No GeoIP data available yet - check scanner status
+                match geoip_state.status {
+                    crate::types::ScanStatus::Running => {
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 Location: ", Style::default().fg(Color::White)),
+                            Span::styled("locating...", Style::default().fg(Color::Yellow)),
+                        ]));
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
+                            Span::styled("identifying...", Style::default().fg(Color::Yellow)),
+                        ]));
+                    }
+                    crate::types::ScanStatus::Failed => {
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                            Span::styled("location lookup failed", Style::default().fg(Color::Red)),
+                        ]));
+                    }
+                    _ => {
+                        lines.push(Line::from(vec![
+                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                            Span::styled("waiting to locate...", Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
             }
         } else {
             // No GeoIP scanner available
+            lines[0] = Line::from(vec![
+                Span::styled("🌍 GEOIP: ", Style::default().fg(Color::Cyan)),
+                Span::styled("unavailable", Style::default().fg(Color::Red)),
+            ]);
+            
             lines.push(Line::from(vec![
-                Span::styled("GEOIP: ", Style::default().fg(Color::White)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                Span::styled("GeoIP scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
         

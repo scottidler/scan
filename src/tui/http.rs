@@ -21,6 +21,25 @@ impl HttpPane {
             id: "http",
         }
     }
+    
+    /// Truncate URL to fit in the display
+    fn truncate_url(url: &str) -> String {
+        if url.len() <= 35 {
+            url.to_string()
+        } else {
+            // Remove protocol and show domain + path
+            let url_without_protocol = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(url);
+            
+            if url_without_protocol.len() <= 35 {
+                url_without_protocol.to_string()
+            } else {
+                format!("{}...", &url_without_protocol[..32])
+            }
+        }
+    }
 }
 
 impl Default for HttpPane {
@@ -54,6 +73,23 @@ impl Pane for HttpPane {
         
         // Get HTTP results and render them
         if let Some(http_state) = state.scanners.get("http") {
+            // Update header with current status
+            lines[0] = Line::from(vec![
+                Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    match http_state.status {
+                        crate::types::ScanStatus::Running => "scanning...",
+                        crate::types::ScanStatus::Complete => "completed",
+                        crate::types::ScanStatus::Failed => "failed",
+                    },
+                    Style::default().fg(match http_state.status {
+                        crate::types::ScanStatus::Running => Color::Yellow,
+                        crate::types::ScanStatus::Complete => Color::Green,
+                        crate::types::ScanStatus::Failed => Color::Red,
+                    })
+                ),
+            ]);
+            
             if let Some(ScanResult::Http(http_result)) = &http_state.result {
                 // Status code
                 let status_color = match http_result.status_code {
@@ -125,7 +161,7 @@ impl Pane for HttpPane {
                     ),
                 ]));
                 
-                // Redirect chain
+                // Redirect chain - show details
                 if !http_result.redirect_chain.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled("🔗 Redirects: ", Style::default().fg(Color::White)),
@@ -134,9 +170,23 @@ impl Pane for HttpPane {
                             Style::default().fg(Color::Magenta)
                         ),
                     ]));
+                    
+                    // Show each redirect in the chain
+                    for redirect in &http_result.redirect_chain {
+                        let from_url = Self::truncate_url(&redirect.from);
+                        let to_url = Self::truncate_url(&redirect.to);
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", Style::default()),
+                            Span::styled(from_url, Style::default().fg(Color::Gray)),
+                            Span::styled(" → ", Style::default().fg(Color::Magenta)),
+                            Span::styled(to_url, Style::default().fg(Color::Cyan)),
+                            Span::styled(format!(" ({})", redirect.status_code), Style::default().fg(Color::Yellow)),
+                        ]));
+                    }
                 }
                 
-                // Vulnerabilities count
+                // Vulnerabilities - show details
                 if !http_result.vulnerabilities.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled("⚠️  Issues: ", Style::default().fg(Color::White)),
@@ -145,6 +195,24 @@ impl Pane for HttpPane {
                             Style::default().fg(Color::Red)
                         ),
                     ]));
+                    
+                    // Show each vulnerability
+                    for vulnerability in &http_result.vulnerabilities {
+                        let vuln_text = match vulnerability {
+                            crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS",
+                            crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options",
+                            crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options",
+                            crate::scan::http::HttpVulnerability::MissingCsp => "Missing CSP",
+                            crate::scan::http::HttpVulnerability::WeakCsp => "Weak CSP",
+                            crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS",
+                            crate::scan::http::HttpVulnerability::InformationDisclosure => "Information Disclosure",
+                        };
+                        
+                        lines.push(Line::from(vec![
+                            Span::styled("  • ", Style::default().fg(Color::Red)),
+                            Span::styled(vuln_text, Style::default().fg(Color::Red)),
+                        ]));
+                    }
                 }
             } else {
                 // No HTTP data available yet
@@ -165,9 +233,14 @@ impl Pane for HttpPane {
             }
         } else {
             // No HTTP scanner available
+            lines[0] = Line::from(vec![
+                Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
+                Span::styled("unavailable", Style::default().fg(Color::Red)),
+            ]);
+            
             lines.push(Line::from(vec![
-                Span::styled("HTTP: ", Style::default().fg(Color::White)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("📊 Status: ", Style::default().fg(Color::White)),
+                Span::styled("HTTP scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
         
