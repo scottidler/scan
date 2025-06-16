@@ -565,7 +565,7 @@ impl WhoisScanner {
 #[async_trait::async_trait]
 impl Scanner for WhoisScanner {
     fn name(&self) -> &'static str {
-        "WHOIS"
+        "whois"
     }
 
     fn interval(&self) -> Duration {
@@ -692,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn test_whois_scanner_creation() {
         let scanner = WhoisScanner::new();
-        assert_eq!(scanner.name(), "WHOIS");
+        assert_eq!(scanner.name(), "whois");
         assert_eq!(scanner.interval(), Duration::from_secs(3600));
     }
 

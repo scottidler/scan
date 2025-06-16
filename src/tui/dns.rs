@@ -21,6 +21,416 @@ impl DnsPane {
             id: "dns",
         }
     }
+
+    fn truncate_txt(text: &str, max_len: usize) -> String {
+        if text.len() <= max_len {
+            text.to_string()
+        } else {
+            format!("{}...", &text[..max_len.saturating_sub(3)])
+        }
+    }
+
+    fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        
+        // A records
+        if !dns_result.A.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("A: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.A.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" records", Style::default().fg(Color::White)),
+            ]));
+            
+            // Show A records with TTL (up to 6)
+            for record in dns_result.A.iter().take(6) {
+                let ttl_color = if record.ttl_remaining() > 300 {
+                    Color::Green
+                } else if record.ttl_remaining() > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        record.value.to_string(),
+                        Style::default().fg(Color::Cyan)
+                    ),
+                    Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}s", record.ttl_remaining()),
+                        Style::default().fg(ttl_color)
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+            }
+            
+            if dns_result.A.len() > 6 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("... and {} more", dns_result.A.len() - 6),
+                        Style::default().fg(Color::Gray)
+                    ),
+                ]));
+            }
+        }
+        
+        // AAAA records (IPv6)
+        if !dns_result.AAAA.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("AAAA: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.AAAA.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" IPv6", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.AAAA.iter().take(3) {
+                let ttl_color = if record.ttl_remaining() > 300 {
+                    Color::Green
+                } else if record.ttl_remaining() > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                let ipv6_str = record.value.to_string();
+                let display_str = if ipv6_str.len() > 25 {
+                    format!("{}...", &ipv6_str[..22])
+                } else {
+                    ipv6_str
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        display_str,
+                        Style::default().fg(Color::Cyan)
+                    ),
+                    Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}s", record.ttl_remaining()),
+                        Style::default().fg(ttl_color)
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+            }
+            
+            if dns_result.AAAA.len() > 3 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("... and {} more", dns_result.AAAA.len() - 3),
+                        Style::default().fg(Color::Gray)
+                    ),
+                ]));
+            }
+        }
+        
+        // MX records
+        if !dns_result.MX.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("MX: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.MX.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" records", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.MX.iter().take(4) {
+                let ttl_color = if record.ttl_remaining() > 300 {
+                    Color::Green
+                } else if record.ttl_remaining() > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                let priority_color = if record.value.priority <= 10 {
+                    Color::Green
+                } else if record.value.priority <= 20 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        record.value.exchange.clone(),
+                        Style::default().fg(Color::Magenta)
+                    ),
+                    Span::styled(" (pri: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", record.value.priority),
+                        Style::default().fg(priority_color)
+                    ),
+                    Span::styled(", TTL: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}s", record.ttl_remaining()),
+                        Style::default().fg(ttl_color)
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+            }
+            
+            if dns_result.MX.len() > 4 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("... and {} more", dns_result.MX.len() - 4),
+                        Style::default().fg(Color::Gray)
+                    ),
+                ]));
+            }
+        }
+        
+        // TXT records (basic display, security analysis goes to security pane)
+        if !dns_result.TXT.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("TXT: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.TXT.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" records", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.TXT.iter().take(4) {
+                let value = record.value.clone();
+                let display_value = if value.starts_with("google-site-verification") {
+                    "google-site-verification=...".to_string()
+                } else if value.starts_with("MS=") {
+                    format!("MS={}...", &value[3..].chars().take(10).collect::<String>())
+                } else {
+                    Self::truncate_txt(&value, 45)
+                };
+                
+                let ttl_color = if record.ttl_remaining() > 300 {
+                    Color::Green
+                } else if record.ttl_remaining() > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        display_value,
+                        Style::default().fg(Color::Yellow)
+                    ),
+                    Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}s", record.ttl_remaining()),
+                        Style::default().fg(ttl_color)
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+            }
+            
+            if dns_result.TXT.len() > 4 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("... and {} more TXT records", dns_result.TXT.len() - 4),
+                        Style::default().fg(Color::Gray)
+                    ),
+                ]));
+            }
+        }
+        
+        // NS records
+        if !dns_result.NS.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("NS: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.NS.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" records", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.NS.iter().take(4) {
+                let ttl_color = if record.ttl_remaining() > 300 {
+                    Color::Green
+                } else if record.ttl_remaining() > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        record.value.clone(),
+                        Style::default().fg(Color::Blue)
+                    ),
+                    Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}s", record.ttl_remaining()),
+                        Style::default().fg(ttl_color)
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+            }
+            
+            if dns_result.NS.len() > 4 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("... and {} more", dns_result.NS.len() - 4),
+                        Style::default().fg(Color::Gray)
+                    ),
+                ]));
+            }
+        }
+        
+        // CNAME records
+        if !dns_result.CNAME.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("CNAME: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.CNAME.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" records", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.CNAME.iter().take(3) {
+                let ttl_color = if record.ttl_remaining() > 300 {
+                    Color::Green
+                } else if record.ttl_remaining() > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        record.value.clone(),
+                        Style::default().fg(Color::Magenta)
+                    ),
+                    Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}s", record.ttl_remaining()),
+                        Style::default().fg(ttl_color)
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+        
+        // CAA records
+        if !dns_result.CAA.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("CAA: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.CAA.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" cert auth", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.CAA.iter().take(3) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("{} {}", record.value.tag, record.value.value),
+                        Style::default().fg(Color::Green)
+                    ),
+                ]));
+            }
+        }
+        
+        // SOA records
+        if !dns_result.SOA.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("SOA: ", Style::default().fg(Color::White)),
+                Span::styled("authority", Style::default().fg(Color::Green)),
+            ]));
+            
+            if let Some(soa) = dns_result.SOA.first() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("NS: {}", soa.value.primary_ns),
+                        Style::default().fg(Color::Cyan)
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("Serial: {}", soa.value.serial),
+                        Style::default().fg(Color::Gray)
+                    ),
+                ]));
+            }
+        }
+        
+        // SRV records
+        if !dns_result.SRV.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("SRV: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    dns_result.SRV.len().to_string(),
+                    Style::default().fg(Color::Green)
+                ),
+                Span::styled(" services", Style::default().fg(Color::White)),
+            ]));
+            
+            for record in dns_result.SRV.iter().take(3) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("{}:{} (p:{}, w:{})", 
+                            record.value.target, 
+                            record.value.port,
+                            record.value.priority,
+                            record.value.weight
+                        ),
+                        Style::default().fg(Color::Blue)
+                    ),
+                ]));
+            }
+        }
+        
+        lines
+    }
+
+    fn build_dns_loading_lines() -> Vec<Line<'static>> {
+        vec![
+            Line::from(vec![
+                Span::styled("A: ", Style::default().fg(Color::White)),
+                Span::styled("resolving...", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled("AAAA: ", Style::default().fg(Color::White)),
+                Span::styled("resolving...", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled("MX: ", Style::default().fg(Color::White)),
+                Span::styled("resolving...", Style::default().fg(Color::Gray)),
+            ]),
+        ]
+    }
+
+    fn build_dns_unavailable_lines() -> Vec<Line<'static>> {
+        vec![
+            Line::from(vec![
+                Span::styled("DNS: ", Style::default().fg(Color::White)),
+                Span::styled("scanner not available", Style::default().fg(Color::Red)),
+            ])
+        ]
+    }
 }
 
 impl Default for DnsPane {
@@ -53,176 +463,20 @@ impl Pane for DnsPane {
         lines.push(Line::from(""));
         
         // Get DNS results and render them
-        if let Some(dns_state) = state.scanners.get("dns") {
-            if let Some(ScanResult::Dns(dns_result)) = &dns_state.result {
-                // A records
-                if !dns_result.A.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("A: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            dns_result.A.len().to_string(),
-                            Style::default().fg(Color::Green)
-                        ),
-                        Span::styled(" records", Style::default().fg(Color::White)),
-                    ]));
-                    
-                    // Show first A record with TTL
-                    if let Some(first_a) = dns_result.A.first() {
-                        let ttl_color = if first_a.ttl_remaining() > 300 {
-                            Color::Green
-                        } else if first_a.ttl_remaining() > 60 {
-                            Color::Yellow
-                        } else {
-                            Color::Red
-                        };
-                        
-                        lines.push(Line::from(vec![
-                            Span::styled("   ", Style::default()),
-                            Span::styled(
-                                first_a.value.to_string(),
-                                Style::default().fg(Color::Cyan)
-                            ),
-                            Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
-                            Span::styled(
-                                first_a.ttl_remaining().to_string(),
-                                Style::default().fg(ttl_color)
-                            ),
-                            Span::styled("s)", Style::default().fg(Color::Gray)),
-                        ]));
-                    }
-                }
-                
-                // AAAA records
-                if !dns_result.AAAA.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("AAAA: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            dns_result.AAAA.len().to_string(),
-                            Style::default().fg(Color::Green)
-                        ),
-                        Span::styled(" records", Style::default().fg(Color::White)),
-                    ]));
-                    
-                    // Show first AAAA record with TTL
-                    if let Some(first_aaaa) = dns_result.AAAA.first() {
-                        let ttl_color = if first_aaaa.ttl_remaining() > 300 {
-                            Color::Green
-                        } else if first_aaaa.ttl_remaining() > 60 {
-                            Color::Yellow
-                        } else {
-                            Color::Red
-                        };
-                        
-                        lines.push(Line::from(vec![
-                            Span::styled("   ", Style::default()),
-                            Span::styled(
-                                first_aaaa.value.to_string(),
-                                Style::default().fg(Color::Cyan)
-                            ),
-                            Span::styled(" (TTL: ", Style::default().fg(Color::Gray)),
-                            Span::styled(
-                                first_aaaa.ttl_remaining().to_string(),
-                                Style::default().fg(ttl_color)
-                            ),
-                            Span::styled("s)", Style::default().fg(Color::Gray)),
-                        ]));
-                    }
-                }
-                
-                // MX records
-                if !dns_result.MX.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("MX: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            dns_result.MX.len().to_string(),
-                            Style::default().fg(Color::Green)
-                        ),
-                        Span::styled(" records", Style::default().fg(Color::White)),
-                    ]));
-                    
-                    // Show first MX record
-                    if let Some(first_mx) = dns_result.MX.first() {
-                        lines.push(Line::from(vec![
-                            Span::styled("   ", Style::default()),
-                            Span::styled(
-                                format!("{} ({})", first_mx.value.exchange, first_mx.value.priority),
-                                Style::default().fg(Color::Magenta)
-                            ),
-                        ]));
-                    }
-                }
-                
-                // CNAME records
-                if !dns_result.CNAME.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("CNAME: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            dns_result.CNAME.len().to_string(),
-                            Style::default().fg(Color::Green)
-                        ),
-                        Span::styled(" records", Style::default().fg(Color::White)),
-                    ]));
-                    
-                    // Show first CNAME
-                    if let Some(first_cname) = dns_result.CNAME.first() {
-                        lines.push(Line::from(vec![
-                            Span::styled("   ", Style::default()),
-                            Span::styled(
-                                first_cname.value.to_string(),
-                                Style::default().fg(Color::Yellow)
-                            ),
-                        ]));
-                    }
-                }
-                
-                // TXT records
-                if !dns_result.TXT.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("TXT: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            dns_result.TXT.len().to_string(),
-                            Style::default().fg(Color::Green)
-                        ),
-                        Span::styled(" records", Style::default().fg(Color::White)),
-                    ]));
-                }
-                
-                // NS records
-                if !dns_result.NS.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("NS: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            dns_result.NS.len().to_string(),
-                            Style::default().fg(Color::Green)
-                        ),
-                        Span::styled(" records", Style::default().fg(Color::White)),
-                    ]));
-                }
-                
+        let dns_lines = if let Some(dns_state) = state.scanners.get("dns") {
+            // Clone the result to avoid lifetime issues
+            let result = dns_state.result.clone();
+            if let Some(ScanResult::Dns(dns_result)) = result {
+                Self::build_dns_result_lines(dns_result)
             } else {
-                // No DNS data available yet
-                lines.push(Line::from(vec![
-                    Span::styled("A: ", Style::default().fg(Color::White)),
-                    Span::styled("resolving...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("AAAA: ", Style::default().fg(Color::White)),
-                    Span::styled("resolving...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("MX: ", Style::default().fg(Color::White)),
-                    Span::styled("resolving...", Style::default().fg(Color::Gray)),
-                ]));
+                Self::build_dns_loading_lines()
             }
         } else {
-            // No DNS scanner available
-            lines.push(Line::from(vec![
-                Span::styled("DNS: ", Style::default().fg(Color::White)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
-            ]));
-        }
+            Self::build_dns_unavailable_lines()
+        };
+        
+        // Add DNS lines to main lines
+        lines.extend(dns_lines);
         
         // Create and render the paragraph
         let paragraph = Paragraph::new(lines)

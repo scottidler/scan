@@ -76,7 +76,7 @@ impl Pane for ConnectivityPane {
                 if let Some(ttl) = ping.ttl {
                     lines.push(Line::from(vec![
                         Span::styled("🔢 TTL: ", Style::default().fg(Color::White)),
-                        Span::styled(ttl.to_string(), Style::default().fg(Color::Gray)),
+                        Span::styled(format!("{} hops", ttl), Style::default().fg(Color::Gray)),
                     ]));
                 }
             } else {

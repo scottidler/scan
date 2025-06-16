@@ -21,6 +21,97 @@ impl PortsPane {
             id: "ports",
         }
     }
+
+    fn build_port_result_lines(
+        open_count: usize,
+        open_ports: Vec<crate::scan::port::OpenPort>,
+        filtered_ports: u16,
+        scan_duration_ms: u128,
+    ) -> Vec<Line<'static>> {
+        let mut port_lines = Vec::new();
+        
+        // Open ports count with color coding
+        let port_color = if open_count == 0 {
+            Color::Green
+        } else if open_count <= 5 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        
+        port_lines.push(Line::from(vec![
+            Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
+            Span::styled("completed", Style::default().fg(Color::Green)),
+        ]));
+        
+        port_lines.push(Line::from(vec![
+            Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
+            Span::styled(
+                open_count.to_string(),
+                Style::default().fg(port_color)
+            ),
+            Span::styled(" ports", Style::default().fg(Color::White)),
+        ]));
+        
+        // Show first few open ports
+        for open_port in open_ports.iter() {
+            let service_name = open_port.service.as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            
+            let protocol_str = match open_port.protocol {
+                crate::scan::port::Protocol::Tcp => "tcp",
+                crate::scan::port::Protocol::Udp => "udp",
+            };
+            
+            port_lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!("{}/{}", open_port.port, protocol_str),
+                    Style::default().fg(Color::Cyan)
+                ),
+                Span::styled(" (", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    service_name,
+                    Style::default().fg(Color::Yellow)
+                ),
+                Span::styled(")", Style::default().fg(Color::Gray)),
+            ]));
+        }
+        
+        // Show "more" indicator
+        if open_count > 3 {
+            port_lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!("... and {} more", open_count - 3),
+                    Style::default().fg(Color::Gray)
+                ),
+            ]));
+        }
+        
+        // Filtered and closed ports summary
+        if filtered_ports > 0 {
+            port_lines.push(Line::from(vec![
+                Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    filtered_ports.to_string(),
+                    Style::default().fg(Color::Yellow)
+                ),
+            ]));
+        }
+        
+        // Scan duration
+        port_lines.push(Line::from(vec![
+            Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{}ms", scan_duration_ms),
+                Style::default().fg(Color::Gray)
+            ),
+        ]));
+        
+        port_lines
+    }
 }
 
 impl Default for PortsPane {
@@ -53,135 +144,76 @@ impl Pane for PortsPane {
         lines.push(Line::from(""));
         
         // Get port scan results and render them
-        if let Some(port_state) = state.scanners.get("port") {
-            if let Some(ScanResult::Port(port_result)) = &port_state.result {
-                // Open ports count
-                let open_count = port_result.open_ports.len();
-                let open_color = if open_count == 0 {
-                    Color::Green
-                } else if open_count <= 5 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
+        let port_lines = match state.scanners.get("port") {
+            Some(port_state) => {
+                // Clone the data we need to avoid lifetime issues
+                let result = port_state.result.clone();
+                let status = port_state.status.clone();
                 
-                lines.push(Line::from(vec![
-                    Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        open_count.to_string(),
-                        Style::default().fg(open_color)
-                    ),
-                    Span::styled(" ports", Style::default().fg(Color::White)),
-                ]));
-                
-                // Show first few open ports
-                if !port_result.open_ports.is_empty() {
-                    let ports_to_show = std::cmp::min(port_result.open_ports.len(), 4);
-                    for i in 0..ports_to_show {
-                        let port = &port_result.open_ports[i];
-                        let service_info = if let Some(service) = &port.service {
-                            format!(" ({})", service.name)
-                        } else {
-                            String::new()
-                        };
+                match result {
+                    Some(ScanResult::Port(port_result)) => {
+                        // Extract the data we need to avoid lifetime issues
+                        let open_count = port_result.open_ports.len();
+                        let open_ports: Vec<_> = port_result.open_ports.iter().take(3).cloned().collect();
+                        let filtered_ports = port_result.filtered_ports;
+                        let scan_duration_ms = port_result.scan_duration.as_millis();
                         
-                        let protocol_str = match port.protocol {
-                            crate::scan::port::Protocol::Tcp => "tcp",
-                            crate::scan::port::Protocol::Udp => "udp",
-                        };
-                        
-                        lines.push(Line::from(vec![
-                            Span::styled("   ", Style::default()),
-                            Span::styled(
-                                format!("{}/{}", port.port, protocol_str),
-                                Style::default().fg(Color::Green)
-                            ),
-                            Span::styled(
-                                service_info,
-                                Style::default().fg(Color::Gray)
-                            ),
-                        ]));
+                        // Build the port lines
+                        Self::build_port_result_lines(open_count, open_ports, filtered_ports, scan_duration_ms)
                     }
-                    
-                    // Show "more" indicator if there are additional ports
-                    if port_result.open_ports.len() > 4 {
-                        let remaining = port_result.open_ports.len() - 4;
-                        lines.push(Line::from(vec![
-                            Span::styled("   ", Style::default()),
-                            Span::styled(
-                                format!("... +{} more", remaining),
-                                Style::default().fg(Color::Gray)
-                            ),
-                        ]));
+                    Some(_) => {
+                        // Wrong result type (shouldn't happen)
+                        vec![Line::from(vec![
+                            Span::styled("❌ Error: ", Style::default().fg(Color::White)),
+                            Span::styled("wrong result type", Style::default().fg(Color::Red)),
+                        ])]
+                    }
+                    None => {
+                        // Still scanning or no results yet
+                        match status {
+                            crate::types::ScanStatus::Running => {
+                                vec![
+                                    Line::from(vec![
+                                        Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
+                                        Span::styled("scanning...", Style::default().fg(Color::Gray)),
+                                    ]),
+                                    Line::from(vec![
+                                        Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
+                                        Span::styled("detecting...", Style::default().fg(Color::Gray)),
+                                    ]),
+                                    Line::from(vec![
+                                        Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
+                                        Span::styled("checking...", Style::default().fg(Color::Gray)),
+                                    ]),
+                                ]
+                            }
+                            crate::types::ScanStatus::Failed => {
+                                vec![Line::from(vec![
+                                    Span::styled("❌ Status: ", Style::default().fg(Color::White)),
+                                    Span::styled("scan failed", Style::default().fg(Color::Red)),
+                                ])]
+                            }
+                            _ => {
+                                vec![Line::from(vec![
+                                    Span::styled("📊 Status: ", Style::default().fg(Color::White)),
+                                    Span::styled("initializing...", Style::default().fg(Color::Gray)),
+                                ])]
+                            }
+                        }
                     }
                 }
-                
-                // Filtered ports
-                if port_result.filtered_ports > 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("🔒 Filtered: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            port_result.filtered_ports.to_string(),
-                            Style::default().fg(Color::Yellow)
-                        ),
-                        Span::styled(" ports", Style::default().fg(Color::White)),
-                    ]));
-                }
-                
-                // Closed ports
-                if port_result.closed_ports > 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("🔴 Closed: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            port_result.closed_ports.to_string(),
-                            Style::default().fg(Color::Red)
-                        ),
-                        Span::styled(" ports", Style::default().fg(Color::White)),
-                    ]));
-                }
-                
-                // Scan duration
-                let scan_time_ms = port_result.scan_duration.as_millis();
-                let time_color = if scan_time_ms < 1000 {
-                    Color::Green
-                } else if scan_time_ms < 5000 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
-                
-                lines.push(Line::from(vec![
-                    Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{}ms", scan_time_ms),
-                        Style::default().fg(time_color)
-                    ),
-                ]));
-                
-            } else {
-                // No port data available yet
-                lines.push(Line::from(vec![
-                    Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
-                    Span::styled("scanning...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
-                    Span::styled("detecting...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("🔒 Filtered: ", Style::default().fg(Color::White)),
-                    Span::styled("checking...", Style::default().fg(Color::Gray)),
-                ]));
             }
-        } else {
-            // No port scanner available
-            lines.push(Line::from(vec![
-                Span::styled("PORTS: ", Style::default().fg(Color::White)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
-            ]));
-        }
+            None => {
+                // No port scanner available
+                vec![Line::from(vec![
+                    Span::styled("PORTS: ", Style::default().fg(Color::White)),
+                    Span::styled("scanner not available", Style::default().fg(Color::Red)),
+                ])]
+            }
+        };
+        
+        // Add port lines to main lines
+        lines.extend(port_lines);
         
         // Create and render the paragraph
         let paragraph = Paragraph::new(lines)

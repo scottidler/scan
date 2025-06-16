@@ -454,7 +454,7 @@ impl HttpScanner {
 #[async_trait::async_trait]
 impl Scanner for HttpScanner {
     fn name(&self) -> &'static str {
-        "HTTP"
+        "http"
     }
 
     fn interval(&self) -> Duration {
