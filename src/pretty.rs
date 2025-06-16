@@ -195,6 +195,47 @@ fn print_scan_result(result: &ScanResult) {
                 geoip.data_source
             );
         }
+        
+        ScanResult::Port(port) => {
+            let open_count = port.open_ports.len();
+            
+            if open_count == 0 {
+                println!("No open ports found ({}ms)",
+                    port.scan_duration.as_millis()
+                );
+            } else {
+                // Show first few ports with services
+                let mut port_descriptions = Vec::new();
+                for open_port in port.open_ports.iter().take(4) {
+                    let service_name = if let Some(service) = &open_port.service {
+                        service.name.clone()
+                    } else {
+                        "unknown".to_string()
+                    };
+                    
+                    port_descriptions.push(format!("{} {}", open_port.port, service_name.to_uppercase()));
+                }
+                
+                let ports_str = if open_count > 4 {
+                    format!("{}, +{} more", port_descriptions.join(", "), open_count - 4)
+                } else {
+                    port_descriptions.join(", ")
+                };
+                
+                let mode_str = match port.scan_mode {
+                    crate::scan::port::ScanMode::Quick => "quick",
+                    crate::scan::port::ScanMode::Standard => "standard", 
+                    crate::scan::port::ScanMode::Custom(_) => "custom",
+                };
+                
+                println!("{} open ({}) ({}ms, {} scan)",
+                    open_count,
+                    ports_str,
+                    port.scan_duration.as_millis(),
+                    mode_str
+                );
+            }
+        }
     }
 }
 
