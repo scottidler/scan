@@ -45,6 +45,7 @@ pub enum ScanResult {
     Http(crate::scan::http::HttpResult),
     Whois(crate::scan::whois::WhoisResult),
     Traceroute(crate::scan::traceroute::TracerouteResult),
+    GeoIp(crate::scan::geoip::GeoIpResult),
     // TODO: Add other scanner result types
     // Port(crate::scan::port::PortResult),
 } 

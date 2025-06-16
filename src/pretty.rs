@@ -166,6 +166,35 @@ fn print_scan_result(result: &ScanResult) {
                 traceroute.scan_duration.as_millis()
             );
         }
+        
+        ScanResult::GeoIp(geoip) => {
+            let location_str = if let Some(location) = &geoip.location {
+                if location.city.is_empty() {
+                    format!("{}, {}", location.region, location.country)
+                } else {
+                    format!("{}, {}, {}", location.city, location.region, location.country)
+                }
+            } else {
+                "Unknown location".to_string()
+            };
+            
+            let network_str = if let Some(network) = &geoip.network_info {
+                if let Some(asn) = network.asn {
+                    format!("AS{} {}", asn, network.organization)
+                } else {
+                    network.organization.clone()
+                }
+            } else {
+                "Unknown network".to_string()
+            };
+            
+            println!("{} - {} ({}ms, {})",
+                location_str,
+                network_str,
+                geoip.scan_duration.as_millis(),
+                geoip.data_source
+            );
+        }
     }
 }
 
