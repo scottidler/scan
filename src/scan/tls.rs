@@ -222,15 +222,15 @@ impl TlsScanner {
             Ok::<(bool, Option<TlsVersion>), eyre::Error>((true, tls_version))
         }).await {
             Ok(Ok((success, version))) => {
-                let handshake_time = start_time.elapsed();
-                Ok((success, handshake_time, version))
+                let _handshake_time = start_time.elapsed();
+                Ok((success, _handshake_time, version))
             }
             Ok(Err(e)) => {
-                let handshake_time = start_time.elapsed();
+                let _handshake_time = start_time.elapsed();
                 Err(e.wrap_err("TLS handshake failed"))
             }
             Err(_) => {
-                let handshake_time = start_time.elapsed();
+                let _handshake_time = start_time.elapsed();
                 Err(eyre::eyre!("TLS connection timeout after {:?}", self.connection_timeout))
             }
         }

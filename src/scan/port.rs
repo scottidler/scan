@@ -4,7 +4,6 @@ use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::stream::{self, StreamExt};
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -116,7 +115,7 @@ impl PortScanner {
             .ok_or_else(|| eyre::eyre!("No IP address available for port scan"))?;
         
         let ports = self.get_ports();
-        let total_ports = ports.len();
+        let _total_ports = ports.len();
         
         // Create concurrent stream of port scan tasks
         let scan_results = stream::iter(ports)

@@ -1,95 +1,102 @@
-use std::sync::Arc;
-use std::time::Duration;
+use clap::Parser;
 use eyre::Result;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
 
-mod cli;
-mod types;
-mod scanner;
-mod scan;
-mod target;
-mod pretty;
-// mod tui; // TODO: Implement TUI module
+#[derive(Parser)]
+#[command(name = "scan")]
+#[command(about = "A comprehensive network scanner")]
+struct Args {
+    /// Target to scan (domain, IP, or URL)
+    target: String,
+    
+    /// Enable debug mode with pretty printing
+    #[arg(long)]
+    debug: bool,
+    
+    /// Disable TUI mode (use debug output instead)
+    #[arg(long)]
+    no_tui: bool,
+}
 
-use types::AppState;
-use target::Target;
-
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
-    let cli = cli::parse();
+    let args = Args::parse();
     
-    if cli.verbose {
-        env_logger::init();
-    }
-
     // Parse the target
-    let mut target = Target::parse(&cli.target)?;
+    let mut target = scan::target::Target::parse(&args.target)?;
+    println!("Resolving domain: {}", target.display_name());
     
-    // Resolve the target if it's a domain
-    match target.target_type {
-        target::TargetType::Domain(_) => {
-            println!("Resolving domain: {}", target.display_name());
-            target.resolve().await?;
-            if let Some(ip) = target.primary_ip() {
-                println!("Resolved to: {}", ip);
-            }
-        }
-        _ => {}
+    // Resolve the target to get IP addresses
+    target.resolve().await?;
+    if let Some(ip) = target.primary_ip() {
+        println!("Resolved to: {}", ip);
     }
-
-    // Initialize shared application state
-    let state = Arc::new(AppState::new(cli.target.clone()));
     
-    // Create and spawn scanner tasks
-    let scanners = scan::create_default_scanners();
-    scan::spawn_scanner_tasks(scanners, target.clone(), state.clone()).await;
+    // Create shared application state
+    let state = Arc::new(scan::types::AppState::new(args.target.clone()));
     
-    if !cli.no_tui && !cli.debug {
-        // TODO: Run the TUI application
-        // let mut app = tui::App::new(state, Duration::from_millis(cli.refresh_rate));
-        // app.run().await?;
+    // Create and start all scanners
+    let scanners = scan::scan::create_default_scanners();
+    let mut scanner_handles = Vec::new();
+    
+    for scanner in scanners {
+        let target_clone = target.clone();
+        let state_clone = Arc::clone(&state);
         
-        // For now, just run indefinitely until TUI is implemented
-        println!("TUI mode not yet implemented. Use --debug for debug output or --no-tui for debug mode.");
-        println!("Press Ctrl+C to exit");
+        let handle = tokio::spawn(async move {
+            scanner.run(target_clone, state_clone).await;
+        });
         
-        // Keep the application running silently
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        scanner_handles.push(handle);
+    }
+    
+    // Choose between TUI and debug mode
+    if args.no_tui || args.debug {
+        // Debug mode - pretty print results
+        println!("🎯 Scanning: {}", args.target);
+        println!("────────────────────────────────────────────────────────────────────────────────");
+        
+        if args.debug {
+            println!("Debug mode enabled. Press Ctrl+C to exit");
+        }
+        
+        // Print results every 5 seconds
         loop {
-            interval.tick().await;
+            println!("🎯 Scanning: {}", args.target);
+            println!("────────────────────────────────────────────────────────────────────────────────");
+            
+            // Print scanner results using the pretty print function
+            for scanner_state in state.scanners.iter() {
+                let scanner_name = scanner_state.key();
+                let scan_state = scanner_state.value();
+                
+                scan::pretty::print_scan_state(scanner_name, &scan_state);
+            }
+            
+            println!("────────────────────────────────────────────────────────────────────────────────");
+            
+            if args.debug {
+                println!("Refreshing every 5 seconds...");
+                println!();
+            }
+            
+            sleep(Duration::from_secs(5)).await;
         }
     } else {
-        // Debug mode: pretty print scan results to stdout
-        pretty::print_header(&cli.target);
-        println!("Debug mode enabled. Press Ctrl+C to exit");
-        pretty::print_separator();
+        // TUI mode
+        let mut terminal = scan::tui::init_terminal()?;
+        let app = scan::tui::TuiApp::new();
         
-        // Keep the application running and print scanner state periodically
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            
-            // Clear screen for better readability (optional)
-            if cli.debug {
-                print!("\x1B[2J\x1B[1;1H"); // ANSI escape codes to clear screen
-                pretty::print_header(&cli.target);
-            }
-            
-            // Print current scanner states using pretty printing
-            let mut scanner_names: Vec<String> = state.scanners.iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            scanner_names.sort();
-            
-            for scanner_name in scanner_names {
-                if let Some(scan_state) = state.scanners.get(&scanner_name) {
-                    pretty::print_scan_state(&scanner_name, &scan_state);
-                }
-            }
-            
-            if cli.debug {
-                pretty::print_separator();
-                println!("Refreshing every 5 seconds...");
-            }
-        }
+        // Run the TUI application
+        let result = app.run(&mut terminal, state);
+        
+        // Restore terminal
+        scan::tui::restore_terminal(&mut terminal)?;
+        
+        // Handle any TUI errors
+        result?;
     }
+    
+    Ok(())
 }

@@ -300,7 +300,7 @@ impl Scanner for TracerouteScanner {
             state.scanners.insert(self.name().to_string(), scan_state);
             
             // Perform scan
-            let start_time = Instant::now();
+            let _start_time = Instant::now();
             match self.scan(&target).await {
                 Ok(result) => {
                     let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
