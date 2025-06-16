@@ -21,6 +21,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize logging first
+    if let Err(e) = scan::init_logging() {
+        eprintln!("Warning: Failed to initialize logging: {}", e);
+    }
+    
+    // Add a gigantic divider to separate runs
+    log::info!("================================================================================");
+    log::info!("🚀 NEW SCAN SESSION STARTING");
+    log::info!("================================================================================");
+    
     let args = Args::parse();
     
     // Parse the target
