@@ -80,7 +80,7 @@ impl PortScanner {
             tcp_timeout: Duration::from_secs(3),
             max_concurrent: 50,
             service_detection: true,
-            scan_mode: ScanMode::Standard,
+            scan_mode: ScanMode::Quick,
         }
     }
 
@@ -270,6 +270,75 @@ impl PortScanner {
             None
         }
     }
+
+    async fn progressive_port_scan(&self, target: &Target, state: &Arc<AppState>) -> Result<PortResult> {
+        let start_time = Instant::now();
+        
+        // Get target IP
+        let target_ip = target.primary_ip()
+            .ok_or_else(|| eyre::eyre!("No IP address available for port scan"))?;
+        
+        let ports = self.get_ports();
+        let _total_ports = ports.len();
+        
+        // Initialize progress tracking
+        let mut open_ports = Vec::new();
+        let mut closed_count = 0;
+        let mut filtered_count = 0;
+        
+        // Scan ports in batches for progressive updates
+        let batch_size = 50;
+        for batch in ports.chunks(batch_size) {
+            // Scan batch concurrently
+            let batch_results = stream::iter(batch.iter().copied())
+                .map(|port| self.scan_port(target_ip, port))
+                .buffer_unordered(self.max_concurrent)
+                .collect::<Vec<_>>()
+                .await;
+            
+            // Process batch results
+            for result in batch_results {
+                match result {
+                    Ok(Some(open_port)) => open_ports.push(open_port),
+                    Ok(None) => closed_count += 1,
+                    Err(_) => filtered_count += 1,
+                }
+            }
+            
+            // Update progress in state
+            open_ports.sort_by_key(|p| p.port);
+            let progress_result = PortResult {
+                target_ip,
+                open_ports: open_ports.clone(),
+                closed_ports: closed_count,
+                filtered_ports: filtered_count,
+                scan_duration: start_time.elapsed(),
+                scan_mode: self.scan_mode.clone(),
+            };
+            
+            // Update state with current progress
+            if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
+                scan_state.result = Some(ScanResult::Port(progress_result));
+                scan_state.last_updated = Instant::now();
+                
+                // Add progress info to the status (we'll create a custom status field)
+                // For now, we'll update the result with progress
+            }
+            
+            // Small delay between batches to allow UI updates
+            sleep(Duration::from_millis(100)).await;
+        }
+        
+        // Final result
+        Ok(PortResult {
+            target_ip,
+            open_ports,
+            closed_ports: closed_count,
+            filtered_ports: filtered_count,
+            scan_duration: start_time.elapsed(),
+            scan_mode: self.scan_mode.clone(),
+        })
+    }
 }
 
 // Service name mapping for common ports
@@ -444,11 +513,11 @@ impl Scanner for PortScanner {
             };
             state.scanners.insert(self.name().to_string(), scan_state);
             
-            // Perform scan
-            match self.scan(&target).await {
-                Ok(result) => {
+            // Perform progressive scan with updates
+            match self.progressive_port_scan(&target, &state).await {
+                Ok(final_result) => {
                     let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = Some(result);
+                    scan_state.result = Some(ScanResult::Port(final_result));
                     scan_state.error = None;
                     scan_state.status = ScanStatus::Complete;
                     scan_state.last_updated = Instant::now();

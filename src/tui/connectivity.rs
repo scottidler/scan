@@ -45,52 +45,217 @@ impl Pane for ConnectivityPane {
         // Prepare content lines
         let mut lines = Vec::new();
         
-        // Connectivity status header
-        lines.push(Line::from(vec![
-            Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("checking...", Style::default().fg(Color::Gray)),
-        ]));
-        
-        // Empty line for spacing
-        lines.push(Line::from(""));
-        
         // Get ping results and render them
         if let Some(ping_state) = state.scanners.get("ping") {
-            if let Some(ScanResult::Ping(ping)) = &ping_state.result {
-            let latency_ms = ping.latency.as_millis();
-            let loss_percent = ping.packet_loss * 100.0;
-            
-            // Latency information
-            lines.push(Line::from(vec![
-                Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}ms", latency_ms), Style::default().fg(Color::Green)),
-            ]));
-            
-            // Packet loss
-            lines.push(Line::from(vec![
-                Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{:.1}%", loss_percent), Style::default().fg(Color::Green)),
-            ]));
-            
-                // TTL information if available
-                if let Some(ttl) = ping.ttl {
+            match &ping_state.result {
+                Some(ScanResult::Ping(ping)) => {
+                    let latency_ms = ping.latency.as_millis();
+                    let loss_percent = ping.packet_loss * 100.0;
+                    
+                    // Connection status header with color coding
+                    let status_color = if loss_percent == 0.0 && latency_ms < 100 {
+                        Color::Green
+                    } else if loss_percent < 5.0 && latency_ms < 300 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    
+                    let status_text = if loss_percent == 0.0 {
+                        "connected"
+                    } else if loss_percent < 50.0 {
+                        "unstable"
+                    } else {
+                        "poor"
+                    };
+                    
                     lines.push(Line::from(vec![
-                        Span::styled("🔢 TTL: ", Style::default().fg(Color::White)),
-                        Span::styled(format!("{} hops", ttl), Style::default().fg(Color::Gray)),
+                        Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(status_text, Style::default().fg(status_color)),
+                    ]));
+                    
+                    // Empty line for spacing
+                    lines.push(Line::from(""));
+                    
+                    // Latency with performance grading
+                    let latency_color = if latency_ms < 50 {
+                        Color::Green
+                    } else if latency_ms < 150 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    
+                    let latency_grade = if latency_ms < 50 {
+                        "excellent"
+                    } else if latency_ms < 100 {
+                        "good"
+                    } else if latency_ms < 200 {
+                        "fair"
+                    } else {
+                        "poor"
+                    };
+                    
+                    lines.push(Line::from(vec![
+                        Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
+                        Span::styled(format!("{}ms", latency_ms), Style::default().fg(latency_color)),
+                        Span::styled(" (", Style::default().fg(Color::Gray)),
+                        Span::styled(latency_grade, Style::default().fg(latency_color)),
+                        Span::styled(")", Style::default().fg(Color::Gray)),
+                    ]));
+                    
+                    // Packet loss with color coding
+                    let loss_color = if loss_percent == 0.0 {
+                        Color::Green
+                    } else if loss_percent < 1.0 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    
+                    lines.push(Line::from(vec![
+                        Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
+                        Span::styled(format!("{:.1}%", loss_percent), Style::default().fg(loss_color)),
+                    ]));
+                    
+                    // TTL information if available
+                    if let Some(ttl) = ping.ttl {
+                        lines.push(Line::from(vec![
+                            Span::styled("🔢 TTL: ", Style::default().fg(Color::White)),
+                            Span::styled(format!("{} hops", ttl), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                    
+                    // Reliability metrics
+                    lines.push(Line::from(vec![
+                        Span::styled("📊 Reliability: ", Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("{}/{} pkts", ping.packets_received, ping.packets_sent),
+                            Style::default().fg(Color::Gray)
+                        ),
+                    ]));
+                    
+                    // Show additional connectivity info from other scanners
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![
+                        Span::styled("🔗 Services:", Style::default().fg(Color::Cyan)),
+                    ]));
+                    
+                    // Check HTTP connectivity
+                    if let Some(http_state) = state.scanners.get("http") {
+                        if let Some(ScanResult::Http(http_result)) = &http_state.result {
+                            let http_status = if http_result.status_code == 200 {
+                                ("✅", Color::Green)
+                            } else if http_result.status_code < 400 {
+                                ("⚠️", Color::Yellow)
+                            } else {
+                                ("❌", Color::Red)
+                            };
+                            
+                            lines.push(Line::from(vec![
+                                Span::styled("  HTTP: ", Style::default().fg(Color::White)),
+                                Span::styled(http_status.0, Style::default().fg(http_status.1)),
+                                Span::styled(format!(" {}", http_result.status_code), Style::default().fg(Color::Gray)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled("  HTTP: ", Style::default().fg(Color::White)),
+                                Span::styled("checking...", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                    }
+                    
+                    // Check TLS connectivity
+                    if let Some(tls_state) = state.scanners.get("tls") {
+                        if let Some(ScanResult::Tls(tls_result)) = &tls_state.result {
+                            let tls_status = if tls_result.connection_successful && tls_result.certificate_valid {
+                                ("✅", Color::Green)
+                            } else if tls_result.connection_successful {
+                                ("⚠️", Color::Yellow)
+                            } else {
+                                ("❌", Color::Red)
+                            };
+                            
+                            let version_text = tls_result.negotiated_version
+                                .as_ref()
+                                .map(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            
+                            lines.push(Line::from(vec![
+                                Span::styled("  TLS: ", Style::default().fg(Color::White)),
+                                Span::styled(tls_status.0, Style::default().fg(tls_status.1)),
+                                Span::styled(
+                                    format!(" {}", version_text),
+                                    Style::default().fg(Color::Gray)
+                                ),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled("  TLS: ", Style::default().fg(Color::White)),
+                                Span::styled("checking...", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Non-ping result (shouldn't happen for ping scanner)
+                    lines.push(Line::from(vec![
+                        Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                        Span::styled("error", Style::default().fg(Color::Red)),
                     ]));
                 }
-            } else {
-                // No ping data available yet
-                lines.push(Line::from(vec![
-                    Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
-                    Span::styled("measuring...", Style::default().fg(Color::Gray)),
-                ]));
-                
-                lines.push(Line::from(vec![
-                    Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
-                    Span::styled("measuring...", Style::default().fg(Color::Gray)),
-                ]));
+                None => {
+                    // Show scanning status based on ping scanner state
+                    match ping_state.status {
+                        crate::types::ScanStatus::Running => {
+                            lines.push(Line::from(vec![
+                                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                                Span::styled("checking...", Style::default().fg(Color::Yellow)),
+                            ]));
+                            
+                            lines.push(Line::from(""));
+                            lines.push(Line::from(vec![
+                                Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
+                                Span::styled("measuring...", Style::default().fg(Color::Gray)),
+                            ]));
+                            
+                            lines.push(Line::from(vec![
+                                Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
+                                Span::styled("measuring...", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                        crate::types::ScanStatus::Failed => {
+                            lines.push(Line::from(vec![
+                                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                                Span::styled("failed", Style::default().fg(Color::Red)),
+                            ]));
+                            
+                            if let Some(error) = &ping_state.error {
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(vec![
+                                    Span::styled("❌ Error: ", Style::default().fg(Color::White)),
+                                    Span::styled(
+                                        error.to_string().chars().take(30).collect::<String>(),
+                                        Style::default().fg(Color::Red)
+                                    ),
+                                ]));
+                            }
+                        }
+                        _ => {
+                            lines.push(Line::from(vec![
+                                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                                Span::styled("initializing...", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                    }
+                }
             }
+        } else {
+            // No ping scanner data
+            lines.push(Line::from(vec![
+                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("waiting...", Style::default().fg(Color::Gray)),
+            ]));
         }
         
         // Create and render the paragraph

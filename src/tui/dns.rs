@@ -464,6 +464,23 @@ impl Pane for DnsPane {
         
         // Get DNS results and render them
         let dns_lines = if let Some(dns_state) = state.scanners.get("dns") {
+            // Update header with current status
+            lines[0] = Line::from(vec![
+                Span::styled("🌐 DNS: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    match dns_state.status {
+                        crate::types::ScanStatus::Running => "resolving...",
+                        crate::types::ScanStatus::Complete => "resolved",
+                        crate::types::ScanStatus::Failed => "failed",
+                    },
+                    Style::default().fg(match dns_state.status {
+                        crate::types::ScanStatus::Running => Color::Yellow,
+                        crate::types::ScanStatus::Complete => Color::Green,
+                        crate::types::ScanStatus::Failed => Color::Red,
+                    })
+                ),
+            ]);
+            
             // Clone the result to avoid lifetime issues
             let result = dns_state.result.clone();
             if let Some(ScanResult::Dns(dns_result)) = result {

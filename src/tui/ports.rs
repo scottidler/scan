@@ -149,17 +149,159 @@ impl Pane for PortsPane {
                 // Clone the data we need to avoid lifetime issues
                 let result = port_state.result.clone();
                 let status = port_state.status.clone();
+                let last_updated = port_state.last_updated;
                 
                 match result {
                     Some(ScanResult::Port(port_result)) => {
+                        // Update header with current status
+                        lines[0] = Line::from(vec![
+                            Span::styled("🔌 PORTS: ", Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                match status {
+                                    crate::types::ScanStatus::Running => "scanning...",
+                                    crate::types::ScanStatus::Complete => "completed",
+                                    crate::types::ScanStatus::Failed => "failed",
+                                },
+                                Style::default().fg(match status {
+                                    crate::types::ScanStatus::Running => Color::Yellow,
+                                    crate::types::ScanStatus::Complete => Color::Green,
+                                    crate::types::ScanStatus::Failed => Color::Red,
+                                })
+                            ),
+                        ]);
+                        
                         // Extract the data we need to avoid lifetime issues
                         let open_count = port_result.open_ports.len();
-                        let open_ports: Vec<_> = port_result.open_ports.iter().take(3).cloned().collect();
+                        let open_ports: Vec<_> = port_result.open_ports.iter().take(5).cloned().collect();
                         let filtered_ports = port_result.filtered_ports;
+                        let closed_ports = port_result.closed_ports;
                         let scan_duration_ms = port_result.scan_duration.as_millis();
                         
-                        // Build the port lines
-                        Self::build_port_result_lines(open_count, open_ports, filtered_ports, scan_duration_ms)
+                        // Calculate estimated progress (rough estimate based on duration and typical scan times)
+                        let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
+                            // Estimate progress based on scan duration and typical port scan timing
+                            let total_expected = match port_result.scan_mode {
+                                crate::scan::port::ScanMode::Quick => 100,
+                                crate::scan::port::ScanMode::Standard => 1000,
+                                crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
+                            };
+                            let scanned_so_far = open_count + filtered_ports as usize + closed_ports as usize;
+                            let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0).min(99.0) as u32;
+                            Some((scanned_so_far, total_expected, progress_percent))
+                        } else {
+                            None
+                        };
+                        
+                        let mut result_lines = Vec::new();
+                        
+                        // Progress information if actively scanning
+                        if let Some((scanned, total, percent)) = progress_info {
+                            result_lines.push(Line::from(vec![
+                                Span::styled("📊 Progress: ", Style::default().fg(Color::White)),
+                                Span::styled(
+                                    format!("{}% ({}/{})", percent, scanned, total),
+                                    Style::default().fg(Color::Yellow)
+                                ),
+                            ]));
+                        } else {
+                            result_lines.push(Line::from(vec![
+                                Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
+                                Span::styled("completed", Style::default().fg(Color::Green)),
+                            ]));
+                        }
+                        
+                        // Open ports count with color coding
+                        let port_color = if open_count == 0 {
+                            Color::Green
+                        } else if open_count <= 5 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        };
+                        
+                        result_lines.push(Line::from(vec![
+                            Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                open_count.to_string(),
+                                Style::default().fg(port_color)
+                            ),
+                            Span::styled(" ports", Style::default().fg(Color::White)),
+                        ]));
+                        
+                        // Show discovered open ports (up to 5)
+                        for (idx, open_port) in open_ports.iter().enumerate() {
+                            if idx >= 5 { break; } // Limit display
+                            
+                            let service_name = open_port.service.as_ref()
+                                .map(|s| s.name.clone())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            
+                            let protocol_str = match open_port.protocol {
+                                crate::scan::port::Protocol::Tcp => "tcp",
+                                crate::scan::port::Protocol::Udp => "udp",
+                            };
+                            
+                            result_lines.push(Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled(
+                                    format!("{}/{}", open_port.port, protocol_str),
+                                    Style::default().fg(Color::Cyan)
+                                ),
+                                Span::styled(" (", Style::default().fg(Color::Gray)),
+                                Span::styled(
+                                    service_name,
+                                    Style::default().fg(Color::Yellow)
+                                ),
+                                Span::styled(")", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                        
+                        // Show "more" indicator if there are more open ports
+                        if open_count > 5 {
+                            result_lines.push(Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled(
+                                    format!("... and {} more", open_count - 5),
+                                    Style::default().fg(Color::Gray)
+                                ),
+                            ]));
+                        }
+                        
+                        // Filtered and closed ports summary
+                        if filtered_ports > 0 {
+                            result_lines.push(Line::from(vec![
+                                Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
+                                Span::styled(
+                                    filtered_ports.to_string(),
+                                    Style::default().fg(Color::Yellow)
+                                ),
+                            ]));
+                        }
+                        
+                        if closed_ports > 0 {
+                            result_lines.push(Line::from(vec![
+                                Span::styled("🔴 Closed: ", Style::default().fg(Color::White)),
+                                Span::styled(
+                                    closed_ports.to_string(),
+                                    Style::default().fg(Color::Gray)
+                                ),
+                            ]));
+                        }
+                        
+                        // Scan duration
+                        result_lines.push(Line::from(vec![
+                            Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                if scan_duration_ms > 1000 {
+                                    format!("{:.1}s", scan_duration_ms as f32 / 1000.0)
+                                } else {
+                                    format!("{}ms", scan_duration_ms)
+                                },
+                                Style::default().fg(Color::Gray)
+                            ),
+                        ]));
+                        
+                        result_lines
                     }
                     Some(_) => {
                         // Wrong result type (shouldn't happen)
@@ -172,10 +314,22 @@ impl Pane for PortsPane {
                         // Still scanning or no results yet
                         match status {
                             crate::types::ScanStatus::Running => {
+                                // Show last updated time
+                                let seconds_ago = last_updated.elapsed().as_secs();
+                                let time_info = if seconds_ago < 60 {
+                                    format!("{}s ago", seconds_ago)
+                                } else {
+                                    format!("{}m ago", seconds_ago / 60)
+                                };
+                                
                                 vec![
                                     Line::from(vec![
-                                        Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
-                                        Span::styled("scanning...", Style::default().fg(Color::Gray)),
+                                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
+                                        Span::styled("initializing scan...", Style::default().fg(Color::Yellow)),
+                                    ]),
+                                    Line::from(vec![
+                                        Span::styled("⏱️  Started: ", Style::default().fg(Color::White)),
+                                        Span::styled(time_info, Style::default().fg(Color::Gray)),
                                     ]),
                                     Line::from(vec![
                                         Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
@@ -196,7 +350,7 @@ impl Pane for PortsPane {
                             _ => {
                                 vec![Line::from(vec![
                                     Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                                    Span::styled("initializing...", Style::default().fg(Color::Gray)),
+                                    Span::styled("waiting to start...", Style::default().fg(Color::Gray)),
                                 ])]
                             }
                         }
@@ -204,10 +358,10 @@ impl Pane for PortsPane {
                 }
             }
             None => {
-                // No port scanner available
+                // No port scanner registered
                 vec![Line::from(vec![
-                    Span::styled("PORTS: ", Style::default().fg(Color::White)),
-                    Span::styled("scanner not available", Style::default().fg(Color::Red)),
+                    Span::styled("❌ Error: ", Style::default().fg(Color::White)),
+                    Span::styled("port scanner not available", Style::default().fg(Color::Red)),
                 ])]
             }
         };
