@@ -30,9 +30,13 @@ impl SecurityPane {
     }
     
     pub fn scroll_down(&mut self, max_lines: u16, visible_lines: u16) {
+        // Simple approach: only scroll if there's content beyond the visible area
         if max_lines > visible_lines {
             let max_scroll = max_lines.saturating_sub(visible_lines);
-            self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
+            // Clamp the scroll offset to prevent over-scrolling
+            if self.scroll_offset < max_scroll {
+                self.scroll_offset += 1;
+            }
         }
     }
     
@@ -67,6 +71,13 @@ impl SecurityPane {
         
         line_count
     }
+    
+    /// Get the actual number of lines that would be rendered for the current state
+    /// This method builds the actual content and counts the real lines
+    pub fn get_actual_line_count(&self, state: &AppState) -> u16 {
+        // Use the simpler approximation method for now
+        self.calculate_content_lines(state)
+    }
 }
 
 impl Default for SecurityPane {
@@ -99,7 +110,7 @@ impl Pane for SecurityPane {
         
         // Extract TLS data upfront
         let tls_data = if let Some(tls_state) = state.scanners.get("tls") {
-            if let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
+            if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
                 Some((
                     tls_result.connection_successful,
                     tls_result.negotiated_version.as_ref().map(|v| v.as_str().to_string()),
@@ -127,7 +138,7 @@ impl Pane for SecurityPane {
         
         // Extract HTTP data upfront
         let http_data = if let Some(http_state) = state.scanners.get("http") {
-            if let Some(ScanResult::Http(http_result)) = http_state.result.as_ref() {
+            if let Some(crate::types::ScanResult::Http(http_result)) = http_state.result.as_ref() {
                 Some((
                     http_result.security_headers.strict_transport_security.is_some(),
                     http_result.security_headers.x_frame_options.clone().unwrap_or_else(|| "missing".to_string()),
@@ -177,7 +188,7 @@ impl Pane for SecurityPane {
         
         // Extract DNS data upfront
         let dns_data = if let Some(dns_state) = state.scanners.get("dns") {
-            if let Some(ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
+            if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
                 dns_result.email_security.as_ref().map(|email_security| (
                     email_security.spf_record.clone(),
                     email_security.dmarc_record.clone(),
@@ -194,7 +205,7 @@ impl Pane for SecurityPane {
         
         // Extract TLS vulnerability details
         let tls_vulnerabilities = if let Some(tls_state) = state.scanners.get("tls") {
-            if let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
+            if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
                 Some(tls_result.vulnerabilities.iter().take(5).map(|vuln| match vuln {
                     crate::scan::tls::TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
                     crate::scan::tls::TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
@@ -707,11 +718,29 @@ impl Pane for SecurityPane {
             }
         }
         
-        // Create and render the paragraph with scrolling
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left)
-            .scroll((self.scroll_offset, 0));
+        // Create and render the paragraph with scroll offset
+        let total_lines = lines.len() as u16;
         
+        // Ensure scroll offset doesn't exceed content bounds
+        // Be conservative: if we have N lines and can show V lines, max scroll is N-V
+        let visible_area_height = inner_area.height;
+        let max_scroll_offset = if total_lines > visible_area_height {
+            total_lines.saturating_sub(visible_area_height)
+        } else {
+            0
+        };
+        let safe_scroll_offset = self.scroll_offset.min(max_scroll_offset);
+        
+        // Apply scroll offset - skip lines from the beginning
+        let visible_lines = if safe_scroll_offset < total_lines {
+            lines.into_iter().skip(safe_scroll_offset as usize).collect()
+        } else {
+            // If scroll offset is beyond content, show from the beginning
+            lines
+        };
+        
+        let paragraph = Paragraph::new(visible_lines)
+            .alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
     

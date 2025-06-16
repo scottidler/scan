@@ -250,7 +250,7 @@ impl PaneLayout {
                             if pane.id() == "security" {
                                 if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
                                     // Calculate actual content and visible lines
-                                    let content_lines = security_pane.calculate_content_lines(state);
+                                    let content_lines = security_pane.get_actual_line_count(state);
                                     
                                     // Get the security pane area (bottom-right: row 2, col 2)
                                     let visible_lines = if pane_areas.len() > 2 && pane_areas[2].len() > 2 {

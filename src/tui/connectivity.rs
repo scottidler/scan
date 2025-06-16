@@ -280,6 +280,10 @@ impl Pane for ConnectivityPane {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    
+    fn is_focusable(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +297,6 @@ mod tests {
         assert_eq!(pane.id(), "connectivity");
         assert_eq!(pane.min_size(), (25, 8));
         assert!(pane.is_visible());
-        assert!(!pane.is_focusable());
+        assert!(pane.is_focusable());
     }
 } 
