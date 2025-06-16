@@ -3,12 +3,14 @@ pub mod dns;
 pub mod tls;
 pub mod http;
 pub mod whois;
+pub mod traceroute;
 
 pub use ping::{PingScanner, PingResult};
 pub use dns::{DnsScanner, DnsResult};
 pub use tls::{TlsScanner, TlsResult};
 pub use http::{HttpScanner, HttpResult};
 pub use whois::{WhoisScanner, WhoisResult};
+pub use traceroute::{TracerouteScanner, TracerouteResult};
 
 use crate::scanner::Scanner;
 use crate::target::Target;
@@ -21,6 +23,7 @@ pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
         Box::new(TlsScanner::new()),
         Box::new(HttpScanner::default()),
         Box::new(WhoisScanner::default()),
+        Box::new(TracerouteScanner::new()),
         // TODO: Add other scanners as they're implemented
     ]
 }

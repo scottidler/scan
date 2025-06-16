@@ -135,6 +135,37 @@ fn print_scan_result(result: &ScanResult) {
                 whois.scan_duration.as_millis(), risk_str
             );
         }
+        
+        ScanResult::Traceroute(traceroute) => {
+            let protocol = if traceroute.ipv6 { "IPv6" } else { "IPv4" };
+            let reached = if traceroute.destination_reached { "reached" } else { "unreached" };
+            
+            // Calculate average RTT from last hop
+            let last_hop_rtt = traceroute.hops.last()
+                .and_then(|hop| hop.avg_rtt)
+                .map(|rtt| format!("{}ms", rtt.as_millis()))
+                .unwrap_or_else(|| "timeout".to_string());
+            
+            // Count timeouts
+            let timeout_hops = traceroute.hops.iter()
+                .filter(|hop| hop.packet_loss > 0.5)
+                .count();
+            
+            let timeout_str = if timeout_hops > 0 {
+                format!(", {} timeouts", timeout_hops)
+            } else {
+                String::new()
+            };
+            
+            println!("{} {} hops, {} ({}{}, {}ms)",
+                protocol,
+                traceroute.total_hops,
+                reached,
+                last_hop_rtt,
+                timeout_str,
+                traceroute.scan_duration.as_millis()
+            );
+        }
     }
 }
 
