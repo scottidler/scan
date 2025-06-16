@@ -29,11 +29,13 @@ impl SecurityPane {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
     
-    pub fn scroll_down(&mut self, max_lines: u16, visible_lines: u16) {
-        // Simple approach: only scroll if there's content beyond the visible area
-        if max_lines > visible_lines {
-            let max_scroll = max_lines.saturating_sub(visible_lines);
-            // Clamp the scroll offset to prevent over-scrolling
+    pub fn scroll_down_smart(&mut self, state: &AppState, visible_height: u16) {
+        // Use the SINGLE SOURCE OF TRUTH for content calculation
+        let lines = self.build_content_lines(state);
+        let actual_lines = lines.len() as u16;
+        
+        if actual_lines > visible_height {
+            let max_scroll = actual_lines.saturating_sub(visible_height);
             if self.scroll_offset < max_scroll {
                 self.scroll_offset += 1;
             }
@@ -44,59 +46,9 @@ impl SecurityPane {
         self.scroll_offset = 0;
     }
     
-    /// Calculate the total number of content lines that would be rendered
-    pub fn calculate_content_lines(&self, state: &AppState) -> u16 {
-        let mut line_count = 0u16;
-        
-        // Header + empty line
-        line_count += 2;
-        
-        // TLS section
-        if state.scanners.get("tls").is_some() {
-            line_count += 25; // Approximate TLS section size
-        }
-        
-        // HTTP section  
-        if state.scanners.get("http").is_some() {
-            line_count += 20; // Approximate HTTP section size
-        }
-        
-        // DNS section
-        if state.scanners.get("dns").is_some() {
-            line_count += 10; // Approximate DNS section size
-        }
-        
-        // Vulnerabilities section
-        line_count += 15; // Approximate vulnerabilities section size
-        
-        line_count
-    }
-    
-    /// Get the actual number of lines that would be rendered for the current state
-    /// This method builds the actual content and counts the real lines
-    pub fn get_actual_line_count(&self, state: &AppState) -> u16 {
-        // Use the simpler approximation method for now
-        self.calculate_content_lines(state)
-    }
-}
-
-impl Default for SecurityPane {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Pane for SecurityPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        let block = create_block(self.title, focused);
-        
-        // Calculate content area (inside the border)
-        let inner_area = block.inner(area);
-        
-        // Render the block first
-        block.render(area, frame.buffer_mut());
-        
-        // Prepare content lines
+    /// Build the actual content lines - SINGLE SOURCE OF TRUTH
+    /// This method is used by both scroll calculation and rendering
+    fn build_content_lines(&self, state: &AppState) -> Vec<Line> {
         let mut lines = Vec::new();
         
         // Security status header
@@ -586,7 +538,10 @@ impl Pane for SecurityPane {
                 for issue in issues {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
-                        Span::styled(issue, Style::default().fg(Color::Red)),
+                        Span::styled(
+                            if issue.len() > 20 { format!("{}...", &issue[..17]) } else { issue },
+                            Style::default().fg(Color::Red)
+                        ),
                     ]));
                 }
             }
@@ -701,15 +656,15 @@ impl Pane for SecurityPane {
             }
         }
         
-        // TLS Vulnerabilities
-        if let Some(tls_vulns) = tls_vulnerabilities {
-            if !tls_vulns.is_empty() {
+        // TLS Vulnerabilities section
+        if let Some(vulnerabilities) = tls_vulnerabilities {
+            if !vulnerabilities.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled("🔓 TLS Vulnerabilities", Style::default().fg(Color::Red)),
+                    Span::styled("⚠️ TLS Vulnerabilities", Style::default().fg(Color::Red)),
                 ]));
                 
-                for vuln in tls_vulns {
+                for vuln in vulnerabilities {
                     lines.push(Line::from(vec![
                         Span::styled("  • ", Style::default().fg(Color::Red)),
                         Span::styled(vuln, Style::default().fg(Color::Red)),
@@ -718,11 +673,37 @@ impl Pane for SecurityPane {
             }
         }
         
-        // Create and render the paragraph with scroll offset
-        let total_lines = lines.len() as u16;
+        lines
+    }
+    
+    /// Get the actual number of lines that would be rendered for the current state
+    pub fn get_actual_line_count(&self, state: &AppState) -> u16 {
+        // Use the SINGLE SOURCE OF TRUTH
+        self.build_content_lines(state).len() as u16
+    }
+}
+
+impl Default for SecurityPane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pane for SecurityPane {
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        let block = create_block(self.title, focused);
         
-        // Ensure scroll offset doesn't exceed content bounds
-        // Be conservative: if we have N lines and can show V lines, max scroll is N-V
+        // Calculate content area (inside the border)
+        let inner_area = block.inner(area);
+        
+        // Render the block first
+        block.render(area, frame.buffer_mut());
+        
+        // Use the SINGLE SOURCE OF TRUTH for content
+        let lines = self.build_content_lines(state);
+        
+        // Apply scrolling
+        let total_lines = lines.len() as u16;
         let visible_area_height = inner_area.height;
         let max_scroll_offset = if total_lines > visible_area_height {
             total_lines.saturating_sub(visible_area_height)
@@ -735,7 +716,6 @@ impl Pane for SecurityPane {
         let visible_lines = if safe_scroll_offset < total_lines {
             lines.into_iter().skip(safe_scroll_offset as usize).collect()
         } else {
-            // If scroll offset is beyond content, show from the beginning
             lines
         };
         
@@ -768,7 +748,7 @@ impl Pane for SecurityPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AppState, ScanState, ScanStatus};
+    use crate::types::{AppState, ScanState, ScanStatus, ScanResult};
     use crate::scan::tls::{TlsResult, TlsVersion, CertificateInfo, SecurityGrade, TlsVulnerability};
     use crate::scan::http::{HttpResult, SecurityHeaders, CspPolicy, CspStrength, CspIssue, CorsPolicy, CorsSecurityLevel, CorsIssue, HttpVulnerability, SecurityGrade as HttpSecurityGrade};
     use crate::scan::dns::{DnsResult, EmailSecurityAnalysis};

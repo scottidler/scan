@@ -249,9 +249,6 @@ impl PaneLayout {
                         for pane in &mut self.panes {
                             if pane.id() == "security" {
                                 if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
-                                    // Calculate actual content and visible lines
-                                    let content_lines = security_pane.get_actual_line_count(state);
-                                    
                                     // Get the security pane area (bottom-right: row 2, col 2)
                                     let visible_lines = if pane_areas.len() > 2 && pane_areas[2].len() > 2 {
                                         // Subtract 2 for borders
@@ -260,7 +257,7 @@ impl PaneLayout {
                                         20 // Fallback
                                     };
                                     
-                                    security_pane.scroll_down(content_lines, visible_lines);
+                                    security_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
                             }
