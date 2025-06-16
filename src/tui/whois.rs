@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
     Frame,
 };
+use std::any::Any;
 
 /// WHOIS pane displays domain registration and ownership information
 pub struct WhoisPane {
@@ -30,8 +31,7 @@ impl Default for WhoisPane {
 }
 
 impl Pane for WhoisPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        let focused = false; // TODO: Get from layout focus state
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -294,6 +294,14 @@ impl Pane for WhoisPane {
     fn min_size(&self) -> (u16, u16) {
         (35, 16) // Larger to show all nameservers and details
     }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    
+    fn is_focusable(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +315,6 @@ mod tests {
         assert_eq!(pane.id(), "whois");
         assert_eq!(pane.min_size(), (30, 12));
         assert!(pane.is_visible());
-        assert!(!pane.is_focusable());
+        assert!(pane.is_focusable());
     }
 } 

@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
     Frame,
 };
+use std::any::Any;
 
 /// HTTP pane displays web server response information
 pub struct HttpPane {
@@ -49,8 +50,7 @@ impl Default for HttpPane {
 }
 
 impl Pane for HttpPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        let focused = false; // TODO: Get from layout focus state
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -261,6 +261,14 @@ impl Pane for HttpPane {
     fn min_size(&self) -> (u16, u16) {
         (25, 10) // Minimum width and height for HTTP information
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn is_focusable(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +282,6 @@ mod tests {
         assert_eq!(pane.id(), "http");
         assert_eq!(pane.min_size(), (25, 10));
         assert!(pane.is_visible());
-        assert!(!pane.is_focusable());
+        assert!(pane.is_focusable());
     }
 } 

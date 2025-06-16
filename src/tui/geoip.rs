@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
     Frame,
 };
+use std::any::Any;
 
 /// GeoIP pane displays geographical and network location information
 pub struct GeoIpPane {
@@ -30,8 +31,7 @@ impl Default for GeoIpPane {
 }
 
 impl Pane for GeoIpPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        let focused = false; // TODO: Get from layout focus state
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -209,6 +209,10 @@ impl Pane for GeoIpPane {
 
     fn min_size(&self) -> (u16, u16) {
         (30, 10) // Minimum width and height for GeoIP information
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

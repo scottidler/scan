@@ -4,11 +4,12 @@ use ratatui::{
     widgets::{Block, Borders},
     Frame,
 };
+use std::any::Any;
 
 /// Trait for TUI panes that display scanner data
 pub trait Pane {
     /// Render the pane content to the given area
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState);
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool);
     
     /// Get the pane's title for display
     fn title(&self) -> &'static str;
@@ -30,20 +31,30 @@ pub trait Pane {
     fn is_focusable(&self) -> bool {
         false
     }
+    
+    /// Enable downcasting to concrete types
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Helper function to create a standard bordered block for panes
 pub fn create_block(title: &str, focused: bool) -> Block {
-    let border_style = if focused {
-        ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
+    let (border_style, border_type) = if focused {
+        (
+            ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
+            ratatui::widgets::BorderType::Double
+        )
     } else {
-        ratatui::style::Style::default().fg(ratatui::style::Color::Gray)
+        (
+            ratatui::style::Style::default().fg(ratatui::style::Color::Gray),
+            ratatui::widgets::BorderType::Plain
+        )
     };
     
     Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style)
+        .border_type(border_type)
 }
 
 /// Pane position in the grid layout

@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     } else {
         // TUI mode
         let mut terminal = scan::tui::init_terminal()?;
-        let app = scan::tui::TuiApp::new();
+        let app = scan::tui::TuiApp::new()?;
         
         // Run the TUI application
         let result = app.run(&mut terminal, state);

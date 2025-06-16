@@ -242,7 +242,15 @@ impl HttpScanner {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        if access_control_allow_origin.is_none() {
+        // Check for any CORS-related headers, not just allow-origin
+        let has_cors_headers = access_control_allow_origin.is_some() ||
+            headers.contains_key("access-control-allow-methods") ||
+            headers.contains_key("access-control-allow-headers") ||
+            headers.contains_key("access-control-allow-credentials") ||
+            headers.contains_key("access-control-expose-headers") ||
+            headers.contains_key("access-control-max-age");
+
+        if !has_cors_headers {
             return None;
         }
 
@@ -557,7 +565,7 @@ pub enum CspIssue {
     MissingDirective(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CspStrength {
     None,
     Weak,
@@ -583,7 +591,7 @@ pub enum CorsIssue {
     WildcardWithCredentials,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CorsSecurityLevel {
     Secure,
     Moderate,
@@ -610,7 +618,7 @@ pub enum HttpVulnerability {
     InformationDisclosure,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SecurityGrade {
     APlus,
     A,

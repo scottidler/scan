@@ -64,10 +64,20 @@ impl PaneLayout {
                 }
                 
                 if let Some(pane_area) = self.get_pane_area(&grid_areas, config) {
-                    pane.render(frame, pane_area, state);
+                    // Check if this pane is focused
+                    let is_focused = self.focused_pane.as_ref()
+                        .map(|focused_id| focused_id == pane_id)
+                        .unwrap_or(false);
+                    
+                    pane.render(frame, pane_area, state, is_focused);
                 }
             }
         }
+    }
+    
+    /// Create the grid layout areas with custom proportions (public version)
+    pub fn create_grid_layout_public(&self, area: ratatui::layout::Rect) -> Vec<Vec<ratatui::layout::Rect>> {
+        self.create_grid_layout(area)
     }
     
     /// Create the grid layout areas with custom proportions
@@ -215,6 +225,63 @@ impl PaneLayout {
                 }
             }
         }
+    }
+    
+    /// Handle keyboard events for the focused pane
+    pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent, state: &AppState, pane_areas: &[Vec<ratatui::layout::Rect>]) -> bool {
+        if let Some(focused_id) = &self.focused_pane {
+            // Handle scrolling for security pane specifically
+            if focused_id == "security" {
+                match key.code {
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        // Find the security pane and scroll up
+                        for pane in &mut self.panes {
+                            if pane.id() == "security" {
+                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                    security_pane.scroll_up();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        // Find the security pane and scroll down
+                        for pane in &mut self.panes {
+                            if pane.id() == "security" {
+                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                    // Calculate actual content and visible lines
+                                    let content_lines = security_pane.calculate_content_lines(state);
+                                    
+                                    // Get the security pane area (bottom-right: row 2, col 2)
+                                    let visible_lines = if pane_areas.len() > 2 && pane_areas[2].len() > 2 {
+                                        // Subtract 2 for borders
+                                        pane_areas[2][2].height.saturating_sub(2)
+                                    } else {
+                                        20 // Fallback
+                                    };
+                                    
+                                    security_pane.scroll_down(content_lines, visible_lines);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Home => {
+                        // Reset scroll to top
+                        for pane in &mut self.panes {
+                            if pane.id() == "security" {
+                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                    security_pane.reset_scroll();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
     }
 }
 

@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
     Frame,
 };
+use std::any::Any;
 
 /// Traceroute pane displays network path tracing information
 pub struct TraceroutePane {
@@ -30,8 +31,7 @@ impl Default for TraceroutePane {
 }
 
 impl Pane for TraceroutePane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        let focused = false; // TODO: Get from layout focus state
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -193,6 +193,10 @@ impl Pane for TraceroutePane {
 
     fn min_size(&self) -> (u16, u16) {
         (35, 20) // Much larger to show all hops (up to ~30 hops)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

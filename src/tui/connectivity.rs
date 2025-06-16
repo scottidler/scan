@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
     Frame,
 };
+use std::any::Any;
 
 /// CONNECTIVITY pane displays real-time ping latency and network connectivity metrics
 pub struct ConnectivityPane {
@@ -32,8 +33,7 @@ impl Default for ConnectivityPane {
 }
 
 impl Pane for ConnectivityPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        let focused = false; // TODO: Get from layout focus state
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -275,6 +275,10 @@ impl Pane for ConnectivityPane {
     
     fn min_size(&self) -> (u16, u16) {
         (25, 8)
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

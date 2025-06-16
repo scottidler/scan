@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
     Frame,
 };
+use std::any::Any;
 
 /// TARGET pane displays basic target information and scanner status overview
 pub struct TargetPane {
@@ -69,8 +70,7 @@ impl Default for TargetPane {
 }
 
 impl Pane for TargetPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        let focused = false; // TODO: Get from layout focus state
+    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -200,6 +200,10 @@ impl Pane for TargetPane {
     
     fn min_size(&self) -> (u16, u16) {
         (25, 12) // Larger to show all scanners
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
