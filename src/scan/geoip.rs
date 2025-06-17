@@ -616,4 +616,180 @@ mod tests {
         // Should fail because no IP is resolved
         assert!(scanner.scan(&target).await.is_err());
     }
+
+    #[test]
+    fn test_geo_location_structure() {
+        let location = GeoLocation {
+            country: "United States".to_string(),
+            country_code: "US".to_string(),
+            region: "California".to_string(),
+            region_code: "CA".to_string(),
+            city: "Mountain View".to_string(),
+            latitude: 37.4056,
+            longitude: -122.0775,
+            timezone: "America/Los_Angeles".to_string(),
+        };
+
+        assert_eq!(location.country, "United States");
+        assert_eq!(location.country_code, "US");
+        assert_eq!(location.city, "Mountain View");
+        assert!((location.latitude - 37.4056).abs() < 0.0001);
+        assert!((location.longitude - (-122.0775)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_network_info_structure() {
+        let network_info = NetworkInfo {
+            isp: "Google LLC".to_string(),
+            organization: "Google LLC".to_string(),
+            asn: Some(15169),
+            asn_name: Some("GOOGLE".to_string()),
+            network_range: Some("8.8.8.0/24".to_string()),
+        };
+
+        assert_eq!(network_info.isp, "Google LLC");
+        assert_eq!(network_info.asn, Some(15169));
+        assert!(network_info.asn_name.is_some());
+        assert!(network_info.network_range.is_some());
+    }
+
+    #[test]
+    fn test_coordinate_parsing_edge_cases() {
+        // Valid coordinates
+        assert!(parse_coordinates("37.4056,-122.0775").is_some());
+        assert!(parse_coordinates("0.0,0.0").is_some());
+        assert!(parse_coordinates("-90.0,180.0").is_some());
+        
+        // Invalid coordinates
+        assert!(parse_coordinates("invalid,coords").is_none());
+        assert!(parse_coordinates("37.4056").is_none()); // Missing longitude
+        assert!(parse_coordinates("37.4056,-122.0775,extra").is_none()); // Too many parts
+        assert!(parse_coordinates("").is_none());
+    }
+
+    #[test]
+    fn test_asn_parsing_edge_cases() {
+        // Valid ASN formats
+        let (asn, name) = parse_asn_info("AS15169 Google LLC").unwrap();
+        assert_eq!(asn, Some(15169));
+        assert_eq!(name, Some("Google LLC".to_string()));
+
+        let (asn2, name2) = parse_asn_info("AS0 Test ASN").unwrap();
+        assert_eq!(asn2, Some(0));
+        assert_eq!(name2, Some("Test ASN".to_string()));
+
+        // Invalid ASN formats
+        assert!(parse_asn_info("15169 Google LLC").is_none()); // Missing AS prefix
+        assert!(parse_asn_info("AS Google LLC").is_none()); // Non-numeric ASN
+        assert!(parse_asn_info("ASinvalid Name").is_none());
+        assert!(parse_asn_info("").is_none());
+        assert!(parse_asn_info("AS15169").is_none()); // No name part
+    }
+
+    #[test]
+    fn test_org_info_parsing() {
+        // With ASN
+        let (asn, name) = parse_org_info("AS15169 Google LLC");
+        assert_eq!(asn, Some(15169));
+        assert_eq!(name, Some("Google LLC".to_string()));
+
+        // Without ASN
+        let (asn2, name2) = parse_org_info("Some Organization");
+        assert_eq!(asn2, None);
+        assert_eq!(name2, Some("Some Organization".to_string()));
+
+        // Edge cases
+        let (asn3, name3) = parse_org_info("AS Invalid Organization");
+        assert_eq!(asn3, None);
+        assert_eq!(name3, Some("AS Invalid Organization".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_geoip_result_structure() {
+        let result = GeoIpResult {
+            target_ip: "8.8.8.8".parse().unwrap(),
+            location: Some(GeoLocation {
+                country: "United States".to_string(),
+                country_code: "US".to_string(),
+                region: "California".to_string(),
+                region_code: "CA".to_string(),
+                city: "Mountain View".to_string(),
+                latitude: 37.4056,
+                longitude: -122.0775,
+                timezone: "America/Los_Angeles".to_string(),
+            }),
+            network_info: Some(NetworkInfo {
+                isp: "Google LLC".to_string(),
+                organization: "Google LLC".to_string(),
+                asn: Some(15169),
+                asn_name: Some("GOOGLE".to_string()),
+                network_range: Some("8.8.8.0/24".to_string()),
+            }),
+            scan_duration: Duration::from_millis(100),
+            data_source: "ip-api.com".to_string(),
+        };
+
+        assert!(result.location.is_some());
+        assert!(result.network_info.is_some());
+        assert_eq!(result.data_source, "ip-api.com");
+        assert!(result.scan_duration.as_millis() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_edge_cases() {
+        let service = GeoIpService::new();
+        
+        // Test rate limiting with different limits
+        assert!(service.check_rate_limit(10).await.is_ok());
+        assert!(service.check_rate_limit(10).await.is_ok());
+        
+        // Fill up the rate limit
+        for _ in 0..8 {
+            let _ = service.check_rate_limit(10).await;
+        }
+        
+        // Should now be rate limited
+        assert!(service.check_rate_limit(10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cache_functionality() {
+        let service = GeoIpService::new();
+        let test_ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        
+        // Cache a result
+        service.cache_result(
+            test_ip,
+            Some(GeoLocation {
+                country: "US".to_string(),
+                country_code: "US".to_string(),
+                region: "CA".to_string(),
+                region_code: "CA".to_string(),
+                city: "Mountain View".to_string(),
+                latitude: 37.4056,
+                longitude: -122.0775,
+                timezone: "America/Los_Angeles".to_string(),
+            }),
+            None,
+            "test".to_string(),
+        ).await;
+        
+        // Verify cache contains the entry
+        let cache = service.cache.read().await;
+        assert!(cache.contains_key(&test_ip));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_ip_lookup() {
+        let service = GeoIpService::new();
+        let ips = vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+        ];
+        
+        let results = service.lookup_multiple_ips(ips).await;
+        
+        // Should return results for both IPs (though they might be errors for test environment)
+        assert_eq!(results.len(), 2);
+    }
 } 

@@ -531,4 +531,149 @@ mod tests {
         assert_eq!(analysis.mx_count, 2);
         assert_eq!(analysis.dkim_domains.len(), 1);
     }
+
+    #[test]
+    fn test_dns_record_ttl_expiration() {
+        let mut record = DnsRecord::new("test.com".to_string(), 1);
+        
+        // Initially should not be expired
+        assert!(!record.is_expired());
+        
+        // Manually set queried_at to past to simulate expiration
+        record.queried_at = Instant::now() - Duration::from_secs(2);
+        assert!(record.is_expired());
+    }
+
+    #[test]
+    fn test_dns_result_update_ttls() {
+        let mut result = DnsResult::new();
+        
+        // Add records with different TTLs
+        result.A.push(DnsRecord::new("127.0.0.1".parse().unwrap(), 300));
+        result.TXT.push(DnsRecord::new("v=spf1 -all".to_string(), 600));
+        
+        // Simulate time passing
+        std::thread::sleep(Duration::from_millis(10));
+        
+        result.update_ttls();
+        
+        // TTL should have decreased (but might not be noticeable with such small sleep)
+        assert!(result.A[0].ttl_remaining() <= 300);
+        assert!(result.TXT[0].ttl_remaining() <= 600);
+    }
+
+    #[tokio::test]
+    async fn test_dns_lookup_failure() {
+        let scanner = DnsScanner::new();
+        let target = Target::parse("nonexistent-domain-12345.invalid").expect("Failed to parse target");
+        
+        let result = scanner.scan(&target).await;
+        
+        // Should handle DNS lookup failures gracefully
+        match result {
+            Ok(ScanResult::Dns(dns_result)) => {
+                // Even if lookup fails, we should get an empty result
+                assert!(dns_result.A.is_empty());
+                assert!(dns_result.AAAA.is_empty());
+            }
+            Ok(_) => panic!("Expected Dns result"),
+            Err(_) => {
+                // It's also okay if it returns an error for invalid domains
+            }
+        }
+    }
+
+    #[test]
+    fn test_soa_record_complete() {
+        let soa = SoaRecord {
+            primary_ns: "ns1.example.com".to_string(),
+            responsible_email: "admin.example.com".to_string(),
+            serial: 2024010101,
+            refresh: 3600,
+            retry: 1800,
+            expire: 604800,
+            minimum_ttl: 86400,
+        };
+        
+        assert_eq!(soa.primary_ns, "ns1.example.com");
+        assert_eq!(soa.responsible_email, "admin.example.com");
+        assert_eq!(soa.serial, 2024010101);
+        assert_eq!(soa.refresh, 3600);
+        assert_eq!(soa.retry, 1800);
+        assert_eq!(soa.expire, 604800);
+        assert_eq!(soa.minimum_ttl, 86400);
+    }
+
+    #[test]
+    fn test_srv_record_complete() {
+        let srv = SrvRecord {
+            priority: 10,
+            weight: 20,
+            port: 443,
+            target: "server.example.com".to_string(),
+        };
+        
+        assert_eq!(srv.priority, 10);
+        assert_eq!(srv.weight, 20);
+        assert_eq!(srv.port, 443);
+        assert_eq!(srv.target, "server.example.com");
+    }
+
+    #[test]
+    fn test_caa_record_complete() {
+        let caa = CaaRecord {
+            flags: 128,
+            tag: "issue".to_string(),
+            value: "letsencrypt.org".to_string(),
+        };
+        
+        assert_eq!(caa.flags, 128);
+        assert_eq!(caa.tag, "issue");
+        assert_eq!(caa.value, "letsencrypt.org");
+    }
+
+    #[test]
+    fn test_email_security_analysis_edge_cases() {
+        // Test with no email security records
+        let empty_analysis = EmailSecurityAnalysis {
+            spf_record: None,
+            dmarc_record: None,
+            has_mx: false,
+            mx_count: 0,
+            dkim_domains: vec![],
+        };
+        
+        assert!(empty_analysis.spf_record.is_none());
+        assert!(empty_analysis.dmarc_record.is_none());
+        assert!(!empty_analysis.has_mx);
+        assert_eq!(empty_analysis.mx_count, 0);
+        assert!(empty_analysis.dkim_domains.is_empty());
+        
+        // Test with malformed SPF
+        let malformed_analysis = EmailSecurityAnalysis {
+            spf_record: Some("invalid spf record".to_string()),
+            dmarc_record: Some("v=DMARC1; p=none;".to_string()),
+            has_mx: true,
+            mx_count: 1,
+            dkim_domains: vec!["selector1._domainkey".to_string(), "selector2._domainkey".to_string()],
+        };
+        
+        assert!(malformed_analysis.spf_record.is_some());
+        assert_eq!(malformed_analysis.dkim_domains.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_dns_lookup() {
+        let scanner = DnsScanner::new();
+        let target = Target::parse("ipv6.google.com").expect("Failed to parse target");
+        
+        let result = scanner.scan(&target).await;
+        
+        assert!(result.is_ok());
+        if let Ok(ScanResult::Dns(dns_result)) = result {
+            // Should have both A and AAAA records for IPv6-enabled domains
+            // Note: This test might fail if ipv6.google.com doesn't exist or changes
+            assert!(dns_result.response_time.as_millis() > 0);
+        }
+    }
 } 

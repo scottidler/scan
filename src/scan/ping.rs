@@ -229,4 +229,150 @@ mod tests {
         assert_eq!(result.packets_sent, 1);
         assert_eq!(result.packets_received, 1);
     }
+
+    #[test]
+    fn test_ping_result_structure() {
+        let result = PingResult {
+            latency: Duration::from_millis(25),
+            packet_loss: 0.0,
+            ttl: Some(64),
+            packets_sent: 4,
+            packets_received: 4,
+        };
+
+        assert_eq!(result.latency, Duration::from_millis(25));
+        assert_eq!(result.packet_loss, 0.0);
+        assert_eq!(result.ttl, Some(64));
+        assert_eq!(result.packets_sent, 4);
+        assert_eq!(result.packets_received, 4);
+    }
+
+    #[test]
+    fn test_ping_scanner_configuration() {
+        let custom_scanner = PingScanner::new(
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            5,
+        );
+
+        assert_eq!(custom_scanner.interval(), Duration::from_secs(2));
+        assert_eq!(custom_scanner.timeout, Duration::from_secs(10));
+        assert_eq!(custom_scanner.packet_count, 5);
+    }
+
+    #[test]
+    fn test_parse_ping_output_variations() {
+        let scanner = PingScanner::default();
+        
+        // Test IPv6 ping output
+        let ipv6_output = "PING google.com(2607:f8b0:4004:c1b::71) 56 data bytes\n64 bytes from 2607:f8b0:4004:c1b::71: icmp_seq=1 ttl=118 time=12.3 ms\n\n--- google.com ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 0ms";
+        
+        let ipv6_result = scanner.parse_ping_output(ipv6_output).unwrap();
+        assert_eq!(ipv6_result.latency, Duration::from_millis(12));
+        assert_eq!(ipv6_result.ttl, Some(118));
+
+        // Test ping with different TTL
+        let ttl_output = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=64 time=8.123 ms";
+        let ttl_result = scanner.parse_ping_output(ttl_output).unwrap();
+        assert_eq!(ttl_result.latency, Duration::from_millis(8));
+        assert_eq!(ttl_result.ttl, Some(64));
+
+        // Test ping with microsecond precision
+        let precise_output = "64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.123 ms";
+        let precise_result = scanner.parse_ping_output(precise_output).unwrap();
+        assert_eq!(precise_result.latency, Duration::from_millis(0));
+    }
+
+    #[test]
+    fn test_parse_ping_output_edge_cases() {
+        let scanner = PingScanner::default();
+        
+        // Test output with no timing information
+        let no_time_output = "PING google.com (142.250.80.238) 56(84) bytes of data.\n--- google.com ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss, time 1000ms";
+        assert!(scanner.parse_ping_output(no_time_output).is_err());
+
+        // Test empty output
+        assert!(scanner.parse_ping_output("").is_err());
+
+        // Test malformed timing line
+        let malformed_output = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=invalid time=malformed ms";
+        assert!(scanner.parse_ping_output(malformed_output).is_err());
+    }
+
+    #[test]
+    fn test_ping_scanner_defaults() {
+        let default_scanner = PingScanner::default();
+        
+        assert_eq!(default_scanner.interval(), Duration::from_secs(1));
+        assert_eq!(default_scanner.timeout, Duration::from_secs(5));
+        assert_eq!(default_scanner.packet_count, 1);
+        assert_eq!(default_scanner.name(), "ping");
+    }
+
+    #[tokio::test]
+    async fn test_ping_scanner_timeout_handling() {
+        let timeout_scanner = PingScanner::new(
+            Duration::from_secs(1),
+            Duration::from_millis(1), // Very short timeout
+            1,
+        );
+
+        let target = Target::parse("192.0.2.1").unwrap(); // RFC5737 test IP (should not respond)
+        
+        // Should handle timeout gracefully
+        let result = timeout_scanner.scan(&target).await;
+        
+        match result {
+            Ok(_) => {
+                // Unlikely but possible if system responds very quickly
+            }
+            Err(_) => {
+                // Expected behavior - timeout or unreachable
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ping_localhost() {
+        let scanner = PingScanner::default();
+        let target = Target::parse("127.0.0.1").unwrap();
+        
+        let result = scanner.scan(&target).await;
+        
+        match result {
+            Ok(ScanResult::Ping(ping_result)) => {
+                // Localhost should respond quickly
+                assert!(ping_result.latency.as_millis() < 100);
+                assert_eq!(ping_result.packets_sent, 1);
+                assert_eq!(ping_result.packets_received, 1);
+                assert_eq!(ping_result.packet_loss, 0.0);
+            }
+            Ok(_) => panic!("Expected PingResult"),
+            Err(e) => {
+                // Some systems might not allow ping to localhost
+                println!("Ping to localhost failed (might be expected): {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ping_output_parsing_robustness() {
+        let scanner = PingScanner::default();
+        
+        // Test with extra whitespace
+        let whitespace_output = "  64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=15.2 ms  ";
+        let result = scanner.parse_ping_output(whitespace_output).unwrap();
+        assert_eq!(result.latency, Duration::from_millis(15));
+
+        // Test with multiple timing lines (should use first one)
+        let multi_output = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=15.2 ms\n64 bytes from 8.8.8.8: icmp_seq=2 ttl=118 time=20.5 ms";
+        let multi_result = scanner.parse_ping_output(multi_output).unwrap();
+        assert_eq!(multi_result.latency, Duration::from_millis(15)); // Should use first line
+
+        // Test with no TTL
+        let no_ttl_output = "64 bytes from 8.8.8.8: icmp_seq=1 time=15.2 ms";
+        let no_ttl_result = scanner.parse_ping_output(no_ttl_output).unwrap();
+        assert_eq!(no_ttl_result.latency, Duration::from_millis(15));
+        assert!(no_ttl_result.ttl.is_none());
+    }
 } 

@@ -761,4 +761,191 @@ mod tests {
             assert!(!tls_result.certificate_errors.is_empty());
         }
     }
+
+    #[test]
+    fn test_certificate_info_structure() {
+        let cert_info = CertificateInfo {
+            subject: "CN=example.com".to_string(),
+            issuer: "CN=Let's Encrypt Authority X3".to_string(),
+            serial_number: "123456789".to_string(),
+            not_before: chrono::Utc::now() - chrono::Duration::days(30),
+            not_after: chrono::Utc::now() + chrono::Duration::days(60),
+            signature_algorithm: "SHA256withRSA".to_string(),
+            public_key_algorithm: "RSA".to_string(),
+            key_size: Some(2048),
+            san_domains: vec!["example.com".to_string(), "www.example.com".to_string()],
+            is_self_signed: false,
+            is_ca: false,
+        };
+
+        assert_eq!(cert_info.subject, "CN=example.com");
+        assert_eq!(cert_info.issuer, "CN=Let's Encrypt Authority X3");
+        assert_eq!(cert_info.key_size, Some(2048));
+        assert!(!cert_info.is_self_signed);
+        assert!(!cert_info.is_ca);
+        assert_eq!(cert_info.san_domains.len(), 2);
+    }
+
+    #[test]
+    fn test_cipher_suite_structure() {
+        let cipher = CipherSuite {
+            name: "TLS_AES_256_GCM_SHA384".to_string(),
+            protocol_version: "TLSv1.3".to_string(),
+            key_exchange: "ECDHE".to_string(),
+            authentication: "RSA".to_string(),
+            encryption: "AES256-GCM".to_string(),
+            mac: "SHA384".to_string(),
+            is_secure: true,
+        };
+
+        assert_eq!(cipher.name, "TLS_AES_256_GCM_SHA384");
+        assert_eq!(cipher.protocol_version, "TLSv1.3");
+        assert!(cipher.is_secure);
+        assert_eq!(cipher.encryption, "AES256-GCM");
+    }
+
+    #[test]
+    fn test_vulnerability_types() {
+        let vulnerabilities = vec![
+            TlsVulnerability::Heartbleed,
+            TlsVulnerability::Poodle,
+            TlsVulnerability::Beast,
+            TlsVulnerability::Crime,
+            TlsVulnerability::WeakCipher("RC4".to_string()),
+            TlsVulnerability::ExpiredCertificate,
+            TlsVulnerability::SelfSignedCertificate,
+            TlsVulnerability::WeakSignatureAlgorithm("MD5".to_string()),
+            TlsVulnerability::InsecureRenegotiation,
+            TlsVulnerability::WeakDhParams,
+            TlsVulnerability::SslV2Enabled,
+            TlsVulnerability::SslV3Enabled,
+        ];
+
+        assert_eq!(vulnerabilities.len(), 12);
+        assert!(matches!(vulnerabilities[0], TlsVulnerability::Heartbleed));
+        assert!(matches!(vulnerabilities[4], TlsVulnerability::WeakCipher(_)));
+        assert!(matches!(vulnerabilities[7], TlsVulnerability::WeakSignatureAlgorithm(_)));
+    }
+
+    #[test]
+    fn test_security_grade_comparison() {
+        let grades = vec![
+            SecurityGrade::APlus,
+            SecurityGrade::A,
+            SecurityGrade::B,
+            SecurityGrade::C,
+            SecurityGrade::D,
+            SecurityGrade::F,
+        ];
+
+        assert_eq!(grades[0].as_str(), "A+");
+        assert_eq!(grades[1].as_str(), "A");
+        assert_eq!(grades[5].as_str(), "F");
+    }
+
+    #[test]
+    fn test_tls_result_defaults() {
+        let result = TlsResult::new();
+        
+        assert!(!result.connection_successful);
+        assert_eq!(result.security_grade, SecurityGrade::F);
+        assert!(result.certificate_chain.is_empty());
+        assert!(result.vulnerabilities.is_empty());
+        assert!(result.supported_versions.is_empty());
+        assert!(result.supported_ciphers.is_empty());
+        assert!(result.negotiated_version.is_none());
+        assert!(result.negotiated_cipher.is_none());
+        assert!(!result.perfect_forward_secrecy);
+        assert!(!result.ocsp_stapling);
+    }
+
+    #[test]
+    fn test_vulnerability_detection_expired_cert() {
+        let scanner = TlsScanner::new();
+        let mut result = TlsResult::new();
+        
+        // Set expired certificate
+        result.expiry_date = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        result.days_until_expiry = Some(-1);
+        
+        let vulnerabilities = scanner.detect_vulnerabilities(&result);
+        assert!(vulnerabilities.contains(&TlsVulnerability::ExpiredCertificate));
+    }
+
+    #[test]
+    fn test_vulnerability_detection_soon_expiring_cert() {
+        let scanner = TlsScanner::new();
+        let mut result = TlsResult::new();
+        
+        // Set certificate expiring in 25 days (soon)
+        result.expiry_date = Some(chrono::Utc::now() + chrono::Duration::days(25));
+        result.days_until_expiry = Some(25);
+        
+        let vulnerabilities = scanner.detect_vulnerabilities(&result);
+        
+        // This should not be flagged as expired, but might be flagged as "soon expiring"
+        // depending on implementation
+        assert!(!vulnerabilities.contains(&TlsVulnerability::ExpiredCertificate));
+    }
+
+    #[test]
+    fn test_security_grading_with_vulnerabilities() {
+        let scanner = TlsScanner::new();
+        let mut result = TlsResult::new();
+        
+        // Set up a result with critical vulnerabilities
+        result.connection_successful = true;
+        result.supported_versions = vec![TlsVersion::V1_0, TlsVersion::V1_1]; // Old versions
+        result.vulnerabilities = vec![
+            TlsVulnerability::Heartbleed,
+            TlsVulnerability::ExpiredCertificate,
+        ];
+        
+        let grade = scanner.calculate_security_grade(&result);
+        assert_eq!(grade, SecurityGrade::F);
+        
+        // Test with good security
+        result.vulnerabilities.clear();
+        result.supported_versions = vec![TlsVersion::V1_2, TlsVersion::V1_3];
+        result.perfect_forward_secrecy = true;
+        result.ocsp_stapling = true;
+        
+        let better_grade = scanner.calculate_security_grade(&result);
+        assert!(better_grade != SecurityGrade::F);
+    }
+
+    #[test]
+    fn test_tls_port_detection() {
+        let scanner = TlsScanner::new();
+        
+        // Test HTTPS URL
+        let https_target = Target::parse("https://example.com").unwrap();
+        let https_ports = scanner.get_tls_ports(&https_target);
+        assert_eq!(https_ports, vec![443]);
+        
+        // Test explicit port
+        let port_target = Target::parse("example.com:8443").unwrap();
+        let explicit_ports = scanner.get_tls_ports(&port_target);
+        assert_eq!(explicit_ports, vec![8443]);
+        
+        // Test default
+        let default_target = Target::parse("example.com").unwrap();
+        let default_ports = scanner.get_tls_ports(&default_target);
+        assert_eq!(default_ports, vec![443]);
+    }
+
+    #[test]
+    fn test_tls_version_ordering() {
+        let versions = vec![
+            TlsVersion::V1_0,
+            TlsVersion::V1_1,
+            TlsVersion::V1_2,
+            TlsVersion::V1_3,
+        ];
+        
+        assert_eq!(versions[0].as_str(), "TLSv1.0");
+        assert_eq!(versions[1].as_str(), "TLSv1.1");
+        assert_eq!(versions[2].as_str(), "TLSv1.2");
+        assert_eq!(versions[3].as_str(), "TLSv1.3");
+    }
 } 
