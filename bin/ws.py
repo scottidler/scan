@@ -40,11 +40,11 @@ def remove_trailing_whitespace(file_path):
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description='Detect and optionally remove trailing whitespace from Rust files')
+    parser = argparse.ArgumentParser(description='Detect and optionally remove trailing whitespace from files')
     parser.add_argument('-d', '--delete', action='store_true', 
                        help='Remove trailing whitespace instead of just detecting it')
-    parser.add_argument('paths', nargs='*', default=['src/scan/*.rs'],
-                       help='File paths or patterns to process (default: src/scan/*.rs)')
+    parser.add_argument('paths', nargs='*', default=['**/*.rs'],
+                       help='File paths or patterns to process (default: **/*.rs - all Rust files recursively)')
     
     args = parser.parse_args()
     
@@ -52,11 +52,21 @@ def main():
     all_files = []
     for pattern in args.paths:
         if '*' in pattern or '?' in pattern:
-            all_files.extend(glob.glob(pattern))
+            # Use recursive=True for ** patterns
+            matches = glob.glob(pattern, recursive=True)
+            all_files.extend(matches)
         elif os.path.isfile(pattern):
             all_files.append(pattern)
+        elif os.path.isdir(pattern):
+            # If it's a directory, search for common source files recursively
+            for ext in ['*.rs', '*.py', '*.js', '*.ts', '*.go', '*.java', '*.cpp', '*.c', '*.h']:
+                matches = glob.glob(os.path.join(pattern, '**', ext), recursive=True)
+                all_files.extend(matches)
         else:
-            print(f"Warning: {pattern} is not a valid file or pattern")
+            print(f"Warning: {pattern} is not a valid file, directory, or pattern")
+
+    # Remove duplicates and sort
+    all_files = sorted(list(set(all_files)))
     
     if not all_files:
         print("No files found to process")
@@ -110,4 +120,4 @@ def main():
             print("Run with -d flag to remove trailing whitespace")
 
 if __name__ == "__main__":
-    main() 
+    main()

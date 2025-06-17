@@ -122,21 +122,13 @@ impl TuiApp {
                                 log::debug!("[tui] quit_requested: ctrl_c");
                                 self.should_quit = true;
                             }
-                            KeyCode::Tab => {
-                                // Cycle through focusable panes
-                                let current = self.layout.focused_pane().map(|s| s.as_str());
-                                if let Some(next_pane) = self.layout.next_focusable_pane(current) {
-                                    log::debug!("[tui] focus_next: old={:?} new={}", current, next_pane);
-                                    self.layout.set_focus(Some(next_pane));
-                                }
+                            KeyCode::Tab | KeyCode::Right => {
+                                // Cycle forward through focusable panes
+                                self.focus_next_pane();
                             }
-                            KeyCode::BackTab => {
-                                // Cycle backwards through focusable panes
-                                let current = self.layout.focused_pane().map(|s| s.as_str());
-                                if let Some(prev_pane) = self.layout.prev_focusable_pane(current) {
-                                    log::debug!("[tui] focus_prev: old={:?} new={}", current, prev_pane);
-                                    self.layout.set_focus(Some(prev_pane));
-                                }
+                            KeyCode::BackTab | KeyCode::Left => {
+                                // Cycle backward through focusable panes
+                                self.focus_prev_pane();
                             }
                             // Handle scrolling and navigation for focused pane
                             _ => {
@@ -193,6 +185,24 @@ impl TuiApp {
     pub fn quit(&mut self) {
         log::debug!("[tui] quit: setting quit flag");
         self.should_quit = true;
+    }
+
+    /// Focus the next pane in the layout
+    fn focus_next_pane(&mut self) {
+        let current = self.layout.focused_pane().map(|s| s.as_str());
+        if let Some(next_pane) = self.layout.next_focusable_pane(current) {
+            log::debug!("[tui] focus_next_pane: old={:?} new={}", current, next_pane);
+            self.layout.set_focus(Some(next_pane));
+        }
+    }
+
+    /// Focus the previous pane in the layout
+    fn focus_prev_pane(&mut self) {
+        let current = self.layout.focused_pane().map(|s| s.as_str());
+        if let Some(prev_pane) = self.layout.prev_focusable_pane(current) {
+            log::debug!("[tui] focus_prev_pane: old={:?} new={}", current, prev_pane);
+            self.layout.set_focus(Some(prev_pane));
+        }
     }
 }
 
@@ -343,4 +353,4 @@ mod tests {
         let ctrl_modifier = KeyModifiers::CONTROL;
         assert_eq!(ctrl_modifier, KeyModifiers::CONTROL);
     }
-} 
+}
