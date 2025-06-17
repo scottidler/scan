@@ -10,7 +10,7 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use log;
 
-const TRACEROUTE_INTERVAL_SECS: u64 = 10 * 60;
+const TRACEROUTE_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes - more responsive for network monitoring
 const TRACEROUTE_TIMEOUT_SECS: u64 = 30;
 const MAX_TRACEROUTE_HOPS: u8 = 20;
 const PROBES_PER_HOP: u8 = 3;
@@ -63,9 +63,9 @@ impl Default for TracerouteScanner {
 
 impl TracerouteScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::traceroute] new: interval=600s timeout=30s max_hops=20 probes_per_hop=3");
+        log::debug!("[scan::traceroute] new: interval=120s timeout=30s max_hops=20 probes_per_hop=3");
         Self {
-            interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS), // 10 minutes
+            interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS), // 2 minutes
             timeout: Duration::from_secs(TRACEROUTE_TIMEOUT_SECS),
             max_hops: MAX_TRACEROUTE_HOPS,
             probes_per_hop: PROBES_PER_HOP,

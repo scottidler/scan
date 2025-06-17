@@ -301,27 +301,30 @@ impl PaneLayout {
             self.focused_pane, key.code);
         
         if let Some(focused_id) = &self.focused_pane {
-            // Handle scrolling for security pane specifically
-            if focused_id == "security" {
-                match key.code {
-                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                        log::debug!("[tui::layout] security_scroll_up:");
-                        // Find the security pane and scroll up
-                        for pane in &mut self.panes {
-                            if pane.id() == "security" {
+            match key.code {
+                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                    log::debug!("[tui::layout] pane_scroll_up: pane={}", focused_id);
+                    for pane in &mut self.panes {
+                        if pane.id() == focused_id {
+                            if focused_id == "security" {
                                 if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
                                     security_pane.scroll_up();
-                                    log::trace!("[tui::layout] security_scrolled_up:");
+                                    return true;
+                                }
+                            } else if focused_id == "dns" {
+                                if let Some(dns_pane) = pane.as_any_mut().downcast_mut::<crate::tui::dns::DnsPane>() {
+                                    dns_pane.scroll_up();
                                     return true;
                                 }
                             }
                         }
                     }
-                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                        log::debug!("[tui::layout] security_scroll_down:");
-                        // Find the security pane and scroll down
-                        for pane in &mut self.panes {
-                            if pane.id() == "security" {
+                }
+                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                    log::debug!("[tui::layout] pane_scroll_down: pane={}", focused_id);
+                    for pane in &mut self.panes {
+                        if pane.id() == focused_id {
+                            if focused_id == "security" {
                                 if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
                                     // Get the security pane area (bottom-right: row 2, col 2)
                                     let visible_lines = if pane_areas.len() > 2 && pane_areas[2].len() > 2 {
@@ -331,33 +334,49 @@ impl PaneLayout {
                                         FALLBACK_VISIBLE_LINES // Fallback
                                     };
                                     
-                                    log::trace!("[tui::layout] security_scroll_down: visible_lines={}", visible_lines);
                                     security_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
-                            }
-                        }
-                    }
-                    crossterm::event::KeyCode::Home => {
-                        log::debug!("[tui::layout] security_scroll_home:");
-                        // Reset scroll to top
-                        for pane in &mut self.panes {
-                            if pane.id() == "security" {
-                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
-                                    security_pane.reset_scroll();
-                                    log::trace!("[tui::layout] security_scroll_reset:");
+                            } else if focused_id == "dns" {
+                                if let Some(dns_pane) = pane.as_any_mut().downcast_mut::<crate::tui::dns::DnsPane>() {
+                                    // Get the DNS pane area - need to find which position dns pane is in
+                                    let mut visible_lines = FALLBACK_VISIBLE_LINES;
+                                    if let Some(config) = self.config.get("dns") {
+                                        let row = config.position.row;
+                                        let col = config.position.col;
+                                        if pane_areas.len() > row && pane_areas[row].len() > col {
+                                            visible_lines = pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
+                                        }
+                                    }
+                                    
+                                    dns_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
                             }
                         }
                     }
-                    _ => {
-                        log::trace!("[tui::layout] unhandled_key_in_security: key={:?}", key.code);
+                }
+                crossterm::event::KeyCode::Home => {
+                    log::debug!("[tui::layout] pane_scroll_home: pane={}", focused_id);
+                    for pane in &mut self.panes {
+                        if pane.id() == focused_id {
+                            if focused_id == "security" {
+                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                    security_pane.reset_scroll();
+                                    return true;
+                                }
+                            } else if focused_id == "dns" {
+                                if let Some(dns_pane) = pane.as_any_mut().downcast_mut::<crate::tui::dns::DnsPane>() {
+                                    dns_pane.reset_scroll();
+                                    return true;
+                                }
+                            }
+                        }
                     }
                 }
-            } else {
-                log::trace!("[tui::layout] key_event_for_non_security_pane: pane={} key={:?}", 
-                    focused_id, key.code);
+                _ => {
+                    log::trace!("[tui::layout] unhandled_key_in_pane: pane={} key={:?}", focused_id, key.code);
+                }
             }
         } else {
             log::trace!("[tui::layout] key_event_no_focused_pane: key={:?}", key.code);
