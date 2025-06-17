@@ -1,6 +1,16 @@
 use crate::types::{ScanResult, ScanState, ScanStatus};
 use std::time::Duration;
 
+const PACKET_LOSS_PERCENTAGE_MULTIPLIER: f64 = 100.0;
+const CERT_EXPIRY_WARNING_DAYS: u64 = 30;
+const DAYS_PER_YEAR: u64 = 365;
+const EXPIRY_WARNING_DAYS: u64 = 30;
+const PACKET_LOSS_TIMEOUT_THRESHOLD: f64 = 0.5;
+const MAX_PORTS_DISPLAY: usize = 4;
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 3600;
+const SEPARATOR_WIDTH: usize = 80;
+
 pub fn print_scan_state(scanner_name: &str, scan_state: &ScanState) {
     let status_icon = match scan_state.status {
         ScanStatus::Running => "🔄",
@@ -30,7 +40,7 @@ fn print_scan_result(result: &ScanResult) {
             println!("{}ms latency (TTL: {}, Loss: {:.1}%)", 
                 ping.latency.as_millis(),
                 ping.ttl.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string()),
-                ping.packet_loss * 100.0
+                ping.packet_loss * PACKET_LOSS_PERCENTAGE_MULTIPLIER
             );
         }
         
@@ -62,7 +72,7 @@ fn print_scan_result(result: &ScanResult) {
                 
                 let cert_status = if tls.certificate_valid {
                     if let Some(days) = tls.days_until_expiry {
-                        if days > 30 {
+                        if days > CERT_EXPIRY_WARNING_DAYS {
                             format!("cert valid ({}d)", days)
                         } else {
                             format!("cert expires soon ({}d)", days)
@@ -98,22 +108,22 @@ fn print_scan_result(result: &ScanResult) {
         ScanResult::Whois(whois) => {
             let age_str = whois.domain_age_days
                 .map(|days| {
-                    if days < 365 {
+                    if days < DAYS_PER_YEAR {
                         format!("{}d old", days)
                     } else {
-                        format!("{}yr old", days / 365)
+                        format!("{}yr old", days / DAYS_PER_YEAR)
                     }
                 })
                 .unwrap_or_else(|| "unknown age".to_string());
             
             let expiry_str = whois.expires_in_days
                 .map(|days| {
-                    if days < 30 {
+                    if days < EXPIRY_WARNING_DAYS {
                         format!("expires in {}d", days)
-                    } else if days < 365 {
+                    } else if days < DAYS_PER_YEAR {
                         format!("expires in {}d", days)
                     } else {
-                        format!("expires in {}yr", days / 365)
+                        format!("expires in {}yr", days / DAYS_PER_YEAR)
                     }
                 })
                 .unwrap_or_else(|| "unknown expiry".to_string());
@@ -148,7 +158,7 @@ fn print_scan_result(result: &ScanResult) {
             
             // Count timeouts
             let timeout_hops = traceroute.hops.iter()
-                .filter(|hop| hop.packet_loss > 0.5)
+                .filter(|hop| hop.packet_loss > PACKET_LOSS_TIMEOUT_THRESHOLD)
                 .count();
             
             let timeout_str = if timeout_hops > 0 {
@@ -206,7 +216,7 @@ fn print_scan_result(result: &ScanResult) {
             } else {
                 // Show first few ports with services
                 let mut port_descriptions = Vec::new();
-                for open_port in port.open_ports.iter().take(4) {
+                for open_port in port.open_ports.iter().take(MAX_PORTS_DISPLAY) {
                     let service_name = if let Some(service) = &open_port.service {
                         service.name.clone()
                     } else {
@@ -216,8 +226,8 @@ fn print_scan_result(result: &ScanResult) {
                     port_descriptions.push(format!("{} {}", open_port.port, service_name.to_uppercase()));
                 }
                 
-                let ports_str = if open_count > 4 {
-                    format!("{}, +{} more", port_descriptions.join(", "), open_count - 4)
+                let ports_str = if open_count > MAX_PORTS_DISPLAY {
+                    format!("{}, +{} more", port_descriptions.join(", "), open_count - MAX_PORTS_DISPLAY)
                 } else {
                     port_descriptions.join(", ")
                 };
@@ -256,19 +266,19 @@ fn count_security_features(http: &crate::scan::http::HttpResult) -> usize {
 fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     
-    if total_secs < 60 {
+    if total_secs < SECONDS_PER_MINUTE {
         format!("{}s", total_secs)
-    } else if total_secs < 3600 {
-        format!("{}m{}s", total_secs / 60, total_secs % 60)
+    } else if total_secs < SECONDS_PER_HOUR {
+        format!("{}m{}s", total_secs / SECONDS_PER_MINUTE, total_secs % SECONDS_PER_MINUTE)
     } else {
-        let hours = total_secs / 3600;
-        let minutes = (total_secs % 3600) / 60;
+        let hours = total_secs / SECONDS_PER_HOUR;
+        let minutes = (total_secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
         format!("{}h{}m", hours, minutes)
     }
 }
 
 pub fn print_separator() {
-    println!("{}", "─".repeat(80));
+    println!("{}", "─".repeat(SEPARATOR_WIDTH));
 }
 
 pub fn print_header(target: &str) {

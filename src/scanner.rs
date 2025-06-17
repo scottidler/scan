@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use crate::types::{AppState, ScanResult, ScanState, ScanStatus, TimestampedResult};
 use crate::target::Target;
 
+const MAX_HISTORY_RESULTS: usize = 100;
+
 #[async_trait]
 pub trait Scanner {
     /// Scanner identifier for state storage
@@ -70,14 +72,14 @@ pub trait Scanner {
                         scan_state.history.push_back(timestamped);
                         
                         // Keep last 100 results
-                        if scan_state.history.len() > 100 {
+                        if scan_state.history.len() > MAX_HISTORY_RESULTS {
                             scan_state.history.pop_front();
                         }
                         
                         log::debug!("[scanner] state_updated: scanner={} status=Complete history_len={}", 
                             self.name(), scan_state.history.len());
                         
-                        if old_history_len >= 100 {
+                        if old_history_len >= MAX_HISTORY_RESULTS {
                             log::trace!("[scanner] history_trimmed: scanner={} old_len={} new_len={}", 
                                 self.name(), old_history_len + 1, scan_state.history.len());
                         }

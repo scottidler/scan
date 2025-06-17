@@ -3,6 +3,8 @@ use eyre::Result;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 
+const DEBUG_REFRESH_INTERVAL_SECS: u64 = 5;
+
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(about = "A comprehensive network scanner")]
@@ -110,7 +112,7 @@ async fn main() -> Result<()> {
                 println!();
             }
             
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(DEBUG_REFRESH_INTERVAL_SECS)).await;
         }
     } else {
         log::info!("[main] Starting TUI mode");

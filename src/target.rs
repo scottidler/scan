@@ -4,6 +4,11 @@ use eyre::{Result, WrapErr};
 use tokio::net::lookup_host;
 use tokio::time::Instant;
 
+const DEFAULT_HTTP_PORT: u16 = 80;
+const DEFAULT_HTTPS_PORT: u16 = 443;
+const DEFAULT_FTP_PORT: u16 = 21;
+const DEFAULT_DNS_RESOLUTION_PORT: u16 = 80;
+
 #[derive(Debug, Clone)]
 pub struct Target {
     pub original: String,
@@ -31,9 +36,9 @@ impl Target {
                 // Get port from URL, or use default for scheme
                 let port = url.port().or_else(|| {
                     match url.scheme() {
-                        "http" => Some(80),
-                        "https" => Some(443),
-                        "ftp" => Some(21),
+                        "http" => Some(DEFAULT_HTTP_PORT),
+                        "https" => Some(DEFAULT_HTTPS_PORT),
+                        "ftp" => Some(DEFAULT_FTP_PORT),
                         _ => None,
                     }
                 });
@@ -181,7 +186,7 @@ impl Target {
         log::debug!("[target] resolve_domain: domain={} port={:?}", domain, self.port);
         
         // Use port 80 as default for resolution if no port specified
-        let port = self.port.unwrap_or(80);
+        let port = self.port.unwrap_or(DEFAULT_DNS_RESOLUTION_PORT);
         let lookup_addr = format!("{}:{}", domain, port);
         
         log::trace!("[target] DNS lookup starting: lookup_addr={}", lookup_addr);

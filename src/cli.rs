@@ -1,5 +1,7 @@
 use clap::Parser;
 
+const DEFAULT_REFRESH_RATE_MS: &str = "250";
+
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(about = "A network scanning TUI application")]
@@ -8,7 +10,7 @@ pub struct Cli {
     pub target: String,
     
     /// Refresh rate in milliseconds
-    #[arg(short, long, default_value = "250")]
+    #[arg(short, long, default_value = DEFAULT_REFRESH_RATE_MS)]
     pub refresh_rate: u64,
     
     /// Enable verbose logging
