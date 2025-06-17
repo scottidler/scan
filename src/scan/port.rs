@@ -598,7 +598,7 @@ impl Scanner for PortScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+
     
     #[test]
     fn test_port_scanner_creation() {

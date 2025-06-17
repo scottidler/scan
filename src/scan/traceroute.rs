@@ -373,7 +373,7 @@ impl Scanner for TracerouteScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
     
     #[test]
     fn test_traceroute_scanner_creation() {

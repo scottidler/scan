@@ -209,7 +209,8 @@ impl TlsScanner {
         
         match tokio::time::timeout(self.connection_timeout, async {
             let socket = tokio::net::TcpStream::connect(&addr).await?;
-            let tls_stream = connector.connect(server_name, socket).await?;
+            // Use handshake_timeout for the TLS handshake specifically
+            let tls_stream = tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await??;
             
             // Get TLS version from the connection
             let (_, connection) = tls_stream.into_inner();
@@ -601,22 +602,29 @@ impl TlsScanner {
 #[async_trait]
 impl Scanner for TlsScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        log::debug!("[scan::tls] scan: target={}", target.display_name());
+        log::debug!("[scan::tls] scan: target={} total_timeout={}s", 
+            target.display_name(), self.total_scan_timeout.as_secs());
         
         let scan_start = Instant::now();
-        match self.perform_tls_scan(target).await {
-            Ok(result) => {
+        match tokio::time::timeout(self.total_scan_timeout, self.perform_tls_scan(target)).await {
+            Ok(Ok(result)) => {
                 let scan_duration = scan_start.elapsed();
                 log::trace!("[scan::tls] tls_scan_completed: target={} duration={}ms connection_successful={} grade={:?} cert_valid={} vulnerabilities={}", 
                     target.display_name(), scan_duration.as_millis(), result.connection_successful, 
                     result.security_grade, result.certificate_valid, result.vulnerabilities.len());
                 Ok(ScanResult::Tls(result))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let scan_duration = scan_start.elapsed();
                 log::error!("[scan::tls] tls_scan_failed: target={} duration={}ms error={}", 
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("TLS scan failed"))
+            }
+            Err(_) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::tls] tls_scan_timeout: target={} duration={}ms timeout={}s", 
+                    target.display_name(), scan_duration.as_millis(), self.total_scan_timeout.as_secs());
+                Err(eyre::eyre!("TLS scan timeout after {:?}", self.total_scan_timeout))
             }
         }
     }

@@ -25,8 +25,9 @@ impl HttpScanner {
     pub fn new() -> Self {
         log::debug!("[scan::http] new: timeout=10s");
         
+        let timeout = Duration::from_secs(10);
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent("scan/1.0")
             .build()
@@ -34,8 +35,12 @@ impl HttpScanner {
 
         Self {
             client,
-            timeout: Duration::from_secs(10),
+            timeout,
         }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     async fn scan_http(&self, target: &Target) -> eyre::Result<HttpResult> {

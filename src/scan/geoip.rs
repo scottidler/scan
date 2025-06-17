@@ -91,12 +91,10 @@ struct IpApiResponse {
     org: Option<String>,
     #[serde(rename = "as")]
     asn_info: Option<String>,
-    query: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct IpInfoResponse {
-    ip: String,
     city: Option<String>,
     region: Option<String>,
     country: Option<String>,
@@ -540,7 +538,7 @@ impl Scanner for GeoIpScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+
     
     #[test]
     fn test_geoip_scanner_creation() {

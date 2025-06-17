@@ -195,8 +195,8 @@ impl DnsScanner {
         let resolver = match Resolver::builder_tokio() {
             Ok(builder) => {
                 let r = builder.build();
-                log::trace!("[scan::dns] resolver_created: duration={}μs", 
-                    start_time.elapsed().as_micros());
+                log::trace!("[scan::dns] resolver_created: duration={}μs timeout={}ms", 
+                    start_time.elapsed().as_micros(), self.timeout.as_millis());
                 r
             }
             Err(e) => {
@@ -211,8 +211,8 @@ impl DnsScanner {
             
             // A records (IPv4)
             let a_start = Instant::now();
-            match resolver.ipv4_lookup(domain).await {
-                Ok(response) => {
+            match tokio::time::timeout(self.timeout, resolver.ipv4_lookup(domain)).await {
+                Ok(Ok(response)) => {
                     let a_duration = a_start.elapsed();
                     for ip in response.iter() {
                         let ttl = response.as_lookup().records().first()
@@ -223,17 +223,22 @@ impl DnsScanner {
                     log::trace!("[scan::dns] a_records_found: domain={} count={} duration={}ms", 
                         domain, result.A.len(), a_duration.as_millis());
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let a_duration = a_start.elapsed();
                     log::trace!("[scan::dns] a_records_failed: domain={} duration={}ms error={}", 
                         domain, a_duration.as_millis(), e);
+                }
+                Err(_) => {
+                    let a_duration = a_start.elapsed();
+                    log::warn!("[scan::dns] a_records_timeout: domain={} duration={}ms timeout={}ms", 
+                        domain, a_duration.as_millis(), self.timeout.as_millis());
                 }
             }
 
             // AAAA records (IPv6)
             let aaaa_start = Instant::now();
-            match resolver.ipv6_lookup(domain).await {
-                Ok(response) => {
+            match tokio::time::timeout(self.timeout, resolver.ipv6_lookup(domain)).await {
+                Ok(Ok(response)) => {
                     let aaaa_duration = aaaa_start.elapsed();
                     for ip in response.iter() {
                         let ttl = response.as_lookup().records().first()
@@ -244,10 +249,15 @@ impl DnsScanner {
                     log::trace!("[scan::dns] aaaa_records_found: domain={} count={} duration={}ms", 
                         domain, result.AAAA.len(), aaaa_duration.as_millis());
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let aaaa_duration = aaaa_start.elapsed();
                     log::trace!("[scan::dns] aaaa_records_failed: domain={} duration={}ms error={}", 
                         domain, aaaa_duration.as_millis(), e);
+                }
+                Err(_) => {
+                    let aaaa_duration = aaaa_start.elapsed();
+                    log::warn!("[scan::dns] aaaa_records_timeout: domain={} duration={}ms timeout={}ms", 
+                        domain, aaaa_duration.as_millis(), self.timeout.as_millis());
                 }
             }
 

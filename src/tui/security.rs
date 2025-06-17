@@ -790,6 +790,8 @@ mod tests {
 
     #[test]
     fn test_tls_data_extraction() {
+        // False positive: mut is required for state.scanners.insert() calls
+        #[allow(unused_mut)]
         let mut state = AppState::new("example.com".to_string());
         
         // Create comprehensive TLS result with certificate details
@@ -873,6 +875,8 @@ mod tests {
 
     #[test]
     fn test_http_data_extraction() {
+        // False positive: mut is required for state.scanners.insert() calls
+        #[allow(unused_mut)]
         let mut state = AppState::new("example.com".to_string());
         
         let security_headers = SecurityHeaders {
@@ -974,6 +978,8 @@ mod tests {
 
     #[test]
     fn test_dns_data_extraction() {
+        // False positive: mut is required for state.scanners.insert() calls
+        #[allow(unused_mut)]
         let mut state = AppState::new("example.com".to_string());
         
         let email_security = EmailSecurityAnalysis {
@@ -1034,6 +1040,8 @@ mod tests {
 
     #[test]
     fn test_comprehensive_data_availability() {
+        // False positive: mut is required for state.scanners.insert() calls
+        #[allow(unused_mut)]
         let mut state = AppState::new("comprehensive.com".to_string());
         
         // Add all scanner types with data
