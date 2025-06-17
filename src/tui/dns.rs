@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// DNS pane displays domain name system resolution information
 pub struct DnsPane {
@@ -17,6 +18,7 @@ pub struct DnsPane {
 
 impl DnsPane {
     pub fn new() -> Self {
+        log::debug!("[tui::dns] new:");
         Self {
             title: "dns",
             id: "dns",
@@ -442,6 +444,9 @@ impl Default for DnsPane {
 
 impl Pane for DnsPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::dns] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)

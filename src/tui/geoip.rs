@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// GeoIP pane displays geographical and network location information
 pub struct GeoIpPane {
@@ -17,6 +18,7 @@ pub struct GeoIpPane {
 
 impl GeoIpPane {
     pub fn new() -> Self {
+        log::debug!("[tui::geoip] new:");
         Self {
             title: "geoip",
             id: "geoip",
@@ -32,6 +34,9 @@ impl Default for GeoIpPane {
 
 impl Pane for GeoIpPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::geoip] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)

@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// WHOIS pane displays domain registration and ownership information
 pub struct WhoisPane {
@@ -17,6 +18,7 @@ pub struct WhoisPane {
 
 impl WhoisPane {
     pub fn new() -> Self {
+        log::debug!("[tui::whois] new:");
         Self {
             title: "whois",
             id: "whois",
@@ -32,6 +34,9 @@ impl Default for WhoisPane {
 
 impl Pane for WhoisPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::whois] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -313,7 +318,7 @@ mod tests {
         let pane = WhoisPane::new();
         assert_eq!(pane.title(), "whois");
         assert_eq!(pane.id(), "whois");
-        assert_eq!(pane.min_size(), (30, 12));
+        assert_eq!(pane.min_size(), (35, 16));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
 use webpki_roots;
+use log;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TlsVersion {
@@ -160,26 +161,27 @@ pub struct TlsScanner {
 
 impl TlsScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::tls] new: interval=300s connection_timeout=10s handshake_timeout=5s");
         Self {
             interval: Duration::from_secs(300), // TLS scans every 5 minutes
             connection_timeout: Duration::from_secs(10),
-            handshake_timeout: Duration::from_secs(15),
-            total_scan_timeout: Duration::from_secs(60),
+            handshake_timeout: Duration::from_secs(5),
+            total_scan_timeout: Duration::from_secs(30),
         }
     }
 
     fn get_tls_ports(&self, target: &Target) -> Vec<u16> {
-        match target.port {
-            Some(port) => vec![port],
-            None => match target.scheme.as_deref() {
-                Some("https") => vec![443],
-                Some("ftps") => vec![990],
-                Some("smtps") => vec![465, 587],
-                Some("imaps") => vec![993],
-                Some("pop3s") => vec![995],
-                _ => vec![443], // Default to HTTPS
-            }
-        }
+        let ports = if let Some(port) = target.port {
+            vec![port]
+        } else if target.scheme.as_deref() == Some("https") {
+            vec![443]
+        } else {
+            vec![443] // Default to HTTPS port
+        };
+        
+        log::debug!("[scan::tls] get_tls_ports: target={} ports={:?}", 
+            target.display_name(), ports);
+        ports
     }
 
     async fn test_basic_connection(&self, target: &Target, port: u16) -> Result<(bool, Duration, Option<TlsVersion>)> {
@@ -482,8 +484,6 @@ impl TlsScanner {
             score += 5;
         }
 
-
-
         // Convert score to grade
         match score {
             90..=i32::MAX => SecurityGrade::APlus,
@@ -496,23 +496,34 @@ impl TlsScanner {
     }
 
     async fn perform_tls_scan(&self, target: &Target) -> Result<TlsResult> {
+        log::debug!("[scan::tls] perform_tls_scan: target={}", target.display_name());
+        
         let start_time = Instant::now();
         let mut result = TlsResult::new();
 
         let ports = self.get_tls_ports(target);
         let port = ports[0]; // Use first port for now
+        log::debug!("[scan::tls] using_port: target={} port={}", target.display_name(), port);
 
         // Phase 1: Basic connectivity test
+        log::debug!("[scan::tls] phase1_basic_connection: target={} port={}", target.display_name(), port);
+        let phase1_start = Instant::now();
         match self.test_basic_connection(target, port).await {
             Ok((success, handshake_time, version)) => {
+                let phase1_duration = phase1_start.elapsed();
                 result.connection_successful = success;
                 result.handshake_time = handshake_time;
                 if let Some(v) = version {
                     result.negotiated_version = Some(v.clone());
                     result.supported_versions.push(v);
                 }
+                log::trace!("[scan::tls] phase1_completed: target={} port={} success={} handshake_time={}ms phase_duration={}ms version={:?}", 
+                    target.display_name(), port, success, handshake_time.as_millis(), phase1_duration.as_millis(), result.negotiated_version);
             }
             Err(e) => {
+                let phase1_duration = phase1_start.elapsed();
+                log::error!("[scan::tls] phase1_failed: target={} port={} duration={}ms error={}", 
+                    target.display_name(), port, phase1_duration.as_millis(), e);
                 result.certificate_errors.push(format!("Connection failed: {}", e));
                 result.scan_time = start_time.elapsed();
                 return Ok(result);
@@ -520,39 +531,68 @@ impl TlsScanner {
         }
 
         // Phase 2: TLS version enumeration
+        log::debug!("[scan::tls] phase2_version_enumeration: target={} port={}", target.display_name(), port);
+        let phase2_start = Instant::now();
         match self.test_tls_versions(target, port).await {
             Ok(versions) => {
-                result.supported_versions = versions;
+                let phase2_duration = phase2_start.elapsed();
+                result.supported_versions = versions.clone();
+                log::trace!("[scan::tls] phase2_completed: target={} port={} duration={}ms versions={:?}", 
+                    target.display_name(), port, phase2_duration.as_millis(), versions);
             }
             Err(e) => {
+                let phase2_duration = phase2_start.elapsed();
+                log::warn!("[scan::tls] phase2_failed: target={} port={} duration={}ms error={}", 
+                    target.display_name(), port, phase2_duration.as_millis(), e);
                 result.certificate_errors.push(format!("Version enumeration failed: {}", e));
             }
         }
 
         // Phase 3: Certificate analysis
+        log::debug!("[scan::tls] phase3_certificate_analysis: target={} port={}", target.display_name(), port);
+        let phase3_start = Instant::now();
         match self.analyze_certificate_with_openssl(target, port) {
             Ok(cert_chain) => {
+                let phase3_duration = phase3_start.elapsed();
                 result.certificate_valid = !cert_chain.is_empty();
                 if let Some(leaf_cert) = cert_chain.first() {
                     result.expiry_date = Some(leaf_cert.not_after);
                     let days_until_expiry = (leaf_cert.not_after - chrono::Utc::now()).num_days();
                     result.days_until_expiry = Some(days_until_expiry);
                 }
-                result.certificate_chain = cert_chain;
+                result.certificate_chain = cert_chain.clone();
+                log::trace!("[scan::tls] phase3_completed: target={} port={} duration={}ms cert_count={} valid={} days_until_expiry={:?}", 
+                    target.display_name(), port, phase3_duration.as_millis(), cert_chain.len(), result.certificate_valid, result.days_until_expiry);
             }
             Err(e) => {
+                let phase3_duration = phase3_start.elapsed();
+                log::error!("[scan::tls] phase3_failed: target={} port={} duration={}ms error={}", 
+                    target.display_name(), port, phase3_duration.as_millis(), e);
                 result.certificate_errors.push(format!("Certificate analysis failed: {}", e));
             }
         }
 
         // Phase 4: Vulnerability detection
+        log::debug!("[scan::tls] phase4_vulnerability_detection: target={}", target.display_name());
+        let phase4_start = Instant::now();
         result.vulnerabilities = self.detect_vulnerabilities(&result);
+        let phase4_duration = phase4_start.elapsed();
+        log::trace!("[scan::tls] phase4_completed: target={} duration={}μs vulnerabilities={:?}", 
+            target.display_name(), phase4_duration.as_micros(), result.vulnerabilities);
 
         // Phase 5: Security grading
+        log::debug!("[scan::tls] phase5_security_grading: target={}", target.display_name());
+        let phase5_start = Instant::now();
         result.security_grade = self.calculate_security_grade(&result);
+        let phase5_duration = phase5_start.elapsed();
+        log::trace!("[scan::tls] phase5_completed: target={} duration={}μs grade={:?}", 
+            target.display_name(), phase5_duration.as_micros(), result.security_grade);
 
         result.scan_time = start_time.elapsed();
         result.queried_at = start_time;
+
+        log::debug!("[scan::tls] tls_scan_completed: target={} total_duration={}ms grade={:?} vulnerabilities={}", 
+            target.display_name(), result.scan_time.as_millis(), result.security_grade, result.vulnerabilities.len());
 
         Ok(result)
     }
@@ -561,10 +601,24 @@ impl TlsScanner {
 #[async_trait]
 impl Scanner for TlsScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        let result = self.perform_tls_scan(target).await
-            .wrap_err("TLS scan failed")?;
+        log::debug!("[scan::tls] scan: target={}", target.display_name());
         
-        Ok(ScanResult::Tls(result))
+        let scan_start = Instant::now();
+        match self.perform_tls_scan(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::tls] tls_scan_completed: target={} duration={}ms connection_successful={} grade={:?} cert_valid={} vulnerabilities={}", 
+                    target.display_name(), scan_duration.as_millis(), result.connection_successful, 
+                    result.security_grade, result.certificate_valid, result.vulnerabilities.len());
+                Ok(ScanResult::Tls(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::tls] tls_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e.wrap_err("TLS scan failed"))
+            }
+        }
     }
 
     fn interval(&self) -> Duration {

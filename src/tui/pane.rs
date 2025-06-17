@@ -1,10 +1,12 @@
 use crate::types::AppState;
 use ratatui::{
     layout::Rect,
+    style::{Color, Style},
     widgets::{Block, Borders},
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// Trait for TUI panes that display scanner data
 pub trait Pane {
@@ -38,23 +40,16 @@ pub trait Pane {
 
 /// Helper function to create a standard bordered block for panes
 pub fn create_block(title: &str, focused: bool) -> Block {
-    let (border_style, border_type) = if focused {
-        (
-            ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
-            ratatui::widgets::BorderType::Double
-        )
-    } else {
-        (
-            ratatui::style::Style::default().fg(ratatui::style::Color::Gray),
-            ratatui::widgets::BorderType::Plain
-        )
-    };
+    log::trace!("[tui::pane] create_block: title={} focused={}", title, focused);
     
     Block::default()
-        .title(title)
+        .title(title.to_uppercase())
         .borders(Borders::ALL)
-        .border_style(border_style)
-        .border_type(border_type)
+        .border_style(if focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Gray)
+        })
 }
 
 /// Pane position in the grid layout
@@ -81,6 +76,7 @@ pub struct PaneConfig {
 
 impl PaneConfig {
     pub fn new(row: usize, col: usize) -> Self {
+        log::trace!("[tui::pane] PaneConfig::new: row={} col={}", row, col);
         Self {
             position: PanePosition::new(row, col),
             span_rows: 1,

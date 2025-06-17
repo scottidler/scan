@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// TARGET pane displays basic target information and scanner status overview
 pub struct TargetPane {
@@ -17,6 +18,7 @@ pub struct TargetPane {
 
 impl TargetPane {
     pub fn new() -> Self {
+        log::debug!("[tui::target] new:");
         Self {
             title: "target",
             id: "target",
@@ -59,6 +61,9 @@ impl TargetPane {
             }
         }
         
+        log::trace!("[tui::target] calculate_stats: total={} running={} complete={} failed={}", 
+            total, running, complete, failed);
+        
         (total, running, complete, failed)
     }
 }
@@ -71,6 +76,9 @@ impl Default for TargetPane {
 
 impl Pane for TargetPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::target] render: area={}x{} focused={} target={}", 
+            area.width, area.height, focused, state.target);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -95,11 +103,13 @@ impl Pane for TargetPane {
                     Some(crate::types::ScanResult::Dns(dns_result)) => {
                         if !dns_result.A.is_empty() {
                             let ip = &dns_result.A[0].value;
+                            log::trace!("[tui::target] dns_resolved: ip={}", ip);
                             lines.push(Line::from(vec![
                                 Span::styled("📍 ", Style::default().fg(Color::Blue)),
                                 Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
                             ]));
                         } else {
+                            log::trace!("[tui::target] dns_no_a_records:");
                             lines.push(Line::from(vec![
                                 Span::styled("📍 ", Style::default().fg(Color::Blue)),
                                 Span::styled("resolved (no A records)", Style::default().fg(Color::Yellow)),
@@ -109,18 +119,21 @@ impl Pane for TargetPane {
                     None => {
                         match dns_state.status {
                             ScanStatus::Running => {
+                                log::trace!("[tui::target] dns_resolving:");
                                 lines.push(Line::from(vec![
                                     Span::styled("📍 ", Style::default().fg(Color::Blue)),
                                     Span::styled("resolving...", Style::default().fg(Color::Yellow)),
                                 ]));
                             }
                             ScanStatus::Failed => {
+                                log::trace!("[tui::target] dns_failed:");
                                 lines.push(Line::from(vec![
                                     Span::styled("📍 ", Style::default().fg(Color::Blue)),
                                     Span::styled("resolution failed", Style::default().fg(Color::Red)),
                                 ]));
                             }
                             _ => {
+                                log::trace!("[tui::target] dns_waiting:");
                                 lines.push(Line::from(vec![
                                     Span::styled("📍 ", Style::default().fg(Color::Blue)),
                                     Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
@@ -130,6 +143,7 @@ impl Pane for TargetPane {
                     }
                     Some(_) => {
                         // Non-DNS result (shouldn't happen)
+                        log::warn!("[tui::target] dns_unexpected_result_type:");
                         lines.push(Line::from(vec![
                             Span::styled("📍 ", Style::default().fg(Color::Blue)),
                             Span::styled("error", Style::default().fg(Color::Red)),
@@ -138,6 +152,7 @@ impl Pane for TargetPane {
                 }
             }
             None => {
+                log::warn!("[tui::target] dns_scanner_missing:");
                 lines.push(Line::from(vec![
                     Span::styled("📍 ", Style::default().fg(Color::Blue)),
                     Span::styled("DNS scanner not available", Style::default().fg(Color::Red)),
@@ -183,6 +198,9 @@ impl Pane for TargetPane {
             ]));
         }
         
+        log::trace!("[tui::target] content_prepared: lines={} scanners={}", 
+            lines.len(), state.scanners.len());
+        
         // Create and render the paragraph
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
@@ -223,7 +241,7 @@ mod tests {
         let pane = TargetPane::new();
         assert_eq!(pane.title(), "target");
         assert_eq!(pane.id(), "target");
-        assert_eq!(pane.min_size(), (25, 8));
+        assert_eq!(pane.min_size(), (25, 12));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

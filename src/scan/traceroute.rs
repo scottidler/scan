@@ -4,10 +4,11 @@ use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use std::net::IpAddr;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 use tokio::time::sleep;
+use log;
 
 #[derive(Debug, Clone)]
 pub struct TracerouteScanner {
@@ -53,58 +54,74 @@ impl Default for TracerouteScanner {
 
 impl TracerouteScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::traceroute] new: interval=600s timeout=30s max_hops=20 probes_per_hop=3");
         Self {
-            interval: Duration::from_secs(15 * 60), // 15 minutes
-            timeout: Duration::from_secs(60),       // 60 seconds total
+            interval: Duration::from_secs(10 * 60), // 10 minutes
+            timeout: Duration::from_secs(30),
             max_hops: 20,
             probes_per_hop: 3,
         }
     }
 
     async fn perform_traceroute(&self, target: &Target) -> Result<TracerouteResult> {
+        log::debug!("[scan::traceroute] perform_traceroute: target={}", target.display_name());
+        
         let start_time = Instant::now();
         
         // Determine target IP and whether to use IPv6
-        let (target_ip, use_ipv6) = self.determine_target_ip(target)?;
+        let (target_ip, ipv6) = self.determine_target_ip(target)?;
+        log::debug!("[scan::traceroute] target_determined: target={} ip={} ipv6={}", 
+            target.display_name(), target_ip, ipv6);
         
         // Build traceroute command
-        let mut cmd = Command::new("traceroute");
-        
-        if use_ipv6 {
-            cmd.arg("-6");
-        }
-        
+        let mut cmd = Command::new(if ipv6 { "traceroute6" } else { "traceroute" });
         cmd.args([
-            "-n",                                    // Numeric output
-            "-w", "3",                              // 3 second timeout per probe
+            "-n", // Don't resolve hostnames
+            "-w", &self.timeout.as_secs().to_string(), // Wait time
+            "-m", &self.max_hops.to_string(), // Max hops
             "-q", &self.probes_per_hop.to_string(), // Probes per hop
-            "-m", &self.max_hops.to_string(),       // Max hops
+            &target_ip.to_string(),
         ]);
         
-        // Add target
-        match target_ip {
-            IpAddr::V4(ip) => { cmd.arg(ip.to_string()); },
-            IpAddr::V6(ip) => { cmd.arg(ip.to_string()); },
-        }
+        log::trace!("[scan::traceroute] executing_command: target={} cmd={:?}", 
+            target.display_name(), cmd);
         
-        // Execute command with timeout
-        let output = tokio::time::timeout(self.timeout, async {
-            let result = tokio::task::spawn_blocking(move || cmd.output()).await;
-            match result {
-                Ok(output) => output.wrap_err("Failed to execute traceroute command"),
-                Err(e) => Err(eyre::eyre!("Failed to spawn traceroute command: {}", e)),
-            }
-        })
-        .await
-        .wrap_err("Traceroute command timed out")??;
+        let command_start = Instant::now();
+        let output = cmd.output().await
+            .wrap_err("Failed to execute traceroute command")?;
+        let command_duration = command_start.elapsed();
         
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre::eyre!("Traceroute failed: {}", stderr));
+            log::error!("[scan::traceroute] command_failed: target={} duration={}ms status={} stderr={}", 
+                target.display_name(), command_duration.as_millis(), output.status, stderr.trim());
+            return Err(eyre::eyre!("Traceroute command failed: {}", stderr));
         }
         
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        self.parse_traceroute_output(&stdout, target_ip, use_ipv6, start_time.elapsed())
+        let stdout = String::from_utf8(output.stdout)
+            .wrap_err("Invalid UTF-8 in traceroute output")?;
+        
+        log::trace!("[scan::traceroute] command_completed: target={} duration={}ms output_len={}", 
+            target.display_name(), command_duration.as_millis(), stdout.len());
+        
+        let parse_start = Instant::now();
+        let result = self.parse_traceroute_output(&stdout, target_ip, ipv6, start_time.elapsed())?;
+        let parse_duration = parse_start.elapsed();
+        
+        log::debug!("[scan::traceroute] traceroute_completed: target={} duration={}ms parse_duration={}μs hops={} destination_reached={}", 
+            target.display_name(), result.scan_duration.as_millis(), parse_duration.as_micros(), 
+            result.hops.len(), result.destination_reached);
+        
+        if !result.hops.is_empty() {
+            let hop_summary: Vec<String> = result.hops.iter().take(5).map(|h| {
+                format!("{}:{:.1}ms", h.hop_number, 
+                    h.best_rtt.map(|d| d.as_millis() as f32).unwrap_or(-1.0))
+            }).collect();
+            log::trace!("[scan::traceroute] hop_summary: target={} first_5_hops=[{}]", 
+                target.display_name(), hop_summary.join(", "));
+        }
+        
+        Ok(result)
     }
     
     fn determine_target_ip(&self, target: &Target) -> Result<(IpAddr, bool)> {
@@ -273,10 +290,24 @@ impl TracerouteScanner {
 #[async_trait]
 impl Scanner for TracerouteScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        let result = self.perform_traceroute(target).await
-            .wrap_err("Traceroute scan failed")?;
+        log::debug!("[scan::traceroute] scan: target={}", target.display_name());
         
-        Ok(ScanResult::Traceroute(result))
+        let scan_start = Instant::now();
+        match self.perform_traceroute(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::traceroute] traceroute_scan_completed: target={} duration={}ms hops={} destination_reached={}", 
+                    target.display_name(), scan_duration.as_millis(), 
+                    result.hops.len(), result.destination_reached);
+                Ok(ScanResult::Traceroute(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::traceroute] traceroute_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e.wrap_err("Traceroute scan failed"))
+            }
+        }
     }
     
     fn interval(&self) -> Duration {

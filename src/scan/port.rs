@@ -2,7 +2,7 @@ use crate::scanner::Scanner;
 use crate::target::Target;
 use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use futures::stream::{self, StreamExt};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
+use log;
 
 #[derive(Debug, Clone)]
 pub struct PortScanner {
@@ -75,8 +76,9 @@ impl Default for PortScanner {
 
 impl PortScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::port] new: interval=30s timeout=3s concurrency=50 service_detection=true");
         Self {
-            interval: Duration::from_secs(30), // 30 seconds - reasonable for port changes
+            interval: Duration::from_secs(30),
             tcp_timeout: Duration::from_secs(3),
             max_concurrent: 50,
             service_detection: true,
@@ -108,16 +110,29 @@ impl PortScanner {
     }
 
     async fn perform_port_scan(&self, target: &Target) -> Result<PortResult> {
-        let start_time = Instant::now();
+        log::debug!("[scan::port] perform_port_scan: target={} mode={:?}", 
+            target.display_name(), self.scan_mode);
         
         // Get target IP
-        let target_ip = target.primary_ip()
-            .ok_or_else(|| eyre::eyre!("No IP address available for port scan"))?;
+        let target_ip = if let Some(primary_ip) = target.primary_ip() {
+            primary_ip
+        } else {
+            log::error!("[scan::port] no_ip_available: target={}", target.display_name());
+            return Err(eyre::eyre!("No IP address available for port scan"));
+        };
+        
+        log::debug!("[scan::port] scanning_ip: target={} ip={}", target.display_name(), target_ip);
         
         let ports = self.get_ports();
-        let _total_ports = ports.len();
+        log::debug!("[scan::port] port_list: target={} port_count={} ports={:?}", 
+            target.display_name(), ports.len(), 
+            if ports.len() <= 10 { format!("{:?}", ports) } else { format!("{:?}...", &ports[..10]) });
+        
+        log::trace!("[scan::port] starting_concurrent_scans: target={} concurrency={}", 
+            target.display_name(), self.max_concurrent);
         
         // Create concurrent stream of port scan tasks
+        let scan_start = Instant::now();
         let scan_results = stream::iter(ports)
             .map(|port| self.scan_port(target_ip, port))
             .buffer_unordered(self.max_concurrent)
@@ -140,14 +155,28 @@ impl PortScanner {
         // Sort open ports by port number
         open_ports.sort_by_key(|p| p.port);
         
-        Ok(PortResult {
+        let scan_duration = scan_start.elapsed();
+        
+        let result = PortResult {
             target_ip,
-            open_ports,
+            open_ports: open_ports.clone(),
             closed_ports: closed_count,
             filtered_ports: filtered_count,
-            scan_duration: start_time.elapsed(),
+            scan_duration,
             scan_mode: self.scan_mode.clone(),
-        })
+        };
+        
+        log::debug!("[scan::port] port_scan_completed: target={} duration={}ms open={} closed={} filtered={}", 
+            target.display_name(), result.scan_duration.as_millis(), 
+            result.open_ports.len(), result.closed_ports, result.filtered_ports);
+        
+        if !result.open_ports.is_empty() {
+            let open_port_numbers: Vec<u16> = result.open_ports.iter().map(|p| p.port).collect();
+            log::trace!("[scan::port] open_ports_found: target={} ports={:?}", 
+                target.display_name(), open_port_numbers);
+        }
+        
+        Ok(result)
     }
 
     async fn scan_port(&self, ip: IpAddr, port: u16) -> Result<Option<OpenPort>> {
@@ -487,10 +516,24 @@ fn get_top_1000_ports() -> Vec<u16> {
 #[async_trait]
 impl Scanner for PortScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        let result = self.perform_port_scan(target).await
-            .wrap_err("Port scan failed")?;
+        log::debug!("[scan::port] scan: target={}", target.display_name());
         
-        Ok(ScanResult::Port(result))
+        let scan_start = Instant::now();
+        match self.perform_port_scan(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::port] port_scan_completed: target={} duration={}ms open_ports={} closed={} filtered={}", 
+                    target.display_name(), scan_duration.as_millis(), 
+                    result.open_ports.len(), result.closed_ports, result.filtered_ports);
+                Ok(ScanResult::Port(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::port] port_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e.wrap_err("Port scan failed"))
+            }
+        }
     }
     
     fn interval(&self) -> Duration {

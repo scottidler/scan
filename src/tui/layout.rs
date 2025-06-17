@@ -5,6 +5,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashMap;
+use log;
 
 /// Manages the layout and rendering of TUI panes in a grid
 pub struct PaneLayout {
@@ -18,6 +19,7 @@ pub struct PaneLayout {
 impl PaneLayout {
     /// Create a new pane layout with the specified grid dimensions
     pub fn new(grid_rows: usize, grid_cols: usize) -> Self {
+        log::debug!("[tui::layout] new: grid_rows={} grid_cols={}", grid_rows, grid_cols);
         Self {
             panes: Vec::new(),
             config: HashMap::new(),
@@ -29,18 +31,26 @@ impl PaneLayout {
     
     /// Create the default 3x3 layout for our dashboard
     pub fn default_dashboard() -> Self {
+        log::debug!("[tui::layout] default_dashboard: creating 3x3 layout");
         Self::new(3, 3)
     }
     
     /// Add a pane to the layout with its configuration
     pub fn add_pane(&mut self, pane: Box<dyn Pane>, config: PaneConfig) {
         let pane_id = pane.id().to_string();
+        log::debug!("[tui::layout] add_pane: pane_id={} position=({},{}) visible={}", 
+            pane_id, config.position.row, config.position.col, config.visible);
+        
         self.config.insert(pane_id, config);
         self.panes.push(pane);
+        
+        log::trace!("[tui::layout] pane_added: total_panes={}", self.panes.len());
     }
     
     /// Set the focused pane by ID
     pub fn set_focus(&mut self, pane_id: Option<String>) {
+        log::debug!("[tui::layout] set_focus: old_focus={:?} new_focus={:?}", 
+            self.focused_pane, pane_id);
         self.focused_pane = pane_id;
     }
     
@@ -51,8 +61,16 @@ impl PaneLayout {
     
     /// Render all panes in the layout
     pub fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
+        log::trace!("[tui::layout] render: area={}x{} panes={} focused={:?}", 
+            area.width, area.height, self.panes.len(), self.focused_pane);
+        
         // Create the grid layout
         let grid_areas = self.create_grid_layout(area);
+        log::trace!("[tui::layout] grid_created: rows={} cols={}", 
+            grid_areas.len(), grid_areas.first().map(|r| r.len()).unwrap_or(0));
+        
+        let mut rendered_count = 0;
+        let mut skipped_count = 0;
         
         // Render each pane in its designated area
         for pane in &self.panes {
@@ -60,6 +78,9 @@ impl PaneLayout {
             
             if let Some(config) = self.config.get(pane_id) {
                 if !config.visible || !pane.is_visible() {
+                    skipped_count += 1;
+                    log::trace!("[tui::layout] pane_skipped: pane_id={} config_visible={} pane_visible={}", 
+                        pane_id, config.visible, pane.is_visible());
                     continue;
                 }
                 
@@ -69,10 +90,24 @@ impl PaneLayout {
                         .map(|focused_id| focused_id == pane_id)
                         .unwrap_or(false);
                     
+                    log::trace!("[tui::layout] rendering_pane: pane_id={} area={}x{} focused={}", 
+                        pane_id, pane_area.width, pane_area.height, is_focused);
+                    
                     pane.render(frame, pane_area, state, is_focused);
+                    rendered_count += 1;
+                } else {
+                    skipped_count += 1;
+                    log::warn!("[tui::layout] pane_area_not_found: pane_id={} position=({},{})", 
+                        pane_id, config.position.row, config.position.col);
                 }
+            } else {
+                skipped_count += 1;
+                log::warn!("[tui::layout] pane_config_not_found: pane_id={}", pane_id);
             }
         }
+        
+        log::trace!("[tui::layout] render_completed: rendered={} skipped={}", 
+            rendered_count, skipped_count);
     }
     
     /// Create the grid layout areas with custom proportions (public version)
@@ -169,7 +204,12 @@ impl PaneLayout {
     /// Toggle pane visibility
     pub fn toggle_pane_visibility(&mut self, pane_id: &str) {
         if let Some(config) = self.config.get_mut(pane_id) {
+            let old_visible = config.visible;
             config.visible = !config.visible;
+            log::debug!("[tui::layout] toggle_pane_visibility: pane_id={} old={} new={}", 
+                pane_id, old_visible, config.visible);
+        } else {
+            log::warn!("[tui::layout] toggle_visibility_failed: pane_id={} not_found", pane_id);
         }
     }
     
@@ -181,11 +221,15 @@ impl PaneLayout {
             .map(|p| p.id().to_string())
             .collect();
         
+        log::trace!("[tui::layout] next_focusable_pane: current={:?} focusable_count={}", 
+            current, focusable_panes.len());
+        
         if focusable_panes.is_empty() {
+            log::debug!("[tui::layout] no_focusable_panes:");
             return None;
         }
         
-        match current {
+        let next_pane = match current {
             None => Some(focusable_panes[0].clone()),
             Some(current_id) => {
                 if let Some(current_index) = focusable_panes.iter().position(|id| id == current_id) {
@@ -195,7 +239,11 @@ impl PaneLayout {
                     Some(focusable_panes[0].clone())
                 }
             }
-        }
+        };
+        
+        log::debug!("[tui::layout] next_focusable_result: current={:?} next={:?}", 
+            current, next_pane);
+        next_pane
     }
     
     /// Get the previous focusable pane ID
@@ -229,22 +277,28 @@ impl PaneLayout {
     
     /// Handle keyboard events for the focused pane
     pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent, state: &AppState, pane_areas: &[Vec<ratatui::layout::Rect>]) -> bool {
+        log::debug!("[tui::layout] handle_key_event: focused_pane={:?} key={:?}", 
+            self.focused_pane, key.code);
+        
         if let Some(focused_id) = &self.focused_pane {
             // Handle scrolling for security pane specifically
             if focused_id == "security" {
                 match key.code {
                     crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        log::debug!("[tui::layout] security_scroll_up:");
                         // Find the security pane and scroll up
                         for pane in &mut self.panes {
                             if pane.id() == "security" {
                                 if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
                                     security_pane.scroll_up();
+                                    log::trace!("[tui::layout] security_scrolled_up:");
                                     return true;
                                 }
                             }
                         }
                     }
                     crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        log::debug!("[tui::layout] security_scroll_down:");
                         // Find the security pane and scroll down
                         for pane in &mut self.panes {
                             if pane.id() == "security" {
@@ -257,6 +311,7 @@ impl PaneLayout {
                                         20 // Fallback
                                     };
                                     
+                                    log::trace!("[tui::layout] security_scroll_down: visible_lines={}", visible_lines);
                                     security_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
@@ -264,19 +319,28 @@ impl PaneLayout {
                         }
                     }
                     crossterm::event::KeyCode::Home => {
+                        log::debug!("[tui::layout] security_scroll_home:");
                         // Reset scroll to top
                         for pane in &mut self.panes {
                             if pane.id() == "security" {
                                 if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
                                     security_pane.reset_scroll();
+                                    log::trace!("[tui::layout] security_scroll_reset:");
                                     return true;
                                 }
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        log::trace!("[tui::layout] unhandled_key_in_security: key={:?}", key.code);
+                    }
                 }
+            } else {
+                log::trace!("[tui::layout] key_event_for_non_security_pane: pane={} key={:?}", 
+                    focused_id, key.code);
             }
+        } else {
+            log::trace!("[tui::layout] key_event_no_focused_pane: key={:?}", key.code);
         }
         false
     }

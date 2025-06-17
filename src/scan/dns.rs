@@ -6,6 +6,7 @@ use eyre::{Result, WrapErr};
 use hickory_resolver::Resolver;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
+use log;
 
 #[derive(Debug, Clone)]
 pub struct DnsRecord<T> {
@@ -126,6 +127,7 @@ pub struct DnsScanner {
 
 impl DnsScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::dns] new: interval=60s timeout=5s");
         Self {
             interval: Duration::from_secs(60), // DNS lookups every 60 seconds
             timeout: Duration::from_secs(5),
@@ -133,17 +135,22 @@ impl DnsScanner {
     }
 
     async fn analyze_email_security(&self, txt_records: &[DnsRecord<String>], mx_records: &[DnsRecord<MxRecord>]) -> EmailSecurityAnalysis {
+        log::debug!("[scan::dns] analyze_email_security: txt_count={} mx_count={}", 
+            txt_records.len(), mx_records.len());
+        
         let mut spf_record = None;
         let mut dmarc_record = None;
         let mut dkim_domains = Vec::new();
 
         // Parse TXT records for SPF and DMARC
-        for record in txt_records {
+        for (i, record) in txt_records.iter().enumerate() {
             let txt = &record.value;
             if txt.starts_with("v=spf1") {
                 spf_record = Some(txt.clone());
+                log::trace!("[scan::dns] found_spf_record: index={} record={}", i, txt);
             } else if txt.starts_with("v=DMARC1") {
                 dmarc_record = Some(txt.clone());
+                log::trace!("[scan::dns] found_dmarc_record: index={} record={}", i, txt);
             }
         }
 
@@ -157,47 +164,90 @@ impl DnsScanner {
             // For now, just add to the list if we find evidence of DKIM usage
             if txt_records.iter().any(|r| r.value.contains("k=rsa") || r.value.contains("p=")) {
                 dkim_domains.push(format!("{}._domainkey", selector));
+                log::trace!("[scan::dns] found_dkim_evidence: selector={}", selector);
                 break; // Only add one entry to avoid duplicates
             }
         }
 
-        EmailSecurityAnalysis {
-            spf_record,
-            dmarc_record,
+        let analysis = EmailSecurityAnalysis {
+            spf_record: spf_record.clone(),
+            dmarc_record: dmarc_record.clone(),
             has_mx: !mx_records.is_empty(),
             mx_count: mx_records.len(),
-            dkim_domains,
-        }
+            dkim_domains: dkim_domains.clone(),
+        };
+        
+        log::debug!("[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={} dkim_count={}", 
+            analysis.spf_record.is_some(), analysis.dmarc_record.is_some(), 
+            analysis.mx_count, analysis.dkim_domains.len());
+
+        analysis
     }
 
     async fn perform_dns_lookup(&self, target: &Target) -> Result<DnsResult> {
+        log::debug!("[scan::dns] perform_dns_lookup: target={} domain={:?}", 
+            target.display_name(), target.domain);
+        
         let start_time = Instant::now();
         let mut result = DnsResult::new();
 
         // Create resolver using system config (which will use system DNS servers)
-        let resolver = Resolver::builder_tokio()
-            .wrap_err("Failed to create DNS resolver")?
-            .build();
+        let resolver = match Resolver::builder_tokio() {
+            Ok(builder) => {
+                let r = builder.build();
+                log::trace!("[scan::dns] resolver_created: duration={}μs", 
+                    start_time.elapsed().as_micros());
+                r
+            }
+            Err(e) => {
+                log::error!("[scan::dns] resolver_builder_failed: error={}", e);
+                return Err(e).wrap_err("Failed to create DNS resolver");
+            }
+        };
 
         // Forward DNS lookups (for domains)
         if let Some(domain) = &target.domain {
+            log::debug!("[scan::dns] starting_forward_lookups: domain={}", domain);
+            
             // A records (IPv4)
-            if let Ok(response) = resolver.ipv4_lookup(domain).await {
-                for ip in response.iter() {
-                    let ttl = response.as_lookup().records().first()
-                        .map(|record| record.ttl())
-                        .unwrap_or(300);
-                    result.A.push(DnsRecord::new(ip.0, ttl));
+            let a_start = Instant::now();
+            match resolver.ipv4_lookup(domain).await {
+                Ok(response) => {
+                    let a_duration = a_start.elapsed();
+                    for ip in response.iter() {
+                        let ttl = response.as_lookup().records().first()
+                            .map(|record| record.ttl())
+                            .unwrap_or(300);
+                        result.A.push(DnsRecord::new(ip.0, ttl));
+                    }
+                    log::trace!("[scan::dns] a_records_found: domain={} count={} duration={}ms", 
+                        domain, result.A.len(), a_duration.as_millis());
+                }
+                Err(e) => {
+                    let a_duration = a_start.elapsed();
+                    log::trace!("[scan::dns] a_records_failed: domain={} duration={}ms error={}", 
+                        domain, a_duration.as_millis(), e);
                 }
             }
 
             // AAAA records (IPv6)
-            if let Ok(response) = resolver.ipv6_lookup(domain).await {
-                for ip in response.iter() {
-                    let ttl = response.as_lookup().records().first()
-                        .map(|record| record.ttl())
-                        .unwrap_or(300);
-                    result.AAAA.push(DnsRecord::new(ip.0, ttl));
+            let aaaa_start = Instant::now();
+            match resolver.ipv6_lookup(domain).await {
+                Ok(response) => {
+                    let aaaa_duration = aaaa_start.elapsed();
+                    for ip in response.iter() {
+                        let ttl = response.as_lookup().records().first()
+                            .map(|record| record.ttl())
+                            .unwrap_or(300);
+                        result.AAAA.push(DnsRecord::new(ip.0, ttl));
+                    }
+                    log::trace!("[scan::dns] aaaa_records_found: domain={} count={} duration={}ms", 
+                        domain, result.AAAA.len(), aaaa_duration.as_millis());
+                }
+                Err(e) => {
+                    let aaaa_duration = aaaa_start.elapsed();
+                    log::trace!("[scan::dns] aaaa_records_failed: domain={} duration={}ms error={}", 
+                        domain, aaaa_duration.as_millis(), e);
                 }
             }
 
@@ -325,10 +375,24 @@ impl DnsScanner {
 #[async_trait]
 impl Scanner for DnsScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        let result = self.perform_dns_lookup(target).await
-            .wrap_err("DNS lookup failed")?;
+        log::debug!("[scan::dns] scan: target={}", target.display_name());
         
-        Ok(ScanResult::Dns(result))
+        let scan_start = Instant::now();
+        match self.perform_dns_lookup(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::dns] dns_scan_completed: target={} duration={}ms response_time={}ms records_found=A:{} AAAA:{} MX:{} TXT:{} NS:{}", 
+                    target.display_name(), scan_duration.as_millis(), result.response_time.as_millis(),
+                    result.A.len(), result.AAAA.len(), result.MX.len(), result.TXT.len(), result.NS.len());
+                Ok(ScanResult::Dns(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::dns] dns_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e.wrap_err("DNS lookup failed"))
+            }
+        }
     }
 
     fn interval(&self) -> Duration {

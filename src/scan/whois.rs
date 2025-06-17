@@ -1,14 +1,15 @@
 use crate::scanner::Scanner;
 use crate::target::Target;
 use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use whois_rust::{WhoIs, WhoIsLookupOptions};
+use log;
 
 #[derive(Debug, Clone)]
 pub struct WhoisScanner {
@@ -25,62 +26,102 @@ impl Default for WhoisScanner {
 
 impl WhoisScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::whois] new: timeout=30s");
+        
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .user_agent("scan/1.0")
             .build()
             .expect("Failed to create HTTP client");
 
         let whois_client = WhoIs::from_path("/usr/bin/whois")
-            .or_else(|_| WhoIs::from_path("whois"))
-            .unwrap_or_else(|_| WhoIs::from_string("whois").unwrap_or_else(|_| {
-                // Fallback to a basic whois client if system whois is not available
-                WhoIs::from_host("whois.iana.org").unwrap()
-            }));
+            .unwrap_or_else(|_| WhoIs::from_path("/bin/whois")
+                .unwrap_or_else(|_| WhoIs::from_string("whois").unwrap_or_else(|_| {
+                    // Fallback to a basic whois client if system whois is not available
+                    WhoIs::from_host("whois.iana.org").unwrap()
+                })));
 
         Self {
             client,
             whois_client,
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(30),
         }
     }
 
     async fn scan_whois(&self, target: &Target) -> eyre::Result<WhoisResult> {
-        let start_time = Instant::now();
-        let domain = target.domain.as_ref().unwrap_or(&target.original);
-
-        // Try RDAP first (modern, structured approach)
-        if let Ok(rdap_result) = self.query_rdap(domain).await {
-            return Ok(rdap_result);
+        log::debug!("[scan::whois] scan_whois: target={}", target.display_name());
+        
+        let domain = match &target.domain {
+            Some(d) => d.clone(),
+            None => {
+                log::error!("[scan::whois] no_domain_available: target={}", target.display_name());
+                return Err(eyre::eyre!("No domain available for WHOIS lookup"));
+            }
+        };
+        
+        log::debug!("[scan::whois] querying_domain: domain={}", domain);
+        
+        // Try RDAP first (modern protocol)
+        log::trace!("[scan::whois] trying_rdap: domain={}", domain);
+        let rdap_start = Instant::now();
+        match self.query_rdap(&domain).await {
+            Ok(mut result) => {
+                let rdap_duration = rdap_start.elapsed();
+                result.data_source = DataSource::Rdap;
+                log::trace!("[scan::whois] rdap_successful: domain={} duration={}ms", 
+                    domain, rdap_duration.as_millis());
+                return Ok(result);
+            }
+            Err(e) => {
+                let rdap_duration = rdap_start.elapsed();
+                log::debug!("[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={}", 
+                    domain, rdap_duration.as_millis(), e);
+            }
         }
-
-        // Fallback to traditional WHOIS
-        if let Ok(whois_result) = self.query_traditional_whois(domain).await {
-            return Ok(whois_result);
+        
+        // Fall back to traditional WHOIS
+        log::trace!("[scan::whois] trying_traditional_whois: domain={}", domain);
+        let whois_start = Instant::now();
+        match self.query_traditional_whois(&domain).await {
+            Ok(mut result) => {
+                let whois_duration = whois_start.elapsed();
+                result.data_source = DataSource::Whois;
+                log::trace!("[scan::whois] whois_successful: domain={} duration={}ms", 
+                    domain, whois_duration.as_millis());
+                Ok(result)
+            }
+            Err(e) => {
+                let whois_duration = whois_start.elapsed();
+                log::error!("[scan::whois] both_methods_failed: domain={} whois_duration={}ms error={}", 
+                    domain, whois_duration.as_millis(), e);
+                
+                // Return a failed result rather than error
+                let mut result = WhoisResult {
+                    domain: domain.clone(),
+                    registration_date: None,
+                    expiry_date: None,
+                    last_updated: None,
+                    nameservers: Vec::new(),
+                    status: Vec::new(),
+                    dnssec: None,
+                    registrar: None,
+                    abuse_contact: None,
+                    registrant: None,
+                    admin_contact: None,
+                    tech_contact: None,
+                    privacy_score: PrivacyLevel::Unknown,
+                    domain_age_days: None,
+                    expires_in_days: None,
+                    risk_indicators: vec![RiskIndicator::QueryFailed],
+                    data_source: DataSource::Failed,
+                    scan_duration: Duration::from_millis(0),
+                    raw_data: None,
+                };
+                
+                self.calculate_derived_fields(&mut result);
+                Ok(result)
+            }
         }
-
-        // Return minimal result if both fail
-        Ok(WhoisResult {
-            domain: domain.to_string(),
-            registration_date: None,
-            expiry_date: None,
-            last_updated: None,
-            nameservers: Vec::new(),
-            status: Vec::new(),
-            dnssec: None,
-            registrar: None,
-            abuse_contact: None,
-            registrant: None,
-            admin_contact: None,
-            tech_contact: None,
-            privacy_score: PrivacyLevel::Unknown,
-            domain_age_days: None,
-            expires_in_days: None,
-            risk_indicators: vec![RiskIndicator::QueryFailed],
-            data_source: DataSource::Failed,
-            scan_duration: start_time.elapsed(),
-            raw_data: None,
-        })
     }
 
     async fn query_rdap(&self, domain: &str) -> eyre::Result<WhoisResult> {
@@ -562,7 +603,7 @@ impl WhoisScanner {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Scanner for WhoisScanner {
     fn name(&self) -> &'static str {
         "whois"
@@ -573,8 +614,31 @@ impl Scanner for WhoisScanner {
     }
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
-        let result = self.scan_whois(target).await?;
-        Ok(ScanResult::Whois(result))
+        log::debug!("[scan::whois] scan: target={}", target.display_name());
+        
+        let scan_start = Instant::now();
+        match self.scan_whois(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::whois] whois_scan_completed: target={} duration={}ms source={:?} privacy={:?} risks={}", 
+                    target.display_name(), scan_duration.as_millis(), result.data_source, 
+                    result.privacy_score, result.risk_indicators.len());
+                
+                if let Some(reg_date) = result.registration_date {
+                    log::trace!("[scan::whois] domain_info: target={} registered={} age_days={:?} expires_in_days={:?}", 
+                        target.display_name(), reg_date.format("%Y-%m-%d"), 
+                        result.domain_age_days, result.expires_in_days);
+                }
+                
+                Ok(ScanResult::Whois(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::whois] whois_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e)
+            }
+        }
     }
 
     async fn run(&self, target: Target, state: Arc<AppState>) {

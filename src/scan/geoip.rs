@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use log;
 
 #[derive(Debug, Clone)]
 pub struct GeoIpScanner {
@@ -112,6 +113,7 @@ impl Default for GeoIpScanner {
 
 impl GeoIpScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::geoip] new: interval=600s");
         Self {
             interval: Duration::from_secs(10 * 60), // 10 minutes
             service: Arc::new(GeoIpService::new()),
@@ -123,22 +125,57 @@ impl GeoIpScanner {
     }
 
     async fn perform_geoip_lookup(&self, target: &Target) -> Result<GeoIpResult> {
+        log::debug!("[scan::geoip] perform_geoip_lookup: target={}", target.display_name());
+        
         let start_time = Instant::now();
         
         // Get target IP
-        let target_ip = target.primary_ip()
-            .ok_or_else(|| eyre::eyre!("No IP address available for GeoIP lookup"))?;
+        let target_ip = if let Some(ip) = target.primary_ip() {
+            ip
+        } else {
+            log::error!("[scan::geoip] no_ip_available: target={}", target.display_name());
+            return Err(eyre::eyre!("No IP address available for GeoIP lookup"));
+        };
         
-        // Use the shared service for lookup
-        let (location, network_info, data_source) = self.service.lookup_ip(target_ip).await?;
+        log::debug!("[scan::geoip] looking_up_ip: target={} ip={}", target.display_name(), target_ip);
         
-        Ok(GeoIpResult {
-            target_ip,
-            location,
-            network_info,
-            scan_duration: start_time.elapsed(),
-            data_source,
-        })
+        let lookup_start = Instant::now();
+        match self.service.lookup_ip(target_ip).await {
+            Ok((location, network_info, data_source)) => {
+                let lookup_duration = lookup_start.elapsed();
+                let scan_duration = start_time.elapsed();
+                
+                let result = GeoIpResult {
+                    target_ip,
+                    location: location.clone(),
+                    network_info: network_info.clone(),
+                    scan_duration,
+                    data_source: data_source.clone(),
+                };
+                
+                log::trace!("[scan::geoip] geoip_lookup_completed: target={} ip={} duration={}ms source={} has_location={} has_network_info={}", 
+                    target.display_name(), target_ip, lookup_duration.as_millis(), data_source, 
+                    location.is_some(), network_info.is_some());
+                
+                if let Some(loc) = &location {
+                    log::trace!("[scan::geoip] location_found: target={} country={} city={} lat={} lon={}", 
+                        target.display_name(), loc.country, loc.city, loc.latitude, loc.longitude);
+                }
+                
+                if let Some(net) = &network_info {
+                    log::trace!("[scan::geoip] network_info_found: target={} isp={} org={} asn={:?}", 
+                        target.display_name(), net.isp, net.organization, net.asn);
+                }
+                
+                Ok(result)
+            }
+            Err(e) => {
+                let lookup_duration = lookup_start.elapsed();
+                log::error!("[scan::geoip] geoip_lookup_failed: target={} ip={} duration={}ms error={}", 
+                    target.display_name(), target_ip, lookup_duration.as_millis(), e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -421,10 +458,24 @@ fn parse_org_info(org_str: &str) -> (Option<u32>, Option<String>) {
 #[async_trait]
 impl Scanner for GeoIpScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        let result = self.perform_geoip_lookup(target).await
-            .wrap_err("GeoIP scan failed")?;
+        log::debug!("[scan::geoip] scan: target={}", target.display_name());
         
-        Ok(ScanResult::GeoIp(result))
+        let scan_start = Instant::now();
+        match self.perform_geoip_lookup(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::geoip] geoip_scan_completed: target={} duration={}ms ip={} source={} has_location={} has_network_info={}", 
+                    target.display_name(), scan_duration.as_millis(), result.target_ip, 
+                    result.data_source, result.location.is_some(), result.network_info.is_some());
+                Ok(ScanResult::GeoIp(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::geoip] geoip_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e.wrap_err("GeoIP scan failed"))
+            }
+        }
     }
     
     fn interval(&self) -> Duration {

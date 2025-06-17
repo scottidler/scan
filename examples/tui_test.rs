@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = init_terminal()?;
     
     // Create and run TUI app
-    let app = TuiApp::new();
+    let app = TuiApp::new()?;
     let result = app.run(&mut terminal, state);
     
     // Restore terminal

@@ -35,6 +35,7 @@ use ratatui::{
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use log;
 
 /// Main TUI application
 pub struct TuiApp {
@@ -47,10 +48,13 @@ pub struct TuiApp {
 impl TuiApp {
     /// Create a new TUI application with default layout
     pub fn new() -> io::Result<Self> {
+        log::debug!("[tui] new: creating TUI application with default layout");
+        
         // Initialize layout with default dashboard
         let mut layout = PaneLayout::default_dashboard();
         
         // Add panes to the layout
+        log::trace!("[tui] adding_panes: setting up 3x3 dashboard layout");
         layout.add_pane(Box::new(TargetPane::new()), PaneConfig::new(0, 0));
         layout.add_pane(Box::new(ConnectivityPane::new()), PaneConfig::new(0, 1));
         layout.add_pane(Box::new(GeoIpPane::new()), PaneConfig::new(0, 2));
@@ -63,7 +67,9 @@ impl TuiApp {
         
         // Set initial focus on the security pane
         layout.set_focus(Some("security".to_string()));
+        log::debug!("[tui] initial_focus_set: pane=security");
         
+        log::debug!("[tui] tui_app_created: tick_rate=250ms panes=9");
         Ok(Self {
             layout,
             should_quit: false,
@@ -74,9 +80,22 @@ impl TuiApp {
     
     /// Run the TUI application
     pub fn run<B: Backend>(mut self, terminal: &mut Terminal<B>, state: Arc<AppState>) -> io::Result<()> {
+        log::debug!("[tui] run: starting TUI event loop");
+        
+        let mut frame_count = 0;
+        let start_time = Instant::now();
+        
         loop {
             // Draw the UI
+            let draw_start = Instant::now();
             terminal.draw(|f| self.ui(f, &state))?;
+            let draw_duration = draw_start.elapsed();
+            
+            frame_count += 1;
+            if frame_count % 100 == 0 {
+                log::trace!("[tui] frame_stats: frames={} avg_draw_time={}μs uptime={}s", 
+                    frame_count, draw_duration.as_micros(), start_time.elapsed().as_secs());
+            }
             
             // Handle events
             let timeout = self.tick_rate
@@ -86,19 +105,24 @@ impl TuiApp {
             if crossterm::event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
+                        log::debug!("[tui] key_event: key={:?} modifiers={:?}", key.code, key.modifiers);
+                        
                         match key.code {
                             // Quit on 'q' or Escape key
                             KeyCode::Char('q') | KeyCode::Esc => {
+                                log::debug!("[tui] quit_requested: key={:?}", key.code);
                                 self.should_quit = true;
                             }
                             // Quit on Ctrl+C
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                log::debug!("[tui] quit_requested: ctrl_c");
                                 self.should_quit = true;
                             }
                             KeyCode::Tab => {
                                 // Cycle through focusable panes
                                 let current = self.layout.focused_pane().map(|s| s.as_str());
                                 if let Some(next_pane) = self.layout.next_focusable_pane(current) {
+                                    log::debug!("[tui] focus_next: old={:?} new={}", current, next_pane);
                                     self.layout.set_focus(Some(next_pane));
                                 }
                             }
@@ -106,6 +130,7 @@ impl TuiApp {
                                 // Cycle backwards through focusable panes
                                 let current = self.layout.focused_pane().map(|s| s.as_str());
                                 if let Some(prev_pane) = self.layout.prev_focusable_pane(current) {
+                                    log::debug!("[tui] focus_prev: old={:?} new={}", current, prev_pane);
                                     self.layout.set_focus(Some(prev_pane));
                                 }
                             }
@@ -118,7 +143,12 @@ impl TuiApp {
                                 let grid_areas = self.layout.create_grid_layout_public(area);
                                 
                                 // Let the layout handle pane-specific events
-                                self.layout.handle_key_event(key, &state, &grid_areas);
+                                let handled = self.layout.handle_key_event(key, &state, &grid_areas);
+                                if handled {
+                                    log::trace!("[tui] key_handled_by_pane: key={:?}", key.code);
+                                } else {
+                                    log::trace!("[tui] key_unhandled: key={:?}", key.code);
+                                }
                             }
                         }
                     }
@@ -127,6 +157,8 @@ impl TuiApp {
             
             // Check if we should quit
             if self.should_quit {
+                log::debug!("[tui] exiting_event_loop: frames_rendered={} uptime={}s", 
+                    frame_count, start_time.elapsed().as_secs());
                 break;
             }
             
@@ -142,6 +174,7 @@ impl TuiApp {
     /// Draw the UI
     fn ui(&mut self, frame: &mut ratatui::Frame, state: &AppState) {
         let size = frame.area();
+        log::trace!("[tui] ui_render: area={}x{}", size.width, size.height);
         
         // Render the layout with all panes
         self.layout.render(frame, size, state);
@@ -154,6 +187,7 @@ impl TuiApp {
     
     /// Set the quit flag
     pub fn quit(&mut self) {
+        log::debug!("[tui] quit: setting quit flag");
         self.should_quit = true;
     }
 }
@@ -166,16 +200,22 @@ impl Default for TuiApp {
 
 /// Initialize the terminal for TUI mode
 pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    log::debug!("[tui] init_terminal: enabling raw mode and alternate screen");
+    
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
+    
+    log::debug!("[tui] terminal_initialized: backend=crossterm");
     Ok(terminal)
 }
 
 /// Restore the terminal after TUI mode
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    log::debug!("[tui] restore_terminal: disabling raw mode and restoring screen");
+    
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -183,6 +223,8 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+    
+    log::debug!("[tui] terminal_restored:");
     Ok(())
 }
 

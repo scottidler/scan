@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// SECURITY pane displays TLS/SSL certificate information and security analysis
 pub struct SecurityPane {
@@ -18,6 +19,7 @@ pub struct SecurityPane {
 
 impl SecurityPane {
     pub fn new() -> Self {
+        log::debug!("[tui::security] new:");
         Self {
             title: "security",
             id: "security",
@@ -26,7 +28,10 @@ impl SecurityPane {
     }
     
     pub fn scroll_up(&mut self) {
+        let old_offset = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        log::debug!("[tui::security] scroll_up: old_offset={} new_offset={}", 
+            old_offset, self.scroll_offset);
     }
     
     pub fn scroll_down_smart(&mut self, state: &AppState, visible_height: u16) {
@@ -34,21 +39,30 @@ impl SecurityPane {
         let lines = self.build_content_lines(state);
         let actual_lines = lines.len() as u16;
         
+        let old_offset = self.scroll_offset;
         if actual_lines > visible_height {
             let max_scroll = actual_lines.saturating_sub(visible_height);
             if self.scroll_offset < max_scroll {
                 self.scroll_offset += 1;
             }
         }
+        
+        log::debug!("[tui::security] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}", 
+            old_offset, self.scroll_offset, actual_lines, visible_height, 
+            actual_lines.saturating_sub(visible_height));
     }
     
     pub fn reset_scroll(&mut self) {
+        let old_offset = self.scroll_offset;
         self.scroll_offset = 0;
+        log::debug!("[tui::security] reset_scroll: old_offset={}", old_offset);
     }
     
     /// Build the actual content lines - SINGLE SOURCE OF TRUTH
     /// This method is used by both scroll calculation and rendering
     fn build_content_lines(&self, state: &AppState) -> Vec<Line> {
+        log::trace!("[tui::security] build_content_lines: building security analysis content");
+        
         let mut lines = Vec::new();
         
         // Security status header
@@ -691,6 +705,9 @@ impl Default for SecurityPane {
 
 impl Pane for SecurityPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::security] render: area={}x{} focused={} scroll_offset={}", 
+            area.width, area.height, focused, self.scroll_offset);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -712,12 +729,17 @@ impl Pane for SecurityPane {
         };
         let safe_scroll_offset = self.scroll_offset.min(max_scroll_offset);
         
+        log::trace!("[tui::security] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}", 
+            total_lines, visible_area_height, max_scroll_offset, safe_scroll_offset);
+        
         // Apply scroll offset - skip lines from the beginning
         let visible_lines = if safe_scroll_offset < total_lines {
             lines.into_iter().skip(safe_scroll_offset as usize).collect()
         } else {
             lines
         };
+        
+        log::trace!("[tui::security] render_content: visible_lines={}", visible_lines.len());
         
         let paragraph = Paragraph::new(visible_lines)
             .alignment(Alignment::Left);

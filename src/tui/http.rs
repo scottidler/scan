@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// HTTP pane displays web server response information
 pub struct HttpPane {
@@ -17,6 +18,7 @@ pub struct HttpPane {
 
 impl HttpPane {
     pub fn new() -> Self {
+        log::debug!("[tui::http] new:");
         Self {
             title: "http",
             id: "http",
@@ -51,6 +53,9 @@ impl Default for HttpPane {
 
 impl Pane for HttpPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::http] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)

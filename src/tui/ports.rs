@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// Ports pane displays port scanning results
 pub struct PortsPane {
@@ -17,6 +18,7 @@ pub struct PortsPane {
 
 impl PortsPane {
     pub fn new() -> Self {
+        log::debug!("[tui::ports] new:");
         Self {
             title: "ports",
             id: "ports",
@@ -123,6 +125,9 @@ impl Default for PortsPane {
 
 impl Pane for PortsPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::ports] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)

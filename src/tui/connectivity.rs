@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// CONNECTIVITY pane displays real-time ping latency and network connectivity metrics
 pub struct ConnectivityPane {
@@ -17,6 +18,7 @@ pub struct ConnectivityPane {
 
 impl ConnectivityPane {
     pub fn new() -> Self {
+        log::debug!("[tui::connectivity] new:");
         Self {
             title: "connectivity",
             id: "connectivity",
@@ -34,6 +36,9 @@ impl Default for ConnectivityPane {
 
 impl Pane for ConnectivityPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::connectivity] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)

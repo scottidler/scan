@@ -23,10 +23,12 @@ impl Default for HttpScanner {
 
 impl HttpScanner {
     pub fn new() -> Self {
+        log::debug!("[scan::http] new: timeout=10s");
+        
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("scan/1.0")
             .redirect(reqwest::redirect::Policy::limited(10))
+            .user_agent("scan/1.0")
             .build()
             .expect("Failed to create HTTP client");
 
@@ -37,70 +39,117 @@ impl HttpScanner {
     }
 
     async fn scan_http(&self, target: &Target) -> eyre::Result<HttpResult> {
-        let start_time = Instant::now();
+        log::debug!("[scan::http] scan_http: target={}", target.display_name());
         
-        // Try HTTPS first, then HTTP
-        let host = target.domain.as_ref().unwrap_or(&target.original);
-        let urls = vec![
-            format!("https://{}", host),
-            format!("http://{}", host),
-        ];
-
-        let mut last_error = None;
+        let scan_start = Instant::now();
         
-        for url_str in urls {
-            match self.perform_scan(&url_str).await {
-                Ok(mut result) => {
-                    result.scan_duration = start_time.elapsed();
-                    return Ok(result);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
+        // Determine URL to scan
+        let url = match &target.target_type {
+            crate::target::TargetType::Url(url) => url.to_string(),
+            _ => {
+                // For domains and IPs, try both HTTP and HTTPS
+                let domain = target.display_name();
+                let https_url = format!("https://{}", domain);
+                let http_url = format!("http://{}", domain);
+                
+                log::debug!("[scan::http] trying_https_first: url={}", https_url);
+                
+                // Try HTTPS first
+                match self.perform_scan(&https_url).await {
+                    Ok(mut result) => {
+                        result.scan_duration = scan_start.elapsed();
+                        log::trace!("[scan::http] https_scan_successful: url={} status={} duration={}ms", 
+                            https_url, result.status_code, result.scan_duration.as_millis());
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        log::debug!("[scan::http] https_failed_trying_http: https_error={} http_url={}", e, http_url);
+                        // Fall back to HTTP
+                        match self.perform_scan(&http_url).await {
+                            Ok(mut result) => {
+                                result.scan_duration = scan_start.elapsed();
+                                log::trace!("[scan::http] http_scan_successful: url={} status={} duration={}ms", 
+                                    http_url, result.status_code, result.scan_duration.as_millis());
+                                return Ok(result);
+                            }
+                            Err(http_err) => {
+                                log::error!("[scan::http] both_protocols_failed: https_error={} http_error={}", e, http_err);
+                                return Err(http_err);
+                            }
+                        }
+                    }
                 }
             }
-        }
+        };
 
-        Err(last_error.unwrap_or_else(|| eyre::eyre!("No URLs to scan")))
+        let mut result = self.perform_scan(&url).await?;
+        result.scan_duration = scan_start.elapsed();
+        
+        log::debug!("[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}", 
+            url, result.status_code, result.scan_duration.as_millis(), result.security_grade);
+        
+        Ok(result)
     }
 
     async fn perform_scan(&self, url: &str) -> eyre::Result<HttpResult> {
-        let parsed_url = Url::parse(url)?;
+        log::debug!("[scan::http] perform_scan: url={}", url);
+        
+        let start_time = Instant::now();
+        let original_url = Url::parse(url)?;
+        
+        log::trace!("[scan::http] sending_request: url={}", url);
         let request_start = Instant::now();
-        
         let response = self.client.get(url).send().await?;
-        let response_time = request_start.elapsed();
+        let request_duration = request_start.elapsed();
         
-        let status = response.status();
-        let headers = response.headers().clone();
+        let status_code = response.status().as_u16();
         let final_url = response.url().clone();
+        let headers = response.headers().clone();
         
+        log::trace!("[scan::http] response_received: url={} status={} request_duration={}ms final_url={}", 
+            url, status_code, request_duration.as_millis(), final_url);
+
+        // Analyze redirects
+        let redirect_chain = self.analyze_redirects(&original_url, &final_url);
+        log::trace!("[scan::http] redirect_analysis: url={} redirect_count={}", url, redirect_chain.len());
+
         // Get response body for content analysis
-        let body = response.text().await?;
+        let body_start = Instant::now();
+        let body = response.bytes().await?;
+        let body_duration = body_start.elapsed();
         let content_length = body.len();
         
-        // Analyze redirect chain
-        let redirect_chain = self.analyze_redirects(&parsed_url, &final_url);
+        log::trace!("[scan::http] body_received: url={} content_length={} body_duration={}ms", 
+            url, content_length, body_duration.as_millis());
+
+        // Extract content type
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Security analysis
+        log::debug!("[scan::http] security_analysis_starting: url={}", url);
+        let security_start = Instant::now();
         
-        // Analyze headers
         let security_headers = self.analyze_security_headers(&headers);
         let csp = self.analyze_csp(&headers);
         let cors = self.analyze_cors(&headers);
         let caching = self.analyze_caching(&headers);
         
-        // Perform security assessment
         let vulnerabilities = self.assess_vulnerabilities(&security_headers, &csp, &cors);
         let security_grade = self.calculate_security_grade(&security_headers, &csp, &cors, &vulnerabilities);
         
-        Ok(HttpResult {
+        let security_duration = security_start.elapsed();
+        log::trace!("[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}", 
+            url, security_duration.as_micros(), security_grade, vulnerabilities.len());
+
+        let result = HttpResult {
             url: final_url.to_string(),
-            status_code: status.as_u16(),
-            response_time,
+            status_code,
+            response_time: request_duration,
             content_length,
-            content_type: headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string()),
+            content_type,
             redirect_chain,
             security_headers,
             csp,
@@ -108,8 +157,13 @@ impl HttpScanner {
             caching,
             vulnerabilities,
             security_grade,
-            scan_duration: Duration::default(), // Will be set by caller
-        })
+            scan_duration: start_time.elapsed(),
+        };
+
+        log::debug!("[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}", 
+            result.url, result.status_code, result.content_length, result.security_grade);
+
+        Ok(result)
     }
 
     fn analyze_redirects(&self, original: &Url, final_url: &Url) -> Vec<RedirectInfo> {
@@ -470,8 +524,24 @@ impl Scanner for HttpScanner {
     }
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
-        let result = self.scan_http(target).await?;
-        Ok(ScanResult::Http(result))
+        log::debug!("[scan::http] scan: target={}", target.display_name());
+        
+        let scan_start = Instant::now();
+        match self.scan_http(target).await {
+            Ok(result) => {
+                let scan_duration = scan_start.elapsed();
+                log::trace!("[scan::http] http_scan_completed: target={} duration={}ms status={} grade={:?} vulnerabilities={}", 
+                    target.display_name(), scan_duration.as_millis(), result.status_code, 
+                    result.security_grade, result.vulnerabilities.len());
+                Ok(ScanResult::Http(result))
+            }
+            Err(e) => {
+                let scan_duration = scan_start.elapsed();
+                log::error!("[scan::http] http_scan_failed: target={} duration={}ms error={}", 
+                    target.display_name(), scan_duration.as_millis(), e);
+                Err(e)
+            }
+        }
     }
 
     async fn run(&self, target: Target, state: Arc<AppState>) {

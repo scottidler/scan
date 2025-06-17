@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use std::any::Any;
+use log;
 
 /// Traceroute pane displays network path tracing information
 pub struct TraceroutePane {
@@ -17,6 +18,7 @@ pub struct TraceroutePane {
 
 impl TraceroutePane {
     pub fn new() -> Self {
+        log::debug!("[tui::traceroute] new:");
         Self {
             title: "traceroute",
             id: "traceroute",
@@ -32,6 +34,9 @@ impl Default for TraceroutePane {
 
 impl Pane for TraceroutePane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        log::trace!("[tui::traceroute] render: area={}x{} focused={}", 
+            area.width, area.height, focused);
+        
         let block = create_block(self.title, focused);
         
         // Calculate content area (inside the border)
@@ -213,7 +218,7 @@ mod tests {
         let pane = TraceroutePane::new();
         assert_eq!(pane.title(), "traceroute");
         assert_eq!(pane.id(), "traceroute");
-        assert_eq!(pane.min_size(), (30, 10));
+        assert_eq!(pane.min_size(), (35, 20));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

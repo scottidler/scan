@@ -2,6 +2,7 @@ use std::net::IpAddr;
 use url::Url;
 use eyre::{Result, WrapErr};
 use tokio::net::lookup_host;
+use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -22,6 +23,8 @@ pub enum TargetType {
 
 impl Target {
     pub fn parse(input: &str) -> Result<Self> {
+        log::debug!("[target] parse: input={}", input);
+        
         // Try URL first (must have scheme)
         if input.contains("://") {
             if let Ok(url) = Url::parse(input) {
@@ -35,27 +38,34 @@ impl Target {
                     }
                 });
                 
-                return Ok(Self {
+                let target = Self {
                     original: input.to_string(),
                     target_type: TargetType::Url(url.clone()),
                     domain: url.host_str().map(String::from),
                     port,
                     scheme: Some(url.scheme().to_string()),
                     resolved_ips: Vec::new(),
-                });
+                };
+                
+                log::debug!("[target] parsed_as_url: domain={:?} port={:?} scheme={:?}", 
+                    target.domain, target.port, target.scheme);
+                return Ok(target);
             }
         }
         
         // Try IP address
         if let Ok(ip) = input.parse::<IpAddr>() {
-            return Ok(Self {
+            let target = Self {
                 original: input.to_string(),
                 target_type: TargetType::IpAddress(ip),
                 domain: None,
                 port: None,
                 scheme: None,
                 resolved_ips: vec![ip],
-            });
+            };
+            
+            log::debug!("[target] parsed_as_ip: ip={}", ip);
+            return Ok(target);
         }
         
         // Assume domain (with optional port)
@@ -65,85 +75,143 @@ impl Target {
             (input.to_string(), None)
         };
         
-        Ok(Self {
+        let target = Self {
             original: input.to_string(),
             target_type: TargetType::Domain(domain.clone()),
-            domain: Some(domain),
+            domain: Some(domain.clone()),
             port,
             scheme: None,
             resolved_ips: Vec::new(),
-        })
+        };
+        
+        log::debug!("[target] parsed_as_domain: domain={} port={:?}", domain, port);
+        Ok(target)
     }
     
     pub async fn resolve(&mut self) -> Result<&[IpAddr]> {
+        log::debug!("[target] resolve: domain={:?} cached_ips={}", 
+            self.domain, self.resolved_ips.len());
+        
         if self.resolved_ips.is_empty() && self.domain.is_some() {
-            self.resolved_ips = self.resolve_domain().await
-                .wrap_err("Failed to resolve domain to IP addresses")?;
+            let resolve_start = Instant::now();
+            match self.resolve_domain().await {
+                Ok(ips) => {
+                    let resolve_duration = resolve_start.elapsed();
+                    self.resolved_ips = ips;
+                    log::trace!("[target] DNS resolution completed: domain={:?} ips={:?} duration={}ms", 
+                        self.domain, self.resolved_ips, resolve_duration.as_millis());
+                }
+                Err(e) => {
+                    let resolve_duration = resolve_start.elapsed();
+                    log::error!("[target] DNS resolution failed: domain={:?} duration={}ms error={}", 
+                        self.domain, resolve_duration.as_millis(), e);
+                    return Err(e.wrap_err("Failed to resolve domain to IP addresses"));
+                }
+            }
         }
+        
+        log::debug!("[target] resolve_result: ip_count={}", self.resolved_ips.len());
         Ok(&self.resolved_ips)
     }
     
     pub fn primary_ip(&self) -> Option<IpAddr> {
-        self.resolved_ips.first().copied()
+        let ip = self.resolved_ips.first().copied();
+        log::debug!("[target] primary_ip: {:?}", ip);
+        ip
     }
     
     pub fn all_ips(&self) -> &[IpAddr] {
+        log::debug!("[target] all_ips: count={}", self.resolved_ips.len());
         &self.resolved_ips
     }
     
     /// Get the hostname/domain for display purposes
     pub fn display_name(&self) -> &str {
-        match &self.target_type {
+        let name = match &self.target_type {
             TargetType::Url(url) => url.host_str().unwrap_or(&self.original),
             TargetType::Domain(domain) => domain,
             TargetType::IpAddress(_) => &self.original,
-        }
+        };
+        log::debug!("[target] display_name: {}", name);
+        name
     }
     
     /// Get the target for ping/network commands (IP or domain)
     pub fn network_target(&self) -> String {
-        if let Some(ip) = self.primary_ip() {
+        let target = if let Some(ip) = self.primary_ip() {
             ip.to_string()
         } else if let Some(domain) = &self.domain {
             domain.clone()
         } else {
             self.original.clone()
-        }
+        };
+        log::debug!("[target] network_target: {}", target);
+        target
     }
     
     /// Update resolved IPs from DNS scanner results
     pub fn update_resolved_ips(&mut self, ips: Vec<IpAddr>) {
+        log::debug!("[target] update_resolved_ips: old_count={} new_count={}", 
+            self.resolved_ips.len(), ips.len());
         self.resolved_ips = ips;
+        log::trace!("[target] updated_ips: {:?}", self.resolved_ips);
     }
     
     /// Add additional resolved IPs
     pub fn add_resolved_ips(&mut self, mut ips: Vec<IpAddr>) {
+        let old_count = self.resolved_ips.len();
+        log::debug!("[target] add_resolved_ips: existing_count={} adding_count={}", 
+            old_count, ips.len());
+        
         self.resolved_ips.append(&mut ips);
         // Remove duplicates
         self.resolved_ips.sort();
         self.resolved_ips.dedup();
+        
+        let new_count = self.resolved_ips.len();
+        log::debug!("[target] add_resolved_ips_result: final_count={} added={}", 
+            new_count, new_count - old_count);
+        log::trace!("[target] final_ips: {:?}", self.resolved_ips);
     }
     
     async fn resolve_domain(&self) -> Result<Vec<IpAddr>> {
         let domain = self.domain.as_ref()
             .ok_or_else(|| eyre::eyre!("No domain to resolve"))?;
         
+        log::debug!("[target] resolve_domain: domain={} port={:?}", domain, self.port);
+        
         // Use port 80 as default for resolution if no port specified
         let port = self.port.unwrap_or(80);
         let lookup_addr = format!("{}:{}", domain, port);
         
+        log::trace!("[target] DNS lookup starting: lookup_addr={}", lookup_addr);
+        
+        let lookup_start = Instant::now();
+        let addresses = match lookup_host(&lookup_addr).await {
+            Ok(addrs) => {
+                let lookup_duration = lookup_start.elapsed();
+                log::trace!("[target] DNS lookup succeeded: duration={}ms", lookup_duration.as_millis());
+                addrs
+            }
+            Err(e) => {
+                let lookup_duration = lookup_start.elapsed();
+                log::error!("[target] DNS lookup failed: domain={} duration={}ms error={}", 
+                    domain, lookup_duration.as_millis(), e);
+                return Err(e).wrap_err_with(|| format!("DNS resolution failed for {}", domain));
+            }
+        };
+        
         let mut ips = Vec::new();
-        let addresses = lookup_host(&lookup_addr).await
-            .wrap_err_with(|| format!("DNS resolution failed for {}", domain))?;
-            
         for addr in addresses {
             ips.push(addr.ip());
         }
         
         if ips.is_empty() {
+            log::error!("[target] DNS resolution returned no IPs: domain={}", domain);
             eyre::bail!("No IP addresses found for domain: {}", domain);
         }
         
+        log::trace!("[target] DNS resolution successful: domain={} ips={:?}", domain, ips);
         Ok(ips)
     }
 }
