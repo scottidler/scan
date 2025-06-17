@@ -10,6 +10,21 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const EXCELLENT_LATENCY_THRESHOLD_MS: u128 = 50;
+const GOOD_LATENCY_THRESHOLD_MS: u128 = 100;
+const FAIR_LATENCY_THRESHOLD_MS: u128 = 150;
+const POOR_LATENCY_THRESHOLD_MS: u128 = 200;
+const FAST_CONNECTION_THRESHOLD_MS: u128 = 100;
+const SLOW_CONNECTION_THRESHOLD_MS: u128 = 300;
+const MINOR_PACKET_LOSS_THRESHOLD: f32 = 1.0;
+const MAJOR_PACKET_LOSS_THRESHOLD: f32 = 5.0;
+const SEVERE_PACKET_LOSS_THRESHOLD: f32 = 50.0;
+const HTTP_SUCCESS_STATUS: u16 = 200;
+const HTTP_CLIENT_ERROR_THRESHOLD: u16 = 400;
+const ERROR_MESSAGE_MAX_LENGTH: usize = 30;
+const MIN_CONNECTIVITY_PANE_WIDTH: u16 = 25;
+const MIN_CONNECTIVITY_PANE_HEIGHT: u16 = 8;
+
 /// CONNECTIVITY pane displays real-time ping latency and network connectivity metrics
 pub struct ConnectivityPane {
     title: &'static str,
@@ -58,9 +73,9 @@ impl Pane for ConnectivityPane {
                     let loss_percent = ping.packet_loss * 100.0;
                     
                     // Connection status header with color coding
-                    let status_color = if loss_percent == 0.0 && latency_ms < 100 {
+                    let status_color = if loss_percent == 0.0 && latency_ms < FAST_CONNECTION_THRESHOLD_MS {
                         Color::Green
-                    } else if loss_percent < 5.0 && latency_ms < 300 {
+                    } else if loss_percent < MAJOR_PACKET_LOSS_THRESHOLD && latency_ms < SLOW_CONNECTION_THRESHOLD_MS {
                         Color::Yellow
                     } else {
                         Color::Red
@@ -68,7 +83,7 @@ impl Pane for ConnectivityPane {
                     
                     let status_text = if loss_percent == 0.0 {
                         "connected"
-                    } else if loss_percent < 50.0 {
+                    } else if loss_percent < SEVERE_PACKET_LOSS_THRESHOLD {
                         "unstable"
                     } else {
                         "poor"
@@ -83,19 +98,19 @@ impl Pane for ConnectivityPane {
                     lines.push(Line::from(""));
                     
                     // Latency with performance grading
-                    let latency_color = if latency_ms < 50 {
+                    let latency_color = if latency_ms < EXCELLENT_LATENCY_THRESHOLD_MS {
                         Color::Green
-                    } else if latency_ms < 150 {
+                    } else if latency_ms < FAIR_LATENCY_THRESHOLD_MS {
                         Color::Yellow
                     } else {
                         Color::Red
                     };
                     
-                    let latency_grade = if latency_ms < 50 {
+                    let latency_grade = if latency_ms < EXCELLENT_LATENCY_THRESHOLD_MS {
                         "excellent"
-                    } else if latency_ms < 100 {
+                    } else if latency_ms < GOOD_LATENCY_THRESHOLD_MS {
                         "good"
-                    } else if latency_ms < 200 {
+                    } else if latency_ms < POOR_LATENCY_THRESHOLD_MS {
                         "fair"
                     } else {
                         "poor"
@@ -112,7 +127,7 @@ impl Pane for ConnectivityPane {
                     // Packet loss with color coding
                     let loss_color = if loss_percent == 0.0 {
                         Color::Green
-                    } else if loss_percent < 1.0 {
+                    } else if loss_percent < MINOR_PACKET_LOSS_THRESHOLD {
                         Color::Yellow
                     } else {
                         Color::Red
@@ -149,9 +164,9 @@ impl Pane for ConnectivityPane {
                     // Check HTTP connectivity
                     if let Some(http_state) = state.scanners.get("http") {
                         if let Some(ScanResult::Http(http_result)) = &http_state.result {
-                            let http_status = if http_result.status_code == 200 {
+                            let http_status = if http_result.status_code == HTTP_SUCCESS_STATUS {
                                 ("✅", Color::Green)
-                            } else if http_result.status_code < 400 {
+                            } else if http_result.status_code < HTTP_CLIENT_ERROR_THRESHOLD {
                                 ("⚠️", Color::Yellow)
                             } else {
                                 ("❌", Color::Red)
@@ -240,7 +255,7 @@ impl Pane for ConnectivityPane {
                                 lines.push(Line::from(vec![
                                     Span::styled("❌ Error: ", Style::default().fg(Color::White)),
                                     Span::styled(
-                                        error.to_string().chars().take(30).collect::<String>(),
+                                        error.to_string().chars().take(ERROR_MESSAGE_MAX_LENGTH).collect::<String>(),
                                         Style::default().fg(Color::Red)
                                     ),
                                 ]));
@@ -279,7 +294,7 @@ impl Pane for ConnectivityPane {
     }
     
     fn min_size(&self) -> (u16, u16) {
-        (25, 8)
+        (MIN_CONNECTIVITY_PANE_WIDTH, MIN_CONNECTIVITY_PANE_HEIGHT)
     }
     
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -300,7 +315,7 @@ mod tests {
         let pane = ConnectivityPane::new();
         assert_eq!(pane.title(), "connectivity");
         assert_eq!(pane.id(), "connectivity");
-        assert_eq!(pane.min_size(), (25, 8));
+        assert_eq!(pane.min_size(), (MIN_CONNECTIVITY_PANE_WIDTH, MIN_CONNECTIVITY_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

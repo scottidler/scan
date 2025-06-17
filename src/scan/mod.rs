@@ -21,11 +21,15 @@ use crate::target::Target;
 use std::sync::Arc;
 use std::time::Duration;
 
+const PING_SCANNER_INTERVAL_SECS: u64 = 60;
+const PING_SCANNER_TIMEOUT_SECS: u64 = 5;
+const PING_SCANNER_RETRY_COUNT: u8 = 3;
+
 pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
     log::debug!("[scan] create_default_scanners: creating scanner instances");
     
     let scanners: Vec<Box<dyn Scanner + Send + Sync>> = vec![
-        Box::new(PingScanner::new(Duration::from_secs(60), Duration::from_secs(5), 3)),
+        Box::new(PingScanner::new(Duration::from_secs(PING_SCANNER_INTERVAL_SECS), Duration::from_secs(PING_SCANNER_TIMEOUT_SECS), PING_SCANNER_RETRY_COUNT)),
         Box::new(DnsScanner::new()),
         Box::new(TlsScanner::new()),
         Box::new(HttpScanner::default()),

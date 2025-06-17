@@ -10,6 +10,15 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use log;
 
+const TRACEROUTE_INTERVAL_SECS: u64 = 10 * 60;
+const TRACEROUTE_TIMEOUT_SECS: u64 = 30;
+const MAX_TRACEROUTE_HOPS: u8 = 20;
+const PROBES_PER_HOP: u8 = 3;
+const HOP_SUMMARY_DISPLAY_COUNT: usize = 5;
+const MS_TO_MICROSECONDS_MULTIPLIER: f64 = 1000.0;
+const FULL_PACKET_LOSS: f32 = 1.0;
+const MAX_TRACEROUTE_HISTORY: usize = 10;
+
 #[derive(Debug, Clone)]
 pub struct TracerouteScanner {
     interval: Duration,
@@ -56,10 +65,10 @@ impl TracerouteScanner {
     pub fn new() -> Self {
         log::debug!("[scan::traceroute] new: interval=600s timeout=30s max_hops=20 probes_per_hop=3");
         Self {
-            interval: Duration::from_secs(10 * 60), // 10 minutes
-            timeout: Duration::from_secs(30),
-            max_hops: 20,
-            probes_per_hop: 3,
+            interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS), // 10 minutes
+            timeout: Duration::from_secs(TRACEROUTE_TIMEOUT_SECS),
+            max_hops: MAX_TRACEROUTE_HOPS,
+            probes_per_hop: PROBES_PER_HOP,
         }
     }
 
@@ -113,7 +122,7 @@ impl TracerouteScanner {
             result.hops.len(), result.destination_reached);
         
         if !result.hops.is_empty() {
-            let hop_summary: Vec<String> = result.hops.iter().take(5).map(|h| {
+            let hop_summary: Vec<String> = result.hops.iter().take(HOP_SUMMARY_DISPLAY_COUNT).map(|h| {
                 format!("{}:{:.1}ms", h.hop_number, 
                     h.best_rtt.map(|d| d.as_millis() as f32).unwrap_or(-1.0))
             }).collect();
@@ -225,7 +234,7 @@ impl TracerouteScanner {
                 
                 let ip_address = ip_str.parse::<IpAddr>().ok();
                 let rtt = rtt_str.parse::<f64>().ok()
-                    .map(|ms| Duration::from_micros((ms * 1000.0) as u64));
+                    .map(|ms| Duration::from_micros((ms * MS_TO_MICROSECONDS_MULTIPLIER) as u64));
                 
                 responses.push(HopResponse {
                     ip_address,
@@ -238,7 +247,7 @@ impl TracerouteScanner {
                 // Additional RTT for same IP: "2.345 ms"
                 let rtt_str = parts[i];
                 let rtt = rtt_str.parse::<f64>().ok()
-                    .map(|ms| Duration::from_micros((ms * 1000.0) as u64));
+                    .map(|ms| Duration::from_micros((ms * MS_TO_MICROSECONDS_MULTIPLIER) as u64));
                 
                 // Use the same IP as the previous response
                 let ip_address = responses.last()
@@ -271,7 +280,7 @@ impl TracerouteScanner {
         };
         
         let packet_loss = if responses.is_empty() {
-            1.0
+            FULL_PACKET_LOSS
         } else {
             responses.iter().filter(|r| r.timeout).count() as f32 / responses.len() as f32
         };
@@ -350,7 +359,7 @@ impl Scanner for TracerouteScanner {
                         });
                         
                         // Keep only last 10 results
-                        while scan_state.history.len() > 10 {
+                        while scan_state.history.len() > MAX_TRACEROUTE_HISTORY {
                             scan_state.history.pop_front();
                         }
                     }
@@ -379,8 +388,8 @@ mod tests {
     fn test_traceroute_scanner_creation() {
         let scanner = TracerouteScanner::new();
         assert_eq!(scanner.name(), "traceroute");
-        assert_eq!(scanner.max_hops, 20);
-        assert_eq!(scanner.probes_per_hop, 3);
+        assert_eq!(scanner.max_hops, MAX_TRACEROUTE_HOPS);
+        assert_eq!(scanner.probes_per_hop, PROBES_PER_HOP);
     }
     
     #[test]

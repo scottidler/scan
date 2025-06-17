@@ -10,6 +10,11 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * 60; // 3600
+const MIN_TARGET_PANE_WIDTH: u16 = 25;
+const MIN_TARGET_PANE_HEIGHT: u16 = 12;
+
 /// TARGET pane displays basic target information and scanner status overview
 pub struct TargetPane {
     title: &'static str,
@@ -28,12 +33,12 @@ impl TargetPane {
     /// Format elapsed time in a human-readable way
     fn format_elapsed(elapsed: std::time::Duration) -> String {
         let secs = elapsed.as_secs();
-        if secs < 60 {
+        if secs < SECONDS_PER_MINUTE {
             format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m {}s", secs / 60, secs % 60)
+        } else if secs < SECONDS_PER_HOUR {
+            format!("{}m {}s", secs / SECONDS_PER_MINUTE, secs % SECONDS_PER_MINUTE)
         } else {
-            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+            format!("{}h {}m", secs / SECONDS_PER_HOUR, (secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE)
         }
     }
     
@@ -217,7 +222,7 @@ impl Pane for TargetPane {
     }
     
     fn min_size(&self) -> (u16, u16) {
-        (25, 12) // Larger to show all scanners
+        (MIN_TARGET_PANE_WIDTH, MIN_TARGET_PANE_HEIGHT) // Larger to show all scanners
     }
     
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -241,7 +246,7 @@ mod tests {
         let pane = TargetPane::new();
         assert_eq!(pane.title(), "target");
         assert_eq!(pane.id(), "target");
-        assert_eq!(pane.min_size(), (25, 12));
+        assert_eq!(pane.min_size(), (MIN_TARGET_PANE_WIDTH, MIN_TARGET_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

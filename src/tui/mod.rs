@@ -37,6 +37,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use log;
 
+const TUI_TICK_RATE_MS: u64 = 250;
+const FRAME_STATS_LOG_INTERVAL: u64 = 100;
+const FALLBACK_TIMEOUT_SECS: u64 = 0;
+
 /// Main TUI application
 pub struct TuiApp {
     layout: PaneLayout,
@@ -74,7 +78,7 @@ impl TuiApp {
             layout,
             should_quit: false,
             last_tick: Instant::now(),
-            tick_rate: Duration::from_millis(250), // 4 FPS
+            tick_rate: Duration::from_millis(TUI_TICK_RATE_MS), // 4 FPS
         })
     }
     
@@ -92,7 +96,7 @@ impl TuiApp {
             let draw_duration = draw_start.elapsed();
             
             frame_count += 1;
-            if frame_count % 100 == 0 {
+            if frame_count % FRAME_STATS_LOG_INTERVAL == 0 {
                 log::trace!("[tui] frame_stats: frames={} avg_draw_time={}μs uptime={}s", 
                     frame_count, draw_duration.as_micros(), start_time.elapsed().as_secs());
             }
@@ -100,7 +104,7 @@ impl TuiApp {
             // Handle events
             let timeout = self.tick_rate
                 .checked_sub(self.last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
+                .unwrap_or_else(|| Duration::from_secs(FALLBACK_TIMEOUT_SECS));
             
             if crossterm::event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
@@ -291,7 +295,7 @@ mod tests {
     fn test_tui_app_creation() {
         let app = TuiApp::new().expect("Failed to create TuiApp");
         assert!(!app.should_quit());
-        assert_eq!(app.tick_rate, Duration::from_millis(250));
+        assert_eq!(app.tick_rate, Duration::from_millis(TUI_TICK_RATE_MS));
         
         // Check that panes were added
         let pane_ids = app.layout.pane_ids();

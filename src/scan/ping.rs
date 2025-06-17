@@ -6,6 +6,11 @@ use eyre::{Result, WrapErr};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
+const DEFAULT_PING_INTERVAL_SECS: u64 = 1;
+const DEFAULT_PING_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_PING_PACKET_COUNT: u8 = 1;
+const SIMPLIFIED_PACKETS_RECEIVED: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct PingResult {
     pub latency: Duration,
@@ -37,9 +42,9 @@ impl PingScanner {
 impl Default for PingScanner {
     fn default() -> Self {
         Self::new(
-            Duration::from_secs(1),    // Ping every second
-            Duration::from_secs(5),    // 5 second timeout
-            1,                         // Send 1 packet per scan
+            Duration::from_secs(DEFAULT_PING_INTERVAL_SECS),    // Ping every second
+            Duration::from_secs(DEFAULT_PING_TIMEOUT_SECS),    // 5 second timeout
+            DEFAULT_PING_PACKET_COUNT,                         // Send 1 packet per scan
         )
     }
 }
@@ -193,7 +198,7 @@ impl PingScanner {
                         packet_loss: 0.0, // Would calculate from summary
                         ttl,
                         packets_sent: self.packet_count as u32,
-                        packets_received: 1, // Simplified
+                        packets_received: SIMPLIFIED_PACKETS_RECEIVED, // Simplified
                     };
                     
                     log::debug!("[scan::ping] parse_successful: latency={}ms ttl={:?} packets_sent={}", 

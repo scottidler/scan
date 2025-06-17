@@ -10,6 +10,9 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const MIN_GEOIP_PANE_WIDTH: u16 = 30;
+const MIN_GEOIP_PANE_HEIGHT: u16 = 10;
+
 /// GeoIP pane displays geographical and network location information
 pub struct GeoIpPane {
     title: &'static str,
@@ -213,7 +216,7 @@ impl Pane for GeoIpPane {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (30, 10) // Minimum width and height for GeoIP information
+        (MIN_GEOIP_PANE_WIDTH, MIN_GEOIP_PANE_HEIGHT) // Minimum width and height for GeoIP information
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -234,7 +237,7 @@ mod tests {
         let pane = GeoIpPane::new();
         assert_eq!(pane.title(), "geoip");
         assert_eq!(pane.id(), "geoip");
-        assert_eq!(pane.min_size(), (30, 10));
+        assert_eq!(pane.min_size(), (MIN_GEOIP_PANE_WIDTH, MIN_GEOIP_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

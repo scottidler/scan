@@ -12,6 +12,20 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use log;
 
+const PORT_SCAN_INTERVAL_SECS: u64 = 30;
+const TCP_TIMEOUT_SECS: u64 = 3;
+const MAX_CONCURRENT_SCANS: usize = 50;
+const DEBUG_PORT_DISPLAY_LIMIT: usize = 10;
+const BANNER_BUFFER_SIZE: usize = 1024;
+const BANNER_READ_TIMEOUT_MS: u64 = 500;
+const HTTP_BANNER_BUFFER_SIZE: usize = 2048;
+const HTTP_BANNER_TIMEOUT_MS: u64 = 1000;
+const SERVICE_DETECTION_TIMEOUT_SECS: u64 = 2;
+const HIGH_CONFIDENCE_SCORE: f32 = 0.7;
+const LOW_CONFIDENCE_SCORE: f32 = 0.3;
+const PROGRESSIVE_BATCH_SIZE: usize = 50;
+const BATCH_DELAY_MS: u64 = 100;
+
 #[derive(Debug, Clone)]
 pub struct PortScanner {
     interval: Duration,
@@ -78,9 +92,9 @@ impl PortScanner {
     pub fn new() -> Self {
         log::debug!("[scan::port] new: interval=30s timeout=3s concurrency=50 service_detection=true");
         Self {
-            interval: Duration::from_secs(30),
-            tcp_timeout: Duration::from_secs(3),
-            max_concurrent: 50,
+            interval: Duration::from_secs(PORT_SCAN_INTERVAL_SECS),
+            tcp_timeout: Duration::from_secs(TCP_TIMEOUT_SECS),
+            max_concurrent: MAX_CONCURRENT_SCANS,
             service_detection: true,
             scan_mode: ScanMode::Quick,
         }
@@ -126,7 +140,7 @@ impl PortScanner {
         let ports = self.get_ports();
         log::debug!("[scan::port] port_list: target={} port_count={} ports={:?}", 
             target.display_name(), ports.len(), 
-            if ports.len() <= 10 { format!("{:?}", ports) } else { format!("{:?}...", &ports[..10]) });
+            if ports.len() <= DEBUG_PORT_DISPLAY_LIMIT { format!("{:?}", ports) } else { format!("{:?}...", &ports[..DEBUG_PORT_DISPLAY_LIMIT]) });
         
         log::trace!("[scan::port] starting_concurrent_scans: target={} concurrency={}", 
             target.display_name(), self.max_concurrent);
@@ -213,13 +227,13 @@ impl PortScanner {
         let service_name = get_service_name(port);
         
         // Attempt banner grabbing with a short timeout
-        let banner = timeout(Duration::from_secs(2), self.grab_banner(stream, port)).await.ok().flatten();
+        let banner = timeout(Duration::from_secs(SERVICE_DETECTION_TIMEOUT_SECS), self.grab_banner(stream, port)).await.ok().flatten();
         
         // Analyze banner to improve service detection
         let (refined_name, version, confidence) = if let Some(ref banner_text) = banner {
             analyze_banner(banner_text, port)
         } else {
-            (service_name.clone(), None, if service_name != "unknown" { 0.7 } else { 0.3 })
+            (service_name.clone(), None, if service_name != "unknown" { HIGH_CONFIDENCE_SCORE } else { LOW_CONFIDENCE_SCORE })
         };
         
         Some(ServiceInfo {
@@ -253,8 +267,8 @@ impl PortScanner {
     }
 
     async fn read_banner(&self, stream: &mut TcpStream) -> Option<String> {
-        let mut buffer = [0; 1024];
-        match timeout(Duration::from_millis(500), stream.read(&mut buffer)).await {
+        let mut buffer = [0; BANNER_BUFFER_SIZE];
+        match timeout(Duration::from_millis(BANNER_READ_TIMEOUT_MS), stream.read(&mut buffer)).await {
             Ok(Ok(n)) if n > 0 => {
                 let banner = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
                 if !banner.is_empty() {
@@ -271,8 +285,8 @@ impl PortScanner {
         let http_request = b"GET / HTTP/1.0\r\n\r\n";
         
         if stream.write_all(http_request).await.is_ok() {
-            let mut buffer = [0; 2048];
-            if let Ok(Ok(n)) = timeout(Duration::from_millis(1000), stream.read(&mut buffer)).await {
+            let mut buffer = [0; HTTP_BANNER_BUFFER_SIZE];
+            if let Ok(Ok(n)) = timeout(Duration::from_millis(HTTP_BANNER_TIMEOUT_MS), stream.read(&mut buffer)).await {
                 if n > 0 {
                     let response = String::from_utf8_lossy(&buffer[..n]);
                     // Extract server header
@@ -316,7 +330,7 @@ impl PortScanner {
         let mut filtered_count = 0;
         
         // Scan ports in batches for progressive updates
-        let batch_size = 50;
+        let batch_size = PROGRESSIVE_BATCH_SIZE;
         for batch in ports.chunks(batch_size) {
             // Scan batch concurrently
             let batch_results = stream::iter(batch.iter().copied())
@@ -355,7 +369,7 @@ impl PortScanner {
             }
             
             // Small delay between batches to allow UI updates
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(BATCH_DELAY_MS)).await;
         }
         
         // Final result

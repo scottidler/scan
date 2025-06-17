@@ -10,6 +10,30 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const SCROLL_STEP: u16 = 1;
+const MAX_CSP_ISSUES_DISPLAYED: usize = 3;
+const MAX_CORS_ISSUES_DISPLAYED: usize = 3;
+const MAX_HTTP_VULNERABILITIES_DISPLAYED: usize = 5;
+const MAX_TLS_VULNERABILITIES_DISPLAYED: usize = 5;
+const CIPHER_DISPLAY_MAX_LENGTH: usize = 25;
+const CIPHER_TRUNCATE_LENGTH: usize = 22;
+const CN_EXTRACT_PREFIX_LENGTH: usize = 3;
+const CN_DISPLAY_MAX_LENGTH: usize = 25;
+const CERT_EXPIRY_WARNING_DAYS: i64 = 30;
+const CERT_EXPIRY_CRITICAL_DAYS: i64 = 7;
+const CSP_HEADER_DISPLAY_MAX_LENGTH: usize = 40;
+const CSP_HEADER_TRUNCATE_LENGTH: usize = 37;
+const ISSUE_DISPLAY_MAX_LENGTH: usize = 20;
+const ISSUE_TRUNCATE_LENGTH: usize = 17;
+const CORS_ORIGIN_DISPLAY_MAX_LENGTH: usize = 25;
+const CORS_ORIGIN_TRUNCATE_LENGTH: usize = 22;
+const SPF_DISPLAY_MAX_LENGTH: usize = 50;
+const SPF_TRUNCATE_LENGTH: usize = 47;
+const DMARC_DISPLAY_MAX_LENGTH: usize = 50;
+const DMARC_TRUNCATE_LENGTH: usize = 47;
+const MIN_SECURITY_PANE_WIDTH: u16 = 50;
+const MIN_SECURITY_PANE_HEIGHT: u16 = 35;
+
 /// SECURITY pane displays TLS/SSL certificate information and security analysis
 pub struct SecurityPane {
     title: &'static str,
@@ -29,7 +53,7 @@ impl SecurityPane {
     
     pub fn scroll_up(&mut self) {
         let old_offset = self.scroll_offset;
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_STEP);
         log::debug!("[tui::security] scroll_up: old_offset={} new_offset={}", 
             old_offset, self.scroll_offset);
     }
@@ -43,7 +67,7 @@ impl SecurityPane {
         if actual_lines > visible_height {
             let max_scroll = actual_lines.saturating_sub(visible_height);
             if self.scroll_offset < max_scroll {
-                self.scroll_offset += 1;
+                self.scroll_offset += SCROLL_STEP;
             }
         }
         
@@ -115,7 +139,7 @@ impl SecurityPane {
                     http_result.csp.as_ref().map(|csp| (
                         csp.strength.clone(),
                         csp.header_value.clone(),
-                        csp.issues.iter().take(3).map(|issue| match issue {
+                        csp.issues.iter().take(MAX_CSP_ISSUES_DISPLAYED).map(|issue| match issue {
                             crate::scan::http::CspIssue::UnsafeInline(directive) => format!("unsafe-inline in {}", directive),
                             crate::scan::http::CspIssue::UnsafeEval(directive) => format!("unsafe-eval in {}", directive),
                             crate::scan::http::CspIssue::WildcardSource(directive) => format!("wildcard in {}", directive),
@@ -127,14 +151,14 @@ impl SecurityPane {
                         cors.access_control_allow_origin.clone(),
                         cors.access_control_allow_methods.clone(),
                         cors.access_control_allow_credentials,
-                        cors.issues.iter().take(3).map(|issue| match issue {
+                        cors.issues.iter().take(MAX_CORS_ISSUES_DISPLAYED).map(|issue| match issue {
                             crate::scan::http::CorsIssue::WildcardOrigin => "wildcard origin".to_string(),
                             crate::scan::http::CorsIssue::WildcardMethods => "wildcard methods".to_string(),
                             crate::scan::http::CorsIssue::WildcardHeaders => "wildcard headers".to_string(),
                             crate::scan::http::CorsIssue::WildcardWithCredentials => "wildcard + credentials".to_string(),
                         }).collect::<Vec<_>>()
                     )),
-                    http_result.vulnerabilities.iter().take(5).map(|vuln| match vuln {
+                    http_result.vulnerabilities.iter().take(MAX_HTTP_VULNERABILITIES_DISPLAYED).map(|vuln| match vuln {
                         crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
                         crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options".to_string(),
                         crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options".to_string(),
@@ -172,7 +196,7 @@ impl SecurityPane {
         // Extract TLS vulnerability details
         let tls_vulnerabilities = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                Some(tls_result.vulnerabilities.iter().take(5).map(|vuln| match vuln {
+                Some(tls_result.vulnerabilities.iter().take(MAX_TLS_VULNERABILITIES_DISPLAYED).map(|vuln| match vuln {
                     crate::scan::tls::TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
                     crate::scan::tls::TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
                     crate::scan::tls::TlsVulnerability::Beast => "BEAST (CVE-2011-3389)".to_string(),
@@ -226,7 +250,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("🔑 Cipher: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if cipher.len() > 25 { format!("{}...", &cipher[..22]) } else { cipher },
+                        if cipher.len() > CIPHER_DISPLAY_MAX_LENGTH { format!("{}...", &cipher[..CIPHER_TRUNCATE_LENGTH]) } else { cipher },
                         Style::default().fg(Color::Yellow)
                     ),
                 ]));
@@ -273,11 +297,11 @@ impl SecurityPane {
                 
                 // Subject (extract CN)
                 let subject_display = if let Some(cn_start) = subject.find("CN=") {
-                    let cn_part = &subject[cn_start + 3..];
+                    let cn_part = &subject[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
                     if let Some(comma) = cn_part.find(',') {
-                        &cn_part[..comma.min(25)]
+                        &cn_part[..comma.min(CN_DISPLAY_MAX_LENGTH)]
                     } else {
-                        &cn_part[..cn_part.len().min(25)]
+                        &cn_part[..cn_part.len().min(CN_DISPLAY_MAX_LENGTH)]
                     }
                 } else {
                     "unknown"
@@ -290,11 +314,11 @@ impl SecurityPane {
                 
                 // Issuer (extract CN)
                 let issuer_display = if let Some(cn_start) = issuer.find("CN=") {
-                    let cn_part = &issuer[cn_start + 3..];
+                    let cn_part = &issuer[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
                     if let Some(comma) = cn_part.find(',') {
-                        &cn_part[..comma.min(25)]
+                        &cn_part[..comma.min(CN_DISPLAY_MAX_LENGTH)]
                     } else {
-                        &cn_part[..cn_part.len().min(25)]
+                        &cn_part[..cn_part.len().min(CN_DISPLAY_MAX_LENGTH)]
                     }
                 } else {
                     "unknown"
@@ -307,9 +331,9 @@ impl SecurityPane {
                 
                 // Certificate expiry
                 if let Some(days_until_expiry) = days_until_expiry {
-                    let expiry_color = if days_until_expiry > 30 {
+                    let expiry_color = if days_until_expiry > CERT_EXPIRY_WARNING_DAYS {
                         Color::Green
-                    } else if days_until_expiry > 7 {
+                    } else if days_until_expiry > CERT_EXPIRY_CRITICAL_DAYS {
                         Color::Yellow
                     } else {
                         Color::Red
@@ -480,8 +504,8 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    Policy: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if header_value.len() > 40 { 
-                            format!("{}...", &header_value[..37]) 
+                        if header_value.len() > CSP_HEADER_DISPLAY_MAX_LENGTH { 
+                            format!("{}...", &header_value[..CSP_HEADER_TRUNCATE_LENGTH]) 
                         } else { 
                             header_value.clone() 
                         },
@@ -494,7 +518,7 @@ impl SecurityPane {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
                         Span::styled(
-                            if issue.len() > 20 { format!("{}...", &issue[..17]) } else { issue },
+                            if issue.len() > ISSUE_DISPLAY_MAX_LENGTH { format!("{}...", &issue[..ISSUE_TRUNCATE_LENGTH]) } else { issue },
                             Style::default().fg(Color::Red)
                         ),
                     ]));
@@ -526,7 +550,7 @@ impl SecurityPane {
                     lines.push(Line::from(vec![
                         Span::styled("    Origin: ", Style::default().fg(Color::White)),
                         Span::styled(
-                            if origin.len() > 25 { format!("{}...", &origin[..22]) } else { origin.clone() },
+                            if origin.len() > CORS_ORIGIN_DISPLAY_MAX_LENGTH { format!("{}...", &origin[..CORS_ORIGIN_TRUNCATE_LENGTH]) } else { origin.clone() },
                             Style::default().fg(Color::Gray)
                         ),
                     ]));
@@ -553,7 +577,7 @@ impl SecurityPane {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
                         Span::styled(
-                            if issue.len() > 20 { format!("{}...", &issue[..17]) } else { issue },
+                            if issue.len() > ISSUE_DISPLAY_MAX_LENGTH { format!("{}...", &issue[..ISSUE_TRUNCATE_LENGTH]) } else { issue },
                             Style::default().fg(Color::Red)
                         ),
                     ]));
@@ -643,7 +667,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    SPF: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if spf.len() > 50 { format!("{}...", &spf[..47]) } else { spf.clone() },
+                        if spf.len() > SPF_DISPLAY_MAX_LENGTH { format!("{}...", &spf[..SPF_TRUNCATE_LENGTH]) } else { spf.clone() },
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -653,7 +677,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    DMARC: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if dmarc.len() > 50 { format!("{}...", &dmarc[..47]) } else { dmarc.clone() },
+                        if dmarc.len() > DMARC_DISPLAY_MAX_LENGTH { format!("{}...", &dmarc[..DMARC_TRUNCATE_LENGTH]) } else { dmarc.clone() },
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -755,7 +779,7 @@ impl Pane for SecurityPane {
     }
     
     fn min_size(&self) -> (u16, u16) {
-        (50, 35)
+        (MIN_SECURITY_PANE_WIDTH, MIN_SECURITY_PANE_HEIGHT)
     }
     
     fn is_focusable(&self) -> bool {
@@ -783,7 +807,7 @@ mod tests {
         let pane = SecurityPane::new();
         assert_eq!(pane.title(), "security");
         assert_eq!(pane.id(), "security");
-        assert_eq!(pane.min_size(), (50, 35));
+        assert_eq!(pane.min_size(), (MIN_SECURITY_PANE_WIDTH, MIN_SECURITY_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

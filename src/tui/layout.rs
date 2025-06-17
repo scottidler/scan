@@ -7,6 +7,26 @@ use ratatui::{
 use std::collections::HashMap;
 use log;
 
+const DEFAULT_GRID_ROWS: usize = 3;
+const DEFAULT_GRID_COLS: usize = 3;
+const TOP_ROW_HEIGHT_PERCENT: u16 = 25;
+const MIDDLE_ROW_HEIGHT_PERCENT: u16 = 35;
+const BOTTOM_ROW_HEIGHT_PERCENT: u16 = 40;
+const BORDER_HEIGHT_OFFSET: u16 = 2;
+const FALLBACK_VISIBLE_LINES: u16 = 20;
+const TARGET_PANE_WIDTH_PERCENT: u16 = 30;
+const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 35;
+const SECURITY_PANE_WIDTH_PERCENT: u16 = 35;
+const DNS_PANE_WIDTH_PERCENT: u16 = 35;
+const HTTP_PANE_WIDTH_PERCENT: u16 = 30;
+const PORTS_PANE_WIDTH_PERCENT: u16 = 35;
+const WHOIS_PANE_WIDTH_PERCENT: u16 = 40;
+const TRACEROUTE_PANE_WIDTH_PERCENT: u16 = 35;
+const GEOIP_PANE_WIDTH_PERCENT: u16 = 25;
+const EQUAL_COLUMN_WIDTH_PERCENT_FIRST: u16 = 33;
+const EQUAL_COLUMN_WIDTH_PERCENT_SECOND: u16 = 33;
+const EQUAL_COLUMN_WIDTH_PERCENT_THIRD: u16 = 34;
+
 /// Manages the layout and rendering of TUI panes in a grid
 pub struct PaneLayout {
     panes: Vec<Box<dyn Pane>>,
@@ -32,7 +52,7 @@ impl PaneLayout {
     /// Create the default 3x3 layout for our dashboard
     pub fn default_dashboard() -> Self {
         log::debug!("[tui::layout] default_dashboard: creating 3x3 layout");
-        Self::new(3, 3)
+        Self::new(DEFAULT_GRID_ROWS, DEFAULT_GRID_COLS)
     }
     
     /// Add a pane to the layout with its configuration
@@ -122,9 +142,9 @@ impl PaneLayout {
         // Row 1: Medium for DNS, HTTP, Ports
         // Row 2: Larger for detailed info (whois, traceroute, geoip)
         let row_constraints = vec![
-            Constraint::Percentage(25), // Top row - 25%
-            Constraint::Percentage(35), // Middle row - 35%
-            Constraint::Percentage(40), // Bottom row - 40%
+            Constraint::Percentage(TOP_ROW_HEIGHT_PERCENT), // Top row - 25%
+            Constraint::Percentage(MIDDLE_ROW_HEIGHT_PERCENT), // Middle row - 35%
+            Constraint::Percentage(BOTTOM_ROW_HEIGHT_PERCENT), // Bottom row - 40%
         ];
         
         // Split into rows
@@ -139,24 +159,24 @@ impl PaneLayout {
         for (row_idx, row_area) in rows.iter().enumerate() {
             let col_constraints = match row_idx {
                 0 => vec![
-                    Constraint::Percentage(30), // target - compact
-                    Constraint::Percentage(35), // connectivity - medium
-                    Constraint::Percentage(35), // security - medium
+                    Constraint::Percentage(TARGET_PANE_WIDTH_PERCENT), // target - compact
+                    Constraint::Percentage(CONNECTIVITY_PANE_WIDTH_PERCENT), // connectivity - medium
+                    Constraint::Percentage(SECURITY_PANE_WIDTH_PERCENT), // security - medium
                 ],
                 1 => vec![
-                    Constraint::Percentage(35), // dns - needs more space
-                    Constraint::Percentage(30), // http - medium
-                    Constraint::Percentage(35), // ports - needs more space
+                    Constraint::Percentage(DNS_PANE_WIDTH_PERCENT), // dns - needs more space
+                    Constraint::Percentage(HTTP_PANE_WIDTH_PERCENT), // http - medium
+                    Constraint::Percentage(PORTS_PANE_WIDTH_PERCENT), // ports - needs more space
                 ],
                 2 => vec![
-                    Constraint::Percentage(40), // whois - needs more space
-                    Constraint::Percentage(35), // traceroute - needs lots of space
-                    Constraint::Percentage(25), // geoip - compact
+                    Constraint::Percentage(WHOIS_PANE_WIDTH_PERCENT), // whois - needs more space
+                    Constraint::Percentage(TRACEROUTE_PANE_WIDTH_PERCENT), // traceroute - needs lots of space
+                    Constraint::Percentage(GEOIP_PANE_WIDTH_PERCENT), // geoip - compact
                 ],
                 _ => vec![
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(34),
+                    Constraint::Percentage(EQUAL_COLUMN_WIDTH_PERCENT_FIRST),
+                    Constraint::Percentage(EQUAL_COLUMN_WIDTH_PERCENT_SECOND),
+                    Constraint::Percentage(EQUAL_COLUMN_WIDTH_PERCENT_THIRD),
                 ],
             };
             
@@ -306,9 +326,9 @@ impl PaneLayout {
                                     // Get the security pane area (bottom-right: row 2, col 2)
                                     let visible_lines = if pane_areas.len() > 2 && pane_areas[2].len() > 2 {
                                         // Subtract 2 for borders
-                                        pane_areas[2][2].height.saturating_sub(2)
+                                        pane_areas[2][2].height.saturating_sub(BORDER_HEIGHT_OFFSET)
                                     } else {
-                                        20 // Fallback
+                                        FALLBACK_VISIBLE_LINES // Fallback
                                     };
                                     
                                     log::trace!("[tui::layout] security_scroll_down: visible_lines={}", visible_lines);
@@ -354,8 +374,8 @@ mod tests {
     #[test]
     fn test_layout_creation() {
         let layout = PaneLayout::default_dashboard();
-        assert_eq!(layout.grid_rows, 3);
-        assert_eq!(layout.grid_cols, 3);
+        assert_eq!(layout.grid_rows, DEFAULT_GRID_ROWS);
+        assert_eq!(layout.grid_cols, DEFAULT_GRID_COLS);
         assert!(layout.panes.is_empty());
         assert!(layout.focused_pane.is_none());
     }

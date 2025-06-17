@@ -10,6 +10,21 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const URL_DISPLAY_MAX_LENGTH: usize = 35;
+const URL_TRUNCATE_LENGTH: usize = 32;
+const HTTP_SUCCESS_STATUS_MIN: u16 = 200;
+const HTTP_SUCCESS_STATUS_MAX: u16 = 299;
+const HTTP_REDIRECT_STATUS_MIN: u16 = 300;
+const HTTP_REDIRECT_STATUS_MAX: u16 = 399;
+const HTTP_CLIENT_ERROR_STATUS_MIN: u16 = 400;
+const HTTP_CLIENT_ERROR_STATUS_MAX: u16 = 499;
+const HTTP_SERVER_ERROR_STATUS_MIN: u16 = 500;
+const HTTP_SERVER_ERROR_STATUS_MAX: u16 = 599;
+const RESPONSE_TIME_FAST_THRESHOLD_MS: u128 = 100;
+const RESPONSE_TIME_SLOW_THRESHOLD_MS: u128 = 500;
+const MIN_HTTP_PANE_WIDTH: u16 = 30;
+const MIN_HTTP_PANE_HEIGHT: u16 = 12;
+
 /// HTTP pane displays web server response information
 pub struct HttpPane {
     title: &'static str,
@@ -27,7 +42,7 @@ impl HttpPane {
     
     /// Truncate URL to fit in the display
     fn truncate_url(url: &str) -> String {
-        if url.len() <= 35 {
+        if url.len() <= URL_DISPLAY_MAX_LENGTH {
             url.to_string()
         } else {
             // Remove protocol and show domain + path
@@ -36,10 +51,10 @@ impl HttpPane {
                 .or_else(|| url.strip_prefix("http://"))
                 .unwrap_or(url);
             
-            if url_without_protocol.len() <= 35 {
+            if url_without_protocol.len() <= URL_DISPLAY_MAX_LENGTH {
                 url_without_protocol.to_string()
             } else {
-                format!("{}...", &url_without_protocol[..32])
+                format!("{}...", &url_without_protocol[..URL_TRUNCATE_LENGTH])
             }
         }
     }
@@ -98,10 +113,10 @@ impl Pane for HttpPane {
             if let Some(ScanResult::Http(http_result)) = &http_state.result {
                 // Status code
                 let status_color = match http_result.status_code {
-                    200..=299 => Color::Green,
-                    300..=399 => Color::Yellow,
-                    400..=499 => Color::Red,
-                    500..=599 => Color::Magenta,
+                    HTTP_SUCCESS_STATUS_MIN..=HTTP_SUCCESS_STATUS_MAX => Color::Green,
+                    HTTP_REDIRECT_STATUS_MIN..=HTTP_REDIRECT_STATUS_MAX => Color::Yellow,
+                    HTTP_CLIENT_ERROR_STATUS_MIN..=HTTP_CLIENT_ERROR_STATUS_MAX => Color::Red,
+                    HTTP_SERVER_ERROR_STATUS_MIN..=HTTP_SERVER_ERROR_STATUS_MAX => Color::Magenta,
                     _ => Color::Gray,
                 };
                 
@@ -115,9 +130,9 @@ impl Pane for HttpPane {
                 
                 // Response time
                 let response_time_ms = http_result.response_time.as_millis();
-                let time_color = if response_time_ms < 100 {
+                let time_color = if response_time_ms < RESPONSE_TIME_FAST_THRESHOLD_MS {
                     Color::Green
-                } else if response_time_ms < 500 {
+                } else if response_time_ms < RESPONSE_TIME_SLOW_THRESHOLD_MS {
                     Color::Yellow
                 } else {
                     Color::Red
@@ -264,7 +279,7 @@ impl Pane for HttpPane {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (25, 10) // Minimum width and height for HTTP information
+        (MIN_HTTP_PANE_WIDTH, MIN_HTTP_PANE_HEIGHT) // Minimum width and height for HTTP information
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -285,7 +300,7 @@ mod tests {
         let pane = HttpPane::new();
         assert_eq!(pane.title(), "http");
         assert_eq!(pane.id(), "http");
-        assert_eq!(pane.min_size(), (25, 10));
+        assert_eq!(pane.min_size(), (MIN_HTTP_PANE_WIDTH, MIN_HTTP_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

@@ -13,6 +13,17 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use log;
 
+const GEOIP_SCAN_INTERVAL_SECS: u64 = 10 * 60; // 10 minutes
+const GEOIP_HTTP_TIMEOUT_SECS: u64 = 10;
+const RATE_LIMITER_WINDOW_SECS: u64 = 60;
+const MIN_REQUEST_INTERVAL_SECS: u64 = 1;
+const GEOIP_CACHE_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
+const MAX_CACHE_SIZE: usize = 1000;
+const CACHE_CLEANUP_THRESHOLD_SECS: u64 = 48 * 60 * 60; // 48 hours
+const MULTI_IP_DELAY_MS: u64 = 100;
+const IP_API_RATE_LIMIT: u32 = 45;
+const MAX_GEOIP_HISTORY: usize = 10;
+
 #[derive(Debug, Clone)]
 pub struct GeoIpScanner {
     interval: Duration,
@@ -111,9 +122,9 @@ impl Default for GeoIpScanner {
 
 impl GeoIpScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::geoip] new: interval=600s");
+        log::debug!("[scan::geoip] new: interval={}s", GEOIP_SCAN_INTERVAL_SECS);
         Self {
-            interval: Duration::from_secs(10 * 60), // 10 minutes
+            interval: Duration::from_secs(GEOIP_SCAN_INTERVAL_SECS), // 10 minutes
             service: Arc::new(GeoIpService::new()),
         }
     }
@@ -181,13 +192,13 @@ impl GeoIpService {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(GEOIP_HTTP_TIMEOUT_SECS))
                 .user_agent("scan-tool/1.0")
                 .build()
                 .expect("Failed to create HTTP client"),
             cache: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter {
-                last_request: Instant::now() - Duration::from_secs(60),
+                last_request: Instant::now() - Duration::from_secs(RATE_LIMITER_WINDOW_SECS),
                 requests_this_minute: 0,
                 minute_start: Instant::now(),
             }),
@@ -230,7 +241,7 @@ impl GeoIpService {
 
     async fn lookup_ip_api(&self, ip: IpAddr) -> Result<(Option<GeoLocation>, Option<NetworkInfo>)> {
         // Check rate limit (45 requests per minute)
-        self.check_rate_limit(45).await?;
+        self.check_rate_limit(IP_API_RATE_LIMIT).await?;
 
         let url = format!("http://ip-api.com/json/{}?fields=status,country,countryCode,region,regionName,city,lat,lon,timezone,isp,org,as,query", ip);
         
@@ -346,21 +357,21 @@ impl GeoIpService {
         let now = Instant::now();
         
         // Reset counter if a new minute has started
-        if now.duration_since(limiter.minute_start) >= Duration::from_secs(60) {
+        if now.duration_since(limiter.minute_start) >= Duration::from_secs(RATE_LIMITER_WINDOW_SECS) {
             limiter.requests_this_minute = 0;
             limiter.minute_start = now;
         }
         
         // Check if we're over the limit
         if limiter.requests_this_minute >= max_per_minute {
-            let wait_time = Duration::from_secs(60) - now.duration_since(limiter.minute_start);
+            let wait_time = Duration::from_secs(RATE_LIMITER_WINDOW_SECS) - now.duration_since(limiter.minute_start);
             return Err(eyre::eyre!("Rate limit exceeded, need to wait {:?}", wait_time));
         }
         
         // Ensure minimum delay between requests (1 second)
         let time_since_last = now.duration_since(limiter.last_request);
-        if time_since_last < Duration::from_secs(1) {
-            let wait_time = Duration::from_secs(1) - time_since_last;
+        if time_since_last < Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) {
+            let wait_time = Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) - time_since_last;
             tokio::time::sleep(wait_time).await;
         }
         
@@ -383,13 +394,13 @@ impl GeoIpService {
             network_info,
             data_source,
             cached_at: Instant::now(),
-            ttl: Duration::from_secs(24 * 60 * 60), // Cache for 24 hours
+            ttl: Duration::from_secs(GEOIP_CACHE_TTL_SECS), // Cache for 24 hours
         });
         
         // Limit cache size to prevent memory bloat
-        if cache.len() > 1000 {
+        if cache.len() > MAX_CACHE_SIZE {
             // Remove oldest entries (simple approach - in production might use LRU)
-            let oldest_time = Instant::now() - Duration::from_secs(48 * 60 * 60);
+            let oldest_time = Instant::now() - Duration::from_secs(CACHE_CLEANUP_THRESHOLD_SECS);
             cache.retain(|_, v| v.cached_at > oldest_time);
         }
     }
@@ -404,7 +415,7 @@ impl GeoIpService {
             }
             
             // Small delay between requests to be respectful
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(MULTI_IP_DELAY_MS)).await;
         }
         
         results
@@ -515,7 +526,7 @@ impl Scanner for GeoIpScanner {
                         });
                         
                         // Keep only last 10 results
-                        while scan_state.history.len() > 10 {
+                        while scan_state.history.len() > MAX_GEOIP_HISTORY {
                             scan_state.history.pop_front();
                         }
                     }

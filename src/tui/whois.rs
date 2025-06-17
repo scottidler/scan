@@ -10,6 +10,11 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const EXPIRY_WARNING_DAYS: i64 = 30;
+const EXPIRY_CAUTION_DAYS: i64 = 90;
+const MIN_WHOIS_PANE_WIDTH: u16 = 35;
+const MIN_WHOIS_PANE_HEIGHT: u16 = 16;
+
 /// WHOIS pane displays domain registration and ownership information
 pub struct WhoisPane {
     title: &'static str,
@@ -114,9 +119,9 @@ impl Pane for WhoisPane {
                     let expires_date = expires.date_naive();
                     let days_until_expiry = (expires_date - now).num_days();
                     
-                    let expiry_color = if days_until_expiry < 30 {
+                    let expiry_color = if days_until_expiry < EXPIRY_WARNING_DAYS {
                         Color::Red
-                    } else if days_until_expiry < 90 {
+                    } else if days_until_expiry < EXPIRY_CAUTION_DAYS {
                         Color::Yellow
                     } else {
                         Color::Green
@@ -297,7 +302,7 @@ impl Pane for WhoisPane {
     }
     
     fn min_size(&self) -> (u16, u16) {
-        (35, 16) // Larger to show all nameservers and details
+        (MIN_WHOIS_PANE_WIDTH, MIN_WHOIS_PANE_HEIGHT) // Larger to show all nameservers and details
     }
     
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -318,7 +323,7 @@ mod tests {
         let pane = WhoisPane::new();
         assert_eq!(pane.title(), "whois");
         assert_eq!(pane.id(), "whois");
-        assert_eq!(pane.min_size(), (35, 16));
+        assert_eq!(pane.min_size(), (MIN_WHOIS_PANE_WIDTH, MIN_WHOIS_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

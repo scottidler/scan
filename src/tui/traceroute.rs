@@ -10,6 +10,11 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const LOCAL_ISP_HOP_THRESHOLD: u8 = 3;
+const MID_NETWORK_HOP_THRESHOLD: u8 = 10;
+const MIN_TRACEROUTE_PANE_WIDTH: u16 = 35;
+const MIN_TRACEROUTE_PANE_HEIGHT: u16 = 20;
+
 /// Traceroute pane displays network path tracing information
 pub struct TraceroutePane {
     title: &'static str,
@@ -116,9 +121,9 @@ impl Pane for TraceroutePane {
                     };
                     
                     // Color code hop number based on position
-                    let hop_num_color = if hop.hop_number <= 3 {
+                    let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
                         Color::Green // Local/ISP hops
-                    } else if hop.hop_number <= 10 {
+                    } else if hop.hop_number <= MID_NETWORK_HOP_THRESHOLD {
                         Color::Yellow // Mid-network
                     } else {
                         Color::Red // Far hops
@@ -197,7 +202,7 @@ impl Pane for TraceroutePane {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (35, 20) // Much larger to show all hops (up to ~30 hops)
+        (MIN_TRACEROUTE_PANE_WIDTH, MIN_TRACEROUTE_PANE_HEIGHT) // Much larger to show all hops (up to ~30 hops)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -218,7 +223,7 @@ mod tests {
         let pane = TraceroutePane::new();
         assert_eq!(pane.title(), "traceroute");
         assert_eq!(pane.id(), "traceroute");
-        assert_eq!(pane.min_size(), (35, 20));
+        assert_eq!(pane.min_size(), (MIN_TRACEROUTE_PANE_WIDTH, MIN_TRACEROUTE_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

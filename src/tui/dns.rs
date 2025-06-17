@@ -10,6 +10,27 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const TXT_TRUNCATE_SUFFIX_LENGTH: usize = 3;
+const MAX_A_RECORDS_DISPLAYED: usize = 6;
+const TTL_GOOD_THRESHOLD: u32 = 300;
+const TTL_WARNING_THRESHOLD: u32 = 60;
+const MAX_AAAA_RECORDS_DISPLAYED: usize = 3;
+const IPV6_DISPLAY_MAX_LENGTH: usize = 25;
+const IPV6_TRUNCATE_LENGTH: usize = 22;
+const MAX_MX_RECORDS_DISPLAYED: usize = 4;
+const MX_PRIORITY_GOOD_THRESHOLD: u16 = 10;
+const MX_PRIORITY_WARNING_THRESHOLD: u16 = 20;
+const MAX_TXT_RECORDS_DISPLAYED: usize = 4;
+const TXT_DISPLAY_MAX_LENGTH: usize = 45;
+const MS_RECORD_PREVIEW_LENGTH: usize = 10;
+const MS_RECORD_PREFIX_LENGTH: usize = 3;
+const MAX_NS_RECORDS_DISPLAYED: usize = 4;
+const MAX_CNAME_RECORDS_DISPLAYED: usize = 3;
+const MAX_CAA_RECORDS_DISPLAYED: usize = 3;
+const MAX_SRV_RECORDS_DISPLAYED: usize = 3;
+const MIN_DNS_PANE_WIDTH: u16 = 25;
+const MIN_DNS_PANE_HEIGHT: u16 = 10;
+
 /// DNS pane displays domain name system resolution information
 pub struct DnsPane {
     title: &'static str,
@@ -29,7 +50,7 @@ impl DnsPane {
         if text.len() <= max_len {
             text.to_string()
         } else {
-            format!("{}...", &text[..max_len.saturating_sub(3)])
+            format!("{}...", &text[..max_len.saturating_sub(TXT_TRUNCATE_SUFFIX_LENGTH)])
         }
     }
 
@@ -48,10 +69,10 @@ impl DnsPane {
             ]));
             
             // Show A records with TTL (up to 6)
-            for record in dns_result.A.iter().take(6) {
-                let ttl_color = if record.ttl_remaining() > 300 {
+            for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
+                let ttl_color = if record.ttl_remaining() > TTL_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.ttl_remaining() > 60 {
+                } else if record.ttl_remaining() > TTL_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
@@ -72,11 +93,11 @@ impl DnsPane {
                 ]));
             }
             
-            if dns_result.A.len() > 6 {
+            if dns_result.A.len() > MAX_A_RECORDS_DISPLAYED {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("... and {} more", dns_result.A.len() - 6),
+                        format!("... and {} more", dns_result.A.len() - MAX_A_RECORDS_DISPLAYED),
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -94,18 +115,18 @@ impl DnsPane {
                 Span::styled(" IPv6", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.AAAA.iter().take(3) {
-                let ttl_color = if record.ttl_remaining() > 300 {
+            for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
+                let ttl_color = if record.ttl_remaining() > TTL_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.ttl_remaining() > 60 {
+                } else if record.ttl_remaining() > TTL_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
                 };
                 
                 let ipv6_str = record.value.to_string();
-                let display_str = if ipv6_str.len() > 25 {
-                    format!("{}...", &ipv6_str[..22])
+                let display_str = if ipv6_str.len() > IPV6_DISPLAY_MAX_LENGTH {
+                    format!("{}...", &ipv6_str[..IPV6_TRUNCATE_LENGTH])
                 } else {
                     ipv6_str
                 };
@@ -125,11 +146,11 @@ impl DnsPane {
                 ]));
             }
             
-            if dns_result.AAAA.len() > 3 {
+            if dns_result.AAAA.len() > MAX_AAAA_RECORDS_DISPLAYED {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("... and {} more", dns_result.AAAA.len() - 3),
+                        format!("... and {} more", dns_result.AAAA.len() - MAX_AAAA_RECORDS_DISPLAYED),
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -147,18 +168,18 @@ impl DnsPane {
                 Span::styled(" records", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.MX.iter().take(4) {
-                let ttl_color = if record.ttl_remaining() > 300 {
+            for record in dns_result.MX.iter().take(MAX_MX_RECORDS_DISPLAYED) {
+                let ttl_color = if record.ttl_remaining() > TTL_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.ttl_remaining() > 60 {
+                } else if record.ttl_remaining() > TTL_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
                 };
                 
-                let priority_color = if record.value.priority <= 10 {
+                let priority_color = if record.value.priority <= MX_PRIORITY_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.value.priority <= 20 {
+                } else if record.value.priority <= MX_PRIORITY_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
@@ -184,11 +205,11 @@ impl DnsPane {
                 ]));
             }
             
-            if dns_result.MX.len() > 4 {
+            if dns_result.MX.len() > MAX_MX_RECORDS_DISPLAYED {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("... and {} more", dns_result.MX.len() - 4),
+                        format!("... and {} more", dns_result.MX.len() - MAX_MX_RECORDS_DISPLAYED),
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -206,19 +227,19 @@ impl DnsPane {
                 Span::styled(" records", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.TXT.iter().take(4) {
+            for record in dns_result.TXT.iter().take(MAX_TXT_RECORDS_DISPLAYED) {
                 let value = record.value.clone();
                 let display_value = if value.starts_with("google-site-verification") {
                     "google-site-verification=...".to_string()
                 } else if value.starts_with("MS=") {
-                    format!("MS={}...", &value[3..].chars().take(10).collect::<String>())
+                    format!("MS={}...", &value[MS_RECORD_PREFIX_LENGTH..].chars().take(MS_RECORD_PREVIEW_LENGTH).collect::<String>())
                 } else {
-                    Self::truncate_txt(&value, 45)
+                    Self::truncate_txt(&value, TXT_DISPLAY_MAX_LENGTH)
                 };
                 
-                let ttl_color = if record.ttl_remaining() > 300 {
+                let ttl_color = if record.ttl_remaining() > TTL_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.ttl_remaining() > 60 {
+                } else if record.ttl_remaining() > TTL_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
@@ -239,11 +260,11 @@ impl DnsPane {
                 ]));
             }
             
-            if dns_result.TXT.len() > 4 {
+            if dns_result.TXT.len() > MAX_TXT_RECORDS_DISPLAYED {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("... and {} more TXT records", dns_result.TXT.len() - 4),
+                        format!("... and {} more TXT records", dns_result.TXT.len() - MAX_TXT_RECORDS_DISPLAYED),
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -261,10 +282,10 @@ impl DnsPane {
                 Span::styled(" records", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.NS.iter().take(4) {
-                let ttl_color = if record.ttl_remaining() > 300 {
+            for record in dns_result.NS.iter().take(MAX_NS_RECORDS_DISPLAYED) {
+                let ttl_color = if record.ttl_remaining() > TTL_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.ttl_remaining() > 60 {
+                } else if record.ttl_remaining() > TTL_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
@@ -285,11 +306,11 @@ impl DnsPane {
                 ]));
             }
             
-            if dns_result.NS.len() > 4 {
+            if dns_result.NS.len() > MAX_NS_RECORDS_DISPLAYED {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("... and {} more", dns_result.NS.len() - 4),
+                        format!("... and {} more", dns_result.NS.len() - MAX_NS_RECORDS_DISPLAYED),
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
@@ -307,10 +328,10 @@ impl DnsPane {
                 Span::styled(" records", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.CNAME.iter().take(3) {
-                let ttl_color = if record.ttl_remaining() > 300 {
+            for record in dns_result.CNAME.iter().take(MAX_CNAME_RECORDS_DISPLAYED) {
+                let ttl_color = if record.ttl_remaining() > TTL_GOOD_THRESHOLD {
                     Color::Green
-                } else if record.ttl_remaining() > 60 {
+                } else if record.ttl_remaining() > TTL_WARNING_THRESHOLD {
                     Color::Yellow
                 } else {
                     Color::Red
@@ -343,7 +364,7 @@ impl DnsPane {
                 Span::styled(" cert auth", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.CAA.iter().take(3) {
+            for record in dns_result.CAA.iter().take(MAX_CAA_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
@@ -390,7 +411,7 @@ impl DnsPane {
                 Span::styled(" services", Style::default().fg(Color::White)),
             ]));
             
-            for record in dns_result.SRV.iter().take(3) {
+                            for record in dns_result.SRV.iter().take(MAX_SRV_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
@@ -515,7 +536,7 @@ impl Pane for DnsPane {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (25, 10) // Minimum width and height for DNS information
+        (MIN_DNS_PANE_WIDTH, MIN_DNS_PANE_HEIGHT) // Minimum width and height for DNS information
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -536,7 +557,7 @@ mod tests {
         let pane = DnsPane::new();
         assert_eq!(pane.title(), "dns");
         assert_eq!(pane.id(), "dns");
-        assert_eq!(pane.min_size(), (25, 10));
+        assert_eq!(pane.min_size(), (MIN_DNS_PANE_WIDTH, MIN_DNS_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

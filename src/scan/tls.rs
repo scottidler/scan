@@ -14,6 +14,12 @@ use tokio_rustls::TlsConnector;
 use webpki_roots;
 use log;
 
+const TLS_SCAN_INTERVAL_SECS: u64 = 300;
+const TLS_CONNECTION_TIMEOUT_SECS: u64 = 10;
+const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+const TLS_TOTAL_SCAN_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_HTTPS_PORT: u16 = 443;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TlsVersion {
     V1_0,
@@ -163,10 +169,10 @@ impl TlsScanner {
     pub fn new() -> Self {
         log::debug!("[scan::tls] new: interval=300s connection_timeout=10s handshake_timeout=5s");
         Self {
-            interval: Duration::from_secs(300), // TLS scans every 5 minutes
-            connection_timeout: Duration::from_secs(10),
-            handshake_timeout: Duration::from_secs(5),
-            total_scan_timeout: Duration::from_secs(30),
+            interval: Duration::from_secs(TLS_SCAN_INTERVAL_SECS), // TLS scans every 5 minutes
+            connection_timeout: Duration::from_secs(TLS_CONNECTION_TIMEOUT_SECS),
+            handshake_timeout: Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+            total_scan_timeout: Duration::from_secs(TLS_TOTAL_SCAN_TIMEOUT_SECS),
         }
     }
 
@@ -174,9 +180,9 @@ impl TlsScanner {
         let ports = if let Some(port) = target.port {
             vec![port]
         } else if target.scheme.as_deref() == Some("https") {
-            vec![443]
+            vec![DEFAULT_HTTPS_PORT]
         } else {
-            vec![443] // Default to HTTPS port
+            vec![DEFAULT_HTTPS_PORT] // Default to HTTPS port
         };
         
         log::debug!("[scan::tls] get_tls_ports: target={} ports={:?}", 

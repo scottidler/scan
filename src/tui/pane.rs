@@ -8,6 +8,11 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const DEFAULT_MIN_PANE_WIDTH: u16 = 20;
+const DEFAULT_MIN_PANE_HEIGHT: u16 = 6;
+const DEFAULT_SPAN_ROWS: usize = 1;
+const DEFAULT_SPAN_COLS: usize = 1;
+
 /// Trait for TUI panes that display scanner data
 pub trait Pane {
     /// Render the pane content to the given area
@@ -26,7 +31,7 @@ pub trait Pane {
     
     /// Get the pane's preferred minimum size (width, height)
     fn min_size(&self) -> (u16, u16) {
-        (20, 6)
+        (DEFAULT_MIN_PANE_WIDTH, DEFAULT_MIN_PANE_HEIGHT)
     }
     
     /// Whether this pane can be focused/selected
@@ -79,8 +84,8 @@ impl PaneConfig {
         log::trace!("[tui::pane] PaneConfig::new: row={} col={}", row, col);
         Self {
             position: PanePosition::new(row, col),
-            span_rows: 1,
-            span_cols: 1,
+            span_rows: DEFAULT_SPAN_ROWS,
+            span_cols: DEFAULT_SPAN_COLS,
             visible: true,
         }
     }

@@ -10,6 +10,16 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+const MAX_DISPLAYED_PORTS: usize = 5;
+const QUICK_SCAN_EXPECTED_PORTS: usize = 100;
+const STANDARD_SCAN_EXPECTED_PORTS: usize = 1000;
+const MAX_PROGRESS_PERCENT: f32 = 99.0;
+const SECONDS_THRESHOLD_FOR_MINUTES: u64 = 60;
+const MILLISECONDS_THRESHOLD_FOR_SECONDS: u128 = 1000;
+const MIN_PORTS_PANE_WIDTH: u16 = 25;
+const MIN_PORTS_PANE_HEIGHT: u16 = 10;
+const PORT_COUNT_WARNING_THRESHOLD: usize = 5;
+
 /// Ports pane displays port scanning results
 pub struct PortsPane {
     title: &'static str,
@@ -88,7 +98,7 @@ impl Pane for PortsPane {
                         
                         // Extract the data we need to avoid lifetime issues
                         let open_count = port_result.open_ports.len();
-                        let open_ports: Vec<_> = port_result.open_ports.iter().take(5).cloned().collect();
+                        let open_ports: Vec<_> = port_result.open_ports.iter().take(MAX_DISPLAYED_PORTS).cloned().collect();
                         let filtered_ports = port_result.filtered_ports;
                         let closed_ports = port_result.closed_ports;
                         let scan_duration_ms = port_result.scan_duration.as_millis();
@@ -97,12 +107,12 @@ impl Pane for PortsPane {
                         let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
                             // Estimate progress based on scan duration and typical port scan timing
                             let total_expected = match port_result.scan_mode {
-                                crate::scan::port::ScanMode::Quick => 100,
-                                crate::scan::port::ScanMode::Standard => 1000,
+                                crate::scan::port::ScanMode::Quick => QUICK_SCAN_EXPECTED_PORTS,
+                                crate::scan::port::ScanMode::Standard => STANDARD_SCAN_EXPECTED_PORTS,
                                 crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
                             };
                             let scanned_so_far = open_count + filtered_ports as usize + closed_ports as usize;
-                            let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0).min(99.0) as u32;
+                            let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0).min(MAX_PROGRESS_PERCENT) as u32;
                             Some((scanned_so_far, total_expected, progress_percent))
                         } else {
                             None
@@ -129,7 +139,7 @@ impl Pane for PortsPane {
                         // Open ports count with color coding
                         let port_color = if open_count == 0 {
                             Color::Green
-                        } else if open_count <= 5 {
+                        } else if open_count <= PORT_COUNT_WARNING_THRESHOLD {
                             Color::Yellow
                         } else {
                             Color::Red
@@ -146,7 +156,7 @@ impl Pane for PortsPane {
                         
                         // Show discovered open ports (up to 5)
                         for (idx, open_port) in open_ports.iter().enumerate() {
-                            if idx >= 5 { break; } // Limit display
+                            if idx >= MAX_DISPLAYED_PORTS { break; } // Limit display
                             
                             let service_name = open_port.service.as_ref()
                                 .map(|s| s.name.clone())
@@ -173,11 +183,11 @@ impl Pane for PortsPane {
                         }
                         
                         // Show "more" indicator if there are more open ports
-                        if open_count > 5 {
+                        if open_count > MAX_DISPLAYED_PORTS {
                             result_lines.push(Line::from(vec![
                                 Span::styled("  ", Style::default()),
                                 Span::styled(
-                                    format!("... and {} more", open_count - 5),
+                                    format!("... and {} more", open_count - MAX_DISPLAYED_PORTS),
                                     Style::default().fg(Color::Gray)
                                 ),
                             ]));
@@ -208,8 +218,8 @@ impl Pane for PortsPane {
                         result_lines.push(Line::from(vec![
                             Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
                             Span::styled(
-                                if scan_duration_ms > 1000 {
-                                    format!("{:.1}s", scan_duration_ms as f32 / 1000.0)
+                                if scan_duration_ms > MILLISECONDS_THRESHOLD_FOR_SECONDS {
+                                    format!("{:.1}s", scan_duration_ms as f32 / MILLISECONDS_THRESHOLD_FOR_SECONDS as f32)
                                 } else {
                                     format!("{}ms", scan_duration_ms)
                                 },
@@ -232,10 +242,10 @@ impl Pane for PortsPane {
                             crate::types::ScanStatus::Running => {
                                 // Show last updated time
                                 let seconds_ago = last_updated.elapsed().as_secs();
-                                let time_info = if seconds_ago < 60 {
+                                let time_info = if seconds_ago < SECONDS_THRESHOLD_FOR_MINUTES {
                                     format!("{}s ago", seconds_ago)
                                 } else {
-                                    format!("{}m ago", seconds_ago / 60)
+                                    format!("{}m ago", seconds_ago / SECONDS_THRESHOLD_FOR_MINUTES)
                                 };
                                 
                                 vec![
@@ -300,7 +310,7 @@ impl Pane for PortsPane {
     }
 
     fn min_size(&self) -> (u16, u16) {
-        (25, 10) // Minimum width and height for port information
+        (MIN_PORTS_PANE_WIDTH, MIN_PORTS_PANE_HEIGHT) // Minimum width and height for port information
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -321,7 +331,7 @@ mod tests {
         let pane = PortsPane::new();
         assert_eq!(pane.title(), "ports");
         assert_eq!(pane.id(), "ports");
-        assert_eq!(pane.min_size(), (25, 10));
+        assert_eq!(pane.min_size(), (MIN_PORTS_PANE_WIDTH, MIN_PORTS_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

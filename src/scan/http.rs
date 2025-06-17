@@ -9,6 +9,36 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use url::Url;
 
+const HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
+const HTTP_REDIRECT_LIMIT: usize = 10;
+const ASSUMED_REDIRECT_STATUS: u16 = 301;
+const HTTP_SCAN_INTERVAL_SECS: u64 = 300;
+const INITIAL_SECURITY_SCORE: i32 = 100;
+const HSTS_MISSING_PENALTY: i32 = 15;
+const FRAME_OPTIONS_MISSING_PENALTY: i32 = 10;
+const CONTENT_TYPE_OPTIONS_MISSING_PENALTY: i32 = 5;
+const XSS_PROTECTION_MISSING_PENALTY: i32 = 5;
+const CSP_MISSING_PENALTY: i32 = 20;
+const CSP_WEAK_PENALTY: i32 = 15;
+const CSP_MODERATE_PENALTY: i32 = 5;
+const CORS_DANGEROUS_PENALTY: i32 = 25;
+const CORS_WEAK_PENALTY: i32 = 10;
+const CORS_MODERATE_PENALTY: i32 = 5;
+const INSECURE_CORS_VULN_PENALTY: i32 = 20;
+const WEAK_CSP_VULN_PENALTY: i32 = 15;
+const MISSING_HSTS_VULN_PENALTY: i32 = 10;
+const OTHER_VULN_PENALTY: i32 = 5;
+const GRADE_A_PLUS_MIN: i32 = 90;
+const GRADE_A_MIN: i32 = 80;
+const GRADE_B_MIN: i32 = 70;
+const GRADE_C_MIN: i32 = 60;
+const GRADE_D_MIN: i32 = 50;
+const CSP_STRONG_MIN_DIRECTIVES: usize = 5;
+const CSP_MODERATE_MIN_DIRECTIVES: usize = 3;
+const CSP_MODERATE_MAX_ISSUES: usize = 2;
+const CORS_WEAK_MIN_ISSUES: usize = 2;
+const CORS_MODERATE_ISSUES: usize = 1;
+
 #[derive(Debug, Clone)]
 pub struct HttpScanner {
     client: Client,
@@ -25,10 +55,10 @@ impl HttpScanner {
     pub fn new() -> Self {
         log::debug!("[scan::http] new: timeout=10s");
         
-        let timeout = Duration::from_secs(10);
+        let timeout = Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS);
         let client = Client::builder()
             .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(reqwest::redirect::Policy::limited(HTTP_REDIRECT_LIMIT))
             .user_agent("scan/1.0")
             .build()
             .expect("Failed to create HTTP client");
@@ -181,7 +211,7 @@ impl HttpScanner {
         vec![RedirectInfo {
             from: original.to_string(),
             to: final_url.to_string(),
-            status_code: 301, // Assumption - would need to track actual codes
+            status_code: ASSUMED_REDIRECT_STATUS, // Assumption - would need to track actual codes
         }]
     }
 
@@ -286,9 +316,9 @@ impl HttpScanner {
             return CspStrength::None;
         }
         
-        if issue_count == 0 && directive_count >= 5 {
+        if issue_count == 0 && directive_count >= CSP_STRONG_MIN_DIRECTIVES {
             CspStrength::Strong
-        } else if issue_count <= 2 && directive_count >= 3 {
+        } else if issue_count <= CSP_MODERATE_MAX_ISSUES && directive_count >= CSP_MODERATE_MIN_DIRECTIVES {
             CspStrength::Moderate
         } else {
             CspStrength::Weak
@@ -385,9 +415,9 @@ impl HttpScanner {
             return CorsSecurityLevel::Dangerous;
         }
 
-        if issues.len() >= 2 {
+        if issues.len() >= CORS_WEAK_MIN_ISSUES {
             CorsSecurityLevel::Weak
-        } else if issues.len() == 1 {
+        } else if issues.len() == CORS_MODERATE_ISSUES {
             CorsSecurityLevel::Moderate
         } else {
             CorsSecurityLevel::Secure
@@ -460,29 +490,29 @@ impl HttpScanner {
         cors: &Option<CorsPolicy>,
         vulnerabilities: &[HttpVulnerability],
     ) -> SecurityGrade {
-        let mut score = 100;
+        let mut score = INITIAL_SECURITY_SCORE;
 
         // Deduct points for missing security headers
         if security_headers.strict_transport_security.is_none() {
-            score -= 15;
+            score -= HSTS_MISSING_PENALTY;
         }
         if security_headers.x_frame_options.is_none() {
-            score -= 10;
+            score -= FRAME_OPTIONS_MISSING_PENALTY;
         }
         if security_headers.x_content_type_options.is_none() {
-            score -= 5;
+            score -= CONTENT_TYPE_OPTIONS_MISSING_PENALTY;
         }
         if security_headers.x_xss_protection.is_none() {
-            score -= 5;
+            score -= XSS_PROTECTION_MISSING_PENALTY;
         }
 
         // CSP scoring
         match csp {
-            None => score -= 20,
+            None => score -= CSP_MISSING_PENALTY,
             Some(csp_policy) => match csp_policy.strength {
-                CspStrength::None => score -= 20,
-                CspStrength::Weak => score -= 15,
-                CspStrength::Moderate => score -= 5,
+                CspStrength::None => score -= CSP_MISSING_PENALTY,
+                CspStrength::Weak => score -= CSP_WEAK_PENALTY,
+                CspStrength::Moderate => score -= CSP_MODERATE_PENALTY,
                 CspStrength::Strong => {} // No deduction
             },
         }
@@ -490,9 +520,9 @@ impl HttpScanner {
         // CORS scoring
         if let Some(cors_policy) = cors {
             match cors_policy.security_level {
-                CorsSecurityLevel::Dangerous => score -= 25,
-                CorsSecurityLevel::Weak => score -= 10,
-                CorsSecurityLevel::Moderate => score -= 5,
+                CorsSecurityLevel::Dangerous => score -= CORS_DANGEROUS_PENALTY,
+                CorsSecurityLevel::Weak => score -= CORS_WEAK_PENALTY,
+                CorsSecurityLevel::Moderate => score -= CORS_MODERATE_PENALTY,
                 CorsSecurityLevel::Secure => {} // No deduction
             }
         }
@@ -500,19 +530,19 @@ impl HttpScanner {
         // Additional vulnerability penalties
         for vulnerability in vulnerabilities {
             match vulnerability {
-                HttpVulnerability::InsecureCors => score -= 20,
-                HttpVulnerability::WeakCsp => score -= 15,
-                HttpVulnerability::MissingHsts => score -= 10,
-                _ => score -= 5,
+                HttpVulnerability::InsecureCors => score -= INSECURE_CORS_VULN_PENALTY,
+                HttpVulnerability::WeakCsp => score -= WEAK_CSP_VULN_PENALTY,
+                HttpVulnerability::MissingHsts => score -= MISSING_HSTS_VULN_PENALTY,
+                _ => score -= OTHER_VULN_PENALTY,
             }
         }
 
         match score {
-            90..=100 => SecurityGrade::APlus,
-            80..=89 => SecurityGrade::A,
-            70..=79 => SecurityGrade::B,
-            60..=69 => SecurityGrade::C,
-            50..=59 => SecurityGrade::D,
+            s if s >= GRADE_A_PLUS_MIN => SecurityGrade::APlus,
+            s if s >= GRADE_A_MIN => SecurityGrade::A,
+            s if s >= GRADE_B_MIN => SecurityGrade::B,
+            s if s >= GRADE_C_MIN => SecurityGrade::C,
+            s if s >= GRADE_D_MIN => SecurityGrade::D,
             _ => SecurityGrade::F,
         }
     }
@@ -525,7 +555,7 @@ impl Scanner for HttpScanner {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(300) // 5 minutes
+        Duration::from_secs(HTTP_SCAN_INTERVAL_SECS) // 5 minutes
     }
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {

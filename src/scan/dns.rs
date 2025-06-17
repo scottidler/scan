@@ -8,6 +8,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 use log;
 
+const DNS_SCAN_INTERVAL_SECS: u64 = 60;
+const DNS_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_DNS_TTL: u32 = 300;
+
 #[derive(Debug, Clone)]
 pub struct DnsRecord<T> {
     pub value: T,
@@ -129,8 +133,8 @@ impl DnsScanner {
     pub fn new() -> Self {
         log::debug!("[scan::dns] new: interval=60s timeout=5s");
         Self {
-            interval: Duration::from_secs(60), // DNS lookups every 60 seconds
-            timeout: Duration::from_secs(5),
+            interval: Duration::from_secs(DNS_SCAN_INTERVAL_SECS), // DNS lookups every 60 seconds
+            timeout: Duration::from_secs(DNS_TIMEOUT_SECS),
         }
     }
 
@@ -217,7 +221,7 @@ impl DnsScanner {
                     for ip in response.iter() {
                         let ttl = response.as_lookup().records().first()
                             .map(|record| record.ttl())
-                            .unwrap_or(300);
+                            .unwrap_or(DEFAULT_DNS_TTL);
                         result.A.push(DnsRecord::new(ip.0, ttl));
                     }
                     log::trace!("[scan::dns] a_records_found: domain={} count={} duration={}ms", 
@@ -243,7 +247,7 @@ impl DnsScanner {
                     for ip in response.iter() {
                         let ttl = response.as_lookup().records().first()
                             .map(|record| record.ttl())
-                            .unwrap_or(300);
+                            .unwrap_or(DEFAULT_DNS_TTL);
                         result.AAAA.push(DnsRecord::new(ip.0, ttl));
                     }
                     log::trace!("[scan::dns] aaaa_records_found: domain={} count={} duration={}ms", 
@@ -266,7 +270,7 @@ impl DnsScanner {
                 for mx in response.iter() {
                     let ttl = response.as_lookup().records().first()
                         .map(|record| record.ttl())
-                        .unwrap_or(300);
+                        .unwrap_or(DEFAULT_DNS_TTL);
                     result.MX.push(DnsRecord::new(
                         MxRecord {
                             priority: mx.preference(),
@@ -282,7 +286,7 @@ impl DnsScanner {
                 for txt in response.iter() {
                     let ttl = response.as_lookup().records().first()
                         .map(|record| record.ttl())
-                        .unwrap_or(300);
+                        .unwrap_or(DEFAULT_DNS_TTL);
                     let txt_string = txt.iter()
                         .map(|bytes| String::from_utf8_lossy(bytes))
                         .collect::<Vec<_>>()
@@ -296,7 +300,7 @@ impl DnsScanner {
                 for ns in response.iter() {
                     let ttl = response.as_lookup().records().first()
                         .map(|record| record.ttl())
-                        .unwrap_or(300);
+                        .unwrap_or(DEFAULT_DNS_TTL);
                     result.NS.push(DnsRecord::new(ns.0.to_string(), ttl));
                 }
             }
@@ -369,7 +373,7 @@ impl DnsScanner {
                 for ptr in response.iter() {
                     let ttl = response.as_lookup().records().first()
                         .map(|record| record.ttl())
-                        .unwrap_or(300);
+                        .unwrap_or(DEFAULT_DNS_TTL);
                     result.PTR.push(DnsRecord::new(ptr.to_string(), ttl));
                 }
             }
@@ -477,7 +481,7 @@ mod tests {
     #[test]
     fn test_dns_scanner_creation() {
         let scanner = DnsScanner::new();
-        assert_eq!(scanner.interval(), Duration::from_secs(60));
+        assert_eq!(scanner.interval(), Duration::from_secs(DNS_SCAN_INTERVAL_SECS));
         assert_eq!(scanner.name(), "dns");
     }
 

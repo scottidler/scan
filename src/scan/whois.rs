@@ -11,6 +11,11 @@ use tokio::time::sleep;
 use whois_rust::{WhoIs, WhoIsLookupOptions};
 use log;
 
+const WHOIS_TIMEOUT_SECS: u64 = 30;
+const WHOIS_SCAN_INTERVAL_SECS: u64 = 60 * 60; // 1 hour
+const RECENT_REGISTRATION_THRESHOLD_DAYS: i64 = 30;
+const NEAR_EXPIRY_THRESHOLD_DAYS: i64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct WhoisScanner {
     client: Client,
@@ -26,10 +31,10 @@ impl Default for WhoisScanner {
 
 impl WhoisScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::whois] new: timeout=30s");
+        log::debug!("[scan::whois] new: timeout={}s", WHOIS_TIMEOUT_SECS);
         
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(WHOIS_TIMEOUT_SECS))
             .user_agent("scan/1.0")
             .build()
             .expect("Failed to create HTTP client");
@@ -44,7 +49,7 @@ impl WhoisScanner {
         Self {
             client,
             whois_client,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(WHOIS_TIMEOUT_SECS),
         }
     }
 
@@ -569,14 +574,14 @@ impl WhoisScanner {
 
         // Recent registration (< 30 days)
         if let Some(age_days) = result.domain_age_days {
-            if age_days < 30 {
+            if age_days < RECENT_REGISTRATION_THRESHOLD_DAYS {
                 indicators.push(RiskIndicator::RecentRegistration);
             }
         }
 
         // Near expiry (< 30 days)
         if let Some(expires_in) = result.expires_in_days {
-            if expires_in < 30 && expires_in > 0 {
+            if expires_in < NEAR_EXPIRY_THRESHOLD_DAYS && expires_in > 0 {
                 indicators.push(RiskIndicator::NearExpiry);
             }
         }
@@ -610,7 +615,7 @@ impl Scanner for WhoisScanner {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(3600) // 1 hour - WHOIS data changes infrequently
+        Duration::from_secs(WHOIS_SCAN_INTERVAL_SECS) // 1 hour - WHOIS data changes infrequently
     }
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
