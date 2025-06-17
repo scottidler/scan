@@ -135,9 +135,9 @@ impl GeoIpScanner {
 
     async fn perform_geoip_lookup(&self, target: &Target) -> Result<GeoIpResult> {
         log::debug!("[scan::geoip] perform_geoip_lookup: target={}", target.display_name());
-        
+
         let start_time = Instant::now();
-        
+
         // Get target IP
         let target_ip = if let Some(ip) = target.primary_ip() {
             ip
@@ -145,15 +145,15 @@ impl GeoIpScanner {
             log::error!("[scan::geoip] no_ip_available: target={}", target.display_name());
             return Err(eyre::eyre!("No IP address available for GeoIP lookup"));
         };
-        
+
         log::debug!("[scan::geoip] looking_up_ip: target={} ip={}", target.display_name(), target_ip);
-        
+
         let lookup_start = Instant::now();
         match self.service.lookup_ip(target_ip).await {
             Ok((location, network_info, data_source)) => {
                 let lookup_duration = lookup_start.elapsed();
                 let scan_duration = start_time.elapsed();
-                
+
                 let result = GeoIpResult {
                     target_ip,
                     location: location.clone(),
@@ -161,26 +161,26 @@ impl GeoIpScanner {
                     scan_duration,
                     data_source: data_source.clone(),
                 };
-                
-                log::trace!("[scan::geoip] geoip_lookup_completed: target={} ip={} duration={}ms source={} has_location={} has_network_info={}", 
-                    target.display_name(), target_ip, lookup_duration.as_millis(), data_source, 
+
+                log::trace!("[scan::geoip] geoip_lookup_completed: target={} ip={} duration={}ms source={} has_location={} has_network_info={}",
+                    target.display_name(), target_ip, lookup_duration.as_millis(), data_source,
                     location.is_some(), network_info.is_some());
-                
+
                 if let Some(loc) = &location {
-                    log::trace!("[scan::geoip] location_found: target={} country={} city={} lat={} lon={}", 
+                    log::trace!("[scan::geoip] location_found: target={} country={} city={} lat={} lon={}",
                         target.display_name(), loc.country, loc.city, loc.latitude, loc.longitude);
                 }
-                
+
                 if let Some(net) = &network_info {
-                    log::trace!("[scan::geoip] network_info_found: target={} isp={} org={} asn={:?}", 
+                    log::trace!("[scan::geoip] network_info_found: target={} isp={} org={} asn={:?}",
                         target.display_name(), net.isp, net.organization, net.asn);
                 }
-                
+
                 Ok(result)
             }
             Err(e) => {
                 let lookup_duration = lookup_start.elapsed();
-                log::error!("[scan::geoip] geoip_lookup_failed: target={} ip={} duration={}ms error={}", 
+                log::error!("[scan::geoip] geoip_lookup_failed: target={} ip={} duration={}ms error={}",
                     target.display_name(), target_ip, lookup_duration.as_millis(), e);
                 Err(e)
             }
@@ -244,7 +244,7 @@ impl GeoIpService {
         self.check_rate_limit(IP_API_RATE_LIMIT).await?;
 
         let url = format!("http://ip-api.com/json/{}?fields=status,country,countryCode,region,regionName,city,lat,lon,timezone,isp,org,as,query", ip);
-        
+
         let response = self.client
             .get(&url)
             .send()
@@ -300,7 +300,7 @@ impl GeoIpService {
         self.check_rate_limit(50).await?;
 
         let url = format!("https://ipinfo.io/{}/json", ip);
-        
+
         let response = self.client
             .get(&url)
             .send()
@@ -353,31 +353,31 @@ impl GeoIpService {
 
     async fn check_rate_limit(&self, max_per_minute: u32) -> Result<()> {
         let mut limiter = self.rate_limiter.write().await;
-        
+
         let now = Instant::now();
-        
+
         // Reset counter if a new minute has started
         if now.duration_since(limiter.minute_start) >= Duration::from_secs(RATE_LIMITER_WINDOW_SECS) {
             limiter.requests_this_minute = 0;
             limiter.minute_start = now;
         }
-        
+
         // Check if we're over the limit
         if limiter.requests_this_minute >= max_per_minute {
             let wait_time = Duration::from_secs(RATE_LIMITER_WINDOW_SECS) - now.duration_since(limiter.minute_start);
             return Err(eyre::eyre!("Rate limit exceeded, need to wait {:?}", wait_time));
         }
-        
+
         // Ensure minimum delay between requests (1 second)
         let time_since_last = now.duration_since(limiter.last_request);
         if time_since_last < Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) {
             let wait_time = Duration::from_secs(MIN_REQUEST_INTERVAL_SECS) - time_since_last;
             tokio::time::sleep(wait_time).await;
         }
-        
+
         limiter.requests_this_minute += 1;
         limiter.last_request = Instant::now();
-        
+
         Ok(())
     }
 
@@ -396,7 +396,7 @@ impl GeoIpService {
             cached_at: Instant::now(),
             ttl: Duration::from_secs(GEOIP_CACHE_TTL_SECS), // Cache for 24 hours
         });
-        
+
         // Limit cache size to prevent memory bloat
         if cache.len() > MAX_CACHE_SIZE {
             // Remove oldest entries (simple approach - in production might use LRU)
@@ -408,16 +408,16 @@ impl GeoIpService {
     // Public method for other scanners to use
     pub async fn lookup_multiple_ips(&self, ips: Vec<IpAddr>) -> HashMap<IpAddr, (Option<GeoLocation>, Option<NetworkInfo>, String)> {
         let mut results = HashMap::new();
-        
+
         for ip in ips {
             if let Ok((location, network_info, source)) = self.lookup_ip(ip).await {
                 results.insert(ip, (location, network_info, source));
             }
-            
+
             // Small delay between requests to be respectful
             tokio::time::sleep(Duration::from_millis(MULTI_IP_DELAY_MS)).await;
         }
-        
+
         results
     }
 }
@@ -428,7 +428,7 @@ fn parse_asn_info(asn_str: &str) -> Option<(Option<u32>, Option<String>)> {
     if let Some(space_pos) = asn_str.find(' ') {
         let asn_part = &asn_str[..space_pos];
         let name_part = &asn_str[space_pos + 1..];
-        
+
         if let Some(asn_num_str) = asn_part.strip_prefix("AS") {
             if let Ok(asn_num) = asn_num_str.parse::<u32>() {
                 return Some((Some(asn_num), Some(name_part.to_string())));
@@ -454,7 +454,7 @@ fn parse_org_info(org_str: &str) -> (Option<u32>, Option<String>) {
     if let Some(space_pos) = org_str.find(' ') {
         let asn_part = &org_str[..space_pos];
         let name_part = &org_str[space_pos + 1..];
-        
+
         if let Some(asn_num_str) = asn_part.strip_prefix("AS") {
             if let Ok(asn_num) = asn_num_str.parse::<u32>() {
                 return (Some(asn_num), Some(name_part.to_string()));
@@ -468,33 +468,33 @@ fn parse_org_info(org_str: &str) -> (Option<u32>, Option<String>) {
 impl Scanner for GeoIpScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
         log::debug!("[scan::geoip] scan: target={}", target.display_name());
-        
+
         let scan_start = Instant::now();
         match self.perform_geoip_lookup(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::geoip] geoip_scan_completed: target={} duration={}ms ip={} source={} has_location={} has_network_info={}", 
-                    target.display_name(), scan_duration.as_millis(), result.target_ip, 
+                log::trace!("[scan::geoip] geoip_scan_completed: target={} duration={}ms ip={} source={} has_location={} has_network_info={}",
+                    target.display_name(), scan_duration.as_millis(), result.target_ip,
                     result.data_source, result.location.is_some(), result.network_info.is_some());
                 Ok(ScanResult::GeoIp(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::geoip] geoip_scan_failed: target={} duration={}ms error={}", 
+                log::error!("[scan::geoip] geoip_scan_failed: target={} duration={}ms error={}",
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("GeoIP scan failed"))
             }
         }
     }
-    
+
     fn interval(&self) -> Duration {
         self.interval
     }
-    
+
     fn name(&self) -> &'static str {
         "geoip"
     }
-    
+
     async fn run(&self, target: Target, state: Arc<AppState>) {
         loop {
             // Update scan state to running
@@ -506,7 +506,7 @@ impl Scanner for GeoIpScanner {
                 history: Default::default(),
             };
             state.scanners.insert(self.name().to_string(), scan_state);
-            
+
             // Perform scan
             match self.scan(&target).await {
                 Ok(result) => {
@@ -515,7 +515,7 @@ impl Scanner for GeoIpScanner {
                     scan_state.error = None;
                     scan_state.status = ScanStatus::Complete;
                     scan_state.last_updated = Instant::now();
-                    
+
                     // Add to history
                     let timestamp = Instant::now();
                     let result_clone = scan_state.result.clone();
@@ -524,7 +524,7 @@ impl Scanner for GeoIpScanner {
                             timestamp,
                             result,
                         });
-                        
+
                         // Keep only last 10 results
                         while scan_state.history.len() > MAX_GEOIP_HISTORY {
                             scan_state.history.pop_front();
@@ -539,7 +539,7 @@ impl Scanner for GeoIpScanner {
                     scan_state.last_updated = Instant::now();
                 }
             }
-            
+
             // Wait for next scan
             sleep(self.interval()).await;
         }
@@ -550,69 +550,69 @@ impl Scanner for GeoIpScanner {
 mod tests {
     use super::*;
 
-    
+
     #[test]
     fn test_geoip_scanner_creation() {
         let scanner = GeoIpScanner::new();
         assert_eq!(scanner.name(), "geoip");
         assert_eq!(scanner.interval(), Duration::from_secs(10 * 60));
     }
-    
+
     #[test]
     fn test_parse_asn_info() {
         let (asn, name) = parse_asn_info("AS15169 Google LLC").unwrap();
         assert_eq!(asn, Some(15169));
         assert_eq!(name, Some("Google LLC".to_string()));
-        
+
         assert!(parse_asn_info("Invalid format").is_none());
     }
-    
+
     #[test]
     fn test_parse_coordinates() {
         let (lat, lon) = parse_coordinates("37.4056,-122.0775").unwrap();
         assert!((lat - 37.4056).abs() < 0.0001);
         assert!((lon - (-122.0775)).abs() < 0.0001);
-        
+
         assert!(parse_coordinates("invalid").is_none());
     }
-    
+
     #[test]
     fn test_parse_org_info() {
         let (asn, name) = parse_org_info("AS15169 Google LLC");
         assert_eq!(asn, Some(15169));
         assert_eq!(name, Some("Google LLC".to_string()));
-        
+
         let (asn2, name2) = parse_org_info("Some Organization");
         assert_eq!(asn2, None);
         assert_eq!(name2, Some("Some Organization".to_string()));
     }
-    
+
     #[tokio::test]
     async fn test_geoip_service_creation() {
         let service = GeoIpService::new();
         // Just test that it creates without panicking
         assert!(service.cache.read().await.is_empty());
     }
-    
+
     #[tokio::test]
     async fn test_rate_limiter() {
         let service = GeoIpService::new();
-        
+
         // First request should succeed
         assert!(service.check_rate_limit(2).await.is_ok());
-        
+
         // Second request should succeed
         assert!(service.check_rate_limit(2).await.is_ok());
-        
+
         // Third request should fail (over limit of 2)
         assert!(service.check_rate_limit(2).await.is_err());
     }
-    
+
     #[tokio::test]
     async fn test_geoip_scan_no_ip() {
         let scanner = GeoIpScanner::new();
         let target = Target::parse("nonexistent.invalid").unwrap();
-        
+
         // Should fail because no IP is resolved
         assert!(scanner.scan(&target).await.is_err());
     }
@@ -659,7 +659,7 @@ mod tests {
         assert!(parse_coordinates("37.4056,-122.0775").is_some());
         assert!(parse_coordinates("0.0,0.0").is_some());
         assert!(parse_coordinates("-90.0,180.0").is_some());
-        
+
         // Invalid coordinates
         assert!(parse_coordinates("invalid,coords").is_none());
         assert!(parse_coordinates("37.4056").is_none()); // Missing longitude
@@ -738,16 +738,16 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_edge_cases() {
         let service = GeoIpService::new();
-        
+
         // Test rate limiting with different limits
         assert!(service.check_rate_limit(10).await.is_ok());
         assert!(service.check_rate_limit(10).await.is_ok());
-        
+
         // Fill up the rate limit
         for _ in 0..8 {
             let _ = service.check_rate_limit(10).await;
         }
-        
+
         // Should now be rate limited
         assert!(service.check_rate_limit(10).await.is_err());
     }
@@ -756,7 +756,7 @@ mod tests {
     async fn test_cache_functionality() {
         let service = GeoIpService::new();
         let test_ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
-        
+
         // Cache a result
         service.cache_result(
             test_ip,
@@ -773,7 +773,7 @@ mod tests {
             None,
             "test".to_string(),
         ).await;
-        
+
         // Verify cache contains the entry
         let cache = service.cache.read().await;
         assert!(cache.contains_key(&test_ip));
@@ -786,10 +786,10 @@ mod tests {
             "8.8.8.8".parse().unwrap(),
             "1.1.1.1".parse().unwrap(),
         ];
-        
+
         let results = service.lookup_multiple_ips(ips).await;
-        
+
         // Should return results for both IPs (though they might be errors for test environment)
         assert_eq!(results.len(), 2);
     }
-} 
+}

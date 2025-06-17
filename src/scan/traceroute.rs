@@ -74,14 +74,14 @@ impl TracerouteScanner {
 
     async fn perform_traceroute(&self, target: &Target) -> Result<TracerouteResult> {
         log::debug!("[scan::traceroute] perform_traceroute: target={}", target.display_name());
-        
+
         let start_time = Instant::now();
-        
+
         // Determine target IP and whether to use IPv6
         let (target_ip, ipv6) = self.determine_target_ip(target)?;
-        log::debug!("[scan::traceroute] target_determined: target={} ip={} ipv6={}", 
+        log::debug!("[scan::traceroute] target_determined: target={} ip={} ipv6={}",
             target.display_name(), target_ip, ipv6);
-        
+
         // Build traceroute command
         let mut cmd = Command::new(if ipv6 { "traceroute6" } else { "traceroute" });
         cmd.args([
@@ -91,65 +91,65 @@ impl TracerouteScanner {
             "-q", &self.probes_per_hop.to_string(), // Probes per hop
             &target_ip.to_string(),
         ]);
-        
-        log::trace!("[scan::traceroute] executing_command: target={} cmd={:?}", 
+
+        log::trace!("[scan::traceroute] executing_command: target={} cmd={:?}",
             target.display_name(), cmd);
-        
+
         let command_start = Instant::now();
         let output = cmd.output().await
             .wrap_err("Failed to execute traceroute command")?;
         let command_duration = command_start.elapsed();
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("[scan::traceroute] command_failed: target={} duration={}ms status={} stderr={}", 
+            log::error!("[scan::traceroute] command_failed: target={} duration={}ms status={} stderr={}",
                 target.display_name(), command_duration.as_millis(), output.status, stderr.trim());
             return Err(eyre::eyre!("Traceroute command failed: {}", stderr));
         }
-        
+
         let stdout = String::from_utf8(output.stdout)
             .wrap_err("Invalid UTF-8 in traceroute output")?;
-        
-        log::trace!("[scan::traceroute] command_completed: target={} duration={}ms output_len={}", 
+
+        log::trace!("[scan::traceroute] command_completed: target={} duration={}ms output_len={}",
             target.display_name(), command_duration.as_millis(), stdout.len());
-        
+
         let parse_start = Instant::now();
         let result = self.parse_traceroute_output(&stdout, target_ip, ipv6, start_time.elapsed())?;
         let parse_duration = parse_start.elapsed();
-        
-        log::debug!("[scan::traceroute] traceroute_completed: target={} duration={}ms parse_duration={}μs hops={} destination_reached={}", 
-            target.display_name(), result.scan_duration.as_millis(), parse_duration.as_micros(), 
+
+        log::debug!("[scan::traceroute] traceroute_completed: target={} duration={}ms parse_duration={}μs hops={} destination_reached={}",
+            target.display_name(), result.scan_duration.as_millis(), parse_duration.as_micros(),
             result.hops.len(), result.destination_reached);
-        
+
         if !result.hops.is_empty() {
             let hop_summary: Vec<String> = result.hops.iter().take(HOP_SUMMARY_DISPLAY_COUNT).map(|h| {
-                format!("{}:{:.1}ms", h.hop_number, 
+                format!("{}:{:.1}ms", h.hop_number,
                     h.best_rtt.map(|d| d.as_millis() as f32).unwrap_or(-1.0))
             }).collect();
-            log::trace!("[scan::traceroute] hop_summary: target={} first_5_hops=[{}]", 
+            log::trace!("[scan::traceroute] hop_summary: target={} first_5_hops=[{}]",
                 target.display_name(), hop_summary.join(", "));
         }
-        
+
         Ok(result)
     }
-    
+
     fn determine_target_ip(&self, target: &Target) -> Result<(IpAddr, bool)> {
         // Get primary IP from target
         if let Some(ip) = target.primary_ip() {
             let use_ipv6 = ip.is_ipv6();
             return Ok((ip, use_ipv6));
         }
-        
+
         // If no resolved IP, try to use the domain directly
         if let Some(domain) = &target.domain {
             // For now, default to IPv4. In a real implementation, we might
             // want to check if the domain has AAAA records first
             return Err(eyre::eyre!("No resolved IP available for domain: {}", domain));
         }
-        
+
         Err(eyre::eyre!("No valid target IP found"))
     }
-    
+
     fn parse_traceroute_output(
         &self,
         output: &str,
@@ -160,19 +160,19 @@ impl TracerouteScanner {
         let mut hops = Vec::new();
         let mut destination_reached = false;
         let mut total_hops = 0;
-        
+
         for line in output.lines() {
             let line = line.trim();
-            
+
             // Skip header line
             if line.starts_with("traceroute to") {
                 continue;
             }
-            
+
             // Parse hop line
             if let Some(hop) = self.parse_hop_line(line)? {
                 total_hops = hop.hop_number;
-                
+
                 // Check if this hop reached the destination
                 if let Some(response) = hop.responses.first() {
                     if let Some(ip) = response.ip_address {
@@ -181,11 +181,11 @@ impl TracerouteScanner {
                         }
                     }
                 }
-                
+
                 hops.push(hop);
             }
         }
-        
+
         Ok(TracerouteResult {
             hops,
             destination_reached,
@@ -196,27 +196,27 @@ impl TracerouteScanner {
             ipv6,
         })
     }
-    
+
     fn parse_hop_line(&self, line: &str) -> Result<Option<TracerouteHop>> {
         // Skip empty lines
         if line.is_empty() {
             return Ok(None);
         }
-        
+
         // Parse hop number at the start of the line
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() {
             return Ok(None);
         }
-        
+
         let hop_number = match parts[0].parse::<u8>() {
             Ok(num) => num,
             Err(_) => return Ok(None), // Not a hop line
         };
-        
+
         let mut responses = Vec::new();
         let mut i = 1;
-        
+
         // Parse responses for this hop
         while i < parts.len() {
             if parts[i] == "*" {
@@ -231,45 +231,45 @@ impl TracerouteScanner {
                 // Response with IP and RTT: "192.168.1.1 2.345 ms"
                 let ip_str = parts[i];
                 let rtt_str = parts[i + 1];
-                
+
                 let ip_address = ip_str.parse::<IpAddr>().ok();
                 let rtt = rtt_str.parse::<f64>().ok()
                     .map(|ms| Duration::from_micros((ms * MS_TO_MICROSECONDS_MULTIPLIER) as u64));
-                
+
                 responses.push(HopResponse {
                     ip_address,
                     rtt,
                     timeout: false,
                 });
-                
+
                 i += 3; // Skip IP, RTT, "ms"
             } else if i + 1 < parts.len() && parts[i + 1] == "ms" {
                 // Additional RTT for same IP: "2.345 ms"
                 let rtt_str = parts[i];
                 let rtt = rtt_str.parse::<f64>().ok()
                     .map(|ms| Duration::from_micros((ms * MS_TO_MICROSECONDS_MULTIPLIER) as u64));
-                
+
                 // Use the same IP as the previous response
                 let ip_address = responses.last()
                     .and_then(|r| r.ip_address);
-                
+
                 responses.push(HopResponse {
                     ip_address,
                     rtt,
                     timeout: false,
                 });
-                
+
                 i += 2; // Skip RTT, "ms"
             } else {
                 i += 1; // Skip unknown token
             }
         }
-        
+
         // Calculate statistics
         let rtts: Vec<Duration> = responses.iter()
             .filter_map(|r| r.rtt)
             .collect();
-        
+
         let best_rtt = rtts.iter().min().copied();
         let worst_rtt = rtts.iter().max().copied();
         let avg_rtt = if !rtts.is_empty() {
@@ -278,13 +278,13 @@ impl TracerouteScanner {
         } else {
             None
         };
-        
+
         let packet_loss = if responses.is_empty() {
             FULL_PACKET_LOSS
         } else {
             responses.iter().filter(|r| r.timeout).count() as f32 / responses.len() as f32
         };
-        
+
         Ok(Some(TracerouteHop {
             hop_number,
             responses,
@@ -300,33 +300,33 @@ impl TracerouteScanner {
 impl Scanner for TracerouteScanner {
     async fn scan(&self, target: &Target) -> Result<ScanResult> {
         log::debug!("[scan::traceroute] scan: target={}", target.display_name());
-        
+
         let scan_start = Instant::now();
         match self.perform_traceroute(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::traceroute] traceroute_scan_completed: target={} duration={}ms hops={} destination_reached={}", 
-                    target.display_name(), scan_duration.as_millis(), 
+                log::trace!("[scan::traceroute] traceroute_scan_completed: target={} duration={}ms hops={} destination_reached={}",
+                    target.display_name(), scan_duration.as_millis(),
                     result.hops.len(), result.destination_reached);
                 Ok(ScanResult::Traceroute(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::traceroute] traceroute_scan_failed: target={} duration={}ms error={}", 
+                log::error!("[scan::traceroute] traceroute_scan_failed: target={} duration={}ms error={}",
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("Traceroute scan failed"))
             }
         }
     }
-    
+
     fn interval(&self) -> Duration {
         self.interval
     }
-    
+
     fn name(&self) -> &'static str {
         "traceroute"
     }
-    
+
     async fn run(&self, target: Target, state: Arc<AppState>) {
         loop {
             // Update scan state to running
@@ -338,7 +338,7 @@ impl Scanner for TracerouteScanner {
                 history: Default::default(),
             };
             state.scanners.insert(self.name().to_string(), scan_state);
-            
+
             // Perform scan
             let _start_time = Instant::now();
             match self.scan(&target).await {
@@ -348,7 +348,7 @@ impl Scanner for TracerouteScanner {
                     scan_state.error = None;
                     scan_state.status = ScanStatus::Complete;
                     scan_state.last_updated = Instant::now();
-                    
+
                     // Add to history
                     let timestamp = Instant::now();
                     let result_clone = scan_state.result.clone();
@@ -357,7 +357,7 @@ impl Scanner for TracerouteScanner {
                             timestamp,
                             result,
                         });
-                        
+
                         // Keep only last 10 results
                         while scan_state.history.len() > MAX_TRACEROUTE_HISTORY {
                             scan_state.history.pop_front();
@@ -372,7 +372,7 @@ impl Scanner for TracerouteScanner {
                     scan_state.last_updated = Instant::now();
                 }
             }
-            
+
             // Wait for next scan
             sleep(self.interval()).await;
         }
@@ -383,7 +383,7 @@ impl Scanner for TracerouteScanner {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    
+
     #[test]
     fn test_traceroute_scanner_creation() {
         let scanner = TracerouteScanner::new();
@@ -391,110 +391,110 @@ mod tests {
         assert_eq!(scanner.max_hops, MAX_TRACEROUTE_HOPS);
         assert_eq!(scanner.probes_per_hop, PROBES_PER_HOP);
     }
-    
+
     #[test]
     fn test_parse_hop_line_with_responses() {
         let scanner = TracerouteScanner::new();
         let line = " 1  192.168.10.1  2.390 ms  2.250 ms  2.203 ms";
-        
+
         let hop = scanner.parse_hop_line(line).unwrap().unwrap();
         assert_eq!(hop.hop_number, 1);
         assert_eq!(hop.responses.len(), 3);
-        
+
         // Check first response
         let response = &hop.responses[0];
         assert_eq!(response.ip_address, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 1))));
         assert!(!response.timeout);
         assert!(response.rtt.is_some());
-        
+
         // Check statistics
         assert!(hop.best_rtt.is_some());
         assert!(hop.avg_rtt.is_some());
         assert!(hop.worst_rtt.is_some());
         assert_eq!(hop.packet_loss, 0.0);
     }
-    
+
     #[test]
     fn test_parse_hop_line_with_timeouts() {
         let scanner = TracerouteScanner::new();
         let line = " 3  * * *";
-        
+
         let hop = scanner.parse_hop_line(line).unwrap().unwrap();
         assert_eq!(hop.hop_number, 3);
         assert_eq!(hop.responses.len(), 3);
-        
+
         // All responses should be timeouts
         for response in &hop.responses {
             assert!(response.timeout);
             assert!(response.ip_address.is_none());
             assert!(response.rtt.is_none());
         }
-        
+
         assert_eq!(hop.packet_loss, 1.0);
         assert!(hop.best_rtt.is_none());
     }
-    
+
     #[test]
     fn test_parse_hop_line_mixed_responses() {
         let scanner = TracerouteScanner::new();
         let line = " 2  192.168.7.1  4.929 ms  * 8.298 ms";
-        
+
         let hop = scanner.parse_hop_line(line).unwrap().unwrap();
         assert_eq!(hop.hop_number, 2);
         assert_eq!(hop.responses.len(), 3);
-        
+
         // First response should have IP and RTT
         assert_eq!(hop.responses[0].ip_address, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 7, 1))));
         assert!(!hop.responses[0].timeout);
-        
+
         // Second response should be timeout
         assert!(hop.responses[1].timeout);
-        
+
         // Third response should have RTT (same IP as first)
         assert!(!hop.responses[2].timeout);
         assert!(hop.responses[2].rtt.is_some());
-        
+
         // Packet loss should be 1/3
         assert!((hop.packet_loss - 0.333).abs() < 0.01);
     }
-    
+
     #[test]
     fn test_parse_ipv6_hop() {
         let scanner = TracerouteScanner::new();
         let line = " 1  2001:db8::1  15.234 ms  14.567 ms  16.123 ms";
-        
+
         let hop = scanner.parse_hop_line(line).unwrap().unwrap();
         assert_eq!(hop.hop_number, 1);
-        
+
         let expected_ip = "2001:db8::1".parse::<IpAddr>().unwrap();
         assert_eq!(hop.responses[0].ip_address, Some(expected_ip));
     }
-    
+
     #[test]
     fn test_parse_invalid_hop_line() {
         let scanner = TracerouteScanner::new();
-        
+
         // Empty line
         assert!(scanner.parse_hop_line("").unwrap().is_none());
-        
+
         // Header line
         assert!(scanner.parse_hop_line("traceroute to 8.8.8.8 (8.8.8.8), 30 hops max").unwrap().is_none());
-        
+
         // Invalid format
         assert!(scanner.parse_hop_line("not a hop line").unwrap().is_none());
     }
-    
+
     #[tokio::test]
     async fn test_traceroute_scan_localhost() {
         let scanner = TracerouteScanner::new();
         let target = Target::parse("127.0.0.1").unwrap();
-        
+
         // This test requires traceroute to be installed
         // Skip if not available
         if std::process::Command::new("which").arg("traceroute").output().is_err() {
             return;
         }
-        
+
         match scanner.scan(&target).await {
             Ok(ScanResult::Traceroute(result)) => {
                 assert!(!result.hops.is_empty());
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_parse_hop_line_complex_cases() {
         let scanner = TracerouteScanner::new();
-        
+
         // Test hop with hostname resolution - this might not parse correctly depending on implementation
         let hostname_line = " 1  router.local (192.168.1.1)  2.390 ms  2.250 ms  2.203 ms";
         if let Ok(Some(hop)) = scanner.parse_hop_line(hostname_line) {
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn test_parse_hop_line_error_conditions() {
         let scanner = TracerouteScanner::new();
-        
+
         // Test line without hop number
         let no_hop_line = "invalid line without hop number";
         assert!(scanner.parse_hop_line(no_hop_line).unwrap().is_none());
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn test_traceroute_scanner_defaults() {
         let scanner = TracerouteScanner::default();
-        
+
         assert_eq!(scanner.name(), "traceroute");
         assert_eq!(scanner.max_hops, 20); // Actual constant value
         assert_eq!(scanner.probes_per_hop, 3);
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn test_traceroute_scanner_custom_config() {
         let scanner = TracerouteScanner::new();
-        
+
         assert_eq!(scanner.interval(), Duration::from_secs(120)); // 2 minutes (actual value)
         assert_eq!(scanner.max_hops, 20); // Actual constant value
         assert_eq!(scanner.probes_per_hop, 3);
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_target_ip_determination() {
         let scanner = TracerouteScanner::new();
-        
+
         // Test IPv4 target
         let ipv4_target = Target::parse("8.8.8.8").unwrap();
         let (ip, is_ipv6) = scanner.determine_target_ip(&ipv4_target).unwrap();
@@ -674,23 +674,23 @@ mod tests {
         }
     }
 
-    #[test] 
+    #[test]
     fn test_packet_loss_calculation() {
         let scanner = TracerouteScanner::new();
-        
+
         // Test 100% packet loss
         let all_timeout_line = " 5  * * *";
         let timeout_hop = scanner.parse_hop_line(all_timeout_line).unwrap().unwrap();
         assert_eq!(timeout_hop.packet_loss, 1.0);
-        
+
         // Test 33% packet loss (1 out of 3)
         let partial_timeout_line = " 6  192.168.1.1  5.0 ms * 7.5 ms";
         let partial_hop = scanner.parse_hop_line(partial_timeout_line).unwrap().unwrap();
         assert!((partial_hop.packet_loss - 0.333).abs() < 0.01);
-        
+
         // Test 0% packet loss
         let no_timeout_line = " 7  192.168.1.1  5.0 ms  6.0 ms  7.0 ms";
         let success_hop = scanner.parse_hop_line(no_timeout_line).unwrap().unwrap();
         assert_eq!(success_hop.packet_loss, 0.0);
     }
-} 
+}

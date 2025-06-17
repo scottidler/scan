@@ -28,9 +28,9 @@ pub struct PingScanner {
 
 impl PingScanner {
     pub fn new(interval: Duration, timeout: Duration, packet_count: u8) -> Self {
-        log::debug!("[scan::ping] new: interval={}ms timeout={}ms packet_count={}", 
+        log::debug!("[scan::ping] new: interval={}ms timeout={}ms packet_count={}",
             interval.as_millis(), timeout.as_millis(), packet_count);
-        
+
         Self {
             interval,
             timeout,
@@ -54,28 +54,28 @@ impl Scanner for PingScanner {
     fn name(&self) -> &'static str {
         "ping"
     }
-    
+
     fn interval(&self) -> Duration {
         self.interval
     }
-    
+
     async fn scan(&self, target: &Target) -> Result<ScanResult, eyre::Error> {
         log::debug!("[scan::ping] scan: target={}", target.display_name());
-        
+
         let ping_target = target.network_target();
         log::debug!("[scan::ping] network_target: {}", ping_target);
-        
+
         let scan_start = Instant::now();
         match self.do_ping(&ping_target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::ping] ping_completed: target={} duration={}ms latency={}ms ttl={:?}", 
+                log::trace!("[scan::ping] ping_completed: target={} duration={}ms latency={}ms ttl={:?}",
                     ping_target, scan_duration.as_millis(), result.latency.as_millis(), result.ttl);
                 Ok(ScanResult::Ping(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::ping] ping_failed: target={} duration={}ms error={}", 
+                log::error!("[scan::ping] ping_failed: target={} duration={}ms error={}",
                     ping_target, scan_duration.as_millis(), e);
                 Err(e.wrap_err(format!("Failed to ping target: {}", target.display_name())))
             }
@@ -85,9 +85,9 @@ impl Scanner for PingScanner {
 
 impl PingScanner {
     async fn do_ping(&self, target: &str) -> Result<PingResult> {
-        log::debug!("[scan::ping] do_ping: target={} packet_count={} timeout={}ms", 
+        log::debug!("[scan::ping] do_ping: target={} packet_count={} timeout={}ms",
             target, self.packet_count, self.timeout.as_millis());
-        
+
         let ping_start = Instant::now();
         let output = Command::new("ping")
             .args([
@@ -97,71 +97,71 @@ impl PingScanner {
             ])
             .output()
             .await;
-        
+
         let command_duration = ping_start.elapsed();
-        
+
         let output = match output {
             Ok(out) => {
-                log::trace!("[scan::ping] ping_command_completed: target={} duration={}ms status={}", 
+                log::trace!("[scan::ping] ping_command_completed: target={} duration={}ms status={}",
                     target, command_duration.as_millis(), out.status);
                 out
             }
             Err(e) => {
-                log::error!("[scan::ping] ping_command_failed: target={} duration={}ms error={}", 
+                log::error!("[scan::ping] ping_command_failed: target={} duration={}ms error={}",
                     target, command_duration.as_millis(), e);
                 return Err(e).wrap_err("Failed to execute ping command");
             }
         };
-            
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("[scan::ping] ping_command_unsuccessful: target={} status={} stderr={}", 
+            log::error!("[scan::ping] ping_command_unsuccessful: target={} status={} stderr={}",
                 target, output.status, stderr.trim());
             eyre::bail!("Ping failed for target: {}", target);
         }
-        
+
         let stdout = match String::from_utf8(output.stdout) {
             Ok(s) => {
-                log::trace!("[scan::ping] ping_output_decoded: target={} output_len={}", 
+                log::trace!("[scan::ping] ping_output_decoded: target={} output_len={}",
                     target, s.len());
                 s
             }
             Err(e) => {
-                log::error!("[scan::ping] ping_output_decode_failed: target={} error={}", 
+                log::error!("[scan::ping] ping_output_decode_failed: target={} error={}",
                     target, e);
                 return Err(e).wrap_err("Invalid UTF-8 in ping output");
             }
         };
-        
+
         let parse_start = Instant::now();
         match self.parse_ping_output(&stdout) {
             Ok(result) => {
                 let parse_duration = parse_start.elapsed();
-                log::trace!("[scan::ping] ping_output_parsed: target={} parse_duration={}μs latency={}ms", 
+                log::trace!("[scan::ping] ping_output_parsed: target={} parse_duration={}μs latency={}ms",
                     target, parse_duration.as_micros(), result.latency.as_millis());
                 Ok(result)
             }
             Err(e) => {
                 let parse_duration = parse_start.elapsed();
-                log::error!("[scan::ping] ping_output_parse_failed: target={} parse_duration={}μs error={}", 
+                log::error!("[scan::ping] ping_output_parse_failed: target={} parse_duration={}μs error={}",
                     target, parse_duration.as_micros(), e);
                 log::trace!("[scan::ping] ping_output_content: target={} stdout={}", target, stdout);
                 Err(e.wrap_err("Failed to parse ping output"))
             }
         }
     }
-    
+
     fn parse_ping_output(&self, output: &str) -> Result<PingResult> {
         log::debug!("[scan::ping] parse_ping_output: output_len={}", output.len());
-        
+
         // Parse ping output line like: "64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=15.2 ms"
         for (line_num, line) in output.lines().enumerate() {
             if line.contains("time=") {
                 log::trace!("[scan::ping] found_timing_line: line_num={} content={}", line_num, line);
-                
+
                 let mut latency = None;
                 let mut ttl = None;
-                
+
                 // Parse latency
                 if let Some(time_part) = line.split("time=").nth(1) {
                     if let Some(time_str) = time_part.split_whitespace().next() {
@@ -176,7 +176,7 @@ impl PingScanner {
                         }
                     }
                 }
-                
+
                 // Parse TTL
                 if let Some(ttl_part) = line.split("ttl=").nth(1) {
                     if let Some(ttl_str) = ttl_part.split_whitespace().next() {
@@ -191,7 +191,7 @@ impl PingScanner {
                         }
                     }
                 }
-                
+
                 if let Some(latency) = latency {
                     let result = PingResult {
                         latency,
@@ -200,15 +200,15 @@ impl PingScanner {
                         packets_sent: self.packet_count as u32,
                         packets_received: SIMPLIFIED_PACKETS_RECEIVED, // Simplified
                     };
-                    
-                    log::debug!("[scan::ping] parse_successful: latency={}ms ttl={:?} packets_sent={}", 
+
+                    log::debug!("[scan::ping] parse_successful: latency={}ms ttl={:?} packets_sent={}",
                         result.latency.as_millis(), result.ttl, result.packets_sent);
-                    
+
                     return Ok(result);
                 }
             }
         }
-        
+
         log::error!("[scan::ping] no_timing_info_found: output_lines={}", output.lines().count());
         eyre::bail!("Could not find timing information in ping output");
     }
@@ -217,12 +217,12 @@ impl PingScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_ping_output() {
         let scanner = PingScanner::default();
         let output = "PING google.com (142.250.80.238) 56(84) bytes of data.\n64 bytes from lga25s62-in-f14.1e100.net (142.250.80.238): icmp_seq=1 ttl=118 time=15.2 ms\n\n--- google.com ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 0ms\nrtt min/avg/max/mdev = 15.210/15.210/15.210/0.000 ms";
-        
+
         let result = scanner.parse_ping_output(output).unwrap();
         assert_eq!(result.latency, Duration::from_millis(15));
         assert_eq!(result.ttl, Some(118));
@@ -263,10 +263,10 @@ mod tests {
     #[test]
     fn test_parse_ping_output_variations() {
         let scanner = PingScanner::default();
-        
+
         // Test IPv6 ping output
         let ipv6_output = "PING google.com(2607:f8b0:4004:c1b::71) 56 data bytes\n64 bytes from 2607:f8b0:4004:c1b::71: icmp_seq=1 ttl=118 time=12.3 ms\n\n--- google.com ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 0ms";
-        
+
         let ipv6_result = scanner.parse_ping_output(ipv6_output).unwrap();
         assert_eq!(ipv6_result.latency, Duration::from_millis(12));
         assert_eq!(ipv6_result.ttl, Some(118));
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn test_parse_ping_output_edge_cases() {
         let scanner = PingScanner::default();
-        
+
         // Test output with no timing information
         let no_time_output = "PING google.com (142.250.80.238) 56(84) bytes of data.\n--- google.com ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss, time 1000ms";
         assert!(scanner.parse_ping_output(no_time_output).is_err());
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn test_ping_scanner_defaults() {
         let default_scanner = PingScanner::default();
-        
+
         assert_eq!(default_scanner.interval(), Duration::from_secs(1));
         assert_eq!(default_scanner.timeout, Duration::from_secs(5));
         assert_eq!(default_scanner.packet_count, 1);
@@ -318,10 +318,10 @@ mod tests {
         );
 
         let target = Target::parse("192.0.2.1").unwrap(); // RFC5737 test IP (should not respond)
-        
+
         // Should handle timeout gracefully
         let result = timeout_scanner.scan(&target).await;
-        
+
         match result {
             Ok(_) => {
                 // Unlikely but possible if system responds very quickly
@@ -336,9 +336,9 @@ mod tests {
     async fn test_ping_localhost() {
         let scanner = PingScanner::default();
         let target = Target::parse("127.0.0.1").unwrap();
-        
+
         let result = scanner.scan(&target).await;
-        
+
         match result {
             Ok(ScanResult::Ping(ping_result)) => {
                 // Localhost should respond quickly
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn test_ping_output_parsing_robustness() {
         let scanner = PingScanner::default();
-        
+
         // Test with extra whitespace
         let whitespace_output = "  64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=15.2 ms  ";
         let result = scanner.parse_ping_output(whitespace_output).unwrap();
@@ -375,4 +375,4 @@ mod tests {
         assert_eq!(no_ttl_result.latency, Duration::from_millis(15));
         assert!(no_ttl_result.ttl.is_none());
     }
-} 
+}

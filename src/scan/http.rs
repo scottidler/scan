@@ -54,7 +54,7 @@ impl Default for HttpScanner {
 impl HttpScanner {
     pub fn new() -> Self {
         log::debug!("[scan::http] new: timeout=10s");
-        
+
         let timeout = Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS);
         let client = Client::builder()
             .timeout(timeout)
@@ -75,9 +75,9 @@ impl HttpScanner {
 
     async fn scan_http(&self, target: &Target) -> eyre::Result<HttpResult> {
         log::debug!("[scan::http] scan_http: target={}", target.display_name());
-        
+
         let scan_start = Instant::now();
-        
+
         // Determine URL to scan
         let url = match &target.target_type {
             crate::target::TargetType::Url(url) => url.to_string(),
@@ -86,14 +86,14 @@ impl HttpScanner {
                 let domain = target.display_name();
                 let https_url = format!("https://{}", domain);
                 let http_url = format!("http://{}", domain);
-                
+
                 log::debug!("[scan::http] trying_https_first: url={}", https_url);
-                
+
                 // Try HTTPS first
                 match self.perform_scan(&https_url).await {
                     Ok(mut result) => {
                         result.scan_duration = scan_start.elapsed();
-                        log::trace!("[scan::http] https_scan_successful: url={} status={} duration={}ms", 
+                        log::trace!("[scan::http] https_scan_successful: url={} status={} duration={}ms",
                             https_url, result.status_code, result.scan_duration.as_millis());
                         return Ok(result);
                     }
@@ -103,7 +103,7 @@ impl HttpScanner {
                         match self.perform_scan(&http_url).await {
                             Ok(mut result) => {
                                 result.scan_duration = scan_start.elapsed();
-                                log::trace!("[scan::http] http_scan_successful: url={} status={} duration={}ms", 
+                                log::trace!("[scan::http] http_scan_successful: url={} status={} duration={}ms",
                                     http_url, result.status_code, result.scan_duration.as_millis());
                                 return Ok(result);
                             }
@@ -119,29 +119,29 @@ impl HttpScanner {
 
         let mut result = self.perform_scan(&url).await?;
         result.scan_duration = scan_start.elapsed();
-        
-        log::debug!("[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}", 
+
+        log::debug!("[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}",
             url, result.status_code, result.scan_duration.as_millis(), result.security_grade);
-        
+
         Ok(result)
     }
 
     async fn perform_scan(&self, url: &str) -> eyre::Result<HttpResult> {
         log::debug!("[scan::http] perform_scan: url={}", url);
-        
+
         let start_time = Instant::now();
         let original_url = Url::parse(url)?;
-        
+
         log::trace!("[scan::http] sending_request: url={}", url);
         let request_start = Instant::now();
         let response = self.client.get(url).send().await?;
         let request_duration = request_start.elapsed();
-        
+
         let status_code = response.status().as_u16();
         let final_url = response.url().clone();
         let headers = response.headers().clone();
-        
-        log::trace!("[scan::http] response_received: url={} status={} request_duration={}ms final_url={}", 
+
+        log::trace!("[scan::http] response_received: url={} status={} request_duration={}ms final_url={}",
             url, status_code, request_duration.as_millis(), final_url);
 
         // Analyze redirects
@@ -153,8 +153,8 @@ impl HttpScanner {
         let body = response.bytes().await?;
         let body_duration = body_start.elapsed();
         let content_length = body.len();
-        
-        log::trace!("[scan::http] body_received: url={} content_length={} body_duration={}ms", 
+
+        log::trace!("[scan::http] body_received: url={} content_length={} body_duration={}ms",
             url, content_length, body_duration.as_millis());
 
         // Extract content type
@@ -166,17 +166,17 @@ impl HttpScanner {
         // Security analysis
         log::debug!("[scan::http] security_analysis_starting: url={}", url);
         let security_start = Instant::now();
-        
+
         let security_headers = self.analyze_security_headers(&headers);
         let csp = self.analyze_csp(&headers);
         let cors = self.analyze_cors(&headers);
         let caching = self.analyze_caching(&headers);
-        
+
         let vulnerabilities = self.assess_vulnerabilities(&security_headers, &csp, &cors);
         let security_grade = self.calculate_security_grade(&security_headers, &csp, &cors, &vulnerabilities);
-        
+
         let security_duration = security_start.elapsed();
-        log::trace!("[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}", 
+        log::trace!("[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}",
             url, security_duration.as_micros(), security_grade, vulnerabilities.len());
 
         let result = HttpResult {
@@ -195,7 +195,7 @@ impl HttpScanner {
             scan_duration: start_time.elapsed(),
         };
 
-        log::debug!("[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}", 
+        log::debug!("[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}",
             result.url, result.status_code, result.content_length, result.security_grade);
 
         Ok(result)
@@ -264,20 +264,20 @@ impl HttpScanner {
 
     fn parse_csp_directives(&self, csp: &str) -> HashMap<String, Vec<String>> {
         let mut directives = HashMap::new();
-        
+
         for directive in csp.split(';') {
             let directive = directive.trim();
             if directive.is_empty() {
                 continue;
             }
-            
+
             let parts: Vec<&str> = directive.split_whitespace().collect();
             if let Some(name) = parts.first() {
                 let values = parts[1..].iter().map(|s| s.to_string()).collect();
                 directives.insert(name.to_string(), values);
             }
         }
-        
+
         directives
     }
 
@@ -311,11 +311,11 @@ impl HttpScanner {
     fn calculate_csp_strength(&self, directives: &HashMap<String, Vec<String>>, issues: &[CspIssue]) -> CspStrength {
         let directive_count = directives.len();
         let issue_count = issues.len();
-        
+
         if directive_count == 0 {
             return CspStrength::None;
         }
-        
+
         if issue_count == 0 && directive_count >= CSP_STRONG_MIN_DIRECTIVES {
             CspStrength::Strong
         } else if issue_count <= CSP_MODERATE_MAX_ISSUES && directive_count >= CSP_MODERATE_MIN_DIRECTIVES {
@@ -560,19 +560,19 @@ impl Scanner for HttpScanner {
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
         log::debug!("[scan::http] scan: target={}", target.display_name());
-        
+
         let scan_start = Instant::now();
         match self.scan_http(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::http] http_scan_completed: target={} duration={}ms status={} grade={:?} vulnerabilities={}", 
-                    target.display_name(), scan_duration.as_millis(), result.status_code, 
+                log::trace!("[scan::http] http_scan_completed: target={} duration={}ms status={} grade={:?} vulnerabilities={}",
+                    target.display_name(), scan_duration.as_millis(), result.status_code,
                     result.security_grade, result.vulnerabilities.len());
                 Ok(ScanResult::Http(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::http] http_scan_failed: target={} duration={}ms error={}", 
+                log::error!("[scan::http] http_scan_failed: target={} duration={}ms error={}",
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e)
             }
@@ -582,7 +582,7 @@ impl Scanner for HttpScanner {
     async fn run(&self, target: Target, state: Arc<AppState>) {
         loop {
             let scan_start = Instant::now();
-            
+
             match self.scan_http(&target).await {
                 Ok(result) => {
                     let scan_state = ScanState {
@@ -742,7 +742,7 @@ mod tests {
         let scanner = HttpScanner::new();
         let csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; object-src 'none'";
         let directives = scanner.parse_csp_directives(csp);
-        
+
         assert_eq!(directives.get("default-src"), Some(&vec!["'self'".to_string()]));
         assert_eq!(directives.get("script-src"), Some(&vec!["'self'".to_string(), "'unsafe-inline'".to_string()]));
         assert_eq!(directives.get("object-src"), Some(&vec!["'none'".to_string()]));
@@ -754,9 +754,9 @@ mod tests {
         let mut directives = HashMap::new();
         directives.insert("script-src".to_string(), vec!["'self'".to_string(), "'unsafe-inline'".to_string()]);
         directives.insert("style-src".to_string(), vec!["*".to_string()]);
-        
+
         let issues = scanner.analyze_csp_issues(&directives);
-        
+
         assert!(issues.iter().any(|i| matches!(i, CspIssue::UnsafeInline(_))));
         assert!(issues.iter().any(|i| matches!(i, CspIssue::WildcardSource(_))));
     }
@@ -768,9 +768,9 @@ mod tests {
         let methods = vec!["GET".to_string(), "POST".to_string()];
         let headers = vec!["*".to_string()];
         let credentials = true;
-        
+
         let issues = scanner.analyze_cors_issues(&origin, &methods, &headers, credentials);
-        
+
         assert!(issues.iter().any(|i| matches!(i, CorsIssue::WildcardWithCredentials)));
         assert!(issues.iter().any(|i| matches!(i, CorsIssue::WildcardHeaders)));
     }
@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn test_security_grade_calculation() {
         let scanner = HttpScanner::new();
-        
+
         // Perfect security headers
         let security_headers = SecurityHeaders {
             strict_transport_security: Some("max-age=31536000".to_string()),
@@ -788,17 +788,17 @@ mod tests {
             referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
             permissions_policy: Some("geolocation=()".to_string()),
         };
-        
+
         let csp = Some(CspPolicy {
             header_value: "default-src 'self'".to_string(),
             directives: HashMap::new(),
             issues: vec![],
             strength: CspStrength::Strong,
         });
-        
+
         let cors = None;
         let vulnerabilities = vec![];
-        
+
         let grade = scanner.calculate_security_grade(&security_headers, &csp, &cors, &vulnerabilities);
         assert!(matches!(grade, SecurityGrade::APlus));
     }
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn test_vulnerability_assessment() {
         let scanner = HttpScanner::new();
-        
+
         let security_headers = SecurityHeaders {
             strict_transport_security: None,
             x_frame_options: None,
@@ -815,7 +815,7 @@ mod tests {
             referrer_policy: None,
             permissions_policy: None,
         };
-        
+
         let csp = None;
         let cors = Some(CorsPolicy {
             access_control_allow_origin: Some("*".to_string()),
@@ -825,9 +825,9 @@ mod tests {
             issues: vec![CorsIssue::WildcardWithCredentials],
             security_level: CorsSecurityLevel::Dangerous,
         });
-        
+
         let vulnerabilities = scanner.assess_vulnerabilities(&security_headers, &csp, &cors);
-        
+
         assert!(vulnerabilities.contains(&HttpVulnerability::MissingHsts));
         assert!(vulnerabilities.contains(&HttpVulnerability::MissingXFrameOptions));
         assert!(vulnerabilities.contains(&HttpVulnerability::MissingCsp));
@@ -837,26 +837,26 @@ mod tests {
     #[test]
     fn test_csp_strength_calculation() {
         let scanner = HttpScanner::new();
-        
+
         // Strong CSP
         let mut strong_directives = HashMap::new();
         strong_directives.insert("default-src".to_string(), vec!["'self'".to_string()]);
         strong_directives.insert("script-src".to_string(), vec!["'self'".to_string()]);
         strong_directives.insert("object-src".to_string(), vec!["'none'".to_string()]);
-        
+
         let strong_issues = vec![];
         let strength = scanner.calculate_csp_strength(&strong_directives, &strong_issues);
         // The implementation might be more conservative - accept Moderate or Strong
         assert!(matches!(strength, CspStrength::Strong | CspStrength::Moderate));
-        
+
         // Weak CSP with unsafe-inline
         let mut weak_directives = HashMap::new();
         weak_directives.insert("script-src".to_string(), vec!["'self'".to_string(), "'unsafe-inline'".to_string()]);
-        
+
         let weak_issues = vec![CspIssue::UnsafeInline("script-src".to_string())];
         let weakness = scanner.calculate_csp_strength(&weak_directives, &weak_issues);
         assert_eq!(weakness, CspStrength::Weak);
-        
+
         // No CSP
         let empty_directives = HashMap::new();
         let no_issues = vec![];
@@ -867,17 +867,17 @@ mod tests {
     #[test]
     fn test_cors_security_levels() {
         let scanner = HttpScanner::new();
-        
+
         // Secure CORS
         let secure_issues = vec![];
         let secure_level = scanner.calculate_cors_security(&Some("https://example.com".to_string()), &secure_issues);
         assert_eq!(secure_level, CorsSecurityLevel::Secure);
-        
+
         // Dangerous CORS
         let dangerous_issues = vec![CorsIssue::WildcardWithCredentials];
         let dangerous_level = scanner.calculate_cors_security(&Some("*".to_string()), &dangerous_issues);
         assert_eq!(dangerous_level, CorsSecurityLevel::Dangerous);
-        
+
         // Weak CORS
         let weak_issues = vec![CorsIssue::WildcardOrigin];
         let weak_level = scanner.calculate_cors_security(&Some("*".to_string()), &weak_issues);
@@ -889,7 +889,7 @@ mod tests {
     fn test_security_header_parsing() {
         let scanner = HttpScanner::new();
         let mut headers = reqwest::header::HeaderMap::new();
-        
+
         // Add security headers
         headers.insert("strict-transport-security", "max-age=31536000; includeSubDomains".parse().unwrap());
         headers.insert("x-frame-options", "DENY".parse().unwrap());
@@ -897,16 +897,16 @@ mod tests {
         headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
         headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().unwrap());
         headers.insert("permissions-policy", "geolocation=(), camera=()".parse().unwrap());
-        
+
         let security_headers = scanner.analyze_security_headers(&headers);
-        
+
         assert!(security_headers.strict_transport_security.is_some());
         assert!(security_headers.x_frame_options.is_some());
         assert!(security_headers.x_content_type_options.is_some());
         assert!(security_headers.x_xss_protection.is_some());
         assert!(security_headers.referrer_policy.is_some());
         assert!(security_headers.permissions_policy.is_some());
-        
+
         assert_eq!(security_headers.x_frame_options.as_ref().unwrap(), "DENY");
         assert_eq!(security_headers.x_content_type_options.as_ref().unwrap(), "nosniff");
     }
@@ -915,19 +915,19 @@ mod tests {
     fn test_caching_policy_analysis() {
         let scanner = HttpScanner::new();
         let mut headers = reqwest::header::HeaderMap::new();
-        
+
         headers.insert("cache-control", "max-age=3600, public".parse().unwrap());
         headers.insert("expires", "Wed, 21 Oct 2025 07:28:00 GMT".parse().unwrap());
         headers.insert("etag", "\"abc123\"".parse().unwrap());
         headers.insert("last-modified", "Wed, 21 Oct 2020 07:28:00 GMT".parse().unwrap());
-        
+
         let caching = scanner.analyze_caching(&headers);
-        
+
         assert!(caching.cache_control.is_some());
         assert!(caching.expires.is_some());
         assert!(caching.etag.is_some());
         assert!(caching.last_modified.is_some());
-        
+
         assert_eq!(caching.cache_control.as_ref().unwrap(), "max-age=3600, public");
         assert_eq!(caching.etag.as_ref().unwrap(), "\"abc123\"");
     }
@@ -939,7 +939,7 @@ mod tests {
             to: "https://example.com".to_string(),
             status_code: 301,
         };
-        
+
         assert_eq!(redirect.from, "http://example.com");
         assert_eq!(redirect.to, "https://example.com");
         assert_eq!(redirect.status_code, 301);
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn test_security_grade_edge_cases() {
         let scanner = HttpScanner::new();
-        
+
         // Perfect security should get A+
         let perfect_headers = SecurityHeaders {
             strict_transport_security: Some("max-age=31536000; includeSubDomains; preload".to_string()),
@@ -958,18 +958,18 @@ mod tests {
             referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
             permissions_policy: Some("geolocation=(), camera=()".to_string()),
         };
-        
+
         let perfect_csp = Some(CspPolicy {
             header_value: "default-src 'self'; script-src 'self'; object-src 'none'".to_string(),
             directives: HashMap::new(),
             issues: vec![],
             strength: CspStrength::Strong,
         });
-        
+
         let no_vulnerabilities = vec![];
         let grade = scanner.calculate_security_grade(&perfect_headers, &perfect_csp, &None, &no_vulnerabilities);
         assert_eq!(grade, SecurityGrade::APlus);
-        
+
         // Terrible security should get F
         let terrible_headers = SecurityHeaders {
             strict_transport_security: None,
@@ -979,14 +979,14 @@ mod tests {
             referrer_policy: None,
             permissions_policy: None,
         };
-        
+
         let many_vulnerabilities = vec![
             HttpVulnerability::MissingHsts,
             HttpVulnerability::MissingXFrameOptions,
             HttpVulnerability::MissingCsp,
             HttpVulnerability::InsecureCors,
         ];
-        
+
         let bad_grade = scanner.calculate_security_grade(&terrible_headers, &None, &None, &many_vulnerabilities);
         assert_eq!(bad_grade, SecurityGrade::F);
     }
@@ -995,12 +995,12 @@ mod tests {
     async fn test_http_scanner_timeout() {
         // Test that the scanner respects timeouts
         let short_timeout_scanner = HttpScanner::new();
-        
+
         // Test with a very slow/non-responsive target
         let target = Target::parse("httpbin.org:12345").unwrap(); // Non-standard port likely to timeout
-        
+
         let result = short_timeout_scanner.scan(&target).await;
-        
+
         // Should either succeed or fail, but not hang indefinitely
         match result {
             Ok(_) => {
@@ -1011,4 +1011,4 @@ mod tests {
             }
         }
     }
-} 
+}

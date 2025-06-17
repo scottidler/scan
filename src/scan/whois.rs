@@ -32,7 +32,7 @@ impl Default for WhoisScanner {
 impl WhoisScanner {
     pub fn new() -> Self {
         log::debug!("[scan::whois] new: timeout={}s", WHOIS_TIMEOUT_SECS);
-        
+
         let client = Client::builder()
             .timeout(Duration::from_secs(WHOIS_TIMEOUT_SECS))
             .user_agent("scan/1.0")
@@ -55,7 +55,7 @@ impl WhoisScanner {
 
     async fn scan_whois(&self, target: &Target) -> eyre::Result<WhoisResult> {
         log::debug!("[scan::whois] scan_whois: target={}", target.display_name());
-        
+
         let domain = match &target.domain {
             Some(d) => d.clone(),
             None => {
@@ -63,9 +63,9 @@ impl WhoisScanner {
                 return Err(eyre::eyre!("No domain available for WHOIS lookup"));
             }
         };
-        
+
         log::debug!("[scan::whois] querying_domain: domain={}", domain);
-        
+
         // Try RDAP first (modern protocol)
         log::trace!("[scan::whois] trying_rdap: domain={}", domain);
         let rdap_start = Instant::now();
@@ -73,17 +73,17 @@ impl WhoisScanner {
             Ok(mut result) => {
                 let rdap_duration = rdap_start.elapsed();
                 result.data_source = DataSource::Rdap;
-                log::trace!("[scan::whois] rdap_successful: domain={} duration={}ms", 
+                log::trace!("[scan::whois] rdap_successful: domain={} duration={}ms",
                     domain, rdap_duration.as_millis());
                 return Ok(result);
             }
             Err(e) => {
                 let rdap_duration = rdap_start.elapsed();
-                log::debug!("[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={}", 
+                log::debug!("[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={}",
                     domain, rdap_duration.as_millis(), e);
             }
         }
-        
+
         // Fall back to traditional WHOIS
         log::trace!("[scan::whois] trying_traditional_whois: domain={}", domain);
         let whois_start = Instant::now();
@@ -91,15 +91,15 @@ impl WhoisScanner {
             Ok(mut result) => {
                 let whois_duration = whois_start.elapsed();
                 result.data_source = DataSource::Whois;
-                log::trace!("[scan::whois] whois_successful: domain={} duration={}ms", 
+                log::trace!("[scan::whois] whois_successful: domain={} duration={}ms",
                     domain, whois_duration.as_millis());
                 Ok(result)
             }
             Err(e) => {
                 let whois_duration = whois_start.elapsed();
-                log::error!("[scan::whois] both_methods_failed: domain={} whois_duration={}ms error={}", 
+                log::error!("[scan::whois] both_methods_failed: domain={} whois_duration={}ms error={}",
                     domain, whois_duration.as_millis(), e);
-                
+
                 // Return a failed result rather than error
                 let mut result = WhoisResult {
                     domain: domain.clone(),
@@ -122,7 +122,7 @@ impl WhoisScanner {
                     scan_duration: Duration::from_millis(0),
                     raw_data: None,
                 };
-                
+
                 self.calculate_derived_fields(&mut result);
                 Ok(result)
             }
@@ -132,9 +132,9 @@ impl WhoisScanner {
     async fn query_rdap(&self, domain: &str) -> eyre::Result<WhoisResult> {
         let start_time = Instant::now();
         let tld = domain.split('.').last().unwrap_or("");
-        
+
         let rdap_url = self.get_rdap_endpoint(tld, domain);
-        
+
         let response = self.client
             .get(&rdap_url)
             .timeout(self.timeout)
@@ -151,10 +151,10 @@ impl WhoisScanner {
 
     async fn query_traditional_whois(&self, domain: &str) -> eyre::Result<WhoisResult> {
         let start_time = Instant::now();
-        
+
         let lookup_options = WhoIsLookupOptions::from_string(domain)?;
         let whois_text = self.whois_client.lookup(lookup_options)?;
-        
+
         self.parse_whois_text(domain, &whois_text, start_time.elapsed()).await
     }
 
@@ -620,26 +620,26 @@ impl Scanner for WhoisScanner {
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
         log::debug!("[scan::whois] scan: target={}", target.display_name());
-        
+
         let scan_start = Instant::now();
         match self.scan_whois(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::whois] whois_scan_completed: target={} duration={}ms source={:?} privacy={:?} risks={}", 
-                    target.display_name(), scan_duration.as_millis(), result.data_source, 
+                log::trace!("[scan::whois] whois_scan_completed: target={} duration={}ms source={:?} privacy={:?} risks={}",
+                    target.display_name(), scan_duration.as_millis(), result.data_source,
                     result.privacy_score, result.risk_indicators.len());
-                
+
                 if let Some(reg_date) = result.registration_date {
-                    log::trace!("[scan::whois] domain_info: target={} registered={} age_days={:?} expires_in_days={:?}", 
-                        target.display_name(), reg_date.format("%Y-%m-%d"), 
+                    log::trace!("[scan::whois] domain_info: target={} registered={} age_days={:?} expires_in_days={:?}",
+                        target.display_name(), reg_date.format("%Y-%m-%d"),
                         result.domain_age_days, result.expires_in_days);
                 }
-                
+
                 Ok(ScanResult::Whois(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::whois] whois_scan_failed: target={} duration={}ms error={}", 
+                log::error!("[scan::whois] whois_scan_failed: target={} duration={}ms error={}",
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e)
             }
@@ -649,7 +649,7 @@ impl Scanner for WhoisScanner {
     async fn run(&self, target: Target, state: Arc<AppState>) {
         loop {
             let scan_start = Instant::now();
-            
+
             match self.scan_whois(&target).await {
                 Ok(result) => {
                     let scan_state = ScanState {
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn test_privacy_level_assessment() {
         let scanner = WhoisScanner::new();
-        
+
         // Test open privacy (has contact info)
         let mut result = WhoisResult {
             domain: "test.com".to_string(),
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn test_risk_indicators() {
         let scanner = WhoisScanner::new();
-        
+
         let result = WhoisResult {
             domain: "test.com".to_string(),
             registration_date: Some(Utc::now() - chrono::Duration::days(15)), // Recent registration
@@ -853,7 +853,7 @@ mod tests {
         };
 
         let indicators = scanner.identify_risk_indicators(&result);
-        
+
         assert!(indicators.contains(&RiskIndicator::RecentRegistration));
         assert!(indicators.contains(&RiskIndicator::NearExpiry));
         assert!(indicators.contains(&RiskIndicator::NoAbuseContact));
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn test_rdap_endpoint_selection() {
         let scanner = WhoisScanner::new();
-        
+
         assert!(scanner.get_rdap_endpoint("com", "example.com").contains("verisign"));
         assert!(scanner.get_rdap_endpoint("org", "example.org").contains("publicinterestregistry"));
         assert!(scanner.get_rdap_endpoint("tv", "example.tv").contains("nic.tv"));
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn test_whois_date_parsing() {
         let scanner = WhoisScanner::new();
-        
+
         // Test various date formats
         assert!(scanner.parse_whois_date("2023-01-15T10:30:00Z").is_some());
         assert!(scanner.parse_whois_date("2023-01-15 10:30:00").is_some());
@@ -885,13 +885,13 @@ mod tests {
     #[tokio::test]
     async fn test_get_rdap_endpoint() {
         let scanner = WhoisScanner::new();
-        
+
         let com_endpoint = scanner.get_rdap_endpoint("com", "google.com");
         assert!(com_endpoint.contains("verisign.com"));
-        
+
         let tv_endpoint = scanner.get_rdap_endpoint("tv", "example.tv");
         assert!(tv_endpoint.contains("nic.tv"));
-        
+
         let unknown_endpoint = scanner.get_rdap_endpoint("unknown", "example.unknown");
         assert!(unknown_endpoint.contains("iana.org"));
     }
@@ -998,7 +998,7 @@ mod tests {
     #[test]
     fn test_comprehensive_risk_indicators() {
         let scanner = WhoisScanner::new();
-        
+
         // Create a result with multiple risk factors
         let result = WhoisResult {
             domain: "suspicious.com".to_string(),
@@ -1028,7 +1028,7 @@ mod tests {
         };
 
         let indicators = scanner.identify_risk_indicators(&result);
-        
+
         assert!(indicators.contains(&RiskIndicator::RecentRegistration));
         assert!(indicators.contains(&RiskIndicator::NearExpiry));
         assert!(indicators.contains(&RiskIndicator::NoAbuseContact));
@@ -1038,7 +1038,7 @@ mod tests {
     #[test]
     fn test_whois_date_parsing_formats() {
         let scanner = WhoisScanner::new();
-        
+
         // Test various common date formats
         let test_dates = vec![
             "2023-01-15T10:30:00Z",           // ISO 8601 with Z
@@ -1078,9 +1078,9 @@ mod tests {
     async fn test_whois_scanner_timeout() {
         let scanner = WhoisScanner::new();
         let target = Target::parse("nonexistent-domain-12345.test").unwrap();
-        
+
         let result = scanner.scan(&target).await;
-        
+
         // Should handle timeout gracefully
         match result {
             Ok(ScanResult::Whois(whois_result)) => {
@@ -1096,7 +1096,7 @@ mod tests {
     #[test]
     fn test_privacy_level_edge_cases() {
         let scanner = WhoisScanner::new();
-        
+
         // Test with mixed information
         let mixed_result = WhoisResult {
             domain: "mixed.com".to_string(),
@@ -1135,8 +1135,8 @@ mod tests {
         };
 
         let privacy_level = scanner.assess_privacy_level(&mixed_result);
-        
+
         // Should handle mixed privacy information gracefully
         assert!(matches!(privacy_level, PrivacyLevel::Protected | PrivacyLevel::Corporate));
     }
-} 
+}

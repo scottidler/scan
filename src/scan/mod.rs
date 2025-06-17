@@ -27,7 +27,7 @@ const PING_SCANNER_RETRY_COUNT: u8 = 3;
 
 pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
     log::debug!("[scan] create_default_scanners: creating scanner instances");
-    
+
     let scanners: Vec<Box<dyn Scanner + Send + Sync>> = vec![
         Box::new(PingScanner::new(Duration::from_secs(PING_SCANNER_INTERVAL_SECS), Duration::from_secs(PING_SCANNER_TIMEOUT_SECS), PING_SCANNER_RETRY_COUNT)),
         Box::new(DnsScanner::new()),
@@ -38,7 +38,7 @@ pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
         Box::new(GeoIpScanner::new()),
         Box::new(PortScanner::new()),
     ];
-    
+
     log::debug!("[scan] scanners_created: count={}", scanners.len());
     scanners
 }
@@ -48,22 +48,22 @@ pub async fn spawn_scanner_tasks(
     target: Target,
     state: Arc<crate::types::AppState>,
 ) {
-    log::debug!("[scan] spawn_scanner_tasks: scanner_count={} target={}", 
+    log::debug!("[scan] spawn_scanner_tasks: scanner_count={} target={}",
         scanners.len(), target.display_name());
-    
+
     for scanner in scanners {
         let scanner_name = scanner.name();
         let target_clone = target.clone();
         let state_clone = state.clone();
-        
+
         log::debug!("[scan] spawning_scanner_task: scanner={}", scanner_name);
-        
+
         tokio::spawn(async move {
             log::debug!("[scan] scanner_task_started: scanner={}", scanner_name);
             scanner.run(target_clone, state_clone).await;
             log::debug!("[scan] scanner_task_ended: scanner={}", scanner_name);
         });
     }
-    
+
     log::debug!("[scan] all_scanner_tasks_spawned:");
-} 
+}
