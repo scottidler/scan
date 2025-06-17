@@ -196,6 +196,9 @@ impl TlsScanner {
 
         let start_time = Instant::now();
 
+        // Install default crypto provider if not already installed
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Create rustls config with system root certificates
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
