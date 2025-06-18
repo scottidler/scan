@@ -1,10 +1,12 @@
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::time::Instant;
+use crate::target::Protocol;
 
 pub struct AppState {
     pub target: String,
     pub scanners: DashMap<String, ScanState>,
+    pub protocol: Protocol,
 }
 
 impl AppState {
@@ -12,7 +14,22 @@ impl AppState {
         Self {
             target,
             scanners: DashMap::new(),
+            protocol: Protocol::Both, // Default to scanning both IPv4 and IPv6
         }
+    }
+
+    /// Switch to the next protocol in the cycle: Both -> Ipv4 -> Ipv6 -> Both
+    pub fn cycle_protocol(&mut self) {
+        self.protocol = match self.protocol {
+            Protocol::Both => Protocol::Ipv4,
+            Protocol::Ipv4 => Protocol::Ipv6,
+            Protocol::Ipv6 => Protocol::Both,
+        };
+    }
+
+    /// Get the current protocol as a display string
+    pub fn protocol_display(&self) -> &'static str {
+        self.protocol.as_str()
     }
 }
 

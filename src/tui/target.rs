@@ -101,6 +101,16 @@ impl Pane for TargetPane {
             Span::styled(&state.target, Style::default().fg(Color::White)),
         ]));
 
+        // Protocol information
+        lines.push(Line::from(vec![
+            Span::styled("🔗 ", Style::default().fg(Color::Magenta)),
+            Span::styled("Protocol: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{} (Press 'p' to cycle)", state.protocol_display()),
+                Style::default().fg(Color::Cyan)
+            ),
+        ]));
+
         // Show resolved IP information from DNS scanner
         match state.scanners.get("dns") {
             Some(dns_state) => {
@@ -238,6 +248,7 @@ impl Pane for TargetPane {
 mod tests {
     use super::*;
     use crate::types::{ScanState, ScanStatus};
+    use crate::target::Protocol;
     use dashmap::DashMap;
     use std::time::Instant;
 
@@ -280,6 +291,7 @@ mod tests {
         let state = AppState {
             target: "example.com".to_string(),
             scanners: DashMap::new(),
+            protocol: Protocol::Both,
         };
 
         // Add some test scanner states

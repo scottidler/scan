@@ -1,6 +1,6 @@
 use clap::Parser;
 use eyre::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration, Instant};
 
 const DEBUG_REFRESH_INTERVAL_SECS: u64 = 5;
@@ -54,16 +54,19 @@ async fn main() -> Result<()> {
         println!("Resolved to: {}", ip);
     }
 
-    // Create shared application state
-    let state = Arc::new(scan::types::AppState::new(args.target.clone()));
+    // Create shared application state (wrapped in Mutex for protocol changes)
+    let state = Arc::new(Mutex::new(scan::types::AppState::new(args.target.clone())));
     log::debug!("[main] app_state_created: target={}", args.target);
 
-    // Create and start all scanners with default protocol (Both)
+    // Create and start all scanners using the protocol from app state
     let scanners = scan::scan::create_default_scanners();
     log::debug!("[main] scanners_created: count={}", scanners.len());
 
-    // Use default Protocol::Both for now - this will be user-configurable later
-    let protocol = scan::target::Protocol::Both;
+    // Use the protocol from app state (defaults to Both, but user can change it)
+    let protocol = {
+        let state_guard = state.lock().unwrap();
+        state_guard.protocol
+    };
     scan::scan::spawn_scanner_tasks(scanners, target.clone(), protocol, Arc::clone(&state)).await;
     log::debug!("[main] all_scanners_started: protocol={}", protocol.as_str());
 
@@ -85,11 +88,14 @@ async fn main() -> Result<()> {
             println!("────────────────────────────────────────────────────────────────────────────────");
 
             // Print scanner results using the pretty print function
-            for scanner_state in state.scanners.iter() {
-                let scanner_name = scanner_state.key();
-                let scan_state = scanner_state.value();
+            {
+                let state_guard = state.lock().unwrap();
+                for scanner_state in state_guard.scanners.iter() {
+                    let scanner_name = scanner_state.key();
+                    let scan_state = scanner_state.value();
 
-                scan::pretty::print_scan_state(scanner_name, &scan_state);
+                    scan::pretty::print_scan_state(scanner_name, &scan_state);
+                }
             }
 
             println!("────────────────────────────────────────────────────────────────────────────────");

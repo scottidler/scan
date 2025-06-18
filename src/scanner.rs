@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use eyre::Result;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::types::{AppState, ScanResult, ScanState, ScanStatus, TimestampedResult};
@@ -26,7 +26,7 @@ pub trait Scanner {
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error>;
 
     /// Default implementation of the scanner loop
-    async fn run(&self, target: Target, protocol: Protocol, state: Arc<AppState>) {
+    async fn run(&self, target: Target, protocol: Protocol, state: Arc<Mutex<AppState>>) {
         log::debug!("[scanner] run: scanner={} target={} protocol={} interval={}ms",
             self.name(), target.display_name(), protocol.as_str(), self.interval().as_millis());
 
@@ -49,7 +49,9 @@ pub trait Scanner {
                     last_updated: Instant::now(),
                     history: VecDeque::new(),
                 };
-                state.scanners.insert(self.name().to_string(), scan_state);
+                #[allow(unused_mut)]
+                let mut state_guard = state.lock().unwrap();
+                state_guard.scanners.insert(self.name().to_string(), scan_state);
                 log::debug!("[scanner] status_updated: scanner={} status=Running protocol={}", 
                     self.name(), protocol.as_str());
             }
@@ -68,30 +70,34 @@ pub trait Scanner {
                     log::trace!("[scanner] scan_completed: scanner={} protocol={} duration={}ms result={:#?}",
                         self.name(), protocol.as_str(), scan_duration.as_millis(), result);
 
-                    if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
-                        let old_history_len = scan_state.history.len();
+                    {
+                        #[allow(unused_mut)]
+                        let mut state_guard = state.lock().unwrap();
+                        if let Some(mut scan_state) = state_guard.scanners.get_mut(self.name()) {
+                            let old_history_len = scan_state.history.len();
 
-                        scan_state.result = Some(result);
-                        scan_state.error = None;
-                        scan_state.status = ScanStatus::Complete;
-                        scan_state.last_updated = timestamp;
-                        scan_state.history.push_back(timestamped);
+                            scan_state.result = Some(result);
+                            scan_state.error = None;
+                            scan_state.status = ScanStatus::Complete;
+                            scan_state.last_updated = timestamp;
+                            scan_state.history.push_back(timestamped);
 
-                        // Keep last N results (configurable per scanner)
-                        while scan_state.history.len() > self.max_history() {
-                            scan_state.history.pop_front();
+                            // Keep last N results (configurable per scanner)
+                            while scan_state.history.len() > self.max_history() {
+                                scan_state.history.pop_front();
+                            }
+
+                            log::debug!("[scanner] state_updated: scanner={} protocol={} status=Complete history_len={}",
+                                self.name(), protocol.as_str(), scan_state.history.len());
+
+                            if old_history_len >= self.max_history() {
+                                log::trace!("[scanner] history_trimmed: scanner={} protocol={} old_len={} new_len={}",
+                                    self.name(), protocol.as_str(), old_history_len + 1, scan_state.history.len());
+                            }
+                        } else {
+                            log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update scan state",
+                                self.name(), protocol.as_str());
                         }
-
-                        log::debug!("[scanner] state_updated: scanner={} protocol={} status=Complete history_len={}",
-                            self.name(), protocol.as_str(), scan_state.history.len());
-
-                        if old_history_len >= self.max_history() {
-                            log::trace!("[scanner] history_trimmed: scanner={} protocol={} old_len={} new_len={}",
-                                self.name(), protocol.as_str(), old_history_len + 1, scan_state.history.len());
-                        }
-                    } else {
-                        log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update scan state",
-                            self.name(), protocol.as_str());
                     }
                 }
                 Err(error) => {
@@ -99,16 +105,20 @@ pub trait Scanner {
                     log::error!("[scanner] scan_failed: scanner={} protocol={} duration={}ms error={}",
                         self.name(), protocol.as_str(), scan_duration.as_millis(), error);
 
-                    if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
-                        scan_state.error = Some(error);
-                        scan_state.status = ScanStatus::Failed;
-                        scan_state.last_updated = Instant::now();
+                    {
+                        #[allow(unused_mut)]
+                        let mut state_guard = state.lock().unwrap();
+                        if let Some(mut scan_state) = state_guard.scanners.get_mut(self.name()) {
+                            scan_state.error = Some(error);
+                            scan_state.status = ScanStatus::Failed;
+                            scan_state.last_updated = Instant::now();
 
-                        log::debug!("[scanner] state_updated: scanner={} protocol={} status=Failed", 
-                            self.name(), protocol.as_str());
-                    } else {
-                        log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update error state",
-                            self.name(), protocol.as_str());
+                            log::debug!("[scanner] state_updated: scanner={} protocol={} status=Failed", 
+                                self.name(), protocol.as_str());
+                        } else {
+                            log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update error state",
+                                self.name(), protocol.as_str());
+                        }
                     }
                 }
             }

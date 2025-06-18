@@ -18,7 +18,7 @@ pub use port::{PortScanner, PortResult};
 
 use crate::scanner::Scanner;
 use crate::target::{Target, Protocol};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PING_SCANNER_INTERVAL_SECS: u64 = 60;
@@ -47,7 +47,7 @@ pub async fn spawn_scanner_tasks(
     scanners: Vec<Box<dyn Scanner + Send + Sync>>,
     target: Target,
     protocol: Protocol,
-    state: Arc<crate::types::AppState>,
+    state: Arc<Mutex<crate::types::AppState>>,
 ) {
     log::debug!("[scan] spawn_scanner_tasks: scanner_count={} target={} protocol={}",
         scanners.len(), target.display_name(), protocol.as_str());

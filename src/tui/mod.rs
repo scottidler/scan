@@ -35,7 +35,7 @@ use ratatui::{
     Terminal,
 };
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use log;
 
@@ -85,7 +85,7 @@ impl TuiApp {
     }
 
     /// Run the TUI application
-    pub fn run<B: Backend>(mut self, terminal: &mut Terminal<B>, state: Arc<AppState>) -> io::Result<()> {
+    pub fn run<B: Backend>(mut self, terminal: &mut Terminal<B>, state: Arc<Mutex<AppState>>) -> io::Result<()> {
         log::debug!("[tui] run: starting TUI event loop");
 
         let mut frame_count = 0;
@@ -132,6 +132,19 @@ impl TuiApp {
                                 // Cycle backward through focusable panes
                                 self.focus_prev_pane();
                             }
+                            KeyCode::Char('p') => {
+                                // Cycle through protocols: Both -> IPv4 -> IPv6 -> Both
+                                let (old_protocol, new_protocol) = {
+                                    let mut state_guard = state.lock().unwrap();
+                                    let old = state_guard.protocol;
+                                    state_guard.cycle_protocol();
+                                    let new = state_guard.protocol;
+                                    (old, new)
+                                };
+                                log::info!("[tui] protocol_changed: {} -> {} (scanner restart needed)", 
+                                    old_protocol.as_str(), new_protocol.as_str());
+                                // TODO: Implement scanner restart when protocol changes
+                            }
                             // Handle scrolling and navigation for focused pane
                             _ => {
                                 // We need to calculate pane areas for proper scroll bounds
@@ -141,7 +154,8 @@ impl TuiApp {
                                 let grid_areas = self.layout.create_grid_layout_public(area);
 
                                 // Let the layout handle pane-specific events
-                                let handled = self.layout.handle_key_event(key, &state, &grid_areas);
+                                let state_guard = state.lock().unwrap();
+                                let handled = self.layout.handle_key_event(key, &*state_guard, &grid_areas);
                                 if handled {
                                     log::trace!("[tui] key_handled_by_pane: key={:?}", key.code);
                                 } else {
@@ -170,12 +184,13 @@ impl TuiApp {
     }
 
     /// Draw the UI
-    fn ui(&mut self, frame: &mut ratatui::Frame, state: &AppState) {
+    fn ui(&mut self, frame: &mut ratatui::Frame, state: &Arc<Mutex<AppState>>) {
         let size = frame.area();
         log::trace!("[tui] ui_render: area={}x{}", size.width, size.height);
 
         // Render the layout with all panes
-        self.layout.render(frame, size, state);
+        let state_guard = state.lock().unwrap();
+        self.layout.render(frame, size, &*state_guard);
     }
 
     /// Check if the application should quit
