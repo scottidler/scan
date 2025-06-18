@@ -1,6 +1,6 @@
 use crate::scanner::Scanner;
 use crate::target::Target;
-use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use reqwest::Client;
@@ -10,7 +10,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use log;
 
 const GEOIP_SCAN_INTERVAL_SECS: u64 = 10 * 60; // 10 minutes
@@ -22,7 +21,6 @@ const MAX_CACHE_SIZE: usize = 1000;
 const CACHE_CLEANUP_THRESHOLD_SECS: u64 = 48 * 60 * 60; // 48 hours
 const MULTI_IP_DELAY_MS: u64 = 100;
 const IP_API_RATE_LIMIT: u32 = 45;
-const MAX_GEOIP_HISTORY: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct GeoIpScanner {
@@ -493,56 +491,6 @@ impl Scanner for GeoIpScanner {
 
     fn name(&self) -> &'static str {
         "geoip"
-    }
-
-    async fn run(&self, target: Target, state: Arc<AppState>) {
-        loop {
-            // Update scan state to running
-            let scan_state = ScanState {
-                result: None,
-                error: None,
-                status: ScanStatus::Running,
-                last_updated: Instant::now(),
-                history: Default::default(),
-            };
-            state.scanners.insert(self.name().to_string(), scan_state);
-
-            // Perform scan
-            match self.scan(&target).await {
-                Ok(result) => {
-                    let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = Some(result);
-                    scan_state.error = None;
-                    scan_state.status = ScanStatus::Complete;
-                    scan_state.last_updated = Instant::now();
-
-                    // Add to history
-                    let timestamp = Instant::now();
-                    let result_clone = scan_state.result.clone();
-                    if let Some(result) = result_clone {
-                        scan_state.history.push_back(crate::types::TimestampedResult {
-                            timestamp,
-                            result,
-                        });
-
-                        // Keep only last 10 results
-                        while scan_state.history.len() > MAX_GEOIP_HISTORY {
-                            scan_state.history.pop_front();
-                        }
-                    }
-                }
-                Err(e) => {
-                    let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = None;
-                    scan_state.error = Some(e);
-                    scan_state.status = ScanStatus::Failed;
-                    scan_state.last_updated = Instant::now();
-                }
-            }
-
-            // Wait for next scan
-            sleep(self.interval()).await;
-        }
     }
 }
 

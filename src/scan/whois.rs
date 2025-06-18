@@ -1,13 +1,11 @@
 use crate::scanner::Scanner;
 use crate::target::Target;
-use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+use crate::types::ScanResult;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
 use whois_rust::{WhoIs, WhoIsLookupOptions};
 use log;
 
@@ -643,44 +641,6 @@ impl Scanner for WhoisScanner {
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e)
             }
-        }
-    }
-
-    async fn run(&self, target: Target, state: Arc<AppState>) {
-        loop {
-            let scan_start = Instant::now();
-
-            match self.scan_whois(&target).await {
-                Ok(result) => {
-                    let scan_state = ScanState {
-                        result: Some(ScanResult::Whois(result.clone())),
-                        error: None,
-                        status: ScanStatus::Complete,
-                        last_updated: scan_start,
-                        history: {
-                            let mut history = std::collections::VecDeque::new();
-                            history.push_back(crate::types::TimestampedResult {
-                                timestamp: scan_start,
-                                result: ScanResult::Whois(result),
-                            });
-                            history
-                        },
-                    };
-                    state.scanners.insert(self.name().to_string(), scan_state);
-                }
-                Err(e) => {
-                    let scan_state = ScanState {
-                        result: None,
-                        error: Some(e),
-                        status: ScanStatus::Failed,
-                        last_updated: scan_start,
-                        history: std::collections::VecDeque::new(),
-                    };
-                    state.scanners.insert(self.name().to_string(), scan_state);
-                }
-            }
-
-            sleep(self.interval()).await;
         }
     }
 }

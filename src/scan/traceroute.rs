@@ -1,23 +1,20 @@
 use crate::scanner::Scanner;
 use crate::target::Target;
-use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::time::sleep;
 use log;
 
-const TRACEROUTE_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes - more responsive for network monitoring
-const TRACEROUTE_TIMEOUT_SECS: u64 = 30;
-const MAX_TRACEROUTE_HOPS: u8 = 20;
+const TRACEROUTE_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes - traceroute is slow and noisy if too frequent
+const TRACEROUTE_TIMEOUT_SECS: u64 = 3; // 3 seconds per hop (much faster like your example)
+const MAX_TRACEROUTE_HOPS: u8 = 30;
 const PROBES_PER_HOP: u8 = 3;
 const HOP_SUMMARY_DISPLAY_COUNT: usize = 5;
 const MS_TO_MICROSECONDS_MULTIPLIER: f64 = 1000.0;
 const FULL_PACKET_LOSS: f32 = 1.0;
-const MAX_TRACEROUTE_HISTORY: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct TracerouteScanner {
@@ -326,57 +323,6 @@ impl Scanner for TracerouteScanner {
     fn name(&self) -> &'static str {
         "traceroute"
     }
-
-    async fn run(&self, target: Target, state: Arc<AppState>) {
-        loop {
-            // Update scan state to running
-            let scan_state = ScanState {
-                result: None,
-                error: None,
-                status: ScanStatus::Running,
-                last_updated: Instant::now(),
-                history: Default::default(),
-            };
-            state.scanners.insert(self.name().to_string(), scan_state);
-
-            // Perform scan
-            let _start_time = Instant::now();
-            match self.scan(&target).await {
-                Ok(result) => {
-                    let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = Some(result);
-                    scan_state.error = None;
-                    scan_state.status = ScanStatus::Complete;
-                    scan_state.last_updated = Instant::now();
-
-                    // Add to history
-                    let timestamp = Instant::now();
-                    let result_clone = scan_state.result.clone();
-                    if let Some(result) = result_clone {
-                        scan_state.history.push_back(crate::types::TimestampedResult {
-                            timestamp,
-                            result,
-                        });
-
-                        // Keep only last 10 results
-                        while scan_state.history.len() > MAX_TRACEROUTE_HISTORY {
-                            scan_state.history.pop_front();
-                        }
-                    }
-                }
-                Err(e) => {
-                    let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = None;
-                    scan_state.error = Some(e);
-                    scan_state.status = ScanStatus::Failed;
-                    scan_state.last_updated = Instant::now();
-                }
-            }
-
-            // Wait for next scan
-            sleep(self.interval()).await;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -628,17 +574,17 @@ mod tests {
         let scanner = TracerouteScanner::default();
 
         assert_eq!(scanner.name(), "traceroute");
-        assert_eq!(scanner.max_hops, 20); // Actual constant value
+        assert_eq!(scanner.max_hops, 30); // Updated constant value
         assert_eq!(scanner.probes_per_hop, 3);
-        assert_eq!(scanner.timeout, Duration::from_secs(30)); // Actual timeout value
+        assert_eq!(scanner.timeout, Duration::from_secs(3)); // Updated timeout value
     }
 
     #[test]
     fn test_traceroute_scanner_custom_config() {
         let scanner = TracerouteScanner::new();
 
-        assert_eq!(scanner.interval(), Duration::from_secs(120)); // 2 minutes (actual value)
-        assert_eq!(scanner.max_hops, 20); // Actual constant value
+        assert_eq!(scanner.interval(), Duration::from_secs(300)); // 5 minutes (updated value)
+        assert_eq!(scanner.max_hops, 30); // Updated constant value
         assert_eq!(scanner.probes_per_hop, 3);
     }
 

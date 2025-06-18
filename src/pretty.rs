@@ -233,6 +233,7 @@ fn print_scan_result(result: &ScanResult) {
                 };
                 
                 let mode_str = match port.scan_mode {
+                    crate::scan::port::ScanMode::Minimal => "minimal",
                     crate::scan::port::ScanMode::Quick => "quick",
                     crate::scan::port::ScanMode::Standard => "standard", 
                     crate::scan::port::ScanMode::Custom(_) => "custom",

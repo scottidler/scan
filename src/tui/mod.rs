@@ -1,5 +1,6 @@
 pub mod pane;
 pub mod layout;
+pub mod scrollable;
 pub mod target;
 pub mod connectivity;
 pub mod security;
@@ -12,6 +13,7 @@ pub mod geoip;
 
 pub use pane::{Pane, PaneConfig, PanePosition};
 pub use layout::PaneLayout;
+pub use scrollable::ScrollablePane;
 pub use target::TargetPane;
 pub use connectivity::ConnectivityPane;
 pub use security::SecurityPane;

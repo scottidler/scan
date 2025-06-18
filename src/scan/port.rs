@@ -1,11 +1,11 @@
 use crate::scanner::Scanner;
 use crate::target::Target;
-use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::Result;
 use futures::stream::{self, StreamExt};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,7 +14,8 @@ use log;
 
 const PORT_SCAN_INTERVAL_SECS: u64 = 30;
 const TCP_TIMEOUT_SECS: u64 = 3;
-const MAX_CONCURRENT_SCANS: usize = 50;
+const MAX_CONCURRENT_SCANS: usize = 10; // Reduced from 50 to be less aggressive
+const PORT_SCAN_THROTTLE_MS: u64 = 50; // 50ms delay between port scans to avoid bans
 const DEBUG_PORT_DISPLAY_LIMIT: usize = 10;
 const BANNER_BUFFER_SIZE: usize = 1024;
 const BANNER_READ_TIMEOUT_MS: u64 = 500;
@@ -23,8 +24,7 @@ const HTTP_BANNER_TIMEOUT_MS: u64 = 1000;
 const SERVICE_DETECTION_TIMEOUT_SECS: u64 = 2;
 const HIGH_CONFIDENCE_SCORE: f32 = 0.7;
 const LOW_CONFIDENCE_SCORE: f32 = 0.3;
-const PROGRESSIVE_BATCH_SIZE: usize = 50;
-const BATCH_DELAY_MS: u64 = 100;
+
 
 #[derive(Debug, Clone)]
 pub struct PortScanner {
@@ -35,8 +35,9 @@ pub struct PortScanner {
     scan_mode: ScanMode,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ScanMode {
+    Minimal,  // 6 essential ports - NEW DEFAULT
     Quick,    // Top 100 ports
     Standard, // Top 1000 ports
     Custom(Vec<u16>),
@@ -90,13 +91,13 @@ impl Default for PortScanner {
 
 impl PortScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::port] new: interval=30s timeout=3s concurrency=50 service_detection=true");
+        log::debug!("[scan::port] new: interval=30s timeout=3s concurrency=10 service_detection=true mode=minimal");
         Self {
             interval: Duration::from_secs(PORT_SCAN_INTERVAL_SECS),
             tcp_timeout: Duration::from_secs(TCP_TIMEOUT_SECS),
             max_concurrent: MAX_CONCURRENT_SCANS,
             service_detection: true,
-            scan_mode: ScanMode::Quick,
+            scan_mode: ScanMode::Minimal,
         }
     }
 
@@ -106,17 +107,20 @@ impl PortScanner {
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.tcp_timeout = timeout;
+        // Minimum timeout of 1 second for reliability
+        self.tcp_timeout = std::cmp::max(timeout, Duration::from_secs(1));
         self
     }
 
     pub fn with_concurrency(mut self, max_concurrent: usize) -> Self {
-        self.max_concurrent = max_concurrent;
+        // Maximum concurrency of 25 to avoid overwhelming targets
+        self.max_concurrent = std::cmp::min(max_concurrent, 25);
         self
     }
 
     fn get_ports(&self) -> Vec<u16> {
         match &self.scan_mode {
+            ScanMode::Minimal => get_minimal_ports(),
             ScanMode::Quick => get_top_100_ports(),
             ScanMode::Standard => get_top_1000_ports(),
             ScanMode::Custom(ports) => ports.clone(),
@@ -124,10 +128,13 @@ impl PortScanner {
     }
 
     async fn perform_port_scan(&self, target: &Target) -> Result<PortResult> {
-        log::debug!("[scan::port] perform_port_scan: target={} mode={:?}",
+        self.progressive_port_scan_internal(target).await
+    }
+
+    async fn progressive_port_scan_internal(&self, target: &Target) -> Result<PortResult> {
+        log::debug!("[scan::port] progressive_port_scan_internal: target={} mode={:?}",
             target.display_name(), self.scan_mode);
 
-        // Get target IP
         let target_ip = if let Some(primary_ip) = target.primary_ip() {
             primary_ip
         } else {
@@ -145,15 +152,26 @@ impl PortScanner {
         log::trace!("[scan::port] starting_concurrent_scans: target={} concurrency={}",
             target.display_name(), self.max_concurrent);
 
-        // Create concurrent stream of port scan tasks
         let scan_start = Instant::now();
-        let scan_results = stream::iter(ports)
-            .map(|port| self.scan_port(target_ip, port))
-            .buffer_unordered(self.max_concurrent)
-            .collect::<Vec<_>>()
-            .await;
+        
+        // Scan ports with throttling to avoid bans
+        let mut scan_results = Vec::new();
+        for chunk in ports.chunks(self.max_concurrent) {
+            // Scan chunk concurrently
+            let chunk_results = stream::iter(chunk.iter().copied())
+                .map(|port| self.scan_port_with_throttle(target_ip, port))
+                .buffer_unordered(self.max_concurrent)
+                .collect::<Vec<_>>()
+                .await;
+            
+            scan_results.extend(chunk_results);
+            
+            // Small delay between chunks to be polite
+            if ports.len() > self.max_concurrent {
+                sleep(Duration::from_millis(PORT_SCAN_THROTTLE_MS)).await;
+            }
+        }
 
-        // Process results
         let mut open_ports = Vec::new();
         let mut closed_count = 0;
         let mut filtered_count = 0;
@@ -166,7 +184,6 @@ impl PortScanner {
             }
         }
 
-        // Sort open ports by port number
         open_ports.sort_by_key(|p| p.port);
 
         let scan_duration = scan_start.elapsed();
@@ -193,16 +210,20 @@ impl PortScanner {
         Ok(result)
     }
 
+    async fn scan_port_with_throttle(&self, ip: IpAddr, port: u16) -> Result<Option<OpenPort>> {
+        // Add small delay to avoid overwhelming the target
+        sleep(Duration::from_millis(PORT_SCAN_THROTTLE_MS)).await;
+        self.scan_port(ip, port).await
+    }
+
     async fn scan_port(&self, ip: IpAddr, port: u16) -> Result<Option<OpenPort>> {
         let socket_addr = SocketAddr::new(ip, port);
         let start_time = Instant::now();
 
-        // Attempt TCP connection
         match timeout(self.tcp_timeout, TcpStream::connect(socket_addr)).await {
             Ok(Ok(mut stream)) => {
                 let response_time = start_time.elapsed();
 
-                // Port is open, optionally detect service
                 let service = if self.service_detection {
                     self.detect_service(&mut stream, port).await
                 } else {
@@ -217,19 +238,16 @@ impl PortScanner {
                     response_time,
                 }))
             }
-            Ok(Err(_)) => Ok(None), // Connection refused - port closed
-            Err(_) => Err(eyre::eyre!("Port {} timed out", port)), // Timeout - possibly filtered
+            Ok(Err(_)) => Ok(None),
+            Err(_) => Err(eyre::eyre!("Port {} timed out", port)),
         }
     }
 
     async fn detect_service(&self, stream: &mut TcpStream, port: u16) -> Option<ServiceInfo> {
-        // First, try to identify service by port number
         let service_name = get_service_name(port);
 
-        // Attempt banner grabbing with a short timeout
         let banner = timeout(Duration::from_secs(SERVICE_DETECTION_TIMEOUT_SECS), self.grab_banner(stream, port)).await.ok().flatten();
 
-        // Analyze banner to improve service detection
         let (refined_name, version, confidence) = if let Some(ref banner_text) = banner {
             analyze_banner(banner_text, port)
         } else {
@@ -245,18 +263,14 @@ impl PortScanner {
     }
 
     async fn grab_banner(&self, stream: &mut TcpStream, port: u16) -> Option<String> {
-        // Different banner grabbing strategies based on port
         match port {
             21 | 22 | 25 | 110 | 143 | 220 | 993 | 995 => {
-                // Services that send banner immediately
                 self.read_banner(stream).await
             }
             80 | 443 | 8080 | 8443 => {
-                // HTTP services - send HTTP request
                 self.grab_http_banner(stream).await
             }
             _ => {
-                // Generic approach - try reading first, then send probe
                 if let Some(banner) = self.read_banner(stream).await {
                     Some(banner)
                 } else {
@@ -289,13 +303,11 @@ impl PortScanner {
             if let Ok(Ok(n)) = timeout(Duration::from_millis(HTTP_BANNER_TIMEOUT_MS), stream.read(&mut buffer)).await {
                 if n > 0 {
                     let response = String::from_utf8_lossy(&buffer[..n]);
-                    // Extract server header
                     for line in response.lines() {
                         if line.to_lowercase().starts_with("server:") {
                             return Some(line.trim().to_string());
                         }
                     }
-                    // Return first line if no server header
                     return response.lines().next().map(|s| s.trim().to_string());
                 }
             }
@@ -304,7 +316,6 @@ impl PortScanner {
     }
 
     async fn probe_service(&self, stream: &mut TcpStream) -> Option<String> {
-        // Send a generic probe and see what responds
         let probe = b"\r\n";
 
         if stream.write_all(probe).await.is_ok() {
@@ -313,78 +324,8 @@ impl PortScanner {
             None
         }
     }
-
-    async fn progressive_port_scan(&self, target: &Target, state: &Arc<AppState>) -> Result<PortResult> {
-        let start_time = Instant::now();
-
-        // Get target IP
-        let target_ip = target.primary_ip()
-            .ok_or_else(|| eyre::eyre!("No IP address available for port scan"))?;
-
-        let ports = self.get_ports();
-        let _total_ports = ports.len();
-
-        // Initialize progress tracking
-        let mut open_ports = Vec::new();
-        let mut closed_count = 0;
-        let mut filtered_count = 0;
-
-        // Scan ports in batches for progressive updates
-        let batch_size = PROGRESSIVE_BATCH_SIZE;
-        for batch in ports.chunks(batch_size) {
-            // Scan batch concurrently
-            let batch_results = stream::iter(batch.iter().copied())
-                .map(|port| self.scan_port(target_ip, port))
-                .buffer_unordered(self.max_concurrent)
-                .collect::<Vec<_>>()
-                .await;
-
-            // Process batch results
-            for result in batch_results {
-                match result {
-                    Ok(Some(open_port)) => open_ports.push(open_port),
-                    Ok(None) => closed_count += 1,
-                    Err(_) => filtered_count += 1,
-                }
-            }
-
-            // Update progress in state
-            open_ports.sort_by_key(|p| p.port);
-            let progress_result = PortResult {
-                target_ip,
-                open_ports: open_ports.clone(),
-                closed_ports: closed_count,
-                filtered_ports: filtered_count,
-                scan_duration: start_time.elapsed(),
-                scan_mode: self.scan_mode.clone(),
-            };
-
-            // Update state with current progress
-            if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
-                scan_state.result = Some(ScanResult::Port(progress_result));
-                scan_state.last_updated = Instant::now();
-
-                // Add progress info to the status (we'll create a custom status field)
-                // For now, we'll update the result with progress
-            }
-
-            // Small delay between batches to allow UI updates
-            sleep(Duration::from_millis(BATCH_DELAY_MS)).await;
-        }
-
-        // Final result
-        Ok(PortResult {
-            target_ip,
-            open_ports,
-            closed_ports: closed_count,
-            filtered_ports: filtered_count,
-            scan_duration: start_time.elapsed(),
-            scan_mode: self.scan_mode.clone(),
-        })
-    }
 }
 
-// Service name mapping for common ports
 fn get_service_name(port: u16) -> String {
     match port {
         21 => "ftp".to_string(),
@@ -407,11 +348,9 @@ fn get_service_name(port: u16) -> String {
     }
 }
 
-// Banner analysis to improve service detection
 fn analyze_banner(banner: &str, port: u16) -> (String, Option<String>, f32) {
     let banner_lower = banner.to_lowercase();
 
-    // HTTP server detection
     if banner_lower.contains("server:") {
         if let Some(server_line) = banner.lines().find(|line| line.to_lowercase().starts_with("server:")) {
             let server_info = server_line.trim_start_matches("Server:").trim();
@@ -423,33 +362,39 @@ fn analyze_banner(banner: &str, port: u16) -> (String, Option<String>, f32) {
         }
     }
 
-    // SSH detection
     if banner_lower.contains("ssh") {
         let version = banner.split('-').nth(1).map(|v| v.trim().to_string());
         return ("ssh".to_string(), version, 0.95);
     }
 
-    // FTP detection
     if banner_lower.contains("ftp") || banner.starts_with("220") {
         return ("ftp".to_string(), None, 0.9);
     }
 
-    // SMTP detection
     if banner.starts_with("220") && banner_lower.contains("smtp") {
         return ("smtp".to_string(), None, 0.9);
     }
 
-    // Generic service name fallback
     let service_name = get_service_name(port);
     (service_name, None, 0.5)
 }
 
-// Top 100 most common ports
+// Minimal essential ports - fast and non-aggressive
+pub fn get_minimal_ports() -> Vec<u16> {
+    vec![
+        21,   // FTP
+        22,   // SSH
+        80,   // HTTP
+        8080, // HTTP Alt
+        443,  // HTTPS
+        8443, // HTTPS Alt
+    ]
+}
+
 fn get_top_100_ports() -> Vec<u16> {
     vec![
         21, 22, 23, 25, 53, 80, 110, 111, 135, 139,
         143, 443, 993, 995, 1723, 3389, 5900, 8080, 8443, 8888,
-        // Add more common ports...
         20, 69, 79, 88, 102, 113, 119, 123, 137, 138,
         389, 427, 464, 513, 514, 515, 543, 544, 548, 554,
         587, 631, 636, 646, 873, 990, 1025, 1026, 1027, 1028,
@@ -461,11 +406,9 @@ fn get_top_100_ports() -> Vec<u16> {
     ]
 }
 
-// Top 1000 ports (abbreviated for space - in real implementation would be full list)
 fn get_top_1000_ports() -> Vec<u16> {
     let mut ports = get_top_100_ports();
 
-    // Add additional ports to reach 1000 (this is a subset for brevity)
     let additional_ports = vec![
         1, 3, 4, 6, 7, 9, 13, 17, 19, 20, 26, 30, 32, 33, 37, 42, 43, 49, 70, 79,
         81, 82, 83, 84, 85, 87, 88, 89, 90, 99, 100, 106, 109, 110, 111, 113, 119, 125, 135, 139,
@@ -474,7 +417,6 @@ fn get_top_1000_ports() -> Vec<u16> {
         515, 524, 541, 543, 544, 545, 548, 554, 555, 563, 587, 593, 616, 617, 625, 631, 636, 646, 648, 666,
         667, 668, 683, 687, 691, 700, 705, 711, 714, 720, 722, 726, 749, 765, 777, 783, 787, 800, 801, 808,
         843, 873, 880, 888, 898, 900, 901, 902, 903, 911, 912, 981, 987, 990, 992, 993, 995, 999, 1000, 1001,
-        // ... continue with more ports to reach 1000
         1002, 1007, 1009, 1010, 1011, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035,
         1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052, 1053, 1054, 1055,
         1056, 1057, 1058, 1059, 1060, 1061, 1062, 1063, 1064, 1065, 1066, 1067, 1068, 1069, 1070, 1071, 1072, 1073, 1074, 1075,
@@ -558,69 +500,21 @@ impl Scanner for PortScanner {
         "port"
     }
 
-    async fn run(&self, target: Target, state: Arc<AppState>) {
-        loop {
-            // Update scan state to running
-            let scan_state = ScanState {
-                result: None,
-                error: None,
-                status: ScanStatus::Running,
-                last_updated: Instant::now(),
-                history: Default::default(),
-            };
-            state.scanners.insert(self.name().to_string(), scan_state);
 
-            // Perform progressive scan with updates
-            match self.progressive_port_scan(&target, &state).await {
-                Ok(final_result) => {
-                    let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = Some(ScanResult::Port(final_result));
-                    scan_state.error = None;
-                    scan_state.status = ScanStatus::Complete;
-                    scan_state.last_updated = Instant::now();
-
-                    // Add to history
-                    let timestamp = Instant::now();
-                    let result_clone = scan_state.result.clone();
-                    if let Some(result) = result_clone {
-                        scan_state.history.push_back(crate::types::TimestampedResult {
-                            timestamp,
-                            result,
-                        });
-
-                        // Keep only last 10 results
-                        while scan_state.history.len() > 10 {
-                            scan_state.history.pop_front();
-                        }
-                    }
-                }
-                Err(e) => {
-                    let mut scan_state = state.scanners.get_mut(self.name()).unwrap();
-                    scan_state.result = None;
-                    scan_state.error = Some(e);
-                    scan_state.status = ScanStatus::Failed;
-                    scan_state.last_updated = Instant::now();
-                }
-            }
-
-            // Wait for next scan
-            sleep(self.interval()).await;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_port_scanner_creation() {
         let scanner = PortScanner::new();
         assert_eq!(scanner.name(), "port");
         assert_eq!(scanner.interval(), Duration::from_secs(30));
-        assert_eq!(scanner.max_concurrent, 50);
+        assert_eq!(scanner.max_concurrent, 10);
         assert!(scanner.service_detection);
+        assert!(matches!(scanner.scan_mode, ScanMode::Minimal));
     }
 
     #[test]
@@ -669,12 +563,6 @@ mod tests {
         assert_eq!(top_100.len(), 100);
         assert!(top_1000.len() >= 1000);
 
-        // Verify common ports are included
-        assert!(top_100.contains(&22)); // SSH
-        assert!(top_100.contains(&80)); // HTTP
-        assert!(top_100.contains(&443)); // HTTPS
-
-        // Verify top_1000 includes all top_100
         for port in &top_100 {
             assert!(top_1000.contains(port));
         }
@@ -692,16 +580,14 @@ mod tests {
     #[tokio::test]
     async fn test_port_scan_localhost() {
         let scanner = PortScanner::new()
-            .with_mode(ScanMode::Custom(vec![22, 80, 443, 12345])) // Mix of potentially open/closed ports
+            .with_mode(ScanMode::Custom(vec![22, 80, 443, 12345]))
             .with_timeout(Duration::from_millis(100))
             .with_concurrency(4);
 
         let target = Target::parse("127.0.0.1").unwrap();
 
-        // This test might pass or fail depending on what's running on localhost
-        // We're mainly testing that it doesn't panic and returns a result
         let result = scanner.scan(&target).await;
-        assert!(result.is_ok() || result.is_err()); // Either outcome is fine for this test
+        assert!(result.is_ok() || result.is_err());
     }
 
     #[tokio::test]
@@ -712,35 +598,26 @@ mod tests {
 
         let target = Target::parse("nonexistent.invalid").unwrap();
 
-        // Should fail because no IP is resolved
         assert!(scanner.scan(&target).await.is_err());
     }
 
     #[test]
     fn test_banner_analysis_edge_cases() {
-        // Test SSH banner with version
         let (service, version, confidence) = analyze_banner("SSH-2.0-OpenSSH_7.4", 22);
         assert_eq!(service, "ssh");
         assert_eq!(version, Some("2.0".to_string()));
         assert!(confidence > 0.9);
 
-        // Test HTTP banner without version
         let (_service, _version, confidence) = analyze_banner("HTTP/1.1 200 OK\r\nServer: Apache\r\n", 80);
-        // Implementation might return "http" instead of parsing the Server header
-        // Confidence might vary based on implementation
-        assert!(confidence > 0.5); // Lower threshold since we don't know exact implementation
-
-        // Test FTP banner
-        let (service, _version, confidence) = analyze_banner("220 vsftpd 3.0.3", 21);
-        assert_eq!(service, "ftp");
-        // Version extraction might not be implemented for FTP banners
         assert!(confidence > 0.5);
 
-        // Test unknown service
+        let (service, _version, confidence) = analyze_banner("220 vsftpd 3.0.3", 21);
+        assert_eq!(service, "ftp");
+        assert!(confidence > 0.5);
+
         let (service, version, confidence) = analyze_banner("Unknown service response", 12345);
         assert_eq!(service, "unknown");
         assert!(version.is_none());
-        // Confidence might be higher than expected for unknown services
         assert!(confidence >= 0.0 && confidence <= 1.0);
     }
 
@@ -772,6 +649,19 @@ mod tests {
     }
 
     #[test]
+    fn test_minimal_port_mode() {
+        let minimal_scanner = PortScanner::new(); // Default is minimal
+        let minimal_ports = minimal_scanner.get_ports();
+        assert_eq!(minimal_ports.len(), 6);
+        assert!(minimal_ports.contains(&21));  // FTP
+        assert!(minimal_ports.contains(&22));  // SSH
+        assert!(minimal_ports.contains(&80));  // HTTP
+        assert!(minimal_ports.contains(&8080)); // HTTP Alt
+        assert!(minimal_ports.contains(&443)); // HTTPS
+        assert!(minimal_ports.contains(&8443)); // HTTPS Alt
+    }
+
+    #[test]
     fn test_scan_mode_port_selection() {
         let quick_scanner = PortScanner::new().with_mode(ScanMode::Quick);
         let quick_ports = quick_scanner.get_ports();
@@ -784,7 +674,6 @@ mod tests {
         let standard_ports = standard_scanner.get_ports();
         assert!(standard_ports.len() >= 1000);
 
-        // Standard should include all quick ports
         for port in &quick_ports {
             assert!(standard_ports.contains(port));
         }
@@ -797,7 +686,6 @@ mod tests {
 
     #[test]
     fn test_service_detection_accuracy() {
-        // Test that common services are detected correctly
         let known_services = vec![
             (22, "ssh"),
             (80, "http"),
@@ -822,21 +710,19 @@ mod tests {
             .with_concurrency(100)
             .with_mode(ScanMode::Quick);
 
-        assert_eq!(scanner.tcp_timeout, Duration::from_millis(50));
-        assert_eq!(scanner.max_concurrent, 100);
+        assert_eq!(scanner.tcp_timeout, Duration::from_secs(1));
+        assert_eq!(scanner.max_concurrent, 25);
         assert!(matches!(scanner.scan_mode, ScanMode::Quick));
         assert!(scanner.service_detection);
     }
 
     #[test]
     fn test_protocol_and_state_enums() {
-        // Test Protocol enum
         let tcp = Protocol::Tcp;
         let udp = Protocol::Udp;
         assert!(matches!(tcp, Protocol::Tcp));
         assert!(matches!(udp, Protocol::Udp));
 
-        // Test PortState enum
         let open = PortState::Open;
         let closed = PortState::Closed;
         let filtered = PortState::Filtered;

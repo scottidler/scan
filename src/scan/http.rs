@@ -1,18 +1,17 @@
 use crate::scanner::Scanner;
 use crate::target::Target;
-use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+use crate::types::ScanResult;
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
 use url::Url;
 
 const HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 const HTTP_REDIRECT_LIMIT: usize = 10;
 const ASSUMED_REDIRECT_STATUS: u16 = 301;
-const HTTP_SCAN_INTERVAL_SECS: u64 = 300;
+const HTTP_SCAN_INTERVAL_SECS: u64 = 60;
 const INITIAL_SECURITY_SCORE: i32 = 100;
 const HSTS_MISSING_PENALTY: i32 = 15;
 const FRAME_OPTIONS_MISSING_PENALTY: i32 = 10;
@@ -548,14 +547,14 @@ impl HttpScanner {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Scanner for HttpScanner {
     fn name(&self) -> &'static str {
         "http"
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(HTTP_SCAN_INTERVAL_SECS) // 5 minutes
+        Duration::from_secs(HTTP_SCAN_INTERVAL_SECS)
     }
 
     async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
@@ -565,9 +564,9 @@ impl Scanner for HttpScanner {
         match self.scan_http(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::http] http_scan_completed: target={} duration={}ms status={} grade={:?} vulnerabilities={}",
+                log::trace!("[scan::http] http_scan_completed: target={} duration={}ms status={} response_time={}ms security_grade={:?} vulnerabilities={}",
                     target.display_name(), scan_duration.as_millis(), result.status_code,
-                    result.security_grade, result.vulnerabilities.len());
+                    result.response_time.as_millis(), result.security_grade, result.vulnerabilities.len());
                 Ok(ScanResult::Http(result))
             }
             Err(e) => {
@@ -576,44 +575,6 @@ impl Scanner for HttpScanner {
                     target.display_name(), scan_duration.as_millis(), e);
                 Err(e)
             }
-        }
-    }
-
-    async fn run(&self, target: Target, state: Arc<AppState>) {
-        loop {
-            let scan_start = Instant::now();
-
-            match self.scan_http(&target).await {
-                Ok(result) => {
-                    let scan_state = ScanState {
-                        result: Some(ScanResult::Http(result.clone())),
-                        error: None,
-                        status: ScanStatus::Complete,
-                        last_updated: scan_start,
-                        history: {
-                            let mut history = std::collections::VecDeque::new();
-                            history.push_back(crate::types::TimestampedResult {
-                                timestamp: scan_start,
-                                result: ScanResult::Http(result),
-                            });
-                            history
-                        },
-                    };
-                    state.scanners.insert(self.name().to_string(), scan_state);
-                }
-                Err(e) => {
-                    let scan_state = ScanState {
-                        result: None,
-                        error: Some(e),
-                        status: ScanStatus::Failed,
-                        last_updated: scan_start,
-                        history: std::collections::VecDeque::new(),
-                    };
-                    state.scanners.insert(self.name().to_string(), scan_state);
-                }
-            }
-
-            sleep(self.interval()).await;
         }
     }
 }

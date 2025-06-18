@@ -1,4 +1,5 @@
 use crate::tui::pane::{Pane, PaneConfig};
+use crate::tui::scrollable::ScrollablePane;
 use crate::types::AppState;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -316,6 +317,11 @@ impl PaneLayout {
                                     dns_pane.scroll_up();
                                     return true;
                                 }
+                            } else if focused_id == "traceroute" {
+                                if let Some(traceroute_pane) = pane.as_any_mut().downcast_mut::<crate::tui::traceroute::TraceroutePane>() {
+                                    traceroute_pane.scroll_up();
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -352,6 +358,21 @@ impl PaneLayout {
                                     dns_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
+                            } else if focused_id == "traceroute" {
+                                if let Some(traceroute_pane) = pane.as_any_mut().downcast_mut::<crate::tui::traceroute::TraceroutePane>() {
+                                    // Get the TraceroutePane area
+                                    let mut visible_lines = FALLBACK_VISIBLE_LINES;
+                                    if let Some(config) = self.config.get("traceroute") {
+                                        let row = config.position.row;
+                                        let col = config.position.col;
+                                        if pane_areas.len() > row && pane_areas[row].len() > col {
+                                            visible_lines = pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
+                                        }
+                                    }
+                                    
+                                    traceroute_pane.scroll_down_smart(state, visible_lines);
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -368,6 +389,11 @@ impl PaneLayout {
                             } else if focused_id == "dns" {
                                 if let Some(dns_pane) = pane.as_any_mut().downcast_mut::<crate::tui::dns::DnsPane>() {
                                     dns_pane.reset_scroll();
+                                    return true;
+                                }
+                            } else if focused_id == "traceroute" {
+                                if let Some(traceroute_pane) = pane.as_any_mut().downcast_mut::<crate::tui::traceroute::TraceroutePane>() {
+                                    traceroute_pane.reset_scroll();
                                     return true;
                                 }
                             }

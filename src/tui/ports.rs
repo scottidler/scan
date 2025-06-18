@@ -107,6 +107,7 @@ impl Pane for PortsPane {
                         let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
                             // Estimate progress based on scan duration and typical port scan timing
                             let total_expected = match port_result.scan_mode {
+                                crate::scan::port::ScanMode::Minimal => crate::scan::port::get_minimal_ports().len(),
                                 crate::scan::port::ScanMode::Quick => QUICK_SCAN_EXPECTED_PORTS,
                                 crate::scan::port::ScanMode::Standard => STANDARD_SCAN_EXPECTED_PORTS,
                                 crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
