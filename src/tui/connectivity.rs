@@ -97,90 +97,9 @@ impl Pane for ConnectivityPane {
                             Span::styled(status_text, Style::default().fg(status_color)),
                         ]));
 
-                        // Show protocol results
                         lines.push(Line::from(""));
 
-                        // IPv4 status
-                        match &ping.ipv4_status {
-                            crate::scan::ping::PingStatus::Success(latency) => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("✅", Style::default().fg(Color::Green)),
-                                    Span::styled(format!(" {}ms", latency.as_millis()), Style::default().fg(Color::Green)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::NotQueried => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("⏭️ ", Style::default().fg(Color::Gray)),
-                                    Span::styled("not queried", Style::default().fg(Color::Gray)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::NoAddress => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("❌", Style::default().fg(Color::Red)),
-                                    Span::styled(" no address", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::ToolMissing(tool) => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("🛠️ ", Style::default().fg(Color::Yellow)),
-                                    Span::styled(format!("{} missing", tool), Style::default().fg(Color::Yellow)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::Failed(_) => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("❌", Style::default().fg(Color::Red)),
-                                    Span::styled(" failed", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                        }
-
-                        // IPv6 status
-                        match &ping.ipv6_status {
-                            crate::scan::ping::PingStatus::Success(latency) => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("✅", Style::default().fg(Color::Green)),
-                                    Span::styled(format!(" {}ms", latency.as_millis()), Style::default().fg(Color::Green)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::NotQueried => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("⏭️ ", Style::default().fg(Color::Gray)),
-                                    Span::styled("not queried", Style::default().fg(Color::Gray)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::NoAddress => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("❌", Style::default().fg(Color::Red)),
-                                    Span::styled(" no address", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::ToolMissing(tool) => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("🛠️ ", Style::default().fg(Color::Yellow)),
-                                    Span::styled(format!("{} missing", tool), Style::default().fg(Color::Yellow)),
-                                ]));
-                            }
-                            crate::scan::ping::PingStatus::Failed(_) => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("❌", Style::default().fg(Color::Red)),
-                                    Span::styled(" failed", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                        }
-
-                        lines.push(Line::from(""));
-
-                        // Overall latency with performance grading
+                        // Clean latency display without protocol redundancy
                         let latency_color = if latency_ms < EXCELLENT_LATENCY_THRESHOLD_MS {
                             Color::Green
                         } else if latency_ms < FAIR_LATENCY_THRESHOLD_MS {
@@ -234,36 +153,10 @@ impl Pane for ConnectivityPane {
 
                         lines.push(Line::from(""));
 
-                        // Show why each protocol failed
-                        match &ping.ipv4_status {
-                            crate::scan::ping::PingStatus::NotQueried => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("⏭️ not queried", Style::default().fg(Color::Gray)),
-                                ]));
-                            }
-                            _ => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-                                    Span::styled("❌ failed", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                        }
-
-                        match &ping.ipv6_status {
-                            crate::scan::ping::PingStatus::NotQueried => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("⏭️ not queried", Style::default().fg(Color::Gray)),
-                                ]));
-                            }
-                            _ => {
-                                lines.push(Line::from(vec![
-                                    Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-                                    Span::styled("❌ failed", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                        }
+                        lines.push(Line::from(vec![
+                            Span::styled("❌ ", Style::default().fg(Color::Red)),
+                            Span::styled("No connectivity available", Style::default().fg(Color::Red)),
+                        ]));
                     }
 
                     // Show additional connectivity info from other scanners

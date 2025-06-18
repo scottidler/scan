@@ -58,7 +58,7 @@ impl Pane for TraceroutePane {
 
         // Traceroute status header
         lines.push(Line::from(vec![
-            Span::styled("🗺️  TRACEROUTE: ", Style::default().fg(Color::Cyan)),
+            Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
             Span::styled("tracing...", Style::default().fg(Color::Gray)),
         ]));
 
@@ -69,7 +69,7 @@ impl Pane for TraceroutePane {
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
             // Update header with current status
             lines[0] = Line::from(vec![
-                Span::styled("🗺️  TRACEROUTE: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     match traceroute_state.status {
                         crate::types::ScanStatus::Running => "tracing...",
@@ -85,44 +85,7 @@ impl Pane for TraceroutePane {
             ]);
 
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
-                // Protocol status section
-                lines.push(Line::from(vec![
-                    Span::styled("🌐 Protocols:", Style::default().fg(Color::Cyan)),
-                ]));
-
-                // IPv4 status
-                let (ipv4_icon, ipv4_text, ipv4_color) = match &traceroute_result.ipv4_status {
-                    crate::scan::traceroute::TracerouteStatus::Success(hops) => ("✅", format!("{} hops", hops), Color::Green),
-                    crate::scan::traceroute::TracerouteStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
-                    crate::scan::traceroute::TracerouteStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
-                    crate::scan::traceroute::TracerouteStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("  IPv4: ", Style::default().fg(Color::White)),
-                    Span::styled(ipv4_icon, Style::default().fg(ipv4_color)),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(ipv4_text, Style::default().fg(ipv4_color)),
-                ]));
-
-                // IPv6 status
-                let (ipv6_icon, ipv6_text, ipv6_color) = match &traceroute_result.ipv6_status {
-                    crate::scan::traceroute::TracerouteStatus::Success(hops) => ("✅", format!("{} hops", hops), Color::Green),
-                    crate::scan::traceroute::TracerouteStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
-                    crate::scan::traceroute::TracerouteStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
-                    crate::scan::traceroute::TracerouteStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("  IPv6: ", Style::default().fg(Color::White)),
-                    Span::styled(ipv6_icon, Style::default().fg(ipv6_color)),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(ipv6_text, Style::default().fg(ipv6_color)),
-                ]));
-
-                lines.push(Line::from(""));
-
-                // Show traceroute data for the primary result
+                // Show traceroute data for the primary result with protocol-specific route header
                 if let Some(primary_data) = traceroute_result.get_primary_result() {
                     let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
 
@@ -187,13 +150,8 @@ impl Pane for TraceroutePane {
                 match traceroute_state.status {
                     crate::types::ScanStatus::Running => {
                         lines.push(Line::from(vec![
-                            Span::styled("📍 IPv4: ", Style::default().fg(Color::White)),
-                            Span::styled("tracing...", Style::default().fg(Color::Yellow)),
-                        ]));
-
-                        lines.push(Line::from(vec![
-                            Span::styled("📍 IPv6: ", Style::default().fg(Color::White)),
-                            Span::styled("tracing...", Style::default().fg(Color::Yellow)),
+                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                            Span::styled("tracing route...", Style::default().fg(Color::Yellow)),
                         ]));
                     }
                     crate::types::ScanStatus::Failed => {
@@ -213,7 +171,7 @@ impl Pane for TraceroutePane {
         } else {
             // No traceroute scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🗺️  TRACEROUTE: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
 

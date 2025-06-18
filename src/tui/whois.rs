@@ -55,7 +55,7 @@ impl Pane for WhoisPane {
 
         // WHOIS status header
         lines.push(Line::from(vec![
-            Span::styled("📋 WHOIS: ", Style::default().fg(Color::Cyan)),
+            Span::styled("📋 Status: ", Style::default().fg(Color::Cyan)),
             Span::styled("querying...", Style::default().fg(Color::Gray)),
         ]));
 
@@ -66,7 +66,7 @@ impl Pane for WhoisPane {
         if let Some(whois_state) = state.scanners.get("whois") {
             // Update header with current status
             lines[0] = Line::from(vec![
-                Span::styled("📋 WHOIS: ", Style::default().fg(Color::Cyan)),
+                Span::styled("📋 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     match whois_state.status {
                         crate::types::ScanStatus::Running => "querying...",

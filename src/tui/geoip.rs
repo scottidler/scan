@@ -53,7 +53,7 @@ impl Pane for GeoIpPane {
 
         // GeoIP status header
         lines.push(Line::from(vec![
-            Span::styled("🌍 GEOIP: ", Style::default().fg(Color::Cyan)),
+            Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
             Span::styled("locating...", Style::default().fg(Color::Gray)),
         ]));
 
@@ -64,7 +64,7 @@ impl Pane for GeoIpPane {
         if let Some(geoip_state) = state.scanners.get("geoip") {
             // Update header with current status
             lines[0] = Line::from(vec![
-                Span::styled("🌍 GEOIP: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     match geoip_state.status {
                         crate::types::ScanStatus::Running => "locating...",
@@ -80,53 +80,14 @@ impl Pane for GeoIpPane {
             ]);
 
             if let Some(ScanResult::GeoIp(geoip_result)) = &geoip_state.result {
-                // Protocol status section
-                lines.push(Line::from(vec![
-                    Span::styled("🌐 Protocols:", Style::default().fg(Color::Cyan)),
-                ]));
-
-                // IPv4 status
-                let (ipv4_icon, ipv4_text, ipv4_color) = match &geoip_result.ipv4_status {
-                    crate::scan::geoip::GeoIpStatus::Success => ("✅", "located".to_string(), Color::Green),
-                    crate::scan::geoip::GeoIpStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
-                    crate::scan::geoip::GeoIpStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
-                    crate::scan::geoip::GeoIpStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("  IPv4: ", Style::default().fg(Color::White)),
-                    Span::styled(ipv4_icon, Style::default().fg(ipv4_color)),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(ipv4_text, Style::default().fg(ipv4_color)),
-                ]));
-
-                // IPv6 status
-                let (ipv6_icon, ipv6_text, ipv6_color) = match &geoip_result.ipv6_status {
-                    crate::scan::geoip::GeoIpStatus::Success => ("✅", "located".to_string(), Color::Green),
-                    crate::scan::geoip::GeoIpStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
-                    crate::scan::geoip::GeoIpStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
-                    crate::scan::geoip::GeoIpStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("  IPv6: ", Style::default().fg(Color::White)),
-                    Span::styled(ipv6_icon, Style::default().fg(ipv6_color)),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(ipv6_text, Style::default().fg(ipv6_color)),
-                ]));
-
-                lines.push(Line::from(""));
-
                 // Show location data for the primary result
                 if let Some(primary_data) = geoip_result.get_primary_result() {
-                    let protocol = if primary_data.target_ip.is_ipv6() { "IPv6" } else { "IPv4" };
-
                     // Location
                     if let Some(location) = &primary_data.location {
                         let location_text = format!("{}, {}, {}", location.city, location.region, location.country);
 
                         lines.push(Line::from(vec![
-                            Span::styled(format!("📍 {} Location: ", protocol), Style::default().fg(Color::White)),
+                            Span::styled("📍 Location: ", Style::default().fg(Color::White)),
                             Span::styled(
                                 location_text,
                                 Style::default().fg(Color::Green)
@@ -238,7 +199,7 @@ impl Pane for GeoIpPane {
         } else {
             // No GeoIP scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🌍 GEOIP: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
 

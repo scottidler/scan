@@ -93,7 +93,7 @@ impl SecurityPane {
 
         // Security status header
         lines.push(Line::from(vec![
-            Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
+            Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
             Span::styled("analyzing...", Style::default().fg(Color::Yellow)),
         ]));
 
@@ -120,10 +120,7 @@ impl SecurityPane {
                             cert.public_key_algorithm.clone(),
                             cert.key_size,
                             cert.san_domains.len()
-                        )),
-                        // Add protocol status data
-                        tls_result.ipv4_status.clone(),
-                        tls_result.ipv6_status.clone()
+                        ))
                     ))
                 } else {
                     None
@@ -231,10 +228,10 @@ impl SecurityPane {
         };
 
         // Now build the UI with owned data
-        if let Some((connection_successful, negotiated_version, negotiated_cipher, pfs, ocsp, cert_valid, days_until_expiry, security_grade, vuln_count, cert_info, ipv4_status, ipv6_status)) = tls_data {
+        if let Some((connection_successful, negotiated_version, negotiated_cipher, pfs, ocsp, cert_valid, days_until_expiry, security_grade, vuln_count, cert_info)) = tls_data {
             // Update header based on status
             lines[0] = Line::from(vec![
-                Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled("analyzed", Style::default().fg(Color::Green)),
             ]);
 
@@ -269,41 +266,7 @@ impl SecurityPane {
                 ]));
             }
 
-            // Add protocol status indicators
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("🌐 Protocols:", Style::default().fg(Color::Cyan)),
-            ]));
 
-            // IPv4 status
-            let (ipv4_icon, ipv4_text, ipv4_color) = match &ipv4_status {
-                crate::scan::tls::TlsStatus::Success(grade) => ("✅", format!("{}", grade.as_str()), Color::Green),
-                crate::scan::tls::TlsStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
-                crate::scan::tls::TlsStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
-                crate::scan::tls::TlsStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled("  IPv4: ", Style::default().fg(Color::White)),
-                Span::styled(ipv4_icon, Style::default().fg(ipv4_color)),
-                Span::styled(" ", Style::default()),
-                Span::styled(ipv4_text, Style::default().fg(ipv4_color)),
-            ]));
-
-            // IPv6 status
-            let (ipv6_icon, ipv6_text, ipv6_color) = match &ipv6_status {
-                crate::scan::tls::TlsStatus::Success(grade) => ("✅", format!("{}", grade.as_str()), Color::Green),
-                crate::scan::tls::TlsStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
-                crate::scan::tls::TlsStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
-                crate::scan::tls::TlsStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled("  IPv6: ", Style::default().fg(Color::White)),
-                Span::styled(ipv6_icon, Style::default().fg(ipv6_color)),
-                Span::styled(" ", Style::default()),
-                Span::styled(ipv6_text, Style::default().fg(ipv6_color)),
-            ]));
 
             // Security Features
             lines.push(Line::from(""));
@@ -463,7 +426,7 @@ impl SecurityPane {
         } else {
             // No TLS scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
 

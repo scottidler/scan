@@ -98,7 +98,7 @@ impl DnsPane {
         // DNS status header
         if let Some(dns_state) = state.scanners.get("dns") {
             lines.push(Line::from(vec![
-                Span::styled("🌐 DNS: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     match dns_state.status {
                         crate::types::ScanStatus::Running => "resolving...",
@@ -114,7 +114,7 @@ impl DnsPane {
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("🌐 DNS: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled("scanner not available", Style::default().fg(Color::Red)),
             ]));
         }

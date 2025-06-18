@@ -111,23 +111,66 @@ impl Pane for TargetPane {
             ),
         ]));
 
-        // Show resolved IP information from DNS scanner
+        // IPv4/IPv6 Protocol Status - Single source of truth
         match state.scanners.get("dns") {
             Some(dns_state) => {
                 match &dns_state.result {
                     Some(crate::types::ScanResult::Dns(dns_result)) => {
-                        if !dns_result.A.is_empty() {
-                            let ip = &dns_result.A[0].value;
-                            log::trace!("[tui::target] dns_resolved: ip={}", ip);
-                            lines.push(Line::from(vec![
-                                Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                                Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
-                            ]));
+                        // IPv4 status
+                        let ipv4_selected = state.protocol.includes_ipv4();
+                        let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " }; // Chevron or 2 spaces for alignment
+                        
+                        if ipv4_selected {
+                            if !dns_result.A.is_empty() {
+                                let ip = &dns_result.A[0].value;
+                                log::trace!("[tui::target] ipv4_resolved: ip={}", ip);
+                                lines.push(Line::from(vec![
+                                    Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                                    Span::styled("✅ IPv4: ", Style::default().fg(Color::Green)),
+                                    Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
+                                ]));
+                            } else {
+                                log::trace!("[tui::target] ipv4_no_records:");
+                                lines.push(Line::from(vec![
+                                    Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                                    Span::styled("❌ IPv4: ", Style::default().fg(Color::Red)),
+                                    Span::styled("no data", Style::default().fg(Color::Red)),
+                                ]));
+                            }
                         } else {
-                            log::trace!("[tui::target] dns_no_a_records:");
                             lines.push(Line::from(vec![
-                                Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                                Span::styled("resolved (no A records)", Style::default().fg(Color::Yellow)),
+                                Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
+                                Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                                Span::styled("disabled", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+
+                        // IPv6 status
+                        let ipv6_selected = state.protocol.includes_ipv6();
+                        let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " }; // Chevron or 2 spaces for alignment
+                        
+                        if ipv6_selected {
+                            if !dns_result.AAAA.is_empty() {
+                                let ip = &dns_result.AAAA[0].value;
+                                log::trace!("[tui::target] ipv6_resolved: ip={}", ip);
+                                lines.push(Line::from(vec![
+                                    Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                                    Span::styled("✅ IPv6: ", Style::default().fg(Color::Green)),
+                                    Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
+                                ]));
+                            } else {
+                                log::trace!("[tui::target] ipv6_no_records:");
+                                lines.push(Line::from(vec![
+                                    Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                                    Span::styled("❌ IPv6: ", Style::default().fg(Color::Red)),
+                                    Span::styled("no data", Style::default().fg(Color::Red)),
+                                ]));
+                            }
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
+                                Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                                Span::styled("disabled", Style::default().fg(Color::Gray)),
                             ]));
                         }
                     }
@@ -135,43 +178,204 @@ impl Pane for TargetPane {
                         match dns_state.status {
                             ScanStatus::Running => {
                                 log::trace!("[tui::target] dns_resolving:");
-                                lines.push(Line::from(vec![
-                                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                                    Span::styled("resolving...", Style::default().fg(Color::Yellow)),
-                                ]));
+                                
+                                // IPv4 status during resolution
+                                let ipv4_selected = state.protocol.includes_ipv4();
+                                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
+                                
+                                if ipv4_selected {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                                        Span::styled("🔄 IPv4: ", Style::default().fg(Color::Yellow)),
+                                        Span::styled("resolving...", Style::default().fg(Color::Yellow)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
+                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                                    ]));
+                                }
+                                
+                                // IPv6 status during resolution
+                                let ipv6_selected = state.protocol.includes_ipv6();
+                                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
+                                
+                                if ipv6_selected {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                                        Span::styled("🔄 IPv6: ", Style::default().fg(Color::Yellow)),
+                                        Span::styled("resolving...", Style::default().fg(Color::Yellow)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
+                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                                    ]));
+                                }
                             }
                             ScanStatus::Failed => {
                                 log::trace!("[tui::target] dns_failed:");
-                                lines.push(Line::from(vec![
-                                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                                    Span::styled("resolution failed", Style::default().fg(Color::Red)),
-                                ]));
+                                
+                                // IPv4 status during failure
+                                let ipv4_selected = state.protocol.includes_ipv4();
+                                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
+                                
+                                if ipv4_selected {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                                        Span::styled("❌ IPv4: ", Style::default().fg(Color::Red)),
+                                        Span::styled("resolution failed", Style::default().fg(Color::Red)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
+                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                                    ]));
+                                }
+                                
+                                // IPv6 status during failure
+                                let ipv6_selected = state.protocol.includes_ipv6();
+                                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
+                                
+                                if ipv6_selected {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                                        Span::styled("❌ IPv6: ", Style::default().fg(Color::Red)),
+                                        Span::styled("resolution failed", Style::default().fg(Color::Red)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
+                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                                    ]));
+                                }
                             }
                             _ => {
                                 log::trace!("[tui::target] dns_waiting:");
-                                lines.push(Line::from(vec![
-                                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                                    Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
-                                ]));
+                                
+                                // IPv4 status while waiting
+                                let ipv4_selected = state.protocol.includes_ipv4();
+                                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
+                                
+                                if ipv4_selected {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
+                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                                    ]));
+                                }
+                                
+                                // IPv6 status while waiting
+                                let ipv6_selected = state.protocol.includes_ipv6();
+                                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
+                                
+                                if ipv6_selected {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
+                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                                    ]));
+                                }
                             }
                         }
                     }
                     Some(_) => {
                         // Non-DNS result (shouldn't happen)
                         log::warn!("[tui::target] dns_unexpected_result_type:");
-                        lines.push(Line::from(vec![
-                            Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                            Span::styled("error", Style::default().fg(Color::Red)),
-                        ]));
+                        
+                        // IPv4 status during error
+                        let ipv4_selected = state.protocol.includes_ipv4();
+                        let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
+                        
+                        if ipv4_selected {
+                            lines.push(Line::from(vec![
+                                Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                                Span::styled("❌ IPv4: ", Style::default().fg(Color::Red)),
+                                Span::styled("error", Style::default().fg(Color::Red)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
+                                Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                                Span::styled("disabled", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                        
+                        // IPv6 status during error
+                        let ipv6_selected = state.protocol.includes_ipv6();
+                        let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
+                        
+                        if ipv6_selected {
+                            lines.push(Line::from(vec![
+                                Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                                Span::styled("❌ IPv6: ", Style::default().fg(Color::Red)),
+                                Span::styled("error", Style::default().fg(Color::Red)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
+                                Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                                Span::styled("disabled", Style::default().fg(Color::Gray)),
+                            ]));
+                        }
                     }
                 }
             }
             None => {
-                log::warn!("[tui::target] dns_scanner_missing:");
-                lines.push(Line::from(vec![
-                    Span::styled("📍 ", Style::default().fg(Color::Blue)),
-                    Span::styled("DNS scanner not available", Style::default().fg(Color::Red)),
-                ]));
+                // No DNS scanner state yet
+                log::trace!("[tui::target] dns_no_state:");
+                
+                // IPv4 status when no DNS state
+                let ipv4_selected = state.protocol.includes_ipv4();
+                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
+                
+                if ipv4_selected {
+                    lines.push(Line::from(vec![
+                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
+                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                        Span::styled("initializing...", Style::default().fg(Color::Gray)),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
+                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
+                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                    ]));
+                }
+                
+                // IPv6 status when no DNS state
+                let ipv6_selected = state.protocol.includes_ipv6();
+                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
+                
+                if ipv6_selected {
+                    lines.push(Line::from(vec![
+                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
+                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                        Span::styled("initializing...", Style::default().fg(Color::Gray)),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
+                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
+                        Span::styled("disabled", Style::default().fg(Color::Gray)),
+                    ]));
+                }
             }
         }
 

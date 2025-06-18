@@ -84,7 +84,7 @@ impl Pane for HttpPane {
 
         // HTTP status header
         lines.push(Line::from(vec![
-            Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
+            Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
             Span::styled("scanning...", Style::default().fg(Color::Gray)),
         ]));
 
@@ -95,7 +95,7 @@ impl Pane for HttpPane {
         if let Some(http_state) = state.scanners.get("http") {
             // Update header with current status
             lines[0] = Line::from(vec![
-                Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     match http_state.status {
                         crate::types::ScanStatus::Running => "scanning...",
@@ -184,39 +184,6 @@ impl Pane for HttpPane {
                         ]));
                     }
 
-                    // Protocol status
-                    lines.push(Line::from(vec![
-                        Span::styled("🌐 Protocols: ", Style::default().fg(Color::White)),
-                    ]));
-
-                    // IPv4 status
-                    let ipv4_status = match &http_result.ipv4_status {
-                        crate::scan::http::HttpStatus::Success(_) => ("✅", Color::Green, "success", Color::Gray),
-                        crate::scan::http::HttpStatus::Failed(_) => ("❌", Color::Red, "failed", Color::Red),
-                        crate::scan::http::HttpStatus::NoAddress => ("❌", Color::Red, "no address", Color::Red),
-                        crate::scan::http::HttpStatus::NotQueried => ("⚫", Color::Gray, "not queried", Color::Gray),
-                    };
-
-                    lines.push(Line::from(vec![
-                        Span::styled("  IPv4: ", Style::default().fg(Color::White)),
-                        Span::styled(ipv4_status.0, Style::default().fg(ipv4_status.1)),
-                        Span::styled(format!(" {}", ipv4_status.2), Style::default().fg(ipv4_status.3)),
-                    ]));
-
-                    // IPv6 status
-                    let ipv6_status = match &http_result.ipv6_status {
-                        crate::scan::http::HttpStatus::Success(_) => ("✅", Color::Green, "success", Color::Gray),
-                        crate::scan::http::HttpStatus::Failed(_) => ("❌", Color::Red, "failed", Color::Red),
-                        crate::scan::http::HttpStatus::NoAddress => ("❌", Color::Red, "no address", Color::Red),
-                        crate::scan::http::HttpStatus::NotQueried => ("⚫", Color::Gray, "not queried", Color::Gray),
-                    };
-
-                    lines.push(Line::from(vec![
-                        Span::styled("  IPv6: ", Style::default().fg(Color::White)),
-                        Span::styled(ipv6_status.0, Style::default().fg(ipv6_status.1)),
-                        Span::styled(format!(" {}", ipv6_status.2), Style::default().fg(ipv6_status.3)),
-                    ]));
-
                     // Redirect chain - show details
                     if !primary_data.redirect_chain.is_empty() {
                         lines.push(Line::from(vec![
@@ -298,7 +265,7 @@ impl Pane for HttpPane {
         } else {
             // No HTTP scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
 
