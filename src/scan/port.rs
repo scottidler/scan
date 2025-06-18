@@ -153,7 +153,7 @@ impl PortScanner {
             target.display_name(), self.max_concurrent);
 
         let scan_start = Instant::now();
-        
+
         // Scan ports with throttling to avoid bans
         let mut scan_results = Vec::new();
         for chunk in ports.chunks(self.max_concurrent) {
@@ -163,9 +163,9 @@ impl PortScanner {
                 .buffer_unordered(self.max_concurrent)
                 .collect::<Vec<_>>()
                 .await;
-            
+
             scan_results.extend(chunk_results);
-            
+
             // Small delay between chunks to be polite
             if ports.len() > self.max_concurrent {
                 sleep(Duration::from_millis(PORT_SCAN_THROTTLE_MS)).await;

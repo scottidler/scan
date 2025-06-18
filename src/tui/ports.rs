@@ -46,29 +46,29 @@ impl Default for PortsPane {
 
 impl Pane for PortsPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::ports] render: area={}x{} focused={}", 
+        log::trace!("[tui::ports] render: area={}x{} focused={}",
             area.width, area.height, focused);
-        
+
         let block = create_block(self.title, focused);
-        
+
         // Calculate content area (inside the border)
         let inner_area = block.inner(area);
-        
+
         // Render the block first
         block.render(area, frame.buffer_mut());
-        
+
         // Prepare content lines
         let mut lines = Vec::new();
-        
+
         // Ports status header
         lines.push(Line::from(vec![
             Span::styled("🔌 PORTS: ", Style::default().fg(Color::Cyan)),
             Span::styled("scanning...", Style::default().fg(Color::Gray)),
         ]));
-        
+
         // Empty line for spacing
         lines.push(Line::from(""));
-        
+
         // Get port scan results and render them
         let port_lines = match state.scanners.get("port") {
             Some(port_state) => {
@@ -76,7 +76,7 @@ impl Pane for PortsPane {
                 let result = port_state.result.clone();
                 let status = port_state.status.clone();
                 let last_updated = port_state.last_updated;
-                
+
                 match result {
                     Some(ScanResult::Port(port_result)) => {
                         // Update header with current status
@@ -95,14 +95,14 @@ impl Pane for PortsPane {
                                 })
                             ),
                         ]);
-                        
+
                         // Extract the data we need to avoid lifetime issues
                         let open_count = port_result.open_ports.len();
                         let open_ports: Vec<_> = port_result.open_ports.iter().take(MAX_DISPLAYED_PORTS).cloned().collect();
                         let filtered_ports = port_result.filtered_ports;
                         let closed_ports = port_result.closed_ports;
                         let scan_duration_ms = port_result.scan_duration.as_millis();
-                        
+
                         // Calculate estimated progress (rough estimate based on duration and typical scan times)
                         let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
                             // Estimate progress based on scan duration and typical port scan timing
@@ -118,9 +118,9 @@ impl Pane for PortsPane {
                         } else {
                             None
                         };
-                        
+
                         let mut result_lines = Vec::new();
-                        
+
                         // Progress information if actively scanning
                         if let Some((scanned, total, percent)) = progress_info {
                             result_lines.push(Line::from(vec![
@@ -136,7 +136,7 @@ impl Pane for PortsPane {
                                 Span::styled("completed", Style::default().fg(Color::Green)),
                             ]));
                         }
-                        
+
                         // Open ports count with color coding
                         let port_color = if open_count == 0 {
                             Color::Green
@@ -145,7 +145,7 @@ impl Pane for PortsPane {
                         } else {
                             Color::Red
                         };
-                        
+
                         result_lines.push(Line::from(vec![
                             Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
                             Span::styled(
@@ -154,20 +154,20 @@ impl Pane for PortsPane {
                             ),
                             Span::styled(" ports", Style::default().fg(Color::White)),
                         ]));
-                        
+
                         // Show discovered open ports (up to 5)
                         for (idx, open_port) in open_ports.iter().enumerate() {
                             if idx >= MAX_DISPLAYED_PORTS { break; } // Limit display
-                            
+
                             let service_name = open_port.service.as_ref()
                                 .map(|s| s.name.clone())
                                 .unwrap_or_else(|| "unknown".to_string());
-                            
+
                             let protocol_str = match open_port.protocol {
                                 crate::scan::port::Protocol::Tcp => "tcp",
                                 crate::scan::port::Protocol::Udp => "udp",
                             };
-                            
+
                             result_lines.push(Line::from(vec![
                                 Span::styled("  ", Style::default()),
                                 Span::styled(
@@ -182,7 +182,7 @@ impl Pane for PortsPane {
                                 Span::styled(")", Style::default().fg(Color::Gray)),
                             ]));
                         }
-                        
+
                         // Show "more" indicator if there are more open ports
                         if open_count > MAX_DISPLAYED_PORTS {
                             result_lines.push(Line::from(vec![
@@ -193,7 +193,7 @@ impl Pane for PortsPane {
                                 ),
                             ]));
                         }
-                        
+
                         // Filtered and closed ports summary
                         if filtered_ports > 0 {
                             result_lines.push(Line::from(vec![
@@ -204,7 +204,7 @@ impl Pane for PortsPane {
                                 ),
                             ]));
                         }
-                        
+
                         if closed_ports > 0 {
                             result_lines.push(Line::from(vec![
                                 Span::styled("🔴 Closed: ", Style::default().fg(Color::White)),
@@ -214,7 +214,7 @@ impl Pane for PortsPane {
                                 ),
                             ]));
                         }
-                        
+
                         // Scan duration
                         result_lines.push(Line::from(vec![
                             Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
@@ -227,7 +227,7 @@ impl Pane for PortsPane {
                                 Style::default().fg(Color::Gray)
                             ),
                         ]));
-                        
+
                         result_lines
                     }
                     Some(_) => {
@@ -248,7 +248,7 @@ impl Pane for PortsPane {
                                 } else {
                                     format!("{}m ago", seconds_ago / SECONDS_THRESHOLD_FOR_MINUTES)
                                 };
-                                
+
                                 vec![
                                     Line::from(vec![
                                         Span::styled("📊 Status: ", Style::default().fg(Color::White)),
@@ -292,10 +292,10 @@ impl Pane for PortsPane {
                 ])]
             }
         };
-        
+
         // Add port lines to main lines
         lines.extend(port_lines);
-        
+
         // Create and render the paragraph
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
@@ -336,4 +336,4 @@ mod tests {
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }
-} 
+}

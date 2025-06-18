@@ -47,4 +47,4 @@ pub enum ScanResult {
     Traceroute(crate::scan::traceroute::TracerouteResult),
     GeoIp(crate::scan::geoip::GeoIpResult),
     Port(crate::scan::port::PortResult),
-} 
+}

@@ -49,76 +49,76 @@ impl PaneLayout {
             grid_cols,
         }
     }
-    
+
     /// Create the default 3x3 layout for our dashboard
     pub fn default_dashboard() -> Self {
         log::debug!("[tui::layout] default_dashboard: creating 3x3 layout");
         Self::new(DEFAULT_GRID_ROWS, DEFAULT_GRID_COLS)
     }
-    
+
     /// Add a pane to the layout with its configuration
     pub fn add_pane(&mut self, pane: Box<dyn Pane>, config: PaneConfig) {
         let pane_id = pane.id().to_string();
-        log::debug!("[tui::layout] add_pane: pane_id={} position=({},{}) visible={}", 
+        log::debug!("[tui::layout] add_pane: pane_id={} position=({},{}) visible={}",
             pane_id, config.position.row, config.position.col, config.visible);
-        
+
         self.config.insert(pane_id, config);
         self.panes.push(pane);
-        
+
         log::trace!("[tui::layout] pane_added: total_panes={}", self.panes.len());
     }
-    
+
     /// Set the focused pane by ID
     pub fn set_focus(&mut self, pane_id: Option<String>) {
-        log::debug!("[tui::layout] set_focus: old_focus={:?} new_focus={:?}", 
+        log::debug!("[tui::layout] set_focus: old_focus={:?} new_focus={:?}",
             self.focused_pane, pane_id);
         self.focused_pane = pane_id;
     }
-    
+
     /// Get the currently focused pane ID
     pub fn focused_pane(&self) -> Option<&String> {
         self.focused_pane.as_ref()
     }
-    
+
     /// Render all panes in the layout
     pub fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        log::trace!("[tui::layout] render: area={}x{} panes={} focused={:?}", 
+        log::trace!("[tui::layout] render: area={}x{} panes={} focused={:?}",
             area.width, area.height, self.panes.len(), self.focused_pane);
-        
+
         // Create the grid layout
         let grid_areas = self.create_grid_layout(area);
-        log::trace!("[tui::layout] grid_created: rows={} cols={}", 
+        log::trace!("[tui::layout] grid_created: rows={} cols={}",
             grid_areas.len(), grid_areas.first().map(|r| r.len()).unwrap_or(0));
-        
+
         let mut rendered_count = 0;
         let mut skipped_count = 0;
-        
+
         // Render each pane in its designated area
         for pane in &self.panes {
             let pane_id = pane.id();
-            
+
             if let Some(config) = self.config.get(pane_id) {
                 if !config.visible || !pane.is_visible() {
                     skipped_count += 1;
-                    log::trace!("[tui::layout] pane_skipped: pane_id={} config_visible={} pane_visible={}", 
+                    log::trace!("[tui::layout] pane_skipped: pane_id={} config_visible={} pane_visible={}",
                         pane_id, config.visible, pane.is_visible());
                     continue;
                 }
-                
+
                 if let Some(pane_area) = self.get_pane_area(&grid_areas, config) {
                     // Check if this pane is focused
                     let is_focused = self.focused_pane.as_ref()
                         .map(|focused_id| focused_id == pane_id)
                         .unwrap_or(false);
-                    
-                    log::trace!("[tui::layout] rendering_pane: pane_id={} area={}x{} focused={}", 
+
+                    log::trace!("[tui::layout] rendering_pane: pane_id={} area={}x{} focused={}",
                         pane_id, pane_area.width, pane_area.height, is_focused);
-                    
+
                     pane.render(frame, pane_area, state, is_focused);
                     rendered_count += 1;
                 } else {
                     skipped_count += 1;
-                    log::warn!("[tui::layout] pane_area_not_found: pane_id={} position=({},{})", 
+                    log::warn!("[tui::layout] pane_area_not_found: pane_id={} position=({},{})",
                         pane_id, config.position.row, config.position.col);
                 }
             } else {
@@ -126,16 +126,16 @@ impl PaneLayout {
                 log::warn!("[tui::layout] pane_config_not_found: pane_id={}", pane_id);
             }
         }
-        
-        log::trace!("[tui::layout] render_completed: rendered={} skipped={}", 
+
+        log::trace!("[tui::layout] render_completed: rendered={} skipped={}",
             rendered_count, skipped_count);
     }
-    
+
     /// Create the grid layout areas with custom proportions (public version)
     pub fn create_grid_layout_public(&self, area: ratatui::layout::Rect) -> Vec<Vec<ratatui::layout::Rect>> {
         self.create_grid_layout(area)
     }
-    
+
     /// Create the grid layout areas with custom proportions
     fn create_grid_layout(&self, area: Rect) -> Vec<Vec<Rect>> {
         // Create custom row constraints for better space allocation
@@ -147,16 +147,16 @@ impl PaneLayout {
             Constraint::Percentage(MIDDLE_ROW_HEIGHT_PERCENT), // Middle row - 35%
             Constraint::Percentage(BOTTOM_ROW_HEIGHT_PERCENT), // Bottom row - 40%
         ];
-        
+
         // Split into rows
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints(row_constraints)
             .split(area);
-        
+
         // Split each row into columns with custom proportions
         let mut grid_areas = Vec::new();
-        
+
         for (row_idx, row_area) in rows.iter().enumerate() {
             let col_constraints = match row_idx {
                 0 => vec![
@@ -180,60 +180,60 @@ impl PaneLayout {
                     Constraint::Percentage(EQUAL_COLUMN_WIDTH_PERCENT_THIRD),
                 ],
             };
-            
+
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints(col_constraints)
                 .split(*row_area);
-            
+
             grid_areas.push(cols.iter().copied().collect());
         }
-        
+
         grid_areas
     }
-    
+
     /// Get the area for a specific pane based on its configuration
     fn get_pane_area(&self, grid_areas: &[Vec<Rect>], config: &PaneConfig) -> Option<Rect> {
         let row = config.position.row;
         let col = config.position.col;
-        
+
         // Check bounds
         if row >= self.grid_rows || col >= self.grid_cols {
             return None;
         }
-        
+
         // For now, just return the single cell area
         // TODO: Handle spanning multiple cells
         Some(grid_areas[row][col])
     }
-    
+
     /// Get all pane IDs in the layout
     pub fn pane_ids(&self) -> Vec<String> {
         self.panes.iter().map(|p| p.id().to_string()).collect()
     }
-    
+
     /// Get pane configuration by ID
     pub fn get_config(&self, pane_id: &str) -> Option<&PaneConfig> {
         self.config.get(pane_id)
     }
-    
+
     /// Update pane configuration
     pub fn update_config(&mut self, pane_id: String, config: PaneConfig) {
         self.config.insert(pane_id, config);
     }
-    
+
     /// Toggle pane visibility
     pub fn toggle_pane_visibility(&mut self, pane_id: &str) {
         if let Some(config) = self.config.get_mut(pane_id) {
             let old_visible = config.visible;
             config.visible = !config.visible;
-            log::debug!("[tui::layout] toggle_pane_visibility: pane_id={} old={} new={}", 
+            log::debug!("[tui::layout] toggle_pane_visibility: pane_id={} old={} new={}",
                 pane_id, old_visible, config.visible);
         } else {
             log::warn!("[tui::layout] toggle_visibility_failed: pane_id={} not_found", pane_id);
         }
     }
-    
+
     /// Get the next focusable pane ID
     pub fn next_focusable_pane(&self, current: Option<&str>) -> Option<String> {
         let focusable_panes: Vec<_> = self.panes
@@ -241,15 +241,15 @@ impl PaneLayout {
             .filter(|p| p.is_focusable())
             .map(|p| p.id().to_string())
             .collect();
-        
-        log::trace!("[tui::layout] next_focusable_pane: current={:?} focusable_count={}", 
+
+        log::trace!("[tui::layout] next_focusable_pane: current={:?} focusable_count={}",
             current, focusable_panes.len());
-        
+
         if focusable_panes.is_empty() {
             log::debug!("[tui::layout] no_focusable_panes:");
             return None;
         }
-        
+
         let next_pane = match current {
             None => Some(focusable_panes[0].clone()),
             Some(current_id) => {
@@ -261,12 +261,12 @@ impl PaneLayout {
                 }
             }
         };
-        
-        log::debug!("[tui::layout] next_focusable_result: current={:?} next={:?}", 
+
+        log::debug!("[tui::layout] next_focusable_result: current={:?} next={:?}",
             current, next_pane);
         next_pane
     }
-    
+
     /// Get the previous focusable pane ID
     pub fn prev_focusable_pane(&self, current: Option<&str>) -> Option<String> {
         let focusable_panes: Vec<_> = self.panes
@@ -274,11 +274,11 @@ impl PaneLayout {
             .filter(|p| p.is_focusable())
             .map(|p| p.id().to_string())
             .collect();
-        
+
         if focusable_panes.is_empty() {
             return None;
         }
-        
+
         match current {
             None => Some(focusable_panes[focusable_panes.len() - 1].clone()),
             Some(current_id) => {
@@ -295,12 +295,12 @@ impl PaneLayout {
             }
         }
     }
-    
+
     /// Handle keyboard events for the focused pane
     pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent, state: &AppState, pane_areas: &[Vec<ratatui::layout::Rect>]) -> bool {
-        log::debug!("[tui::layout] handle_key_event: focused_pane={:?} key={:?}", 
+        log::debug!("[tui::layout] handle_key_event: focused_pane={:?} key={:?}",
             self.focused_pane, key.code);
-        
+
         if let Some(focused_id) = &self.focused_pane {
             match key.code {
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
@@ -339,7 +339,7 @@ impl PaneLayout {
                                     } else {
                                         FALLBACK_VISIBLE_LINES // Fallback
                                     };
-                                    
+
                                     security_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
@@ -354,7 +354,7 @@ impl PaneLayout {
                                             visible_lines = pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
                                         }
                                     }
-                                    
+
                                     dns_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
@@ -369,7 +369,7 @@ impl PaneLayout {
                                             visible_lines = pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
                                         }
                                     }
-                                    
+
                                     traceroute_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
@@ -415,7 +415,7 @@ impl PaneLayout {
 mod tests {
     use super::*;
     use crate::tui::target::TargetPane;
-    
+
     #[test]
     fn test_layout_creation() {
         let layout = PaneLayout::default_dashboard();
@@ -424,51 +424,51 @@ mod tests {
         assert!(layout.panes.is_empty());
         assert!(layout.focused_pane.is_none());
     }
-    
+
     #[test]
     fn test_add_pane() {
         let mut layout = PaneLayout::default_dashboard();
         let pane = Box::new(TargetPane::new());
         let config = PaneConfig::new(0, 0);
-        
+
         layout.add_pane(pane, config);
         assert_eq!(layout.panes.len(), 1);
         assert!(layout.config.contains_key("target"));
     }
-    
+
     #[test]
     fn test_focus_management() {
         let mut layout = PaneLayout::default_dashboard();
-        
+
         // Initially no focus
         assert!(layout.focused_pane().is_none());
-        
+
         // Set focus
         layout.set_focus(Some("target".to_string()));
         assert_eq!(layout.focused_pane(), Some(&"target".to_string()));
-        
+
         // Clear focus
         layout.set_focus(None);
         assert!(layout.focused_pane().is_none());
     }
-    
+
     #[test]
     fn test_pane_visibility_toggle() {
         let mut layout = PaneLayout::default_dashboard();
         let pane = Box::new(TargetPane::new());
         let config = PaneConfig::new(0, 0);
-        
+
         layout.add_pane(pane, config);
-        
+
         // Initially visible
         assert!(layout.get_config("target").unwrap().visible);
-        
+
         // Toggle visibility
         layout.toggle_pane_visibility("target");
         assert!(!layout.get_config("target").unwrap().visible);
-        
+
         // Toggle back
         layout.toggle_pane_visibility("target");
         assert!(layout.get_config("target").unwrap().visible);
     }
-} 
+}

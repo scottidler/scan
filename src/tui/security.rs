@@ -50,19 +50,19 @@ impl SecurityPane {
             scroll_offset: 0,
         }
     }
-    
+
     pub fn scroll_up(&mut self) {
         let old_offset = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_STEP);
-        log::debug!("[tui::security] scroll_up: old_offset={} new_offset={}", 
+        log::debug!("[tui::security] scroll_up: old_offset={} new_offset={}",
             old_offset, self.scroll_offset);
     }
-    
+
     pub fn scroll_down_smart(&mut self, state: &AppState, visible_height: u16) {
         // Use the SINGLE SOURCE OF TRUTH for content calculation
         let lines = self.build_content_lines(state);
         let actual_lines = lines.len() as u16;
-        
+
         let old_offset = self.scroll_offset;
         if actual_lines > visible_height {
             let max_scroll = actual_lines.saturating_sub(visible_height);
@@ -70,34 +70,34 @@ impl SecurityPane {
                 self.scroll_offset += SCROLL_STEP;
             }
         }
-        
-        log::debug!("[tui::security] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}", 
-            old_offset, self.scroll_offset, actual_lines, visible_height, 
+
+        log::debug!("[tui::security] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
+            old_offset, self.scroll_offset, actual_lines, visible_height,
             actual_lines.saturating_sub(visible_height));
     }
-    
+
     pub fn reset_scroll(&mut self) {
         let old_offset = self.scroll_offset;
         self.scroll_offset = 0;
         log::debug!("[tui::security] reset_scroll: old_offset={}", old_offset);
     }
-    
+
     /// Build the actual content lines - SINGLE SOURCE OF TRUTH
     /// This method is used by both scroll calculation and rendering
     fn build_content_lines(&self, state: &AppState) -> Vec<Line> {
         log::trace!("[tui::security] build_content_lines: building security analysis content");
-        
+
         let mut lines = Vec::new();
-        
+
         // Security status header
         lines.push(Line::from(vec![
             Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
             Span::styled("analyzing...", Style::default().fg(Color::Yellow)),
         ]));
-        
+
         // Empty line for spacing
         lines.push(Line::from(""));
-        
+
         // Extract TLS data upfront
         let tls_data = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
@@ -125,7 +125,7 @@ impl SecurityPane {
         } else {
             None
         };
-        
+
         // Extract HTTP data upfront
         let http_data = if let Some(http_state) = state.scanners.get("http") {
             if let Some(crate::types::ScanResult::Http(http_result)) = http_state.result.as_ref() {
@@ -175,7 +175,7 @@ impl SecurityPane {
         } else {
             None
         };
-        
+
         // Extract DNS data upfront
         let dns_data = if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
@@ -192,7 +192,7 @@ impl SecurityPane {
         } else {
             None
         };
-        
+
         // Extract TLS vulnerability details
         let tls_vulnerabilities = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
@@ -216,7 +216,7 @@ impl SecurityPane {
         } else {
             None
         };
-        
+
         // Now build the UI with owned data
         if let Some((connection_successful, negotiated_version, negotiated_cipher, pfs, ocsp, cert_valid, days_until_expiry, security_grade, vuln_count, cert_info)) = tls_data {
             // Update header based on status
@@ -224,7 +224,7 @@ impl SecurityPane {
                 Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
                 Span::styled("analyzed", Style::default().fg(Color::Green)),
             ]);
-            
+
             // TLS Connection
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
@@ -233,7 +233,7 @@ impl SecurityPane {
                     Style::default().fg(if connection_successful { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             // TLS Version
             if let Some(version) = negotiated_version {
                 lines.push(Line::from(vec![
@@ -244,7 +244,7 @@ impl SecurityPane {
                     ),
                 ]));
             }
-            
+
             // Cipher Suite
             if let Some(cipher) = negotiated_cipher {
                 lines.push(Line::from(vec![
@@ -255,13 +255,13 @@ impl SecurityPane {
                     ),
                 ]));
             }
-            
+
             // Security Features
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("🛡️ Security Features", Style::default().fg(Color::Cyan)),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("  PFS: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -269,7 +269,7 @@ impl SecurityPane {
                     Style::default().fg(if pfs { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("  OCSP: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -277,16 +277,16 @@ impl SecurityPane {
                     Style::default().fg(if ocsp { Color::Green } else { Color::Yellow })
                 ),
             ]));
-            
+
             // Certificate Details
             if let Some((subject, issuer, key_algo, key_size, san_count)) = cert_info {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("📜 Certificate Details", Style::default().fg(Color::Cyan)),
                 ]));
-                
+
                 let cert_color = if cert_valid { Color::Green } else { Color::Red };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("  Valid: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -294,7 +294,7 @@ impl SecurityPane {
                         Style::default().fg(cert_color)
                     ),
                 ]));
-                
+
                 // Subject (extract CN)
                 let subject_display = if let Some(cn_start) = subject.find("CN=") {
                     let cn_part = &subject[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
@@ -306,12 +306,12 @@ impl SecurityPane {
                 } else {
                     "unknown"
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("  Subject: ", Style::default().fg(Color::White)),
                     Span::styled(subject_display.to_string(), Style::default().fg(Color::Yellow)),
                 ]));
-                
+
                 // Issuer (extract CN)
                 let issuer_display = if let Some(cn_start) = issuer.find("CN=") {
                     let cn_part = &issuer[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
@@ -323,12 +323,12 @@ impl SecurityPane {
                 } else {
                     "unknown"
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("  Issuer: ", Style::default().fg(Color::White)),
                     Span::styled(issuer_display.to_string(), Style::default().fg(Color::Green)),
                 ]));
-                
+
                 // Certificate expiry
                 if let Some(days_until_expiry) = days_until_expiry {
                     let expiry_color = if days_until_expiry > CERT_EXPIRY_WARNING_DAYS {
@@ -338,7 +338,7 @@ impl SecurityPane {
                     } else {
                         Color::Red
                     };
-                    
+
                     lines.push(Line::from(vec![
                         Span::styled("  Expires: ", Style::default().fg(Color::White)),
                         Span::styled(
@@ -347,7 +347,7 @@ impl SecurityPane {
                         ),
                     ]));
                 }
-                
+
                 // Key algorithm and size
                 lines.push(Line::from(vec![
                     Span::styled("  Key: ", Style::default().fg(Color::White)),
@@ -360,7 +360,7 @@ impl SecurityPane {
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
-                
+
                 // SAN domains count
                 if san_count > 0 {
                     lines.push(Line::from(vec![
@@ -372,7 +372,7 @@ impl SecurityPane {
                     ]));
                 }
             }
-            
+
             // Grade and vulnerabilities
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -386,7 +386,7 @@ impl SecurityPane {
                     })
                 ),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("⚠️ Issues: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -394,19 +394,19 @@ impl SecurityPane {
                     Style::default().fg(if vuln_count == 0 { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
         } else if state.scanners.contains_key("tls") {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
                 Span::styled("checking...", Style::default().fg(Color::Gray)),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("🔐 Version: ", Style::default().fg(Color::White)),
                 Span::styled("detecting...", Style::default().fg(Color::Gray)),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("📜 Cert: ", Style::default().fg(Color::White)),
                 Span::styled("validating...", Style::default().fg(Color::Gray)),
@@ -417,20 +417,20 @@ impl SecurityPane {
                 Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
-            
+
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
                 Span::styled("TLS scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
-        
+
         // HTTP Security Headers
         if let Some((hsts_present, x_frame, x_content, xss_protect, referrer_policy, permissions_policy, csp_data, cors_data, http_vulnerabilities, http_grade)) = http_data {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("🌐 HTTP Security", Style::default().fg(Color::Cyan)),
             ]));
-            
+
             // HSTS
             lines.push(Line::from(vec![
                 Span::styled("  HSTS: ", Style::default().fg(Color::White)),
@@ -439,7 +439,7 @@ impl SecurityPane {
                     Style::default().fg(if hsts_present { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             // X-Frame-Options
             lines.push(Line::from(vec![
                 Span::styled("  X-Frame: ", Style::default().fg(Color::White)),
@@ -448,7 +448,7 @@ impl SecurityPane {
                     Style::default().fg(if x_frame != "missing" { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             // X-Content-Type-Options
             lines.push(Line::from(vec![
                 Span::styled("  X-Content: ", Style::default().fg(Color::White)),
@@ -457,7 +457,7 @@ impl SecurityPane {
                     Style::default().fg(if x_content != "missing" { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             // X-XSS-Protection
             lines.push(Line::from(vec![
                 Span::styled("  XSS-Protect: ", Style::default().fg(Color::White)),
@@ -466,7 +466,7 @@ impl SecurityPane {
                     Style::default().fg(if xss_protect != "missing" { Color::Green } else { Color::Yellow })
                 ),
             ]));
-            
+
             // Referrer Policy
             lines.push(Line::from(vec![
                 Span::styled("  Referrer: ", Style::default().fg(Color::White)),
@@ -475,7 +475,7 @@ impl SecurityPane {
                     Style::default().fg(if referrer_policy != "missing" { Color::Green } else { Color::Yellow })
                 ),
             ]));
-            
+
             // Permissions Policy
             lines.push(Line::from(vec![
                 Span::styled("  Permissions: ", Style::default().fg(Color::White)),
@@ -484,7 +484,7 @@ impl SecurityPane {
                     Style::default().fg(if permissions_policy != "missing" { Color::Green } else { Color::Yellow })
                 ),
             ]));
-            
+
             // CSP
             if let Some((strength, header_value, issues)) = csp_data {
                 lines.push(Line::from(vec![
@@ -499,20 +499,20 @@ impl SecurityPane {
                         })
                     ),
                 ]));
-                
+
                 // CSP Header Value (truncated for display)
                 lines.push(Line::from(vec![
                     Span::styled("    Policy: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if header_value.len() > CSP_HEADER_DISPLAY_MAX_LENGTH { 
-                            format!("{}...", &header_value[..CSP_HEADER_TRUNCATE_LENGTH]) 
-                        } else { 
-                            header_value.clone() 
+                        if header_value.len() > CSP_HEADER_DISPLAY_MAX_LENGTH {
+                            format!("{}...", &header_value[..CSP_HEADER_TRUNCATE_LENGTH])
+                        } else {
+                            header_value.clone()
                         },
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
-                
+
                 // CSP Issues
                 for issue in issues {
                     lines.push(Line::from(vec![
@@ -529,7 +529,7 @@ impl SecurityPane {
                     Span::styled("missing", Style::default().fg(Color::Red)),
                 ]));
             }
-            
+
             // CORS
             if let Some((security_level, access_control_allow_origin, access_control_allow_methods, access_control_allow_credentials, issues)) = cors_data {
                 lines.push(Line::from(vec![
@@ -544,7 +544,7 @@ impl SecurityPane {
                         })
                     ),
                 ]));
-                
+
                 // CORS Details (compact)
                 if let Some(origin) = &access_control_allow_origin {
                     lines.push(Line::from(vec![
@@ -555,7 +555,7 @@ impl SecurityPane {
                         ),
                     ]));
                 }
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("    Methods: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -563,7 +563,7 @@ impl SecurityPane {
                         Style::default().fg(Color::Gray)
                     ),
                 ]));
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("    Credentials: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -571,7 +571,7 @@ impl SecurityPane {
                         Style::default().fg(if access_control_allow_credentials { Color::Yellow } else { Color::Green })
                     ),
                 ]));
-                
+
                 // CORS Issues
                 for issue in issues {
                     lines.push(Line::from(vec![
@@ -583,14 +583,14 @@ impl SecurityPane {
                     ]));
                 }
             }
-            
+
             // HTTP Vulnerabilities
             if !http_vulnerabilities.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("⚠️ HTTP Vulnerabilities", Style::default().fg(Color::Red)),
                 ]));
-                
+
                 for vuln in http_vulnerabilities {
                     lines.push(Line::from(vec![
                         Span::styled("  • ", Style::default().fg(Color::Red)),
@@ -598,7 +598,7 @@ impl SecurityPane {
                     ]));
                 }
             }
-            
+
             // HTTP Security Grade
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -614,14 +614,14 @@ impl SecurityPane {
                 ),
             ]));
         }
-        
+
         // DNS Security Records
         if let Some((spf_record, dmarc_record, dkim_domains, mx_count, has_mx)) = dns_data {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("📧 Email Security", Style::default().fg(Color::Cyan)),
             ]));
-            
+
             // SPF Record
             lines.push(Line::from(vec![
                 Span::styled("  SPF: ", Style::default().fg(Color::White)),
@@ -630,7 +630,7 @@ impl SecurityPane {
                     Style::default().fg(if spf_record.is_some() { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             // DMARC Record
             lines.push(Line::from(vec![
                 Span::styled("  DMARC: ", Style::default().fg(Color::White)),
@@ -639,20 +639,20 @@ impl SecurityPane {
                     Style::default().fg(if dmarc_record.is_some() { Color::Green } else { Color::Red })
                 ),
             ]));
-            
+
             // DKIM
             lines.push(Line::from(vec![
                 Span::styled("  DKIM: ", Style::default().fg(Color::White)),
                 Span::styled(
-                    if dkim_domains.is_empty() { 
-                        "not found".to_string() 
-                    } else { 
-                        format!("{} domains", dkim_domains.len()) 
+                    if dkim_domains.is_empty() {
+                        "not found".to_string()
+                    } else {
+                        format!("{} domains", dkim_domains.len())
                     },
                     Style::default().fg(if !dkim_domains.is_empty() { Color::Green } else { Color::Yellow })
                 ),
             ]));
-            
+
             // MX Records
             lines.push(Line::from(vec![
                 Span::styled("  MX: ", Style::default().fg(Color::White)),
@@ -661,7 +661,7 @@ impl SecurityPane {
                     Style::default().fg(if has_mx { Color::Green } else { Color::Gray })
                 ),
             ]));
-            
+
             // Show actual record contents (truncated)
             if let Some(spf) = &spf_record {
                 lines.push(Line::from(vec![
@@ -672,7 +672,7 @@ impl SecurityPane {
                     ),
                 ]));
             }
-            
+
             if let Some(dmarc) = &dmarc_record {
                 lines.push(Line::from(vec![
                     Span::styled("    DMARC: ", Style::default().fg(Color::White)),
@@ -682,7 +682,7 @@ impl SecurityPane {
                     ),
                 ]));
             }
-            
+
             if !dkim_domains.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled("    DKIM: ", Style::default().fg(Color::White)),
@@ -693,7 +693,7 @@ impl SecurityPane {
                 ]));
             }
         }
-        
+
         // TLS Vulnerabilities section
         if let Some(vulnerabilities) = tls_vulnerabilities {
             if !vulnerabilities.is_empty() {
@@ -701,7 +701,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("⚠️ TLS Vulnerabilities", Style::default().fg(Color::Red)),
                 ]));
-                
+
                 for vuln in vulnerabilities {
                     lines.push(Line::from(vec![
                         Span::styled("  • ", Style::default().fg(Color::Red)),
@@ -710,10 +710,10 @@ impl SecurityPane {
                 }
             }
         }
-        
+
         lines
     }
-    
+
     /// Get the actual number of lines that would be rendered for the current state
     pub fn get_actual_line_count(&self, state: &AppState) -> u16 {
         // Use the SINGLE SOURCE OF TRUTH
@@ -729,20 +729,20 @@ impl Default for SecurityPane {
 
 impl Pane for SecurityPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::security] render: area={}x{} focused={} scroll_offset={}", 
+        log::trace!("[tui::security] render: area={}x{} focused={} scroll_offset={}",
             area.width, area.height, focused, self.scroll_offset);
-        
+
         let block = create_block(self.title, focused);
-        
+
         // Calculate content area (inside the border)
         let inner_area = block.inner(area);
-        
+
         // Render the block first
         block.render(area, frame.buffer_mut());
-        
+
         // Use the SINGLE SOURCE OF TRUTH for content
         let lines = self.build_content_lines(state);
-        
+
         // Apply scrolling
         let total_lines = lines.len() as u16;
         let visible_area_height = inner_area.height;
@@ -752,40 +752,40 @@ impl Pane for SecurityPane {
             0
         };
         let safe_scroll_offset = self.scroll_offset.min(max_scroll_offset);
-        
-        log::trace!("[tui::security] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}", 
+
+        log::trace!("[tui::security] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
             total_lines, visible_area_height, max_scroll_offset, safe_scroll_offset);
-        
+
         // Apply scroll offset - skip lines from the beginning
         let visible_lines = if safe_scroll_offset < total_lines {
             lines.into_iter().skip(safe_scroll_offset as usize).collect()
         } else {
             lines
         };
-        
+
         log::trace!("[tui::security] render_content: visible_lines={}", visible_lines.len());
-        
+
         let paragraph = Paragraph::new(visible_lines)
             .alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
-    
+
     fn title(&self) -> &'static str {
         self.title
     }
-    
+
     fn id(&self) -> &'static str {
         self.id
     }
-    
+
     fn min_size(&self) -> (u16, u16) {
         (MIN_SECURITY_PANE_WIDTH, MIN_SECURITY_PANE_HEIGHT)
     }
-    
+
     fn is_focusable(&self) -> bool {
         true
     }
-    
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -817,7 +817,7 @@ mod tests {
         // False positive: mut is required for state.scanners.insert() calls
         #[allow(unused_mut)]
         let mut state = AppState::new("example.com".to_string());
-        
+
         // Create comprehensive TLS result with certificate details
         let cert = CertificateInfo {
             subject: "CN=example.com,O=Example Corp,C=US".to_string(),
@@ -832,7 +832,7 @@ mod tests {
             is_self_signed: false,
             is_ca: false,
         };
-        
+
         let tls_result = TlsResult {
             connection_successful: true,
             handshake_time: Duration::from_millis(100),
@@ -855,7 +855,7 @@ mod tests {
             scan_time: Duration::from_millis(500),
             queried_at: Instant::now(),
         };
-        
+
         state.scanners.insert("tls".to_string(), ScanState {
             result: Some(ScanResult::Tls(tls_result)),
             error: None,
@@ -863,7 +863,7 @@ mod tests {
             last_updated: Instant::now(),
             history: std::collections::VecDeque::new(),
         });
-        
+
         // Test TLS data extraction
         if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
@@ -875,7 +875,7 @@ mod tests {
                 assert_eq!(tls_result.days_until_expiry, Some(90));
                 assert_eq!(tls_result.security_grade.as_str(), "A");
                 assert_eq!(tls_result.vulnerabilities.len(), 2);
-                
+
                 // Test certificate details
                 let cert = &tls_result.certificate_chain[0];
                 assert!(cert.subject.contains("example.com"));
@@ -883,14 +883,14 @@ mod tests {
                 assert_eq!(cert.public_key_algorithm, "RSA");
                 assert_eq!(cert.key_size, Some(2048));
                 assert_eq!(cert.san_domains.len(), 2);
-                
+
                 // Test vulnerability extraction
                 let vuln_strings: Vec<String> = tls_result.vulnerabilities.iter().map(|vuln| match vuln {
                     TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
                     TlsVulnerability::WeakCipher(cipher) => format!("Weak cipher: {}", cipher),
                     _ => "Other vulnerability".to_string(),
                 }).collect();
-                
+
                 assert!(vuln_strings.contains(&"Heartbleed (CVE-2014-0160)".to_string()));
                 assert!(vuln_strings.contains(&"Weak cipher: RC4-MD5".to_string()));
             }
@@ -902,7 +902,7 @@ mod tests {
         // False positive: mut is required for state.scanners.insert() calls
         #[allow(unused_mut)]
         let mut state = AppState::new("example.com".to_string());
-        
+
         let security_headers = SecurityHeaders {
             strict_transport_security: Some("max-age=31536000; includeSubDomains".to_string()),
             x_frame_options: Some("DENY".to_string()),
@@ -911,18 +911,18 @@ mod tests {
             referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
             permissions_policy: Some("geolocation=(), microphone=()".to_string()),
         };
-        
+
         let mut csp_directives = HashMap::new();
         csp_directives.insert("default-src".to_string(), vec!["'self'".to_string()]);
         csp_directives.insert("script-src".to_string(), vec!["'self'".to_string(), "'unsafe-inline'".to_string()]);
-        
+
         let csp_policy = CspPolicy {
             header_value: "default-src 'self'; script-src 'self' 'unsafe-inline'".to_string(),
             directives: csp_directives,
             issues: vec![CspIssue::UnsafeInline("script-src".to_string())],
             strength: CspStrength::Moderate,
         };
-        
+
         let cors_policy = CorsPolicy {
             access_control_allow_origin: Some("*".to_string()),
             access_control_allow_methods: vec!["GET".to_string(), "POST".to_string()],
@@ -931,7 +931,7 @@ mod tests {
             issues: vec![CorsIssue::WildcardWithCredentials],
             security_level: CorsSecurityLevel::Dangerous,
         };
-        
+
         let http_result = HttpResult {
             url: "https://example.com".to_string(),
             status_code: 200,
@@ -955,7 +955,7 @@ mod tests {
             security_grade: HttpSecurityGrade::C,
             scan_duration: Duration::from_millis(300),
         };
-        
+
         state.scanners.insert("http".to_string(), ScanState {
             result: Some(ScanResult::Http(http_result)),
             error: None,
@@ -963,7 +963,7 @@ mod tests {
             last_updated: Instant::now(),
             history: std::collections::VecDeque::new(),
         });
-        
+
         // Test HTTP data extraction
         if let Some(http_state) = state.scanners.get("http") {
             if let Some(ScanResult::Http(http_result)) = http_state.result.as_ref() {
@@ -974,13 +974,13 @@ mod tests {
                 assert_eq!(http_result.security_headers.x_xss_protection.as_ref().unwrap(), "1; mode=block");
                 assert!(http_result.security_headers.referrer_policy.is_some());
                 assert!(http_result.security_headers.permissions_policy.is_some());
-                
+
                 // Test CSP
                 let csp = http_result.csp.as_ref().unwrap();
                 assert_eq!(csp.strength, CspStrength::Moderate);
                 assert!(csp.header_value.contains("default-src 'self'"));
                 assert_eq!(csp.issues.len(), 1);
-                
+
                 // Test CORS
                 let cors = http_result.cors.as_ref().unwrap();
                 assert_eq!(cors.security_level, CorsSecurityLevel::Dangerous);
@@ -988,12 +988,12 @@ mod tests {
                 assert_eq!(cors.access_control_allow_methods.len(), 2);
                 assert!(cors.access_control_allow_credentials);
                 assert_eq!(cors.issues.len(), 1);
-                
+
                 // Test vulnerabilities
                 assert_eq!(http_result.vulnerabilities.len(), 2);
                 assert!(http_result.vulnerabilities.contains(&HttpVulnerability::WeakCsp));
                 assert!(http_result.vulnerabilities.contains(&HttpVulnerability::InsecureCors));
-                
+
                 // Test grade
                 assert_eq!(http_result.security_grade, HttpSecurityGrade::C);
             }
@@ -1005,7 +1005,7 @@ mod tests {
         // False positive: mut is required for state.scanners.insert() calls
         #[allow(unused_mut)]
         let mut state = AppState::new("example.com".to_string());
-        
+
         let email_security = EmailSecurityAnalysis {
             spf_record: Some("v=spf1 include:_spf.google.com ~all".to_string()),
             dmarc_record: Some("v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com".to_string()),
@@ -1013,7 +1013,7 @@ mod tests {
             mx_count: 2,
             dkim_domains: vec!["default._domainkey.example.com".to_string(), "selector1._domainkey.example.com".to_string()],
         };
-        
+
         let dns_result = DnsResult {
             A: vec![],
             AAAA: vec![],
@@ -1029,7 +1029,7 @@ mod tests {
             response_time: Duration::from_millis(50),
             queried_at: Instant::now(),
         };
-        
+
         state.scanners.insert("dns".to_string(), ScanState {
             result: Some(ScanResult::Dns(dns_result)),
             error: None,
@@ -1037,24 +1037,24 @@ mod tests {
             last_updated: Instant::now(),
             history: std::collections::VecDeque::new(),
         });
-        
+
         // Test DNS data extraction
         if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
                 let email_security = dns_result.email_security.as_ref().unwrap();
-                
+
                 // Test SPF
                 assert!(email_security.spf_record.is_some());
                 assert!(email_security.spf_record.as_ref().unwrap().contains("v=spf1"));
-                
+
                 // Test DMARC
                 assert!(email_security.dmarc_record.is_some());
                 assert!(email_security.dmarc_record.as_ref().unwrap().contains("v=DMARC1"));
-                
+
                 // Test DKIM
                 assert_eq!(email_security.dkim_domains.len(), 2);
                 assert!(email_security.dkim_domains[0].contains("default._domainkey"));
-                
+
                 // Test MX
                 assert!(email_security.has_mx);
                 assert_eq!(email_security.mx_count, 2);
@@ -1067,7 +1067,7 @@ mod tests {
         // False positive: mut is required for state.scanners.insert() calls
         #[allow(unused_mut)]
         let mut state = AppState::new("comprehensive.com".to_string());
-        
+
         // Add all scanner types with data
         let cert = CertificateInfo {
             subject: "CN=comprehensive.com".to_string(),
@@ -1082,7 +1082,7 @@ mod tests {
             is_self_signed: false,
             is_ca: false,
         };
-        
+
         let tls_result = TlsResult {
             connection_successful: true,
             handshake_time: Duration::from_millis(100),
@@ -1102,7 +1102,7 @@ mod tests {
             scan_time: Duration::from_millis(500),
             queried_at: Instant::now(),
         };
-        
+
         let http_result = HttpResult {
             url: "https://comprehensive.com".to_string(),
             status_code: 200,
@@ -1130,7 +1130,7 @@ mod tests {
             security_grade: HttpSecurityGrade::B,
             scan_duration: Duration::from_millis(200),
         };
-        
+
         let dns_result = DnsResult {
             A: vec![],
             AAAA: vec![],
@@ -1152,7 +1152,7 @@ mod tests {
             response_time: Duration::from_millis(30),
             queried_at: Instant::now(),
         };
-        
+
         state.scanners.insert("tls".to_string(), ScanState {
             result: Some(ScanResult::Tls(tls_result)),
             error: None,
@@ -1160,7 +1160,7 @@ mod tests {
             last_updated: Instant::now(),
             history: std::collections::VecDeque::new(),
         });
-        
+
         state.scanners.insert("http".to_string(), ScanState {
             result: Some(ScanResult::Http(http_result)),
             error: None,
@@ -1168,7 +1168,7 @@ mod tests {
             last_updated: Instant::now(),
             history: std::collections::VecDeque::new(),
         });
-        
+
         state.scanners.insert("dns".to_string(), ScanState {
             result: Some(ScanResult::Dns(dns_result)),
             error: None,
@@ -1176,12 +1176,12 @@ mod tests {
             last_updated: Instant::now(),
             history: std::collections::VecDeque::new(),
         });
-        
+
         // Verify all scanners have data
         assert!(state.scanners.contains_key("tls"));
         assert!(state.scanners.contains_key("http"));
         assert!(state.scanners.contains_key("dns"));
-        
+
         // Verify TLS data is extractable
         if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
@@ -1192,7 +1192,7 @@ mod tests {
                 panic!("TLS result should be extractable");
             }
         }
-        
+
         // Verify HTTP data is extractable
         if let Some(http_state) = state.scanners.get("http") {
             if let Some(ScanResult::Http(http_result)) = http_state.result.as_ref() {
@@ -1203,7 +1203,7 @@ mod tests {
                 panic!("HTTP result should be extractable");
             }
         }
-        
+
         // Verify DNS data is extractable
         if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
@@ -1226,7 +1226,7 @@ mod tests {
             TlsVulnerability::WeakCipher("RC4-MD5".to_string()),
             TlsVulnerability::ExpiredCertificate,
         ];
-        
+
         let vuln_strings: Vec<String> = tls_vulnerabilities.iter().take(5).map(|vuln| match vuln {
             TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
             TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
@@ -1241,20 +1241,20 @@ mod tests {
             TlsVulnerability::SslV2Enabled => "SSLv2 enabled".to_string(),
             TlsVulnerability::SslV3Enabled => "SSLv3 enabled".to_string(),
         }).collect();
-        
+
         assert_eq!(vuln_strings.len(), 4);
         assert!(vuln_strings.contains(&"Heartbleed (CVE-2014-0160)".to_string()));
         assert!(vuln_strings.contains(&"POODLE (CVE-2014-3566)".to_string()));
         assert!(vuln_strings.contains(&"Weak cipher: RC4-MD5".to_string()));
         assert!(vuln_strings.contains(&"Certificate expired".to_string()));
-        
+
         // Test HTTP vulnerability extraction
         let http_vulnerabilities = vec![
             HttpVulnerability::MissingHsts,
             HttpVulnerability::WeakCsp,
             HttpVulnerability::InsecureCors,
         ];
-        
+
         let http_vuln_strings: Vec<String> = http_vulnerabilities.iter().take(5).map(|vuln| match vuln {
             HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
             HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options".to_string(),
@@ -1264,10 +1264,10 @@ mod tests {
             HttpVulnerability::InsecureCors => "Insecure CORS configuration".to_string(),
             HttpVulnerability::InformationDisclosure => "Information disclosure risk".to_string(),
         }).collect();
-        
+
         assert_eq!(http_vuln_strings.len(), 3);
         assert!(http_vuln_strings.contains(&"Missing HSTS header".to_string()));
         assert!(http_vuln_strings.contains(&"Weak Content Security Policy".to_string()));
         assert!(http_vuln_strings.contains(&"Insecure CORS configuration".to_string()));
     }
-} 
+}

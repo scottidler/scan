@@ -17,28 +17,28 @@ const DEFAULT_SPAN_COLS: usize = 1;
 pub trait Pane {
     /// Render the pane content to the given area
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool);
-    
+
     /// Get the pane's title for display
     fn title(&self) -> &'static str;
-    
+
     /// Get the pane's identifier for positioning
     fn id(&self) -> &'static str;
-    
+
     /// Whether this pane should be visible
     fn is_visible(&self) -> bool {
         true
     }
-    
+
     /// Get the pane's preferred minimum size (width, height)
     fn min_size(&self) -> (u16, u16) {
         (DEFAULT_MIN_PANE_WIDTH, DEFAULT_MIN_PANE_HEIGHT)
     }
-    
+
     /// Whether this pane can be focused/selected
     fn is_focusable(&self) -> bool {
         false
     }
-    
+
     /// Enable downcasting to concrete types
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -46,7 +46,7 @@ pub trait Pane {
 /// Helper function to create a standard bordered block for panes
 pub fn create_block(title: &str, focused: bool) -> Block {
     log::trace!("[tui::pane] create_block: title={} focused={}", title, focused);
-    
+
     Block::default()
         .title(title.to_uppercase())
         .borders(Borders::ALL)
@@ -89,15 +89,15 @@ impl PaneConfig {
             visible: true,
         }
     }
-    
+
     pub fn with_span(mut self, rows: usize, cols: usize) -> Self {
         self.span_rows = rows;
         self.span_cols = cols;
         self
     }
-    
+
     pub fn with_visibility(mut self, visible: bool) -> Self {
         self.visible = visible;
         self
     }
-} 
+}

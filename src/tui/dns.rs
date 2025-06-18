@@ -48,19 +48,19 @@ impl DnsPane {
             scroll_offset: 0,
         }
     }
-    
+
     pub fn scroll_up(&mut self) {
         let old_offset = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_STEP);
-        log::debug!("[tui::dns] scroll_up: old_offset={} new_offset={}", 
+        log::debug!("[tui::dns] scroll_up: old_offset={} new_offset={}",
             old_offset, self.scroll_offset);
     }
-    
+
     pub fn scroll_down_smart(&mut self, state: &AppState, visible_height: u16) {
         // Use the SINGLE SOURCE OF TRUTH for content calculation
         let lines = self.build_content_lines(state);
         let actual_lines = lines.len() as u16;
-        
+
         let old_offset = self.scroll_offset;
         if actual_lines > visible_height {
             let max_scroll = actual_lines.saturating_sub(visible_height);
@@ -68,12 +68,12 @@ impl DnsPane {
                 self.scroll_offset += SCROLL_STEP;
             }
         }
-        
-        log::debug!("[tui::dns] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}", 
-            old_offset, self.scroll_offset, actual_lines, visible_height, 
+
+        log::debug!("[tui::dns] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
+            old_offset, self.scroll_offset, actual_lines, visible_height,
             actual_lines.saturating_sub(visible_height));
     }
-    
+
     pub fn reset_scroll(&mut self) {
         let old_offset = self.scroll_offset;
         self.scroll_offset = 0;
@@ -92,9 +92,9 @@ impl DnsPane {
     /// This method is used by both scroll calculation and rendering
     fn build_content_lines(&self, state: &AppState) -> Vec<Line> {
         log::trace!("[tui::dns] build_content_lines: building DNS resolution content");
-        
+
         let mut lines = Vec::new();
-        
+
         // DNS status header
         if let Some(dns_state) = state.scanners.get("dns") {
             lines.push(Line::from(vec![
@@ -118,10 +118,10 @@ impl DnsPane {
                 Span::styled("scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
-        
+
         // Empty line for spacing
         lines.push(Line::from(""));
-        
+
         // Get DNS results and add them
         let dns_lines = if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
@@ -132,14 +132,14 @@ impl DnsPane {
         } else {
             Self::build_dns_unavailable_lines()
         };
-        
+
         lines.extend(dns_lines);
         lines
     }
-    
+
     fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        
+
         // A records
         if !dns_result.A.is_empty() {
             let ttl = dns_result.A[0].ttl_remaining();
@@ -150,7 +150,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("A: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -164,7 +164,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             // Show A records without individual TTL
             for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
@@ -176,7 +176,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // AAAA records (IPv6)
         if !dns_result.AAAA.is_empty() {
             let ttl = dns_result.AAAA[0].ttl_remaining();
@@ -187,7 +187,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("AAAA: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -201,7 +201,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
                 let ipv6_str = record.value.to_string();
                 let display_str = if ipv6_str.len() > IPV6_DISPLAY_MAX_LENGTH {
@@ -209,7 +209,7 @@ impl DnsPane {
                 } else {
                     ipv6_str
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
@@ -219,7 +219,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // CNAME records
         if !dns_result.CNAME.is_empty() {
             let ttl = dns_result.CNAME[0].ttl_remaining();
@@ -230,7 +230,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("CNAME: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -244,7 +244,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.CNAME.iter().take(MAX_CNAME_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -255,7 +255,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // NS records
         if !dns_result.NS.is_empty() {
             let ttl = dns_result.NS[0].ttl_remaining();
@@ -266,7 +266,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("NS: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -280,7 +280,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.NS.iter().take(MAX_NS_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -291,7 +291,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // TXT records (basic display, security analysis goes to security pane)
         if !dns_result.TXT.is_empty() {
             let ttl = dns_result.TXT[0].ttl_remaining();
@@ -302,7 +302,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("TXT: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -316,7 +316,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.TXT.iter().take(MAX_TXT_RECORDS_DISPLAYED) {
                 let value = record.value.clone();
                 let display_value = if value.starts_with("google-site-verification") {
@@ -326,7 +326,7 @@ impl DnsPane {
                 } else {
                     Self::truncate_txt(&value, TXT_DISPLAY_MAX_LENGTH)
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
@@ -336,7 +336,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // CAA records
         if !dns_result.CAA.is_empty() {
             let ttl = dns_result.CAA[0].ttl_remaining();
@@ -347,7 +347,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("CAA: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -361,7 +361,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.CAA.iter().take(MAX_CAA_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -372,7 +372,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // MX records
         if !dns_result.MX.is_empty() {
             let ttl = dns_result.MX[0].ttl_remaining();
@@ -383,7 +383,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("MX: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -397,7 +397,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.MX.iter().take(MAX_MX_RECORDS_DISPLAYED) {
                 let priority_color = if record.value.priority <= MX_PRIORITY_GOOD_THRESHOLD {
                     Color::Green
@@ -406,7 +406,7 @@ impl DnsPane {
                 } else {
                     Color::Red
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
@@ -422,7 +422,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // SOA records
         if !dns_result.SOA.is_empty() {
             let ttl = dns_result.SOA[0].ttl_remaining();
@@ -433,7 +433,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("SOA: ", Style::default().fg(Color::White)),
                 Span::styled("authority (TTL: ", Style::default().fg(Color::White)),
@@ -443,7 +443,7 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             if let Some(soa) = dns_result.SOA.first() {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -461,7 +461,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         // SRV records
         if !dns_result.SRV.is_empty() {
             let ttl = dns_result.SRV[0].ttl_remaining();
@@ -472,7 +472,7 @@ impl DnsPane {
             } else {
                 Color::Red
             };
-            
+
             lines.push(Line::from(vec![
                 Span::styled("SRV: ", Style::default().fg(Color::White)),
                 Span::styled(
@@ -486,13 +486,13 @@ impl DnsPane {
                 ),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
-            
+
             for record in dns_result.SRV.iter().take(MAX_SRV_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("{}:{} (p:{}, w:{})", 
-                            record.value.target, 
+                        format!("{}:{} (p:{}, w:{})",
+                            record.value.target,
                             record.value.port,
                             record.value.priority,
                             record.value.weight
@@ -502,7 +502,7 @@ impl DnsPane {
                 ]));
             }
         }
-        
+
         lines
     }
 
@@ -541,20 +541,20 @@ impl Default for DnsPane {
 
 impl Pane for DnsPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::dns] render: area={}x{} focused={} scroll_offset={}", 
+        log::trace!("[tui::dns] render: area={}x{} focused={} scroll_offset={}",
             area.width, area.height, focused, self.scroll_offset);
-        
+
         let block = create_block(self.title, focused);
-        
+
         // Calculate content area (inside the border)
         let inner_area = block.inner(area);
-        
+
         // Render the block first
         block.render(area, frame.buffer_mut());
-        
+
         // Use the SINGLE SOURCE OF TRUTH for content
         let lines = self.build_content_lines(state);
-        
+
         // Apply scrolling
         let total_lines = lines.len() as u16;
         let visible_area_height = inner_area.height;
@@ -564,19 +564,19 @@ impl Pane for DnsPane {
             0
         };
         let safe_scroll_offset = self.scroll_offset.min(max_scroll_offset);
-        
-        log::trace!("[tui::dns] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}", 
+
+        log::trace!("[tui::dns] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
             total_lines, visible_area_height, max_scroll_offset, safe_scroll_offset);
-        
+
         // Apply scroll offset - skip lines from the beginning
         let visible_lines = if safe_scroll_offset < total_lines {
             lines.into_iter().skip(safe_scroll_offset as usize).collect()
         } else {
             lines
         };
-        
+
         log::trace!("[tui::dns] render_content: visible_lines={}", visible_lines.len());
-        
+
         let paragraph = Paragraph::new(visible_lines)
             .alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
@@ -616,4 +616,4 @@ mod tests {
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }
-} 
+}

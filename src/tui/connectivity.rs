@@ -39,7 +39,7 @@ impl ConnectivityPane {
             id: "connectivity",
         }
     }
-    
+
 
 }
 
@@ -51,27 +51,27 @@ impl Default for ConnectivityPane {
 
 impl Pane for ConnectivityPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::connectivity] render: area={}x{} focused={}", 
+        log::trace!("[tui::connectivity] render: area={}x{} focused={}",
             area.width, area.height, focused);
-        
+
         let block = create_block(self.title, focused);
-        
+
         // Calculate content area (inside the border)
         let inner_area = block.inner(area);
-        
+
         // Render the block first
         block.render(area, frame.buffer_mut());
-        
+
         // Prepare content lines
         let mut lines = Vec::new();
-        
+
         // Get ping results and render them
         if let Some(ping_state) = state.scanners.get("ping") {
             match &ping_state.result {
                 Some(ScanResult::Ping(ping)) => {
                     let latency_ms = ping.latency.as_millis();
                     let loss_percent = ping.packet_loss * 100.0;
-                    
+
                     // Connection status header with color coding
                     let status_color = if loss_percent == 0.0 && latency_ms < FAST_CONNECTION_THRESHOLD_MS {
                         Color::Green
@@ -80,7 +80,7 @@ impl Pane for ConnectivityPane {
                     } else {
                         Color::Red
                     };
-                    
+
                     let status_text = if loss_percent == 0.0 {
                         "connected"
                     } else if loss_percent < SEVERE_PACKET_LOSS_THRESHOLD {
@@ -88,15 +88,15 @@ impl Pane for ConnectivityPane {
                     } else {
                         "poor"
                     };
-                    
+
                     lines.push(Line::from(vec![
                         Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                         Span::styled(status_text, Style::default().fg(status_color)),
                     ]));
-                    
+
                     // Empty line for spacing
                     lines.push(Line::from(""));
-                    
+
                     // Latency with performance grading
                     let latency_color = if latency_ms < EXCELLENT_LATENCY_THRESHOLD_MS {
                         Color::Green
@@ -105,7 +105,7 @@ impl Pane for ConnectivityPane {
                     } else {
                         Color::Red
                     };
-                    
+
                     let latency_grade = if latency_ms < EXCELLENT_LATENCY_THRESHOLD_MS {
                         "excellent"
                     } else if latency_ms < GOOD_LATENCY_THRESHOLD_MS {
@@ -115,7 +115,7 @@ impl Pane for ConnectivityPane {
                     } else {
                         "poor"
                     };
-                    
+
                     lines.push(Line::from(vec![
                         Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
                         Span::styled(format!("{}ms", latency_ms), Style::default().fg(latency_color)),
@@ -123,7 +123,7 @@ impl Pane for ConnectivityPane {
                         Span::styled(latency_grade, Style::default().fg(latency_color)),
                         Span::styled(")", Style::default().fg(Color::Gray)),
                     ]));
-                    
+
                     // Packet loss with color coding
                     let loss_color = if loss_percent == 0.0 {
                         Color::Green
@@ -132,12 +132,12 @@ impl Pane for ConnectivityPane {
                     } else {
                         Color::Red
                     };
-                    
+
                     lines.push(Line::from(vec![
                         Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
                         Span::styled(format!("{:.1}%", loss_percent), Style::default().fg(loss_color)),
                     ]));
-                    
+
                     // TTL information if available
                     if let Some(ttl) = ping.ttl {
                         lines.push(Line::from(vec![
@@ -145,7 +145,7 @@ impl Pane for ConnectivityPane {
                             Span::styled(format!("{} hops", ttl), Style::default().fg(Color::Gray)),
                         ]));
                     }
-                    
+
                     // Reliability metrics
                     lines.push(Line::from(vec![
                         Span::styled("📊 Reliability: ", Style::default().fg(Color::White)),
@@ -154,13 +154,13 @@ impl Pane for ConnectivityPane {
                             Style::default().fg(Color::Gray)
                         ),
                     ]));
-                    
+
                     // Show additional connectivity info from other scanners
                     lines.push(Line::from(""));
                     lines.push(Line::from(vec![
                         Span::styled("🔗 Services:", Style::default().fg(Color::Cyan)),
                     ]));
-                    
+
                     // Check HTTP connectivity
                     if let Some(http_state) = state.scanners.get("http") {
                         if let Some(ScanResult::Http(http_result)) = &http_state.result {
@@ -171,7 +171,7 @@ impl Pane for ConnectivityPane {
                             } else {
                                 ("❌", Color::Red)
                             };
-                            
+
                             lines.push(Line::from(vec![
                                 Span::styled("  HTTP: ", Style::default().fg(Color::White)),
                                 Span::styled(http_status.0, Style::default().fg(http_status.1)),
@@ -184,7 +184,7 @@ impl Pane for ConnectivityPane {
                             ]));
                         }
                     }
-                    
+
                     // Check TLS connectivity
                     if let Some(tls_state) = state.scanners.get("tls") {
                         if let Some(ScanResult::Tls(tls_result)) = &tls_state.result {
@@ -195,12 +195,12 @@ impl Pane for ConnectivityPane {
                             } else {
                                 ("❌", Color::Red)
                             };
-                            
+
                             let version_text = tls_result.negotiated_version
                                 .as_ref()
                                 .map(|v| v.as_str())
                                 .unwrap_or("unknown");
-                            
+
                             lines.push(Line::from(vec![
                                 Span::styled("  TLS: ", Style::default().fg(Color::White)),
                                 Span::styled(tls_status.0, Style::default().fg(tls_status.1)),
@@ -232,13 +232,13 @@ impl Pane for ConnectivityPane {
                                 Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                                 Span::styled("checking...", Style::default().fg(Color::Yellow)),
                             ]));
-                            
+
                             lines.push(Line::from(""));
                             lines.push(Line::from(vec![
                                 Span::styled("⚡ Latency: ", Style::default().fg(Color::White)),
                                 Span::styled("measuring...", Style::default().fg(Color::Yellow)),
                             ]));
-                            
+
                             lines.push(Line::from(vec![
                                 Span::styled("📦 Loss: ", Style::default().fg(Color::White)),
                                 Span::styled("measuring...", Style::default().fg(Color::Yellow)),
@@ -249,7 +249,7 @@ impl Pane for ConnectivityPane {
                                 Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
                                 Span::styled("failed", Style::default().fg(Color::Red)),
                             ]));
-                            
+
                             if let Some(error) = &ping_state.error {
                                 lines.push(Line::from(""));
                                 lines.push(Line::from(vec![
@@ -277,30 +277,30 @@ impl Pane for ConnectivityPane {
                 Span::styled("waiting...", Style::default().fg(Color::Gray)),
             ]));
         }
-        
+
         // Create and render the paragraph
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
-        
+
         paragraph.render(inner_area, frame.buffer_mut());
     }
-    
+
     fn title(&self) -> &'static str {
         self.title
     }
-    
+
     fn id(&self) -> &'static str {
         self.id
     }
-    
+
     fn min_size(&self) -> (u16, u16) {
         (MIN_CONNECTIVITY_PANE_WIDTH, MIN_CONNECTIVITY_PANE_HEIGHT)
     }
-    
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-    
+
     fn is_focusable(&self) -> bool {
         true
     }
@@ -309,7 +309,7 @@ impl Pane for ConnectivityPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_connectivity_pane_creation() {
         let pane = ConnectivityPane::new();
@@ -319,4 +319,4 @@ mod tests {
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }
-} 
+}

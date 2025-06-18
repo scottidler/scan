@@ -39,7 +39,7 @@ impl HttpPane {
             id: "http",
         }
     }
-    
+
     /// Truncate URL to fit in the display
     fn truncate_url(url: &str) -> String {
         if url.len() <= URL_DISPLAY_MAX_LENGTH {
@@ -50,7 +50,7 @@ impl HttpPane {
                 .strip_prefix("https://")
                 .or_else(|| url.strip_prefix("http://"))
                 .unwrap_or(url);
-            
+
             if url_without_protocol.len() <= URL_DISPLAY_MAX_LENGTH {
                 url_without_protocol.to_string()
             } else {
@@ -68,29 +68,29 @@ impl Default for HttpPane {
 
 impl Pane for HttpPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::http] render: area={}x{} focused={}", 
+        log::trace!("[tui::http] render: area={}x{} focused={}",
             area.width, area.height, focused);
-        
+
         let block = create_block(self.title, focused);
-        
+
         // Calculate content area (inside the border)
         let inner_area = block.inner(area);
-        
+
         // Render the block first
         block.render(area, frame.buffer_mut());
-        
+
         // Prepare content lines
         let mut lines = Vec::new();
-        
+
         // HTTP status header
         lines.push(Line::from(vec![
             Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
             Span::styled("scanning...", Style::default().fg(Color::Gray)),
         ]));
-        
+
         // Empty line for spacing
         lines.push(Line::from(""));
-        
+
         // Get HTTP results and render them
         if let Some(http_state) = state.scanners.get("http") {
             // Update header with current status
@@ -109,7 +109,7 @@ impl Pane for HttpPane {
                     })
                 ),
             ]);
-            
+
             if let Some(ScanResult::Http(http_result)) = &http_state.result {
                 // Status code
                 let status_color = match http_result.status_code {
@@ -119,7 +119,7 @@ impl Pane for HttpPane {
                     HTTP_SERVER_ERROR_STATUS_MIN..=HTTP_SERVER_ERROR_STATUS_MAX => Color::Magenta,
                     _ => Color::Gray,
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("📊 Status: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -127,7 +127,7 @@ impl Pane for HttpPane {
                         Style::default().fg(status_color)
                     ),
                 ]));
-                
+
                 // Response time
                 let response_time_ms = http_result.response_time.as_millis();
                 let time_color = if response_time_ms < RESPONSE_TIME_FAST_THRESHOLD_MS {
@@ -137,7 +137,7 @@ impl Pane for HttpPane {
                 } else {
                     Color::Red
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -145,7 +145,7 @@ impl Pane for HttpPane {
                         Style::default().fg(time_color)
                     ),
                 ]));
-                
+
                 // Content type
                 if let Some(content_type) = &http_result.content_type {
                     lines.push(Line::from(vec![
@@ -156,7 +156,7 @@ impl Pane for HttpPane {
                         ),
                     ]));
                 }
-                
+
                 // Content length
                 lines.push(Line::from(vec![
                     Span::styled("📏 Size: ", Style::default().fg(Color::White)),
@@ -165,14 +165,14 @@ impl Pane for HttpPane {
                         Style::default().fg(Color::Green)
                     ),
                 ]));
-                
+
                 // Security grade
                 let grade_color = match http_result.security_grade {
                     crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => Color::Green,
                     crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
                     crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
                 };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -180,7 +180,7 @@ impl Pane for HttpPane {
                         Style::default().fg(grade_color)
                     ),
                 ]));
-                
+
                 // Redirect chain - show details
                 if !http_result.redirect_chain.is_empty() {
                     lines.push(Line::from(vec![
@@ -190,12 +190,12 @@ impl Pane for HttpPane {
                             Style::default().fg(Color::Magenta)
                         ),
                     ]));
-                    
+
                     // Show each redirect in the chain
                     for redirect in &http_result.redirect_chain {
                         let from_url = Self::truncate_url(&redirect.from);
                         let to_url = Self::truncate_url(&redirect.to);
-                        
+
                         lines.push(Line::from(vec![
                             Span::styled("  ", Style::default()),
                             Span::styled(from_url, Style::default().fg(Color::Gray)),
@@ -205,7 +205,7 @@ impl Pane for HttpPane {
                         ]));
                     }
                 }
-                
+
                 // Vulnerabilities - show details
                 if !http_result.vulnerabilities.is_empty() {
                     lines.push(Line::from(vec![
@@ -215,7 +215,7 @@ impl Pane for HttpPane {
                             Style::default().fg(Color::Red)
                         ),
                     ]));
-                    
+
                     // Show each vulnerability
                     for vulnerability in &http_result.vulnerabilities {
                         let vuln_text = match vulnerability {
@@ -227,7 +227,7 @@ impl Pane for HttpPane {
                             crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS",
                             crate::scan::http::HttpVulnerability::InformationDisclosure => "Information Disclosure",
                         };
-                        
+
                         lines.push(Line::from(vec![
                             Span::styled("  • ", Style::default().fg(Color::Red)),
                             Span::styled(vuln_text, Style::default().fg(Color::Red)),
@@ -240,12 +240,12 @@ impl Pane for HttpPane {
                     Span::styled("📊 Status: ", Style::default().fg(Color::White)),
                     Span::styled("checking...", Style::default().fg(Color::Gray)),
                 ]));
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
                     Span::styled("measuring...", Style::default().fg(Color::Gray)),
                 ]));
-                
+
                 lines.push(Line::from(vec![
                     Span::styled("🖥️  Server: ", Style::default().fg(Color::White)),
                     Span::styled("detecting...", Style::default().fg(Color::Gray)),
@@ -257,13 +257,13 @@ impl Pane for HttpPane {
                 Span::styled("🌐 HTTP: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
-            
+
             lines.push(Line::from(vec![
                 Span::styled("📊 Status: ", Style::default().fg(Color::White)),
                 Span::styled("HTTP scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
-        
+
         // Create and render the paragraph
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
@@ -304,4 +304,4 @@ mod tests {
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }
-} 
+}

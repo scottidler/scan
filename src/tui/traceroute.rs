@@ -42,29 +42,29 @@ impl Default for TraceroutePane {
 
 impl Pane for TraceroutePane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::traceroute] render: area={}x{} focused={}", 
+        log::trace!("[tui::traceroute] render: area={}x{} focused={}",
             area.width, area.height, focused);
-        
+
         let block = create_block(self.title, focused);
-        
+
         // Calculate content area (inside the border)
         let inner_area = block.inner(area);
-        
+
         // Render the block first
         block.render(area, frame.buffer_mut());
-        
+
         // Prepare content lines
         let mut lines = Vec::new();
-        
+
         // Traceroute status header
         lines.push(Line::from(vec![
             Span::styled("🗺️  TRACEROUTE: ", Style::default().fg(Color::Cyan)),
             Span::styled("tracing...", Style::default().fg(Color::Gray)),
         ]));
-        
+
         // Empty line for spacing
         lines.push(Line::from(""));
-        
+
         // Get traceroute results and render them
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
             // Update header with current status
@@ -83,7 +83,7 @@ impl Pane for TraceroutePane {
                     })
                 ),
             ]);
-            
+
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
                 // Basic traceroute info
                 let hop_count = traceroute_result.hops.len();
@@ -92,9 +92,9 @@ impl Pane for TraceroutePane {
                 } else {
                     Color::Yellow
                 };
-                
+
                 let protocol = if traceroute_result.ipv6 { "IPv6" } else { "IPv4" };
-                
+
                 lines.push(Line::from(vec![
                     Span::styled(format!("📍 {}: ", protocol), Style::default().fg(Color::White)),
                     Span::styled(
@@ -107,7 +107,7 @@ impl Pane for TraceroutePane {
                         Span::styled(" ✗", Style::default().fg(Color::Red))
                     },
                 ]));
-                
+
                 // Show all hops
                 for hop in &traceroute_result.hops {
                     // Get first responding IP and best RTT
@@ -122,7 +122,7 @@ impl Pane for TraceroutePane {
                     } else {
                         ("*".to_string(), "timeout".to_string(), Color::Gray)
                     };
-                    
+
                     // Color code hop number based on position
                     let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
                         Color::Green // Local/ISP hops
@@ -131,14 +131,14 @@ impl Pane for TraceroutePane {
                     } else {
                         Color::Red // Far hops
                     };
-                    
+
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(hop_num_color)),
                         Span::styled(ip_display, Style::default().fg(hop_color)),
                         Span::styled(format!(" ({})", rtt_display), Style::default().fg(Color::Gray)),
                     ]));
                 }
-                
+
                 // Total scan time
                 let scan_time_ms = traceroute_result.scan_duration.as_millis();
                 lines.push(Line::from(vec![
@@ -148,7 +148,7 @@ impl Pane for TraceroutePane {
                         Style::default().fg(Color::Yellow)
                     ),
                 ]));
-                
+
             } else {
                 // No traceroute data available yet - check scanner status
                 match traceroute_state.status {
@@ -157,7 +157,7 @@ impl Pane for TraceroutePane {
                             Span::styled("📍 IPv4: ", Style::default().fg(Color::White)),
                             Span::styled("tracing...", Style::default().fg(Color::Yellow)),
                         ]));
-                        
+
                         lines.push(Line::from(vec![
                             Span::styled("📍 IPv6: ", Style::default().fg(Color::White)),
                             Span::styled("tracing...", Style::default().fg(Color::Yellow)),
@@ -183,17 +183,17 @@ impl Pane for TraceroutePane {
                 Span::styled("🗺️  TRACEROUTE: ", Style::default().fg(Color::Cyan)),
                 Span::styled("unavailable", Style::default().fg(Color::Red)),
             ]);
-            
+
             lines.push(Line::from(vec![
                 Span::styled("📍 Status: ", Style::default().fg(Color::White)),
                 Span::styled("Traceroute scanner not available", Style::default().fg(Color::Red)),
             ]));
         }
-        
+
         // Apply scrolling to lines
         let visible_height = inner_area.height;
         let visible_lines = self.apply_scroll_to_lines(lines, visible_height);
-        
+
         // Create and render the paragraph
         let paragraph = Paragraph::new(visible_lines)
             .alignment(Alignment::Left);
@@ -225,20 +225,20 @@ impl ScrollablePane for TraceroutePane {
     fn scroll_offset(&self) -> u16 {
         self.scroll_offset
     }
-    
+
     fn set_scroll_offset(&mut self, offset: u16) {
         self.scroll_offset = offset;
     }
-    
+
     fn calculate_content_lines(&self, state: &AppState) -> u16 {
         // Calculate total lines that would be rendered for traceroute content
         let mut line_count = 0u16;
-        
+
         // Header line
         line_count += 1;
         // Empty line
         line_count += 1;
-        
+
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
                 // Basic info line
@@ -255,7 +255,7 @@ impl ScrollablePane for TraceroutePane {
             // No scanner available lines
             line_count += 1;
         }
-        
+
         line_count
     }
 }
@@ -273,4 +273,4 @@ mod tests {
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }
-} 
+}
