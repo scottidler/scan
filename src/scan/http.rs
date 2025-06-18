@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -557,22 +557,22 @@ impl Scanner for HttpScanner {
         Duration::from_secs(HTTP_SCAN_INTERVAL_SECS)
     }
 
-    async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
-        log::debug!("[scan::http] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
+        log::debug!("[scan::http] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
         match self.scan_http(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::http] http_scan_completed: target={} duration={}ms status={} response_time={}ms security_grade={:?} vulnerabilities={}",
-                    target.display_name(), scan_duration.as_millis(), result.status_code,
+                log::trace!("[scan::http] http_scan_completed: target={} protocol={} duration={}ms status={} response_time={}ms security_grade={:?} vulnerabilities={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.status_code,
                     result.response_time.as_millis(), result.security_grade, result.vulnerabilities.len());
                 Ok(ScanResult::Http(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::http] http_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::http] http_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e)
             }
         }
@@ -960,7 +960,7 @@ mod tests {
         // Test with a very slow/non-responsive target
         let target = Target::parse("httpbin.org:12345").unwrap(); // Non-standard port likely to timeout
 
-        let result = short_timeout_scanner.scan(&target).await;
+        let result = short_timeout_scanner.scan(&target, Protocol::Both).await;
 
         // Should either succeed or fail, but not hang indefinitely
         match result {

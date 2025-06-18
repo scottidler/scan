@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::types::{AppState, ScanResult, ScanState, ScanStatus, TimestampedResult};
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 
 const DEFAULT_MAX_HISTORY_RESULTS: usize = 10;
 
@@ -22,13 +22,13 @@ pub trait Scanner {
         DEFAULT_MAX_HISTORY_RESULTS
     }
 
-    /// Perform the actual scan operation
-    async fn scan(&self, target: &Target) -> Result<ScanResult, eyre::Error>;
+    /// Perform the actual scan operation with protocol specification
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error>;
 
     /// Default implementation of the scanner loop
-    async fn run(&self, target: Target, state: Arc<AppState>) {
-        log::debug!("[scanner] run: scanner={} target={} interval={}ms",
-            self.name(), target.display_name(), self.interval().as_millis());
+    async fn run(&self, target: Target, protocol: Protocol, state: Arc<AppState>) {
+        log::debug!("[scanner] run: scanner={} target={} protocol={} interval={}ms",
+            self.name(), target.display_name(), protocol.as_str(), self.interval().as_millis());
 
         let mut ticker = tokio::time::interval(self.interval());
         let mut scan_count = 0u64;
@@ -37,8 +37,8 @@ pub trait Scanner {
             ticker.tick().await;
             scan_count += 1;
 
-            log::debug!("[scanner] scan_cycle_starting: scanner={} count={}",
-                self.name(), scan_count);
+            log::debug!("[scanner] scan_cycle_starting: scanner={} count={} protocol={}",
+                self.name(), scan_count, protocol.as_str());
 
             // Update status to running
             {
@@ -50,12 +50,13 @@ pub trait Scanner {
                     history: VecDeque::new(),
                 };
                 state.scanners.insert(self.name().to_string(), scan_state);
-                log::debug!("[scanner] status_updated: scanner={} status=Running", self.name());
+                log::debug!("[scanner] status_updated: scanner={} status=Running protocol={}", 
+                    self.name(), protocol.as_str());
             }
 
             // Perform scan
             let scan_start = Instant::now();
-            match self.scan(&target).await {
+            match self.scan(&target, protocol).await {
                 Ok(result) => {
                     let scan_duration = scan_start.elapsed();
                     let timestamp = Instant::now();
@@ -64,8 +65,8 @@ pub trait Scanner {
                         result: result.clone(),
                     };
 
-                    log::trace!("[scanner] scan_completed: scanner={} duration={}ms result={:#?}",
-                        self.name(), scan_duration.as_millis(), result);
+                    log::trace!("[scanner] scan_completed: scanner={} protocol={} duration={}ms result={:#?}",
+                        self.name(), protocol.as_str(), scan_duration.as_millis(), result);
 
                     if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
                         let old_history_len = scan_state.history.len();
@@ -81,38 +82,39 @@ pub trait Scanner {
                             scan_state.history.pop_front();
                         }
 
-                        log::debug!("[scanner] state_updated: scanner={} status=Complete history_len={}",
-                            self.name(), scan_state.history.len());
+                        log::debug!("[scanner] state_updated: scanner={} protocol={} status=Complete history_len={}",
+                            self.name(), protocol.as_str(), scan_state.history.len());
 
                         if old_history_len >= self.max_history() {
-                            log::trace!("[scanner] history_trimmed: scanner={} old_len={} new_len={}",
-                                self.name(), old_history_len + 1, scan_state.history.len());
+                            log::trace!("[scanner] history_trimmed: scanner={} protocol={} old_len={} new_len={}",
+                                self.name(), protocol.as_str(), old_history_len + 1, scan_state.history.len());
                         }
                     } else {
-                        log::warn!("[scanner] state_not_found: scanner={} - could not update scan state",
-                            self.name());
+                        log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update scan state",
+                            self.name(), protocol.as_str());
                     }
                 }
                 Err(error) => {
                     let scan_duration = scan_start.elapsed();
-                    log::error!("[scanner] scan_failed: scanner={} duration={}ms error={}",
-                        self.name(), scan_duration.as_millis(), error);
+                    log::error!("[scanner] scan_failed: scanner={} protocol={} duration={}ms error={}",
+                        self.name(), protocol.as_str(), scan_duration.as_millis(), error);
 
                     if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
                         scan_state.error = Some(error);
                         scan_state.status = ScanStatus::Failed;
                         scan_state.last_updated = Instant::now();
 
-                        log::debug!("[scanner] state_updated: scanner={} status=Failed", self.name());
+                        log::debug!("[scanner] state_updated: scanner={} protocol={} status=Failed", 
+                            self.name(), protocol.as_str());
                     } else {
-                        log::warn!("[scanner] state_not_found: scanner={} - could not update error state",
-                            self.name());
+                        log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update error state",
+                            self.name(), protocol.as_str());
                     }
                 }
             }
 
-            log::debug!("[scanner] scan_cycle_completed: scanner={} count={}",
-                self.name(), scan_count);
+            log::debug!("[scanner] scan_cycle_completed: scanner={} count={} protocol={}",
+                self.name(), scan_count, protocol.as_str());
         }
     }
 }

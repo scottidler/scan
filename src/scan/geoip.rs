@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -464,22 +464,22 @@ fn parse_org_info(org_str: &str) -> (Option<u32>, Option<String>) {
 
 #[async_trait]
 impl Scanner for GeoIpScanner {
-    async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        log::debug!("[scan::geoip] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
+        log::debug!("[scan::geoip] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
         match self.perform_geoip_lookup(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::geoip] geoip_scan_completed: target={} duration={}ms ip={} source={} has_location={} has_network_info={}",
-                    target.display_name(), scan_duration.as_millis(), result.target_ip,
+                log::trace!("[scan::geoip] geoip_scan_completed: target={} protocol={} duration={}ms ip={} source={} has_location={} has_network_info={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.target_ip,
                     result.data_source, result.location.is_some(), result.network_info.is_some());
                 Ok(ScanResult::GeoIp(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::geoip] geoip_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::geoip] geoip_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("GeoIP scan failed"))
             }
         }
@@ -562,7 +562,7 @@ mod tests {
         let target = Target::parse("nonexistent.invalid").unwrap();
 
         // Should fail because no IP is resolved
-        assert!(scanner.scan(&target).await.is_err());
+        assert!(scanner.scan(&target, Protocol::Both).await.is_err());
     }
 
     #[test]

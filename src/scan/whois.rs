@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -616,20 +616,20 @@ impl Scanner for WhoisScanner {
         Duration::from_secs(WHOIS_SCAN_INTERVAL_SECS) // 1 hour - WHOIS data changes infrequently
     }
 
-    async fn scan(&self, target: &Target) -> eyre::Result<ScanResult> {
-        log::debug!("[scan::whois] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
+        log::debug!("[scan::whois] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
         match self.scan_whois(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::whois] whois_scan_completed: target={} duration={}ms source={:?} privacy={:?} risks={}",
-                    target.display_name(), scan_duration.as_millis(), result.data_source,
+                log::trace!("[scan::whois] whois_scan_completed: target={} protocol={} duration={}ms source={:?} privacy={:?} risks={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.data_source,
                     result.privacy_score, result.risk_indicators.len());
 
                 if let Some(reg_date) = result.registration_date {
-                    log::trace!("[scan::whois] domain_info: target={} registered={} age_days={:?} expires_in_days={:?}",
-                        target.display_name(), reg_date.format("%Y-%m-%d"),
+                    log::trace!("[scan::whois] domain_info: target={} protocol={} registered={} age_days={:?} expires_in_days={:?}",
+                        target.display_name(), protocol.as_str(), reg_date.format("%Y-%m-%d"),
                         result.domain_age_days, result.expires_in_days);
                 }
 
@@ -637,8 +637,8 @@ impl Scanner for WhoisScanner {
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::whois] whois_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::whois] whois_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e)
             }
         }
@@ -1039,7 +1039,7 @@ mod tests {
         let scanner = WhoisScanner::new();
         let target = Target::parse("nonexistent-domain-12345.test").unwrap();
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         // Should handle timeout gracefully
         match result {

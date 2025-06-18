@@ -58,27 +58,14 @@ async fn main() -> Result<()> {
     let state = Arc::new(scan::types::AppState::new(args.target.clone()));
     log::debug!("[main] app_state_created: target={}", args.target);
 
-    // Create and start all scanners
+    // Create and start all scanners with default protocol (Both)
     let scanners = scan::scan::create_default_scanners();
     log::debug!("[main] scanners_created: count={}", scanners.len());
-    let mut scanner_handles = Vec::new();
 
-    for scanner in scanners {
-        let scanner_name = scanner.name();
-        log::debug!("[main] starting_scanner: name={}", scanner_name);
-
-        let target_clone = target.clone();
-        let state_clone = Arc::clone(&state);
-
-        let handle = tokio::spawn(async move {
-            log::debug!("[main] scanner_task_started: name={}", scanner_name);
-            scanner.run(target_clone, state_clone).await;
-            log::debug!("[main] scanner_task_completed: name={}", scanner_name);
-        });
-
-        scanner_handles.push(handle);
-    }
-    log::debug!("[main] all_scanners_started: count={}", scanner_handles.len());
+    // Use default Protocol::Both for now - this will be user-configurable later
+    let protocol = scan::target::Protocol::Both;
+    scan::scan::spawn_scanner_tasks(scanners, target.clone(), protocol, Arc::clone(&state)).await;
+    log::debug!("[main] all_scanners_started: protocol={}", protocol.as_str());
 
     // Choose between TUI and debug mode
     if args.no_tui || args.debug {

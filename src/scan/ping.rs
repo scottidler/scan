@@ -1,6 +1,6 @@
 use crate::scanner::Scanner;
 use crate::types::ScanResult;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use std::time::{Duration, Instant};
@@ -59,8 +59,8 @@ impl Scanner for PingScanner {
         self.interval
     }
 
-    async fn scan(&self, target: &Target) -> Result<ScanResult, eyre::Error> {
-        log::debug!("[scan::ping] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error> {
+        log::debug!("[scan::ping] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let ping_target = target.network_target();
         log::debug!("[scan::ping] network_target: {}", ping_target);
@@ -69,14 +69,14 @@ impl Scanner for PingScanner {
         match self.do_ping(&ping_target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::ping] ping_completed: target={} duration={}ms latency={}ms ttl={:?}",
-                    ping_target, scan_duration.as_millis(), result.latency.as_millis(), result.ttl);
+                log::trace!("[scan::ping] ping_completed: target={} protocol={} duration={}ms latency={}ms ttl={:?}",
+                    ping_target, protocol.as_str(), scan_duration.as_millis(), result.latency.as_millis(), result.ttl);
                 Ok(ScanResult::Ping(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::ping] ping_failed: target={} duration={}ms error={}",
-                    ping_target, scan_duration.as_millis(), e);
+                log::error!("[scan::ping] ping_failed: target={} protocol={} duration={}ms error={}",
+                    ping_target, protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e.wrap_err(format!("Failed to ping target: {}", target.display_name())))
             }
         }
@@ -320,7 +320,7 @@ mod tests {
         let target = Target::parse("192.0.2.1").unwrap(); // RFC5737 test IP (should not respond)
 
         // Should handle timeout gracefully
-        let result = timeout_scanner.scan(&target).await;
+        let result = timeout_scanner.scan(&target, Protocol::Ipv4).await;
 
         match result {
             Ok(_) => {
@@ -337,7 +337,7 @@ mod tests {
         let scanner = PingScanner::default();
         let target = Target::parse("127.0.0.1").unwrap();
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Ipv4).await;
 
         match result {
             Ok(ScanResult::Ping(ping_result)) => {

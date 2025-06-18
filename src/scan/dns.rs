@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -388,22 +388,22 @@ impl DnsScanner {
 
 #[async_trait]
 impl Scanner for DnsScanner {
-    async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        log::debug!("[scan::dns] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
+        log::debug!("[scan::dns] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
         match self.perform_dns_lookup(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::dns] dns_scan_completed: target={} duration={}ms response_time={}ms records_found=A:{} AAAA:{} MX:{} TXT:{} NS:{}",
-                    target.display_name(), scan_duration.as_millis(), result.response_time.as_millis(),
+                log::trace!("[scan::dns] dns_scan_completed: target={} protocol={} duration={}ms response_time={}ms records_found=A:{} AAAA:{} MX:{} TXT:{} NS:{}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.response_time.as_millis(),
                     result.A.len(), result.AAAA.len(), result.MX.len(), result.TXT.len(), result.NS.len());
                 Ok(ScanResult::Dns(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::dns] dns_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::dns] dns_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("DNS lookup failed"))
             }
         }
@@ -490,7 +490,7 @@ mod tests {
         let scanner = DnsScanner::new();
         let target = Target::parse("google.com").expect("Failed to parse target");
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         assert!(result.is_ok());
         if let Ok(ScanResult::Dns(dns_result)) = result {
@@ -506,7 +506,7 @@ mod tests {
         let scanner = DnsScanner::new();
         let target = Target::parse("8.8.8.8").expect("Failed to parse target");
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         assert!(result.is_ok());
         if let Ok(ScanResult::Dns(dns_result)) = result {
@@ -567,7 +567,7 @@ mod tests {
         let scanner = DnsScanner::new();
         let target = Target::parse("nonexistent-domain-12345.invalid").expect("Failed to parse target");
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         // Should handle DNS lookup failures gracefully
         match result {
@@ -667,7 +667,7 @@ mod tests {
         let scanner = DnsScanner::new();
         let target = Target::parse("ipv6.google.com").expect("Failed to parse target");
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         assert!(result.is_ok());
         if let Ok(ScanResult::Dns(dns_result)) = result {

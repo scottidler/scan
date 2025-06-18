@@ -163,9 +163,9 @@ impl Pane for PortsPane {
                                 .map(|s| s.name.clone())
                                 .unwrap_or_else(|| "unknown".to_string());
 
-                            let protocol_str = match open_port.protocol {
-                                crate::scan::port::Protocol::Tcp => "tcp",
-                                crate::scan::port::Protocol::Udp => "udp",
+                            let protocol_str = match open_port.transport {
+                                crate::scan::port::Transport::Tcp => "tcp",
+                                crate::scan::port::Transport::Udp => "udp",
                             };
 
                             result_lines.push(Line::from(vec![

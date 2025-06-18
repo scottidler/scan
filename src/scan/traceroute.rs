@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -295,22 +295,22 @@ impl TracerouteScanner {
 
 #[async_trait]
 impl Scanner for TracerouteScanner {
-    async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        log::debug!("[scan::traceroute] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
+        log::debug!("[scan::traceroute] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
         match self.perform_traceroute(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::traceroute] traceroute_scan_completed: target={} duration={}ms hops={} destination_reached={}",
-                    target.display_name(), scan_duration.as_millis(),
+                log::trace!("[scan::traceroute] traceroute_completed: target={} protocol={} duration={}ms hops={} complete={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), 
                     result.hops.len(), result.destination_reached);
                 Ok(ScanResult::Traceroute(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::traceroute] traceroute_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::traceroute] traceroute_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("Traceroute scan failed"))
             }
         }
@@ -441,7 +441,7 @@ mod tests {
             return;
         }
 
-        match scanner.scan(&target).await {
+        match scanner.scan(&target, Protocol::Ipv4).await {
             Ok(ScanResult::Traceroute(result)) => {
                 assert!(!result.hops.is_empty());
                 assert_eq!(result.target_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));

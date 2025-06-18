@@ -17,7 +17,7 @@ pub use geoip::{GeoIpScanner, GeoIpResult};
 pub use port::{PortScanner, PortResult};
 
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,24 +46,28 @@ pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
 pub async fn spawn_scanner_tasks(
     scanners: Vec<Box<dyn Scanner + Send + Sync>>,
     target: Target,
+    protocol: Protocol,
     state: Arc<crate::types::AppState>,
 ) {
-    log::debug!("[scan] spawn_scanner_tasks: scanner_count={} target={}",
-        scanners.len(), target.display_name());
+    log::debug!("[scan] spawn_scanner_tasks: scanner_count={} target={} protocol={}",
+        scanners.len(), target.display_name(), protocol.as_str());
 
     for scanner in scanners {
         let scanner_name = scanner.name();
         let target_clone = target.clone();
         let state_clone = state.clone();
 
-        log::debug!("[scan] spawning_scanner_task: scanner={}", scanner_name);
+        log::debug!("[scan] spawning_scanner_task: scanner={} protocol={}", 
+            scanner_name, protocol.as_str());
 
         tokio::spawn(async move {
-            log::debug!("[scan] scanner_task_started: scanner={}", scanner_name);
-            scanner.run(target_clone, state_clone).await;
-            log::debug!("[scan] scanner_task_ended: scanner={}", scanner_name);
+            log::debug!("[scan] scanner_task_started: scanner={} protocol={}", 
+                scanner_name, protocol.as_str());
+            scanner.run(target_clone, protocol, state_clone).await;
+            log::debug!("[scan] scanner_task_ended: scanner={} protocol={}", 
+                scanner_name, protocol.as_str());
         });
     }
 
-    log::debug!("[scan] all_scanner_tasks_spawned:");
+    log::debug!("[scan] all_scanner_tasks_spawned: protocol={}", protocol.as_str());
 }

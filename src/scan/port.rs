@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::Result;
@@ -56,7 +56,7 @@ pub struct PortResult {
 #[derive(Debug, Clone)]
 pub struct OpenPort {
     pub port: u16,
-    pub protocol: Protocol,
+    pub transport: Transport,
     pub state: PortState,
     pub service: Option<ServiceInfo>,
     pub response_time: Duration,
@@ -71,7 +71,7 @@ pub struct ServiceInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Protocol {
+pub enum Transport {
     Tcp,
     Udp,
 }
@@ -232,7 +232,7 @@ impl PortScanner {
 
                 Ok(Some(OpenPort {
                     port,
-                    protocol: Protocol::Tcp,
+                    transport: Transport::Tcp,
                     state: PortState::Open,
                     service,
                     response_time,
@@ -471,22 +471,24 @@ fn get_top_1000_ports() -> Vec<u16> {
 
 #[async_trait]
 impl Scanner for PortScanner {
-    async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        log::debug!("[scan::port] scan: target={}", target.display_name());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
+        log::debug!("[scan::port] scan: target={} protocol={} mode={:?} timeout={}s concurrency={}",
+            target.display_name(), protocol.as_str(), self.scan_mode, 
+            self.tcp_timeout.as_secs(), self.max_concurrent);
 
         let scan_start = Instant::now();
         match self.perform_port_scan(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::port] port_scan_completed: target={} duration={}ms open_ports={} closed={} filtered={}",
-                    target.display_name(), scan_duration.as_millis(),
+                log::trace!("[scan::port] port_scan_completed: target={} protocol={} duration={}ms open={} closed={} filtered={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(),
                     result.open_ports.len(), result.closed_ports, result.filtered_ports);
                 Ok(ScanResult::Port(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::port] port_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::port] port_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("Port scan failed"))
             }
         }
@@ -499,8 +501,6 @@ impl Scanner for PortScanner {
     fn name(&self) -> &'static str {
         "port"
     }
-
-
 }
 
 #[cfg(test)]
@@ -586,7 +586,7 @@ mod tests {
 
         let target = Target::parse("127.0.0.1").unwrap();
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
         assert!(result.is_ok() || result.is_err());
     }
 
@@ -598,7 +598,7 @@ mod tests {
 
         let target = Target::parse("nonexistent.invalid").unwrap();
 
-        assert!(scanner.scan(&target).await.is_err());
+        assert!(scanner.scan(&target, Protocol::Both).await.is_err());
     }
 
     #[test]
@@ -625,7 +625,7 @@ mod tests {
     fn test_port_result_structure() {
         let open_port = OpenPort {
             port: 80,
-            protocol: Protocol::Tcp,
+            transport: Transport::Tcp,
             state: PortState::Open,
             service: Some(ServiceInfo {
                 name: "http".to_string(),
@@ -637,7 +637,7 @@ mod tests {
         };
 
         assert_eq!(open_port.port, 80);
-        assert!(matches!(open_port.protocol, Protocol::Tcp));
+        assert!(matches!(open_port.transport, Transport::Tcp));
         assert!(matches!(open_port.state, PortState::Open));
         assert!(open_port.service.is_some());
 
@@ -717,11 +717,11 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_and_state_enums() {
-        let tcp = Protocol::Tcp;
-        let udp = Protocol::Udp;
-        assert!(matches!(tcp, Protocol::Tcp));
-        assert!(matches!(udp, Protocol::Udp));
+    fn test_transport_and_state_enums() {
+        let tcp = Transport::Tcp;
+        let udp = Transport::Udp;
+        assert!(matches!(tcp, Transport::Tcp));
+        assert!(matches!(udp, Transport::Udp));
 
         let open = PortState::Open;
         let closed = PortState::Closed;

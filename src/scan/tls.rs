@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::Target;
+use crate::target::{Target, Protocol};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -610,30 +610,24 @@ impl TlsScanner {
 
 #[async_trait]
 impl Scanner for TlsScanner {
-    async fn scan(&self, target: &Target) -> Result<ScanResult> {
-        log::debug!("[scan::tls] scan: target={} total_timeout={}s",
-            target.display_name(), self.total_scan_timeout.as_secs());
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
+        log::debug!("[scan::tls] scan: target={} protocol={} total_timeout={}s",
+            target.display_name(), protocol.as_str(), self.total_scan_timeout.as_secs());
 
         let scan_start = Instant::now();
-        match tokio::time::timeout(self.total_scan_timeout, self.perform_tls_scan(target)).await {
-            Ok(Ok(result)) => {
+        match self.perform_tls_scan(target).await {
+            Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::tls] tls_scan_completed: target={} duration={}ms connection_successful={} grade={:?} cert_valid={} vulnerabilities={}",
-                    target.display_name(), scan_duration.as_millis(), result.connection_successful,
-                    result.security_grade, result.certificate_valid, result.vulnerabilities.len());
+                log::trace!("[scan::tls] tls_scan_completed: target={} protocol={} duration={}ms connection_success={} security_grade={:?} vulnerabilities={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.connection_successful,
+                    result.security_grade, result.vulnerabilities.len());
                 Ok(ScanResult::Tls(result))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::tls] tls_scan_failed: target={} duration={}ms error={}",
-                    target.display_name(), scan_duration.as_millis(), e);
+                log::error!("[scan::tls] tls_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
                 Err(e.wrap_err("TLS scan failed"))
-            }
-            Err(_) => {
-                let scan_duration = scan_start.elapsed();
-                log::error!("[scan::tls] tls_scan_timeout: target={} duration={}ms timeout={}s",
-                    target.display_name(), scan_duration.as_millis(), self.total_scan_timeout.as_secs());
-                Err(eyre::eyre!("TLS scan timeout after {:?}", self.total_scan_timeout))
             }
         }
     }
@@ -734,7 +728,7 @@ mod tests {
         let scanner = TlsScanner::new();
         let target = Target::parse("google.com").expect("Failed to parse target");
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         assert!(result.is_ok());
         if let Ok(ScanResult::Tls(tls_result)) = result {
@@ -754,7 +748,7 @@ mod tests {
         let scanner = TlsScanner::new();
         let target = Target::parse("invalid-domain-that-does-not-exist.com").expect("Failed to parse target");
 
-        let result = scanner.scan(&target).await;
+        let result = scanner.scan(&target, Protocol::Both).await;
 
         assert!(result.is_ok());
         if let Ok(ScanResult::Tls(tls_result)) = result {
