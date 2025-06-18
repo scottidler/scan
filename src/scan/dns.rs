@@ -81,6 +81,32 @@ pub struct EmailSecurityAnalysis {
     pub dkim_domains: Vec<String>, // Common DKIM selectors found
 }
 
+#[derive(Debug, Clone)]
+pub enum QueryStatus {
+    NotQueried,      // Query was not attempted (due to protocol restrictions)
+    Success(usize),  // Query succeeded with N records
+    NoRecords,       // Query succeeded but returned no records
+    Failed(String),  // Query failed with error message
+    Timeout,         // Query timed out
+}
+
+impl QueryStatus {
+    pub fn was_attempted(&self) -> bool {
+        !matches!(self, QueryStatus::NotQueried)
+    }
+    
+    pub fn is_success(&self) -> bool {
+        matches!(self, QueryStatus::Success(_) | QueryStatus::NoRecords)
+    }
+    
+    pub fn record_count(&self) -> usize {
+        match self {
+            QueryStatus::Success(count) => *count,
+            _ => 0,
+        }
+    }
+}
+
 #[allow(non_snake_case)]
 #[derive(Debug, Clone)]
 pub struct DnsResult {
@@ -92,9 +118,20 @@ pub struct DnsResult {
     pub CAA: Vec<DnsRecord<CaaRecord>>,
     pub MX: Vec<DnsRecord<MxRecord>>,
     pub PTR: Vec<DnsRecord<String>>,
-    pub SOA: Vec<DnsRecord<SoaRecord>>,     // New field
-    pub SRV: Vec<DnsRecord<SrvRecord>>,     // New field
-    pub email_security: Option<EmailSecurityAnalysis>, // New field
+    pub SOA: Vec<DnsRecord<SoaRecord>>,
+    pub SRV: Vec<DnsRecord<SrvRecord>>,
+    pub email_security: Option<EmailSecurityAnalysis>,
+    
+    // Query status tracking
+    pub A_status: QueryStatus,
+    pub AAAA_status: QueryStatus,
+    pub MX_status: QueryStatus,
+    pub TXT_status: QueryStatus,
+    pub NS_status: QueryStatus,
+    pub SOA_status: QueryStatus,
+    pub SRV_status: QueryStatus,
+    pub PTR_status: QueryStatus,
+    
     pub response_time: Duration,
     pub queried_at: Instant,
 }
@@ -113,6 +150,14 @@ impl DnsResult {
             SOA: Vec::new(),
             SRV: Vec::new(),
             email_security: None,
+            A_status: QueryStatus::NotQueried,
+            AAAA_status: QueryStatus::NotQueried,
+            MX_status: QueryStatus::NotQueried,
+            TXT_status: QueryStatus::NotQueried,
+            NS_status: QueryStatus::NotQueried,
+            SOA_status: QueryStatus::NotQueried,
+            SRV_status: QueryStatus::NotQueried,
+            PTR_status: QueryStatus::NotQueried,
             response_time: Duration::from_millis(0),
             queried_at: Instant::now(),
         }
@@ -188,9 +233,9 @@ impl DnsScanner {
         analysis
     }
 
-    async fn perform_dns_lookup(&self, target: &Target) -> Result<DnsResult> {
-        log::debug!("[scan::dns] perform_dns_lookup: target={} domain={:?}",
-            target.display_name(), target.domain);
+    async fn perform_dns_lookup(&self, target: &Target, protocol: Protocol) -> Result<DnsResult> {
+        log::debug!("[scan::dns] perform_dns_lookup: target={} domain={:?} protocol={}",
+            target.display_name(), target.domain, protocol.as_str());
 
         let start_time = Instant::now();
         let mut result = DnsResult::new();
@@ -199,8 +244,8 @@ impl DnsScanner {
         let resolver = match Resolver::builder_tokio() {
             Ok(builder) => {
                 let r = builder.build();
-                log::trace!("[scan::dns] resolver_created: duration={}μs timeout={}ms",
-                    start_time.elapsed().as_micros(), self.timeout.as_millis());
+                log::trace!("[scan::dns] resolver_created: duration={}μs timeout={}ms protocol={}",
+                    start_time.elapsed().as_micros(), self.timeout.as_millis(), protocol.as_str());
                 r
             }
             Err(e) => {
@@ -211,122 +256,210 @@ impl DnsScanner {
 
         // Forward DNS lookups (for domains)
         if let Some(domain) = &target.domain {
-            log::debug!("[scan::dns] starting_forward_lookups: domain={}", domain);
+            log::debug!("[scan::dns] starting_forward_lookups: domain={} protocol={}", domain, protocol.as_str());
 
-            // A records (IPv4)
-            let a_start = Instant::now();
-            match tokio::time::timeout(self.timeout, resolver.ipv4_lookup(domain)).await {
-                Ok(Ok(response)) => {
-                    let a_duration = a_start.elapsed();
-                    for ip in response.iter() {
+            // A records (IPv4) - only query if protocol supports IPv4
+            if matches!(protocol, Protocol::Ipv4 | Protocol::Both) {
+                let a_start = Instant::now();
+                match tokio::time::timeout(self.timeout, resolver.ipv4_lookup(domain)).await {
+                    Ok(Ok(response)) => {
+                        let a_duration = a_start.elapsed();
+                        for ip in response.iter() {
+                            let ttl = response.as_lookup().records().first()
+                                .map(|record| record.ttl())
+                                .unwrap_or(DEFAULT_DNS_TTL);
+                            result.A.push(DnsRecord::new(ip.0, ttl));
+                        }
+                        result.A_status = if result.A.is_empty() {
+                            QueryStatus::NoRecords
+                        } else {
+                            QueryStatus::Success(result.A.len())
+                        };
+                        log::trace!("[scan::dns] a_records_found: domain={} count={} duration={}ms protocol={}",
+                            domain, result.A.len(), a_duration.as_millis(), protocol.as_str());
+                    }
+                    Ok(Err(e)) => {
+                        let a_duration = a_start.elapsed();
+                        result.A_status = QueryStatus::Failed(e.to_string());
+                        log::trace!("[scan::dns] a_records_failed: domain={} duration={}ms error={} protocol={}",
+                            domain, a_duration.as_millis(), e, protocol.as_str());
+                    }
+                    Err(_) => {
+                        let a_duration = a_start.elapsed();
+                        result.A_status = QueryStatus::Timeout;
+                        log::warn!("[scan::dns] a_records_timeout: domain={} duration={}ms timeout={}ms protocol={}",
+                            domain, a_duration.as_millis(), self.timeout.as_millis(), protocol.as_str());
+                    }
+                }
+            } else {
+                result.A_status = QueryStatus::NotQueried;
+                log::trace!("[scan::dns] skipping_a_records: domain={} protocol={}", domain, protocol.as_str());
+            }
+
+            // AAAA records (IPv6) - only query if protocol supports IPv6
+            if matches!(protocol, Protocol::Ipv6 | Protocol::Both) {
+                let aaaa_start = Instant::now();
+                match tokio::time::timeout(self.timeout, resolver.ipv6_lookup(domain)).await {
+                    Ok(Ok(response)) => {
+                        let aaaa_duration = aaaa_start.elapsed();
+                        for ip in response.iter() {
+                            let ttl = response.as_lookup().records().first()
+                                .map(|record| record.ttl())
+                                .unwrap_or(DEFAULT_DNS_TTL);
+                            result.AAAA.push(DnsRecord::new(ip.0, ttl));
+                        }
+                        result.AAAA_status = if result.AAAA.is_empty() {
+                            QueryStatus::NoRecords
+                        } else {
+                            QueryStatus::Success(result.AAAA.len())
+                        };
+                        log::trace!("[scan::dns] aaaa_records_found: domain={} count={} duration={}ms protocol={}",
+                            domain, result.AAAA.len(), aaaa_duration.as_millis(), protocol.as_str());
+                    }
+                    Ok(Err(e)) => {
+                        let aaaa_duration = aaaa_start.elapsed();
+                        // Check if this is a "no records" type error vs a real failure
+                        let error_str = e.to_string().to_lowercase();
+                        if error_str.contains("no records found") || error_str.contains("nxdomain") || error_str.contains("name not found") {
+                            result.AAAA_status = QueryStatus::NoRecords;
+                            log::trace!("[scan::dns] aaaa_records_none: domain={} duration={}ms protocol={}",
+                                domain, aaaa_duration.as_millis(), protocol.as_str());
+                        } else {
+                            result.AAAA_status = QueryStatus::Failed(e.to_string());
+                            log::trace!("[scan::dns] aaaa_records_failed: domain={} duration={}ms error={} protocol={}",
+                                domain, aaaa_duration.as_millis(), e, protocol.as_str());
+                        }
+                    }
+                    Err(_) => {
+                        let aaaa_duration = aaaa_start.elapsed();
+                        result.AAAA_status = QueryStatus::Timeout;
+                        log::warn!("[scan::dns] aaaa_records_timeout: domain={} duration={}ms timeout={}ms protocol={}",
+                            domain, aaaa_duration.as_millis(), self.timeout.as_millis(), protocol.as_str());
+                    }
+                }
+            } else {
+                result.AAAA_status = QueryStatus::NotQueried;
+                log::trace!("[scan::dns] skipping_aaaa_records: domain={} protocol={}", domain, protocol.as_str());
+            }
+
+            // MX records (protocol-independent, but log protocol for consistency)
+            match resolver.mx_lookup(domain).await {
+                Ok(response) => {
+                    for mx in response.iter() {
                         let ttl = response.as_lookup().records().first()
                             .map(|record| record.ttl())
                             .unwrap_or(DEFAULT_DNS_TTL);
-                        result.A.push(DnsRecord::new(ip.0, ttl));
-                    }
-                    log::trace!("[scan::dns] a_records_found: domain={} count={} duration={}ms",
-                        domain, result.A.len(), a_duration.as_millis());
-                }
-                Ok(Err(e)) => {
-                    let a_duration = a_start.elapsed();
-                    log::trace!("[scan::dns] a_records_failed: domain={} duration={}ms error={}",
-                        domain, a_duration.as_millis(), e);
-                }
-                Err(_) => {
-                    let a_duration = a_start.elapsed();
-                    log::warn!("[scan::dns] a_records_timeout: domain={} duration={}ms timeout={}ms",
-                        domain, a_duration.as_millis(), self.timeout.as_millis());
-                }
-            }
-
-            // AAAA records (IPv6)
-            let aaaa_start = Instant::now();
-            match tokio::time::timeout(self.timeout, resolver.ipv6_lookup(domain)).await {
-                Ok(Ok(response)) => {
-                    let aaaa_duration = aaaa_start.elapsed();
-                    for ip in response.iter() {
-                        let ttl = response.as_lookup().records().first()
-                            .map(|record| record.ttl())
-                            .unwrap_or(DEFAULT_DNS_TTL);
-                        result.AAAA.push(DnsRecord::new(ip.0, ttl));
-                    }
-                    log::trace!("[scan::dns] aaaa_records_found: domain={} count={} duration={}ms",
-                        domain, result.AAAA.len(), aaaa_duration.as_millis());
-                }
-                Ok(Err(e)) => {
-                    let aaaa_duration = aaaa_start.elapsed();
-                    log::trace!("[scan::dns] aaaa_records_failed: domain={} duration={}ms error={}",
-                        domain, aaaa_duration.as_millis(), e);
-                }
-                Err(_) => {
-                    let aaaa_duration = aaaa_start.elapsed();
-                    log::warn!("[scan::dns] aaaa_records_timeout: domain={} duration={}ms timeout={}ms",
-                        domain, aaaa_duration.as_millis(), self.timeout.as_millis());
-                }
-            }
-
-            // MX records
-            if let Ok(response) = resolver.mx_lookup(domain).await {
-                for mx in response.iter() {
-                    let ttl = response.as_lookup().records().first()
-                        .map(|record| record.ttl())
-                        .unwrap_or(DEFAULT_DNS_TTL);
-                    result.MX.push(DnsRecord::new(
-                        MxRecord {
-                            priority: mx.preference(),
-                            exchange: mx.exchange().to_string(),
-                        },
-                        ttl,
-                    ));
-                }
-            }
-
-            // TXT records
-            if let Ok(response) = resolver.txt_lookup(domain).await {
-                for txt in response.iter() {
-                    let ttl = response.as_lookup().records().first()
-                        .map(|record| record.ttl())
-                        .unwrap_or(DEFAULT_DNS_TTL);
-                    let txt_string = txt.iter()
-                        .map(|bytes| String::from_utf8_lossy(bytes))
-                        .collect::<Vec<_>>()
-                        .join("");
-                    result.TXT.push(DnsRecord::new(txt_string, ttl));
-                }
-            }
-
-            // NS records
-            if let Ok(response) = resolver.ns_lookup(domain).await {
-                for ns in response.iter() {
-                    let ttl = response.as_lookup().records().first()
-                        .map(|record| record.ttl())
-                        .unwrap_or(DEFAULT_DNS_TTL);
-                    result.NS.push(DnsRecord::new(ns.0.to_string(), ttl));
-                }
-            }
-
-            // SOA records (new)
-            use hickory_resolver::proto::rr::RecordType;
-            if let Ok(response) = resolver.lookup(domain, RecordType::SOA).await {
-                for record in response.record_iter() {
-                    if let Some(soa) = record.data().as_soa() {
-                        result.SOA.push(DnsRecord::new(
-                            SoaRecord {
-                                primary_ns: soa.mname().to_string(),
-                                responsible_email: soa.rname().to_string(),
-                                serial: soa.serial(),
-                                refresh: soa.refresh() as u32,
-                                retry: soa.retry() as u32,
-                                expire: soa.expire() as u32,
-                                minimum_ttl: soa.minimum(),
+                        result.MX.push(DnsRecord::new(
+                            MxRecord {
+                                priority: mx.preference(),
+                                exchange: mx.exchange().to_string(),
                             },
-                            record.ttl(),
+                            ttl,
                         ));
                     }
+                    result.MX_status = if result.MX.is_empty() {
+                        QueryStatus::NoRecords
+                    } else {
+                        QueryStatus::Success(result.MX.len())
+                    };
+                    log::trace!("[scan::dns] mx_records_found: domain={} count={} protocol={}", 
+                        domain, result.MX.len(), protocol.as_str());
+                }
+                Err(e) => {
+                    result.MX_status = QueryStatus::Failed(e.to_string());
+                    log::trace!("[scan::dns] mx_records_failed: domain={} error={} protocol={}", 
+                        domain, e, protocol.as_str());
                 }
             }
 
-            // SRV records (new) - checking for common services
+            // TXT records (protocol-independent, but log protocol for consistency)
+            match resolver.txt_lookup(domain).await {
+                Ok(response) => {
+                    for txt in response.iter() {
+                        let ttl = response.as_lookup().records().first()
+                            .map(|record| record.ttl())
+                            .unwrap_or(DEFAULT_DNS_TTL);
+                        let txt_string = txt.iter()
+                            .map(|bytes| String::from_utf8_lossy(bytes))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        result.TXT.push(DnsRecord::new(txt_string, ttl));
+                    }
+                    result.TXT_status = if result.TXT.is_empty() {
+                        QueryStatus::NoRecords
+                    } else {
+                        QueryStatus::Success(result.TXT.len())
+                    };
+                    log::trace!("[scan::dns] txt_records_found: domain={} count={} protocol={}", 
+                        domain, result.TXT.len(), protocol.as_str());
+                }
+                Err(e) => {
+                    result.TXT_status = QueryStatus::Failed(e.to_string());
+                    log::trace!("[scan::dns] txt_records_failed: domain={} error={} protocol={}", 
+                        domain, e, protocol.as_str());
+                }
+            }
+
+            // NS records (protocol-independent, but log protocol for consistency)
+            match resolver.ns_lookup(domain).await {
+                Ok(response) => {
+                    for ns in response.iter() {
+                        let ttl = response.as_lookup().records().first()
+                            .map(|record| record.ttl())
+                            .unwrap_or(DEFAULT_DNS_TTL);
+                        result.NS.push(DnsRecord::new(ns.0.to_string(), ttl));
+                    }
+                    result.NS_status = if result.NS.is_empty() {
+                        QueryStatus::NoRecords
+                    } else {
+                        QueryStatus::Success(result.NS.len())
+                    };
+                    log::trace!("[scan::dns] ns_records_found: domain={} count={} protocol={}", 
+                        domain, result.NS.len(), protocol.as_str());
+                }
+                Err(e) => {
+                    result.NS_status = QueryStatus::Failed(e.to_string());
+                    log::trace!("[scan::dns] ns_records_failed: domain={} error={} protocol={}", 
+                        domain, e, protocol.as_str());
+                }
+            }
+
+            // SOA records (protocol-independent, but log protocol for consistency)
+            use hickory_resolver::proto::rr::RecordType;
+            match resolver.lookup(domain, RecordType::SOA).await {
+                Ok(response) => {
+                    for record in response.record_iter() {
+                        if let Some(soa) = record.data().as_soa() {
+                            result.SOA.push(DnsRecord::new(
+                                SoaRecord {
+                                    primary_ns: soa.mname().to_string(),
+                                    responsible_email: soa.rname().to_string(),
+                                    serial: soa.serial(),
+                                    refresh: soa.refresh() as u32,
+                                    retry: soa.retry() as u32,
+                                    expire: soa.expire() as u32,
+                                    minimum_ttl: soa.minimum(),
+                                },
+                                record.ttl(),
+                            ));
+                        }
+                    }
+                    result.SOA_status = if result.SOA.is_empty() {
+                        QueryStatus::NoRecords
+                    } else {
+                        QueryStatus::Success(result.SOA.len())
+                    };
+                    log::trace!("[scan::dns] soa_records_found: domain={} count={} protocol={}", 
+                        domain, result.SOA.len(), protocol.as_str());
+                }
+                Err(e) => {
+                    result.SOA_status = QueryStatus::Failed(e.to_string());
+                    log::trace!("[scan::dns] soa_records_failed: domain={} error={} protocol={}", 
+                        domain, e, protocol.as_str());
+                }
+            }
+
+            // SRV records (protocol-independent, but log protocol for consistency)
             let srv_services = vec![
                 "_http._tcp",
                 "_https._tcp",
@@ -338,49 +471,119 @@ impl DnsScanner {
                 "_sip._tcp",
             ];
 
+            let mut srv_queries_attempted = 0;
+            let mut srv_queries_successful = 0;
+            let mut srv_errors = Vec::new();
+
             for service in srv_services {
                 let srv_domain = format!("{}.{}", service, domain);
-                if let Ok(response) = resolver.lookup(&srv_domain, RecordType::SRV).await {
-                    for record in response.record_iter() {
-                        if let Some(srv) = record.data().as_srv() {
-                            result.SRV.push(DnsRecord::new(
-                                SrvRecord {
-                                    priority: srv.priority(),
-                                    weight: srv.weight(),
-                                    port: srv.port(),
-                                    target: srv.target().to_string(),
-                                },
-                                record.ttl(),
-                            ));
+                srv_queries_attempted += 1;
+                match resolver.lookup(&srv_domain, RecordType::SRV).await {
+                    Ok(response) => {
+                        srv_queries_successful += 1;
+                        for record in response.record_iter() {
+                            if let Some(srv) = record.data().as_srv() {
+                                result.SRV.push(DnsRecord::new(
+                                    SrvRecord {
+                                        priority: srv.priority(),
+                                        weight: srv.weight(),
+                                        port: srv.port(),
+                                        target: srv.target().to_string(),
+                                    },
+                                    record.ttl(),
+                                ));
+                            }
                         }
+                    }
+                    Err(e) => {
+                        srv_errors.push(format!("{}: {}", service, e));
                     }
                 }
             }
 
-            // Email Security Analysis (new)
+            // Set SRV status based on overall results
+            result.SRV_status = if srv_queries_attempted == 0 {
+                QueryStatus::NotQueried
+            } else if !result.SRV.is_empty() {
+                QueryStatus::Success(result.SRV.len())
+            } else if srv_queries_successful > 0 {
+                QueryStatus::NoRecords
+            } else {
+                QueryStatus::Failed(format!("All {} SRV queries failed: {:?}", srv_queries_attempted, srv_errors))
+            };
+
+            if !result.SRV.is_empty() {
+                log::trace!("[scan::dns] srv_records_found: domain={} count={} protocol={}", 
+                    domain, result.SRV.len(), protocol.as_str());
+            } else {
+                log::trace!("[scan::dns] srv_records_none: domain={} attempted={} successful={} protocol={}", 
+                    domain, srv_queries_attempted, srv_queries_successful, protocol.as_str());
+            }
+
+            // Email Security Analysis (protocol-independent, but log protocol for consistency)
             result.email_security = Some(self.analyze_email_security(&result.TXT, &result.MX).await);
+            log::trace!("[scan::dns] email_security_analyzed: domain={} protocol={}", domain, protocol.as_str());
         }
 
-        // Reverse DNS lookups (for IP addresses)
-        for ip in target.all_ips() {
-            // Create resolver using system config
-            let resolver = Resolver::builder_tokio()
-                .wrap_err("Failed to create DNS resolver")?
-                .build();
+        // Reverse DNS lookups (for IP addresses) - filter by protocol
+        let target_ips = target.ips_for_protocol(protocol);
+        
+        if target_ips.is_empty() {
+            result.PTR_status = QueryStatus::NotQueried;
+            log::trace!("[scan::dns] no_ips_for_protocol: protocol={}", protocol.as_str());
+        } else {
+            let mut ptr_queries_attempted = 0;
+            let mut ptr_queries_successful = 0;
+            let mut ptr_errors = Vec::new();
 
-            // Perform reverse DNS lookup (PTR records)
-            if let Ok(response) = resolver.reverse_lookup(*ip).await {
-                for ptr in response.iter() {
-                    let ttl = response.as_lookup().records().first()
-                        .map(|record| record.ttl())
-                        .unwrap_or(DEFAULT_DNS_TTL);
-                    result.PTR.push(DnsRecord::new(ptr.to_string(), ttl));
+            for ip in &target_ips {
+                log::trace!("[scan::dns] reverse_lookup: ip={} protocol={}", ip, protocol.as_str());
+                
+                // Create resolver using system config
+                let resolver = Resolver::builder_tokio()
+                    .wrap_err("Failed to create DNS resolver")?
+                    .build();
+
+                ptr_queries_attempted += 1;
+                // Perform reverse DNS lookup (PTR records)
+                match resolver.reverse_lookup(*ip).await {
+                    Ok(response) => {
+                        ptr_queries_successful += 1;
+                        for ptr in response.iter() {
+                            let ttl = response.as_lookup().records().first()
+                                .map(|record| record.ttl())
+                                .unwrap_or(DEFAULT_DNS_TTL);
+                            result.PTR.push(DnsRecord::new(ptr.to_string(), ttl));
+                        }
+                        log::trace!("[scan::dns] ptr_records_found: ip={} count={} protocol={}", 
+                            ip, result.PTR.len(), protocol.as_str());
+                    }
+                    Err(e) => {
+                        ptr_errors.push(format!("{}: {}", ip, e));
+                        log::trace!("[scan::dns] ptr_records_failed: ip={} error={} protocol={}", 
+                            ip, e, protocol.as_str());
+                    }
                 }
             }
+
+            // Set PTR status based on overall results
+            result.PTR_status = if ptr_queries_attempted == 0 {
+                QueryStatus::NotQueried
+            } else if !result.PTR.is_empty() {
+                QueryStatus::Success(result.PTR.len())
+            } else if ptr_queries_successful > 0 {
+                QueryStatus::NoRecords
+            } else {
+                QueryStatus::Failed(format!("All {} PTR queries failed: {:?}", ptr_queries_attempted, ptr_errors))
+            };
         }
 
         result.response_time = start_time.elapsed();
         result.queried_at = start_time;
+
+        log::debug!("[scan::dns] dns_lookup_completed: target={} protocol={} duration={}ms a_status={:?} aaaa_status={:?} mx_status={:?} txt_status={:?} ptr_status={:?}",
+            target.display_name(), protocol.as_str(), result.response_time.as_millis(),
+            result.A_status, result.AAAA_status, result.MX_status, result.TXT_status, result.PTR_status);
 
         Ok(result)
     }
@@ -392,7 +595,7 @@ impl Scanner for DnsScanner {
         log::debug!("[scan::dns] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
-        match self.perform_dns_lookup(target).await {
+        match self.perform_dns_lookup(target, protocol).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
                 log::trace!("[scan::dns] dns_scan_completed: target={} protocol={} duration={}ms response_time={}ms records_found=A:{} AAAA:{} MX:{} TXT:{} NS:{}",
@@ -665,15 +868,72 @@ mod tests {
     #[tokio::test]
     async fn test_ipv6_dns_lookup() {
         let scanner = DnsScanner::new();
-        let target = Target::parse("ipv6.google.com").expect("Failed to parse target");
+        let target = Target::parse("google.com").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Both).await;
 
         assert!(result.is_ok());
         if let Ok(ScanResult::Dns(dns_result)) = result {
-            // Should have both A and AAAA records for IPv6-enabled domains
-            // Note: This test might fail if ipv6.google.com doesn't exist or changes
-            assert!(dns_result.response_time.as_millis() > 0);
+            // Google should have both A and AAAA records
+            assert!(!dns_result.A.is_empty());
+            assert!(!dns_result.AAAA.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protocol_aware_ipv4_only() {
+        let scanner = DnsScanner::new();
+        let target = Target::parse("google.com").expect("Failed to parse target");
+
+        let result = scanner.scan(&target, Protocol::Ipv4).await;
+
+        assert!(result.is_ok());
+        if let Ok(ScanResult::Dns(dns_result)) = result {
+            // Should have A records (IPv4)
+            assert!(!dns_result.A.is_empty());
+            // Should NOT have AAAA records (IPv6) when IPv4-only
+            assert!(dns_result.AAAA.is_empty());
+            // Should still have protocol-independent records
+            assert!(dns_result.email_security.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protocol_aware_ipv6_only() {
+        let scanner = DnsScanner::new();
+        let target = Target::parse("google.com").expect("Failed to parse target");
+
+        let result = scanner.scan(&target, Protocol::Ipv6).await;
+
+        assert!(result.is_ok());
+        if let Ok(ScanResult::Dns(dns_result)) = result {
+            // Should NOT have A records (IPv4) when IPv6-only
+            assert!(dns_result.A.is_empty());
+            // Should have AAAA records (IPv6)
+            assert!(!dns_result.AAAA.is_empty());
+            // Should still have protocol-independent records
+            assert!(dns_result.email_security.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protocol_aware_reverse_lookup() {
+        let scanner = DnsScanner::new();
+        
+        // Test IPv4 reverse lookup
+        let ipv4_target = Target::parse("8.8.8.8").expect("Failed to parse IPv4 target");
+        let ipv4_result = scanner.scan(&ipv4_target, Protocol::Ipv4).await;
+        assert!(ipv4_result.is_ok());
+        
+        // Test IPv6 reverse lookup (using Google's IPv6 DNS)
+        let ipv6_target = Target::parse("2001:4860:4860::8888").expect("Failed to parse IPv6 target");
+        let ipv6_result = scanner.scan(&ipv6_target, Protocol::Ipv6).await;
+        assert!(ipv6_result.is_ok());
+        
+        if let Ok(ScanResult::Dns(_dns_result)) = ipv6_result {
+            // Should have PTR records for reverse lookup
+            // Note: This might be empty if the reverse lookup fails, which is okay
+            // The important thing is that it doesn't crash
         }
     }
 }

@@ -140,7 +140,24 @@ impl DnsPane {
     fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
+        // Helper function to get status color and text
+        let get_status_display = |status: &crate::scan::dns::QueryStatus| -> (Color, String) {
+            match status {
+                crate::scan::dns::QueryStatus::NotQueried => (Color::Gray, "not queried".to_string()),
+                crate::scan::dns::QueryStatus::Success(count) => (Color::Green, format!("{} records", count)),
+                crate::scan::dns::QueryStatus::NoRecords => (Color::Yellow, "No Records".to_string()),
+                crate::scan::dns::QueryStatus::Failed(_error) => (Color::Red, "Failed".to_string()),
+                crate::scan::dns::QueryStatus::Timeout => (Color::Red, "Timeout".to_string()),
+            }
+        };
+
         // A records
+        let (a_color, a_status_text) = get_status_display(&dns_result.A_status);
+        lines.push(Line::from(vec![
+            Span::styled("A: ", Style::default().fg(Color::White)),
+            Span::styled(a_status_text, Style::default().fg(a_color)),
+        ]));
+
         if !dns_result.A.is_empty() {
             let ttl = dns_result.A[0].ttl_remaining();
             let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
@@ -152,20 +169,14 @@ impl DnsPane {
             };
 
             lines.push(Line::from(vec![
-                Span::styled("A: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.A.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
-                Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
+                Span::styled("  TTL: ", Style::default().fg(Color::White)),
                 Span::styled(
                     format!("{}s", ttl),
                     Style::default().fg(ttl_color)
                 ),
-                Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
-            // Show A records without individual TTL
+            // Show A records
             for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -178,6 +189,12 @@ impl DnsPane {
         }
 
         // AAAA records (IPv6)
+        let (aaaa_color, aaaa_status_text) = get_status_display(&dns_result.AAAA_status);
+        lines.push(Line::from(vec![
+            Span::styled("AAAA: ", Style::default().fg(Color::White)),
+            Span::styled(aaaa_status_text, Style::default().fg(aaaa_color)),
+        ]));
+
         if !dns_result.AAAA.is_empty() {
             let ttl = dns_result.AAAA[0].ttl_remaining();
             let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
@@ -189,17 +206,11 @@ impl DnsPane {
             };
 
             lines.push(Line::from(vec![
-                Span::styled("AAAA: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.AAAA.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
-                Span::styled(" IPv6 (TTL: ", Style::default().fg(Color::White)),
+                Span::styled("  TTL: ", Style::default().fg(Color::White)),
                 Span::styled(
                     format!("{}s", ttl),
                     Style::default().fg(ttl_color)
                 ),
-                Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
