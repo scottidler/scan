@@ -60,14 +60,14 @@ impl TuiApp {
         let mut layout = PaneLayout::default_dashboard();
 
         // Add panes to the layout
-        log::trace!("[tui] adding_panes: setting up 3x3 dashboard layout");
+        log::trace!("[tui] adding_panes: setting up 3x4 dashboard layout");
         layout.add_pane(Box::new(TargetPane::new()), PaneConfig::new(0, 0));
         layout.add_pane(Box::new(ConnectivityPane::new()), PaneConfig::new(0, 1));
-        layout.add_pane(Box::new(GeoIpPane::new()), PaneConfig::new(0, 2));
-        layout.add_pane(Box::new(DnsPane::new()), PaneConfig::new(1, 0));
+        layout.add_pane(Box::new(WhoisPane::new()), PaneConfig::new(1, 0));
         layout.add_pane(Box::new(HttpPane::new()), PaneConfig::new(1, 1));
         layout.add_pane(Box::new(PortsPane::new()), PaneConfig::new(1, 2));
-        layout.add_pane(Box::new(WhoisPane::new()), PaneConfig::new(2, 0));
+        layout.add_pane(Box::new(GeoIpPane::new()), PaneConfig::new(1, 3));
+        layout.add_pane(Box::new(DnsPane::new()), PaneConfig::new(2, 0));
         layout.add_pane(Box::new(TraceroutePane::new()), PaneConfig::new(2, 1));
         layout.add_pane(Box::new(SecurityPane::new()), PaneConfig::new(2, 2));
 
@@ -263,7 +263,7 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -
 pub fn create_default_layout() -> PaneLayout {
     let mut layout = PaneLayout::default_dashboard();
 
-    // Row 0: TARGET, CONNECTIVITY, GEOIP (smaller panes on top)
+    // Row 0: TARGET, CONNECTIVITY
     layout.add_pane(
         Box::new(TargetPane::new()),
         PaneConfig::new(0, 0)
@@ -274,14 +274,9 @@ pub fn create_default_layout() -> PaneLayout {
         PaneConfig::new(0, 1)
     );
 
+    // Row 1: WHOIS, HTTP, PORTS, GEOIP
     layout.add_pane(
-        Box::new(GeoIpPane::new()),
-        PaneConfig::new(0, 2)
-    );
-
-    // Row 1: DNS, HTTP, PORTS
-    layout.add_pane(
-        Box::new(DnsPane::new()),
+        Box::new(WhoisPane::new()),
         PaneConfig::new(1, 0)
     );
 
@@ -295,9 +290,14 @@ pub fn create_default_layout() -> PaneLayout {
         PaneConfig::new(1, 2)
     );
 
-    // Row 2: WHOIS, TRACEROUTE, SECURITY (bigger panes on bottom)
     layout.add_pane(
-        Box::new(WhoisPane::new()),
+        Box::new(GeoIpPane::new()),
+        PaneConfig::new(1, 3)
+    );
+
+    // Row 2: DNS, TRACEROUTE, SECURITY (bigger panes on bottom)
+    layout.add_pane(
+        Box::new(DnsPane::new()),
         PaneConfig::new(2, 0)
     );
 

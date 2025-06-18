@@ -9,21 +9,28 @@ use std::collections::HashMap;
 use log;
 
 const DEFAULT_GRID_ROWS: usize = 3;
-const DEFAULT_GRID_COLS: usize = 3;
+const DEFAULT_GRID_COLS: usize = 4;
 const TOP_ROW_HEIGHT_PERCENT: u16 = 25;
 const MIDDLE_ROW_HEIGHT_PERCENT: u16 = 35;
 const BOTTOM_ROW_HEIGHT_PERCENT: u16 = 40;
 const BORDER_HEIGHT_OFFSET: u16 = 2;
 const FALLBACK_VISIBLE_LINES: u16 = 20;
+// Row 0 widths (2 columns)
 const TARGET_PANE_WIDTH_PERCENT: u16 = 30;
-const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 35;
-const SECURITY_PANE_WIDTH_PERCENT: u16 = 35;
-const DNS_PANE_WIDTH_PERCENT: u16 = 35;
-const HTTP_PANE_WIDTH_PERCENT: u16 = 30;
-const PORTS_PANE_WIDTH_PERCENT: u16 = 35;
-const WHOIS_PANE_WIDTH_PERCENT: u16 = 40;
-const TRACEROUTE_PANE_WIDTH_PERCENT: u16 = 35;
+const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 70;
+
+// Row 1 widths (4 columns - 25% each)
+const WHOIS_PANE_WIDTH_PERCENT: u16 = 25;
+const HTTP_PANE_WIDTH_PERCENT: u16 = 25;
+const PORTS_PANE_WIDTH_PERCENT: u16 = 25;
 const GEOIP_PANE_WIDTH_PERCENT: u16 = 25;
+
+// Row 2 widths (3 columns)
+const DNS_PANE_WIDTH_PERCENT: u16 = 33;
+const TRACEROUTE_PANE_WIDTH_PERCENT: u16 = 33;
+const SECURITY_PANE_WIDTH_PERCENT: u16 = 34;
+
+// Fallback equal widths
 const EQUAL_COLUMN_WIDTH_PERCENT_FIRST: u16 = 33;
 const EQUAL_COLUMN_WIDTH_PERCENT_SECOND: u16 = 33;
 const EQUAL_COLUMN_WIDTH_PERCENT_THIRD: u16 = 34;
@@ -139,13 +146,13 @@ impl PaneLayout {
     /// Create the grid layout areas with custom proportions
     fn create_grid_layout(&self, area: Rect) -> Vec<Vec<Rect>> {
         // Create custom row constraints for better space allocation
-        // Row 0: Smaller for summary info (target, connectivity, security)
-        // Row 1: Medium for DNS, HTTP, Ports
-        // Row 2: Larger for detailed info (whois, traceroute, geoip)
+        // Row 0: Smaller for summary info (target, connectivity)
+        // Row 1: Medium for WHOIS, HTTP, Ports, GeoIP
+        // Row 2: Larger for detailed info (DNS, traceroute, security)
         let row_constraints = vec![
-            Constraint::Percentage(TOP_ROW_HEIGHT_PERCENT), // Top row - 25%
-            Constraint::Percentage(MIDDLE_ROW_HEIGHT_PERCENT), // Middle row - 35%
-            Constraint::Percentage(BOTTOM_ROW_HEIGHT_PERCENT), // Bottom row - 40%
+            Constraint::Percentage(TOP_ROW_HEIGHT_PERCENT),
+            Constraint::Percentage(MIDDLE_ROW_HEIGHT_PERCENT),
+            Constraint::Percentage(BOTTOM_ROW_HEIGHT_PERCENT),
         ];
 
         // Split into rows
@@ -160,19 +167,19 @@ impl PaneLayout {
         for (row_idx, row_area) in rows.iter().enumerate() {
             let col_constraints = match row_idx {
                 0 => vec![
-                    Constraint::Percentage(TARGET_PANE_WIDTH_PERCENT), // target - compact
-                    Constraint::Percentage(CONNECTIVITY_PANE_WIDTH_PERCENT), // connectivity - medium
-                    Constraint::Percentage(SECURITY_PANE_WIDTH_PERCENT), // security - medium
+                    Constraint::Percentage(TARGET_PANE_WIDTH_PERCENT),
+                    Constraint::Percentage(CONNECTIVITY_PANE_WIDTH_PERCENT),
                 ],
                 1 => vec![
-                    Constraint::Percentage(DNS_PANE_WIDTH_PERCENT), // dns - needs more space
-                    Constraint::Percentage(HTTP_PANE_WIDTH_PERCENT), // http - medium
-                    Constraint::Percentage(PORTS_PANE_WIDTH_PERCENT), // ports - needs more space
+                    Constraint::Percentage(WHOIS_PANE_WIDTH_PERCENT),
+                    Constraint::Percentage(HTTP_PANE_WIDTH_PERCENT),
+                    Constraint::Percentage(PORTS_PANE_WIDTH_PERCENT),
+                    Constraint::Percentage(GEOIP_PANE_WIDTH_PERCENT),
                 ],
                 2 => vec![
-                    Constraint::Percentage(WHOIS_PANE_WIDTH_PERCENT), // whois - needs more space
-                    Constraint::Percentage(TRACEROUTE_PANE_WIDTH_PERCENT), // traceroute - needs lots of space
-                    Constraint::Percentage(GEOIP_PANE_WIDTH_PERCENT), // geoip - compact
+                    Constraint::Percentage(DNS_PANE_WIDTH_PERCENT),
+                    Constraint::Percentage(TRACEROUTE_PANE_WIDTH_PERCENT),
+                    Constraint::Percentage(SECURITY_PANE_WIDTH_PERCENT),
                 ],
                 _ => vec![
                     Constraint::Percentage(EQUAL_COLUMN_WIDTH_PERCENT_FIRST),
