@@ -37,11 +37,45 @@ pub fn print_scan_state(scanner_name: &str, scan_state: &ScanState) {
 fn print_scan_result(result: &ScanResult) {
     match result {
         ScanResult::Ping(ping) => {
-            println!("{}ms latency (TTL: {}, Loss: {:.1}%)",
-                ping.latency.as_millis(),
-                ping.ttl.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string()),
-                ping.packet_loss * PACKET_LOSS_PERCENTAGE_MULTIPLIER
-            );
+            if let Some(best_latency) = ping.get_best_latency() {
+                let primary_result = ping.get_primary_result();
+                let ttl_str = primary_result
+                    .and_then(|r| r.ttl)
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let loss = primary_result
+                    .map(|r| r.packet_loss * PACKET_LOSS_PERCENTAGE_MULTIPLIER)
+                    .unwrap_or(0.0);
+
+                // Show protocol-specific results
+                let mut protocol_results = Vec::new();
+                if ping.ipv4_status.is_success() {
+                    if let Some(latency) = ping.ipv4_status.latency() {
+                        protocol_results.push(format!("IPv4: {}ms", latency.as_millis()));
+                    }
+                }
+                if ping.ipv6_status.is_success() {
+                    if let Some(latency) = ping.ipv6_status.latency() {
+                        protocol_results.push(format!("IPv6: {}ms", latency.as_millis()));
+                    }
+                }
+
+                let protocol_str = if protocol_results.is_empty() {
+                    "no response".to_string()
+                } else {
+                    protocol_results.join(", ")
+                };
+
+                println!("{}ms best latency ({}, TTL: {}, Loss: {:.1}%)",
+                    best_latency.as_millis(),
+                    protocol_str,
+                    ttl_str,
+                    loss
+                );
+            } else {
+                // All pings failed
+                println!("Ping failed (no response from any protocol)");
+            }
         }
 
         ScanResult::Dns(dns) => {
@@ -64,45 +98,55 @@ fn print_scan_result(result: &ScanResult) {
         }
 
         ScanResult::Tls(tls) => {
-            if tls.connection_successful {
-                let version = tls.negotiated_version
-                    .as_ref()
-                    .map(|v| format!("{:?}", v))
-                    .unwrap_or_else(|| "Unknown".to_string());
+            if tls.has_any_success() {
+                if let Some(primary_data) = tls.get_primary_result() {
+                    let version = primary_data.negotiated_version
+                        .as_ref()
+                        .map(|v| format!("{:?}", v))
+                        .unwrap_or_else(|| "Unknown".to_string());
 
-                let cert_status = if tls.certificate_valid {
-                    if let Some(days) = tls.days_until_expiry {
-                        if days > CERT_EXPIRY_WARNING_DAYS {
-                            format!("cert valid ({}d)", days)
+                    let cert_status = if primary_data.certificate_valid {
+                        if let Some(days) = primary_data.days_until_expiry {
+                            if days > CERT_EXPIRY_WARNING_DAYS {
+                                format!("cert valid ({}d)", days)
+                            } else {
+                                format!("cert expires soon ({}d)", days)
+                            }
                         } else {
-                            format!("cert expires soon ({}d)", days)
+                            "cert valid".to_string()
                         }
                     } else {
-                        "cert valid".to_string()
-                    }
-                } else {
-                    "cert invalid".to_string()
-                };
+                        "cert invalid".to_string()
+                    };
 
-                println!("{}, {}, grade {:?} ({}ms)",
-                    version, cert_status, tls.security_grade, tls.handshake_time.as_millis());
+                    let best_grade = tls.get_best_security_grade()
+                        .map(|g| format!("{:?}", g))
+                        .unwrap_or_else(|| "F".to_string());
+
+                    println!("{}, {}, grade {} ({}ms)",
+                        version, cert_status, best_grade, primary_data.handshake_time.as_millis());
+                }
             } else {
                 println!("Connection failed");
             }
         }
 
         ScanResult::Http(http) => {
-            let security_features = count_security_features(http);
-            let vuln_count = http.vulnerabilities.len();
+            if let Some(primary_data) = http.get_primary_result() {
+                let security_features = count_security_features(primary_data);
+                let vuln_count = http.total_vulnerabilities();
 
-            println!("{} {}, {} security features, {} vulnerabilities, grade {:?} ({}ms)",
-                http.status_code,
-                http.content_type.as_deref().unwrap_or("unknown"),
-                security_features,
-                vuln_count,
-                http.security_grade,
-                http.response_time.as_millis()
-            );
+                println!("{} {}, {} security features, {} vulnerabilities, grade {:?} ({}ms)",
+                    primary_data.status_code,
+                    primary_data.content_type.as_deref().unwrap_or("unknown"),
+                    security_features,
+                    vuln_count,
+                    http.get_best_security_grade().map(|g| format!("{:?}", g)).unwrap_or_else(|| "N/A".to_string()),
+                    primary_data.response_time.as_millis()
+                );
+            } else {
+                println!("HTTP scan failed for all protocols");
+            }
         }
 
         ScanResult::Whois(whois) => {
@@ -147,76 +191,105 @@ fn print_scan_result(result: &ScanResult) {
         }
 
         ScanResult::Traceroute(traceroute) => {
-            let protocol = if traceroute.ipv6 { "IPv6" } else { "IPv4" };
-            let reached = if traceroute.destination_reached { "reached" } else { "unreached" };
+            if let Some(primary_data) = traceroute.get_primary_result() {
+                let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
+                let reached = if primary_data.destination_reached { "reached" } else { "unreached" };
 
-            // Calculate average RTT from last hop
-            let last_hop_rtt = traceroute.hops.last()
-                .and_then(|hop| hop.avg_rtt)
-                .map(|rtt| format!("{}ms", rtt.as_millis()))
-                .unwrap_or_else(|| "timeout".to_string());
+                // Calculate average RTT from last hop
+                let last_hop_rtt = primary_data.hops.last()
+                    .and_then(|hop| hop.avg_rtt)
+                    .map(|rtt| format!("{}ms", rtt.as_millis()))
+                    .unwrap_or_else(|| "timeout".to_string());
 
-            // Count timeouts
-            let timeout_hops = traceroute.hops.iter()
-                .filter(|hop| hop.packet_loss > PACKET_LOSS_TIMEOUT_THRESHOLD)
-                .count();
+                // Count timeouts
+                let timeout_hops = primary_data.hops.iter()
+                    .filter(|hop| hop.packet_loss > PACKET_LOSS_TIMEOUT_THRESHOLD)
+                    .count();
 
-            let timeout_str = if timeout_hops > 0 {
-                format!(", {} timeouts", timeout_hops)
+                let timeout_str = if timeout_hops > 0 {
+                    format!(", {} timeouts", timeout_hops)
+                } else {
+                    String::new()
+                };
+
+                // Show protocol status if both were attempted
+                let protocol_info = if traceroute.ipv4_result.is_some() && traceroute.ipv6_result.is_some() {
+                    format!("{} (dual)", protocol)
+                } else {
+                    protocol.to_string()
+                };
+
+                println!("{} {} hops, {} ({}{}, {}ms)",
+                    protocol_info,
+                    traceroute.total_hops(),
+                    reached,
+                    last_hop_rtt,
+                    timeout_str,
+                    traceroute.total_duration.as_millis()
+                );
             } else {
-                String::new()
-            };
-
-            println!("{} {} hops, {} ({}{}, {}ms)",
-                protocol,
-                traceroute.total_hops,
-                reached,
-                last_hop_rtt,
-                timeout_str,
-                traceroute.scan_duration.as_millis()
-            );
+                println!("Traceroute failed for all protocols ({}ms)",
+                    traceroute.total_duration.as_millis()
+                );
+            }
         }
 
         ScanResult::GeoIp(geoip) => {
-            let location_str = if let Some(location) = &geoip.location {
-                if location.city.is_empty() {
-                    format!("{}, {}", location.region, location.country)
+            if let Some(primary_data) = geoip.get_primary_result() {
+                let location_str = if let Some(location) = &primary_data.location {
+                    if location.city.is_empty() {
+                        format!("{}, {}", location.region, location.country)
+                    } else {
+                        format!("{}, {}, {}", location.city, location.region, location.country)
+                    }
                 } else {
-                    format!("{}, {}, {}", location.city, location.region, location.country)
-                }
-            } else {
-                "Unknown location".to_string()
-            };
+                    "Unknown location".to_string()
+                };
 
-            let network_str = if let Some(network) = &geoip.network_info {
-                if let Some(asn) = network.asn {
-                    format!("AS{} {}", asn, network.organization)
+                let network_str = if let Some(network) = &primary_data.network_info {
+                    if let Some(asn) = network.asn {
+                        format!("AS{} {}", asn, network.organization)
+                    } else {
+                        network.organization.clone()
+                    }
                 } else {
-                    network.organization.clone()
-                }
-            } else {
-                "Unknown network".to_string()
-            };
+                    "Unknown network".to_string()
+                };
 
-            println!("{} - {} ({}ms, {})",
-                location_str,
-                network_str,
-                geoip.scan_duration.as_millis(),
-                geoip.data_source
-            );
+                // Show protocol status if both were attempted
+                let protocol_info = if geoip.ipv4_result.is_some() && geoip.ipv6_result.is_some() {
+                    let protocol = if primary_data.target_ip.is_ipv6() { "IPv6" } else { "IPv4" };
+                    format!("{} (dual)", protocol)
+                } else {
+                    let protocol = if primary_data.target_ip.is_ipv6() { "IPv6" } else { "IPv4" };
+                    protocol.to_string()
+                };
+
+                println!("{} - {} ({}ms, {}, {})",
+                    location_str,
+                    network_str,
+                    geoip.total_duration.as_millis(),
+                    primary_data.data_source,
+                    protocol_info
+                );
+            } else {
+                println!("GeoIP lookup failed for all protocols ({}ms)",
+                    geoip.total_duration.as_millis()
+                );
+            }
         }
 
         ScanResult::Port(port) => {
-            let open_count = port.open_ports.len();
+            let open_count = port.total_open_ports();
 
             if open_count == 0 {
                 println!("No open ports found ({}ms)",
-                    port.scan_duration.as_millis()
+                    port.total_duration.as_millis()
                 );
             } else {
                 // Show first few ports with services
                 let mut port_descriptions = Vec::new();
-                for open_port in port.open_ports.iter().take(MAX_PORTS_DISPLAY) {
+                for open_port in port.get_all_open_ports().iter().take(MAX_PORTS_DISPLAY) {
                     let service_name = if let Some(service) = &open_port.service {
                         service.name.clone()
                     } else {
@@ -232,17 +305,21 @@ fn print_scan_result(result: &ScanResult) {
                     port_descriptions.join(", ")
                 };
 
-                let mode_str = match port.scan_mode {
-                    crate::scan::port::ScanMode::Minimal => "minimal",
-                    crate::scan::port::ScanMode::Quick => "quick",
-                    crate::scan::port::ScanMode::Standard => "standard",
-                    crate::scan::port::ScanMode::Custom(_) => "custom",
+                let mode_str = if let Some(primary) = port.get_primary_result() {
+                    match primary.scan_mode {
+                        crate::scan::port::ScanMode::Minimal => "minimal",
+                        crate::scan::port::ScanMode::Quick => "quick",
+                        crate::scan::port::ScanMode::Standard => "standard",
+                        crate::scan::port::ScanMode::Custom(_) => "custom",
+                    }
+                } else {
+                    "unknown"
                 };
 
                 println!("{} open ({}) ({}ms, {} scan)",
                     open_count,
                     ports_str,
-                    port.scan_duration.as_millis(),
+                    port.total_duration.as_millis(),
                     mode_str
                 );
             }
@@ -250,16 +327,16 @@ fn print_scan_result(result: &ScanResult) {
     }
 }
 
-fn count_security_features(http: &crate::scan::http::HttpResult) -> usize {
+fn count_security_features(http_data: &crate::scan::http::HttpData) -> usize {
     let mut count = 0;
 
-    if http.security_headers.strict_transport_security.is_some() { count += 1; }
-    if http.security_headers.x_frame_options.is_some() { count += 1; }
-    if http.security_headers.x_content_type_options.is_some() { count += 1; }
-    if http.security_headers.x_xss_protection.is_some() { count += 1; }
-    if http.security_headers.referrer_policy.is_some() { count += 1; }
-    if http.security_headers.permissions_policy.is_some() { count += 1; }
-    if http.csp.is_some() { count += 1; }
+    if http_data.security_headers.strict_transport_security.is_some() { count += 1; }
+    if http_data.security_headers.x_frame_options.is_some() { count += 1; }
+    if http_data.security_headers.x_content_type_options.is_some() { count += 1; }
+    if http_data.security_headers.x_xss_protection.is_some() { count += 1; }
+    if http_data.security_headers.referrer_policy.is_some() { count += 1; }
+    if http_data.security_headers.permissions_policy.is_some() { count += 1; }
+    if http_data.csp.is_some() { count += 1; }
 
     count
 }

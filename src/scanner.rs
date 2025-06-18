@@ -52,7 +52,7 @@ pub trait Scanner {
                 #[allow(unused_mut)]
                 let mut state_guard = state.lock().unwrap();
                 state_guard.scanners.insert(self.name().to_string(), scan_state);
-                log::debug!("[scanner] status_updated: scanner={} status=Running protocol={}", 
+                log::debug!("[scanner] status_updated: scanner={} status=Running protocol={}",
                     self.name(), protocol.as_str());
             }
 
@@ -113,7 +113,7 @@ pub trait Scanner {
                             scan_state.status = ScanStatus::Failed;
                             scan_state.last_updated = Instant::now();
 
-                            log::debug!("[scanner] state_updated: scanner={} protocol={} status=Failed", 
+                            log::debug!("[scanner] state_updated: scanner={} protocol={} status=Failed",
                                 self.name(), protocol.as_str());
                         } else {
                             log::warn!("[scanner] state_not_found: scanner={} protocol={} - could not update error state",

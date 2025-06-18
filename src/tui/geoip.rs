@@ -80,85 +80,132 @@ impl Pane for GeoIpPane {
             ]);
 
             if let Some(ScanResult::GeoIp(geoip_result)) = &geoip_state.result {
-                // Location
-                if let Some(location) = &geoip_result.location {
-                    let location_text = format!("{}, {}, {}", location.city, location.region, location.country);
-
-                    lines.push(Line::from(vec![
-                        Span::styled("📍 Location: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            location_text,
-                            Style::default().fg(Color::Green)
-                        ),
-                    ]));
-
-                    // Coordinates
-                    lines.push(Line::from(vec![
-                        Span::styled("📐 Coords: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            format!("{:.4}, {:.4}", location.latitude, location.longitude),
-                            Style::default().fg(Color::Yellow)
-                        ),
-                    ]));
-
-                    // Timezone
-                    lines.push(Line::from(vec![
-                        Span::styled("🕐 TZ: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            location.timezone.clone(),
-                            Style::default().fg(Color::Yellow)
-                        ),
-                    ]));
-                }
-
-                // Network information
-                if let Some(network_info) = &geoip_result.network_info {
-                    // ISP/Organization
-                    lines.push(Line::from(vec![
-                        Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            network_info.isp.clone(),
-                            Style::default().fg(Color::Cyan)
-                        ),
-                    ]));
-
-                    // AS Number
-                    if let Some(as_number) = network_info.asn {
-                        let as_text = if let Some(as_name) = &network_info.asn_name {
-                            format!("AS{} ({})", as_number, as_name)
-                        } else {
-                            format!("AS{}", as_number)
-                        };
-
-                        lines.push(Line::from(vec![
-                            Span::styled("🔗 ASN: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                as_text,
-                                Style::default().fg(Color::Magenta)
-                            ),
-                        ]));
-                    }
-
-                    // Organization (if different from ISP)
-                    if network_info.organization != network_info.isp {
-                        lines.push(Line::from(vec![
-                            Span::styled("🏛️  Org: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                network_info.organization.clone(),
-                                Style::default().fg(Color::Blue)
-                            ),
-                        ]));
-                    }
-                }
-
-                // Data source
+                // Protocol status section
                 lines.push(Line::from(vec![
-                    Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        geoip_result.data_source.clone(),
-                        Style::default().fg(Color::Gray)
-                    ),
+                    Span::styled("🌐 Protocols:", Style::default().fg(Color::Cyan)),
                 ]));
+
+                // IPv4 status
+                let (ipv4_icon, ipv4_text, ipv4_color) = match &geoip_result.ipv4_status {
+                    crate::scan::geoip::GeoIpStatus::Success => ("✅", "located".to_string(), Color::Green),
+                    crate::scan::geoip::GeoIpStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
+                    crate::scan::geoip::GeoIpStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
+                    crate::scan::geoip::GeoIpStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled("  IPv4: ", Style::default().fg(Color::White)),
+                    Span::styled(ipv4_icon, Style::default().fg(ipv4_color)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(ipv4_text, Style::default().fg(ipv4_color)),
+                ]));
+
+                // IPv6 status
+                let (ipv6_icon, ipv6_text, ipv6_color) = match &geoip_result.ipv6_status {
+                    crate::scan::geoip::GeoIpStatus::Success => ("✅", "located".to_string(), Color::Green),
+                    crate::scan::geoip::GeoIpStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
+                    crate::scan::geoip::GeoIpStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
+                    crate::scan::geoip::GeoIpStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled("  IPv6: ", Style::default().fg(Color::White)),
+                    Span::styled(ipv6_icon, Style::default().fg(ipv6_color)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(ipv6_text, Style::default().fg(ipv6_color)),
+                ]));
+
+                lines.push(Line::from(""));
+
+                // Show location data for the primary result
+                if let Some(primary_data) = geoip_result.get_primary_result() {
+                    let protocol = if primary_data.target_ip.is_ipv6() { "IPv6" } else { "IPv4" };
+
+                    // Location
+                    if let Some(location) = &primary_data.location {
+                        let location_text = format!("{}, {}, {}", location.city, location.region, location.country);
+
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("📍 {} Location: ", protocol), Style::default().fg(Color::White)),
+                            Span::styled(
+                                location_text,
+                                Style::default().fg(Color::Green)
+                            ),
+                        ]));
+
+                        // Coordinates
+                        lines.push(Line::from(vec![
+                            Span::styled("📐 Coords: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                format!("{:.4}, {:.4}", location.latitude, location.longitude),
+                                Style::default().fg(Color::Yellow)
+                            ),
+                        ]));
+
+                        // Timezone
+                        lines.push(Line::from(vec![
+                            Span::styled("🕐 TZ: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                location.timezone.clone(),
+                                Style::default().fg(Color::Yellow)
+                            ),
+                        ]));
+                    }
+
+                    // Network information
+                    if let Some(network_info) = &primary_data.network_info {
+                        // ISP/Organization
+                        lines.push(Line::from(vec![
+                            Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                network_info.isp.clone(),
+                                Style::default().fg(Color::Cyan)
+                            ),
+                        ]));
+
+                        // AS Number
+                        if let Some(as_number) = network_info.asn {
+                            let as_text = if let Some(as_name) = &network_info.asn_name {
+                                format!("AS{} ({})", as_number, as_name)
+                            } else {
+                                format!("AS{}", as_number)
+                            };
+
+                            lines.push(Line::from(vec![
+                                Span::styled("🔗 ASN: ", Style::default().fg(Color::White)),
+                                Span::styled(
+                                    as_text,
+                                    Style::default().fg(Color::Magenta)
+                                ),
+                            ]));
+                        }
+
+                        // Organization (if different from ISP)
+                        if network_info.organization != network_info.isp {
+                            lines.push(Line::from(vec![
+                                Span::styled("🏛️  Org: ", Style::default().fg(Color::White)),
+                                Span::styled(
+                                    network_info.organization.clone(),
+                                    Style::default().fg(Color::Blue)
+                                ),
+                            ]));
+                        }
+                    }
+
+                    // Data source
+                    lines.push(Line::from(vec![
+                        Span::styled("📡 Source: ", Style::default().fg(Color::White)),
+                        Span::styled(
+                            primary_data.data_source.clone(),
+                            Style::default().fg(Color::Gray)
+                        ),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                        Span::styled("All protocols failed", Style::default().fg(Color::Red)),
+                    ]));
+                }
 
             } else {
                 // No GeoIP data available yet - check scanner status

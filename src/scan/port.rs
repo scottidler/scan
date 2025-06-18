@@ -44,13 +44,90 @@ pub enum ScanMode {
 }
 
 #[derive(Debug, Clone)]
-pub struct PortResult {
+pub struct PortData {
     pub target_ip: IpAddr,
     pub open_ports: Vec<OpenPort>,
     pub closed_ports: u16,
     pub filtered_ports: u16,
     pub scan_duration: Duration,
     pub scan_mode: ScanMode,
+}
+
+#[derive(Debug, Clone)]
+pub enum PortStatus {
+    NotQueried,           // Protocol not attempted (due to protocol restrictions)
+    Success(usize),       // Port scan succeeded with N open ports
+    Failed(String),       // Port scan failed with error message
+    NoAddress,           // No address available for this protocol
+}
+
+impl PortStatus {
+    pub fn was_attempted(&self) -> bool {
+        !matches!(self, PortStatus::NotQueried)
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, PortStatus::Success(_))
+    }
+
+    pub fn open_port_count(&self) -> usize {
+        match self {
+            PortStatus::Success(count) => *count,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PortResult {
+    // Protocol-specific results
+    pub ipv4_result: Option<PortData>,
+    pub ipv6_result: Option<PortData>,
+
+    // Status tracking
+    pub ipv4_status: PortStatus,
+    pub ipv6_status: PortStatus,
+
+    // Metadata
+    pub queried_at: Instant,
+    pub total_duration: Duration,
+}
+
+impl PortResult {
+    pub fn new() -> Self {
+        Self {
+            ipv4_result: None,
+            ipv6_result: None,
+            ipv4_status: PortStatus::NotQueried,
+            ipv6_status: PortStatus::NotQueried,
+            queried_at: Instant::now(),
+            total_duration: Duration::from_millis(0),
+        }
+    }
+
+    pub fn has_any_success(&self) -> bool {
+        self.ipv4_status.is_success() || self.ipv6_status.is_success()
+    }
+
+    pub fn total_open_ports(&self) -> usize {
+        self.ipv4_status.open_port_count() + self.ipv6_status.open_port_count()
+    }
+
+    pub fn get_all_open_ports(&self) -> Vec<&OpenPort> {
+        let mut ports = Vec::new();
+        if let Some(ipv4_data) = &self.ipv4_result {
+            ports.extend(&ipv4_data.open_ports);
+        }
+        if let Some(ipv6_data) = &self.ipv6_result {
+            ports.extend(&ipv6_data.open_ports);
+        }
+        ports
+    }
+
+    pub fn get_primary_result(&self) -> Option<&PortData> {
+        // Prefer IPv4, fallback to IPv6
+        self.ipv4_result.as_ref().or(self.ipv6_result.as_ref())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,30 +204,26 @@ impl PortScanner {
         }
     }
 
-    async fn perform_port_scan(&self, target: &Target) -> Result<PortResult> {
-        self.progressive_port_scan_internal(target).await
-    }
 
-    async fn progressive_port_scan_internal(&self, target: &Target) -> Result<PortResult> {
-        log::debug!("[scan::port] progressive_port_scan_internal: target={} mode={:?}",
-            target.display_name(), self.scan_mode);
 
-        let target_ip = if let Some(primary_ip) = target.primary_ip() {
-            primary_ip
-        } else {
-            log::error!("[scan::port] no_ip_available: target={}", target.display_name());
-            return Err(eyre::eyre!("No IP address available for port scan"));
+    async fn scan_protocol(&self, target: &Target, protocol: Protocol) -> Result<PortData> {
+        // Get protocol-specific target IP
+        let target_ip = match target.primary_ip_for_protocol(protocol) {
+            Some(ip) => ip,
+            None => {
+                log::warn!("[scan::port] no_ip_for_protocol: target={} protocol={}",
+                    target.display_name(), protocol.as_str());
+                eyre::bail!("No {} address available for target: {}", protocol.as_str(), target.display_name());
+            }
         };
 
-        log::debug!("[scan::port] scanning_ip: target={} ip={}", target.display_name(), target_ip);
+        log::debug!("[scan::port] scanning_protocol: target={} ip={} protocol={}",
+            target.display_name(), target_ip, protocol.as_str());
 
         let ports = self.get_ports();
-        log::debug!("[scan::port] port_list: target={} port_count={} ports={:?}",
-            target.display_name(), ports.len(),
+        log::debug!("[scan::port] port_list: target={} protocol={} port_count={} ports={:?}",
+            target.display_name(), protocol.as_str(), ports.len(),
             if ports.len() <= DEBUG_PORT_DISPLAY_LIMIT { format!("{:?}", ports) } else { format!("{:?}...", &ports[..DEBUG_PORT_DISPLAY_LIMIT]) });
-
-        log::trace!("[scan::port] starting_concurrent_scans: target={} concurrency={}",
-            target.display_name(), self.max_concurrent);
 
         let scan_start = Instant::now();
 
@@ -185,10 +258,9 @@ impl PortScanner {
         }
 
         open_ports.sort_by_key(|p| p.port);
-
         let scan_duration = scan_start.elapsed();
 
-        let result = PortResult {
+        let port_data = PortData {
             target_ip,
             open_ports: open_ports.clone(),
             closed_ports: closed_count,
@@ -197,17 +269,27 @@ impl PortScanner {
             scan_mode: self.scan_mode.clone(),
         };
 
-        log::debug!("[scan::port] port_scan_completed: target={} duration={}ms open={} closed={} filtered={}",
-            target.display_name(), result.scan_duration.as_millis(),
-            result.open_ports.len(), result.closed_ports, result.filtered_ports);
+        log::debug!("[scan::port] protocol_scan_completed: target={} protocol={} duration={}ms open={} closed={} filtered={}",
+            target.display_name(), protocol.as_str(), port_data.scan_duration.as_millis(),
+            port_data.open_ports.len(), port_data.closed_ports, port_data.filtered_ports);
 
-        if !result.open_ports.is_empty() {
-            let open_port_numbers: Vec<u16> = result.open_ports.iter().map(|p| p.port).collect();
-            log::trace!("[scan::port] open_ports_found: target={} ports={:?}",
-                target.display_name(), open_port_numbers);
+        if !port_data.open_ports.is_empty() {
+            let open_port_numbers: Vec<u16> = port_data.open_ports.iter().map(|p| p.port).collect();
+            log::trace!("[scan::port] open_ports_found: target={} protocol={} ports={:?}",
+                target.display_name(), protocol.as_str(), open_port_numbers);
         }
 
-        Ok(result)
+        Ok(port_data)
+    }
+
+    fn classify_port_error(error: &eyre::Error) -> PortStatus {
+        let error_msg = error.to_string();
+
+        if error_msg.contains("No") && error_msg.contains("address available") {
+            PortStatus::NoAddress
+        } else {
+            PortStatus::Failed(error_msg)
+        }
     }
 
     async fn scan_port_with_throttle(&self, ip: IpAddr, port: u16) -> Result<Option<OpenPort>> {
@@ -473,24 +555,86 @@ fn get_top_1000_ports() -> Vec<u16> {
 impl Scanner for PortScanner {
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
         log::debug!("[scan::port] scan: target={} protocol={} mode={:?} timeout={}s concurrency={}",
-            target.display_name(), protocol.as_str(), self.scan_mode, 
+            target.display_name(), protocol.as_str(), self.scan_mode,
             self.tcp_timeout.as_secs(), self.max_concurrent);
 
         let scan_start = Instant::now();
-        match self.perform_port_scan(target).await {
-            Ok(result) => {
-                let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::port] port_scan_completed: target={} protocol={} duration={}ms open={} closed={} filtered={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(),
-                    result.open_ports.len(), result.closed_ports, result.filtered_ports);
-                Ok(ScanResult::Port(result))
+        let mut result = PortResult::new();
+
+        match protocol {
+            Protocol::Ipv4 => {
+                // IPv4 only
+                match self.scan_protocol(target, Protocol::Ipv4).await {
+                    Ok(port_data) => {
+                        result.ipv4_status = PortStatus::Success(port_data.open_ports.len());
+                        result.ipv4_result = Some(port_data);
+                    }
+                    Err(e) => {
+                        result.ipv4_status = Self::classify_port_error(&e);
+                        if result.ipv4_status.is_success() {
+                            return Err(e); // Shouldn't happen, but just in case
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                let scan_duration = scan_start.elapsed();
-                log::error!("[scan::port] port_scan_failed: target={} protocol={} duration={}ms error={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
-                Err(e.wrap_err("Port scan failed"))
+            Protocol::Ipv6 => {
+                // IPv6 only
+                match self.scan_protocol(target, Protocol::Ipv6).await {
+                    Ok(port_data) => {
+                        result.ipv6_status = PortStatus::Success(port_data.open_ports.len());
+                        result.ipv6_result = Some(port_data);
+                    }
+                    Err(e) => {
+                        result.ipv6_status = Self::classify_port_error(&e);
+                        if result.ipv6_status.is_success() {
+                            return Err(e); // Shouldn't happen, but just in case
+                        }
+                    }
+                }
             }
+            Protocol::Both => {
+                // Both IPv4 and IPv6
+
+                // Try IPv4
+                match self.scan_protocol(target, Protocol::Ipv4).await {
+                    Ok(port_data) => {
+                        result.ipv4_status = PortStatus::Success(port_data.open_ports.len());
+                        result.ipv4_result = Some(port_data);
+                    }
+                    Err(e) => {
+                        result.ipv4_status = Self::classify_port_error(&e);
+                        log::debug!("[scan::port] ipv4_scan_failed: error={}", e);
+                    }
+                }
+
+                // Try IPv6
+                match self.scan_protocol(target, Protocol::Ipv6).await {
+                    Ok(port_data) => {
+                        result.ipv6_status = PortStatus::Success(port_data.open_ports.len());
+                        result.ipv6_result = Some(port_data);
+                    }
+                    Err(e) => {
+                        result.ipv6_status = Self::classify_port_error(&e);
+                        log::debug!("[scan::port] ipv6_scan_failed: error={}", e);
+                    }
+                }
+            }
+        }
+
+        result.total_duration = scan_start.elapsed();
+
+        // Return success if at least one protocol succeeded, or error if all failed
+        if result.has_any_success() {
+            log::trace!("[scan::port] scan_completed: target={} protocol={} duration={}ms total_open={}",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), result.total_open_ports());
+            Ok(ScanResult::Port(result))
+        } else {
+            // All protocols failed
+            let error_msg = format!("All port scan attempts failed for target: {} ({})",
+                target.display_name(), protocol.as_str());
+            log::error!("[scan::port] all_scans_failed: target={} protocol={} duration={}ms",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis());
+            Err(eyre::eyre!(error_msg))
         }
     }
 

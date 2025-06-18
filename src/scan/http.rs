@@ -72,24 +72,65 @@ impl HttpScanner {
         self.timeout
     }
 
-    async fn scan_http(&self, target: &Target) -> eyre::Result<HttpResult> {
-        log::debug!("[scan::http] scan_http: target={}", target.display_name());
+    async fn http_protocol(&self, target: &Target, protocol: Protocol) -> eyre::Result<HttpData> {
+        log::debug!("[scan::http] http_protocol: target={} protocol={}", target.display_name(), protocol.as_str());
+
+        // Check if target supports this protocol
+        if !target.supports_protocol(protocol) {
+            log::debug!("[scan::http] protocol_not_supported: target={} protocol={}",
+                target.display_name(), protocol.as_str());
+            return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+        }
+
+        // Get protocol-specific network target
+        let network_target = match target.network_target_for_protocol(protocol) {
+            Some(target_addr) => target_addr,
+            None => {
+                log::warn!("[scan::http] no_target_for_protocol: target={} protocol={}",
+                    target.display_name(), protocol.as_str());
+                return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+            }
+        };
+
+        log::debug!("[scan::http] protocol_target: {} -> {} ({})",
+            target.display_name(), network_target, protocol.as_str());
+
+        let http_data = self.perform_http_scan_for_target(target, &network_target).await?;
+        Ok(http_data)
+    }
+
+    fn classify_http_error(error: &eyre::Error) -> HttpStatus {
+        let error_msg = error.to_string();
+
+        if error_msg.contains("No") && error_msg.contains("address available") {
+            HttpStatus::NoAddress
+        } else {
+            HttpStatus::Failed(error_msg)
+        }
+    }
+
+    async fn perform_http_scan_for_target(&self, target: &Target, target_addr: &str) -> eyre::Result<HttpData> {
+        log::debug!("[scan::http] perform_http_scan_for_target: target={} target_addr={}", target.display_name(), target_addr);
 
         let scan_start = Instant::now();
 
-        // Determine URL to scan
+        // Determine URL to scan - use the specific target address
         let url = match &target.target_type {
-            crate::target::TargetType::Url(url) => url.to_string(),
+            crate::target::TargetType::Url(url) => {
+                // For URLs, we need to replace the host with the specific IP
+                let mut parsed_url = url.clone();
+                parsed_url.set_host(Some(target_addr))?;
+                parsed_url.to_string()
+            },
             _ => {
-                // For domains and IPs, try both HTTP and HTTPS
-                let domain = target.display_name();
-                let https_url = format!("https://{}", domain);
-                let http_url = format!("http://{}", domain);
+                // For domains and IPs, try both HTTPS and HTTP with the specific address
+                let https_url = format!("https://{}", target_addr);
+                let http_url = format!("http://{}", target_addr);
 
                 log::debug!("[scan::http] trying_https_first: url={}", https_url);
 
                 // Try HTTPS first
-                match self.perform_scan(&https_url).await {
+                match self.perform_scan(&https_url, target_addr).await {
                     Ok(mut result) => {
                         result.scan_duration = scan_start.elapsed();
                         log::trace!("[scan::http] https_scan_successful: url={} status={} duration={}ms",
@@ -99,7 +140,7 @@ impl HttpScanner {
                     Err(e) => {
                         log::debug!("[scan::http] https_failed_trying_http: https_error={} http_url={}", e, http_url);
                         // Fall back to HTTP
-                        match self.perform_scan(&http_url).await {
+                        match self.perform_scan(&http_url, target_addr).await {
                             Ok(mut result) => {
                                 result.scan_duration = scan_start.elapsed();
                                 log::trace!("[scan::http] http_scan_successful: url={} status={} duration={}ms",
@@ -116,7 +157,7 @@ impl HttpScanner {
             }
         };
 
-        let mut result = self.perform_scan(&url).await?;
+        let mut result = self.perform_scan(&url, target_addr).await?;
         result.scan_duration = scan_start.elapsed();
 
         log::debug!("[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}",
@@ -125,8 +166,8 @@ impl HttpScanner {
         Ok(result)
     }
 
-    async fn perform_scan(&self, url: &str) -> eyre::Result<HttpResult> {
-        log::debug!("[scan::http] perform_scan: url={}", url);
+    async fn perform_scan(&self, url: &str, target_ip: &str) -> eyre::Result<HttpData> {
+        log::debug!("[scan::http] perform_scan: url={} target_ip={}", url, target_ip);
 
         let start_time = Instant::now();
         let original_url = Url::parse(url)?;
@@ -178,7 +219,7 @@ impl HttpScanner {
         log::trace!("[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}",
             url, security_duration.as_micros(), security_grade, vulnerabilities.len());
 
-        let result = HttpResult {
+        let result = HttpData {
             url: final_url.to_string(),
             status_code,
             response_time: request_duration,
@@ -192,6 +233,7 @@ impl HttpScanner {
             vulnerabilities,
             security_grade,
             scan_duration: start_time.elapsed(),
+            target_ip: target_ip.to_string(),
         };
 
         log::debug!("[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}",
@@ -561,28 +603,84 @@ impl Scanner for HttpScanner {
         log::debug!("[scan::http] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
-        match self.scan_http(target).await {
-            Ok(result) => {
-                let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::http] http_scan_completed: target={} protocol={} duration={}ms status={} response_time={}ms security_grade={:?} vulnerabilities={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.status_code,
-                    result.response_time.as_millis(), result.security_grade, result.vulnerabilities.len());
-                Ok(ScanResult::Http(result))
+        let mut result = HttpResult::new();
+
+        match protocol {
+            Protocol::Ipv4 => {
+                // IPv4 only
+                match self.http_protocol(target, Protocol::Ipv4).await {
+                    Ok(http_data) => {
+                        result.ipv4_status = HttpStatus::Success(http_data.security_grade.clone());
+                        result.ipv4_result = Some(http_data);
+                    }
+                    Err(e) => {
+                        result.ipv4_status = Self::classify_http_error(&e);
+                    }
+                }
             }
-            Err(e) => {
-                let scan_duration = scan_start.elapsed();
-                log::error!("[scan::http] http_scan_failed: target={} protocol={} duration={}ms error={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
-                Err(e)
+            Protocol::Ipv6 => {
+                // IPv6 only
+                match self.http_protocol(target, Protocol::Ipv6).await {
+                    Ok(http_data) => {
+                        result.ipv6_status = HttpStatus::Success(http_data.security_grade.clone());
+                        result.ipv6_result = Some(http_data);
+                    }
+                    Err(e) => {
+                        result.ipv6_status = Self::classify_http_error(&e);
+                    }
+                }
             }
+            Protocol::Both => {
+                // Both IPv4 and IPv6
+
+                // Try IPv4
+                match self.http_protocol(target, Protocol::Ipv4).await {
+                    Ok(http_data) => {
+                        result.ipv4_status = HttpStatus::Success(http_data.security_grade.clone());
+                        result.ipv4_result = Some(http_data);
+                    }
+                    Err(e) => {
+                        result.ipv4_status = Self::classify_http_error(&e);
+                        log::debug!("[scan::http] ipv4_http_failed: error={}", e);
+                    }
+                }
+
+                // Try IPv6
+                match self.http_protocol(target, Protocol::Ipv6).await {
+                    Ok(http_data) => {
+                        result.ipv6_status = HttpStatus::Success(http_data.security_grade.clone());
+                        result.ipv6_result = Some(http_data);
+                    }
+                    Err(e) => {
+                        result.ipv6_status = Self::classify_http_error(&e);
+                        log::debug!("[scan::http] ipv6_http_failed: error={}", e);
+                    }
+                }
+            }
+        }
+
+        result.total_duration = scan_start.elapsed();
+
+        // Return success if at least one protocol succeeded, or error if all failed
+        if result.has_any_success() {
+            log::trace!("[scan::http] http_completed: target={} protocol={} duration={}ms best_grade={:?}",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), result.get_best_security_grade());
+            Ok(ScanResult::Http(result))
+        } else {
+            // All protocols failed
+            let error_msg = format!("All HTTP attempts failed for target: {} ({})",
+                target.display_name(), protocol.as_str());
+            log::error!("[scan::http] all_http_failed: target={} protocol={} duration={}ms",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis());
+            Err(eyre::eyre!(error_msg))
         }
     }
 }
 
 // Data structures
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpResult {
+#[derive(Debug, Clone)]
+pub struct HttpData {
     pub url: String,
     pub status_code: u16,
     pub response_time: Duration,
@@ -596,6 +694,130 @@ pub struct HttpResult {
     pub vulnerabilities: Vec<HttpVulnerability>,
     pub security_grade: SecurityGrade,
     pub scan_duration: Duration,
+    pub target_ip: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum HttpStatus {
+    NotQueried,           // Protocol not attempted (due to protocol restrictions)
+    Success(SecurityGrade), // HTTP scan succeeded with security grade
+    Failed(String),       // HTTP scan failed with error message
+    NoAddress,           // No address available for this protocol
+}
+
+impl HttpStatus {
+    pub fn was_attempted(&self) -> bool {
+        !matches!(self, HttpStatus::NotQueried)
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, HttpStatus::Success(_))
+    }
+
+    pub fn security_grade(&self) -> Option<&SecurityGrade> {
+        match self {
+            HttpStatus::Success(grade) => Some(grade),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpResult {
+    // Protocol-specific results
+    pub ipv4_result: Option<HttpData>,
+    pub ipv6_result: Option<HttpData>,
+
+    // Status tracking
+    pub ipv4_status: HttpStatus,
+    pub ipv6_status: HttpStatus,
+
+    // Metadata
+    pub queried_at: Instant,
+    pub total_duration: Duration,
+}
+
+impl HttpResult {
+    pub fn new() -> Self {
+        Self {
+            ipv4_result: None,
+            ipv6_result: None,
+            ipv4_status: HttpStatus::NotQueried,
+            ipv6_status: HttpStatus::NotQueried,
+            queried_at: Instant::now(),
+            total_duration: Duration::from_millis(0),
+        }
+    }
+
+    pub fn has_any_success(&self) -> bool {
+        self.ipv4_status.is_success() || self.ipv6_status.is_success()
+    }
+
+    pub fn get_best_security_grade(&self) -> Option<&SecurityGrade> {
+        let ipv4_grade = self.ipv4_status.security_grade();
+        let ipv6_grade = self.ipv6_status.security_grade();
+
+        match (ipv4_grade, ipv6_grade) {
+            (Some(g4), Some(g6)) => {
+                // Return the better grade (A+ > A > B > C > D > F)
+                if matches!(g4, SecurityGrade::APlus) || matches!(g6, SecurityGrade::APlus) {
+                    if matches!(g4, SecurityGrade::APlus) { Some(g4) } else { Some(g6) }
+                } else if matches!(g4, SecurityGrade::A) || matches!(g6, SecurityGrade::A) {
+                    if matches!(g4, SecurityGrade::A) { Some(g4) } else { Some(g6) }
+                } else if matches!(g4, SecurityGrade::B) || matches!(g6, SecurityGrade::B) {
+                    if matches!(g4, SecurityGrade::B) { Some(g4) } else { Some(g6) }
+                } else if matches!(g4, SecurityGrade::C) || matches!(g6, SecurityGrade::C) {
+                    if matches!(g4, SecurityGrade::C) { Some(g4) } else { Some(g6) }
+                } else if matches!(g4, SecurityGrade::D) || matches!(g6, SecurityGrade::D) {
+                    if matches!(g4, SecurityGrade::D) { Some(g4) } else { Some(g6) }
+                } else {
+                    Some(g4) // Both F, return either
+                }
+            }
+            (Some(g), None) => Some(g),
+            (None, Some(g)) => Some(g),
+            (None, None) => None,
+        }
+    }
+
+    pub fn get_primary_result(&self) -> Option<&HttpData> {
+        // Prefer IPv4, then IPv6
+        if let Some(ipv4_data) = &self.ipv4_result {
+            Some(ipv4_data)
+        } else if let Some(ipv6_data) = &self.ipv6_result {
+            Some(ipv6_data)
+        } else {
+            None
+        }
+    }
+
+    pub fn total_vulnerabilities(&self) -> usize {
+        let ipv4_vulns = self.ipv4_result.as_ref().map(|r| r.vulnerabilities.len()).unwrap_or(0);
+        let ipv6_vulns = self.ipv6_result.as_ref().map(|r| r.vulnerabilities.len()).unwrap_or(0);
+        ipv4_vulns + ipv6_vulns
+    }
+
+    pub fn get_all_vulnerabilities(&self) -> Vec<&HttpVulnerability> {
+        let mut vulnerabilities = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let Some(ipv4_data) = &self.ipv4_result {
+            for vuln in &ipv4_data.vulnerabilities {
+                if seen.insert(vuln) {
+                    vulnerabilities.push(vuln);
+                }
+            }
+        }
+        if let Some(ipv6_data) = &self.ipv6_result {
+            for vuln in &ipv6_data.vulnerabilities {
+                if seen.insert(vuln) {
+                    vulnerabilities.push(vuln);
+                }
+            }
+        }
+
+        vulnerabilities
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -673,7 +895,7 @@ pub struct CachingPolicy {
     pub last_modified: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum HttpVulnerability {
     MissingHsts,
     MissingXFrameOptions,

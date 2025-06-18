@@ -24,8 +24,18 @@ pub struct TracerouteScanner {
     probes_per_hop: u8,
 }
 
+// Dual-protocol Traceroute result structure
 #[derive(Debug, Clone)]
 pub struct TracerouteResult {
+    pub ipv4_result: Option<TracerouteData>,
+    pub ipv6_result: Option<TracerouteData>,
+    pub ipv4_status: TracerouteStatus,
+    pub ipv6_status: TracerouteStatus,
+    pub total_duration: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct TracerouteData {
     pub hops: Vec<TracerouteHop>,
     pub destination_reached: bool,
     pub total_hops: u8,
@@ -33,6 +43,47 @@ pub struct TracerouteResult {
     pub target_ip: IpAddr,
     pub scan_duration: Duration,
     pub ipv6: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum TracerouteStatus {
+    Success(u8),           // Traceroute succeeded with N hops
+    Failed(String),        // Traceroute failed with error message
+    NoAddress,            // No address available for this protocol
+    NotQueried,           // Query was not attempted
+}
+
+impl TracerouteResult {
+    pub fn new() -> Self {
+        Self {
+            ipv4_result: None,
+            ipv6_result: None,
+            ipv4_status: TracerouteStatus::NotQueried,
+            ipv6_status: TracerouteStatus::NotQueried,
+            total_duration: Duration::from_millis(0),
+        }
+    }
+
+    pub fn get_primary_result(&self) -> Option<&TracerouteData> {
+        // Prefer IPv4, then IPv6
+        self.ipv4_result.as_ref().or(self.ipv6_result.as_ref())
+    }
+
+    pub fn has_any_success(&self) -> bool {
+        matches!(self.ipv4_status, TracerouteStatus::Success(_)) ||
+        matches!(self.ipv6_status, TracerouteStatus::Success(_))
+    }
+
+    pub fn total_hops(&self) -> u8 {
+        let ipv4_hops = self.ipv4_result.as_ref().map(|r| r.total_hops).unwrap_or(0);
+        let ipv6_hops = self.ipv6_result.as_ref().map(|r| r.total_hops).unwrap_or(0);
+        ipv4_hops.max(ipv6_hops)
+    }
+
+    pub fn any_destination_reached(&self) -> bool {
+        self.ipv4_result.as_ref().map(|r| r.destination_reached).unwrap_or(false) ||
+        self.ipv6_result.as_ref().map(|r| r.destination_reached).unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,13 +120,39 @@ impl TracerouteScanner {
         }
     }
 
-    async fn perform_traceroute(&self, target: &Target) -> Result<TracerouteResult> {
+    async fn traceroute_protocol(&self, target: &Target, protocol: Protocol) -> Result<TracerouteData> {
+        log::debug!("[scan::traceroute] traceroute_protocol: target={} protocol={}", target.display_name(), protocol.as_str());
+
+        // Check if target supports this protocol
+        if !target.supports_protocol(protocol) {
+            log::warn!("[scan::traceroute] no_address_for_protocol: target={} protocol={}",
+                target.display_name(), protocol.as_str());
+            return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+        }
+
+        // Get protocol-specific IP address
+        let target_ip = match target.primary_ip_for_protocol(protocol) {
+            Some(ip) => ip,
+            None => {
+                log::warn!("[scan::traceroute] no_ip_for_protocol: target={} protocol={}",
+                    target.display_name(), protocol.as_str());
+                return Err(eyre::eyre!("No {} IP address available for target: {}", protocol.as_str(), target.display_name()));
+            }
+        };
+
+        log::debug!("[scan::traceroute] protocol_target: {} -> {} ({})",
+            target.display_name(), target_ip, protocol.as_str());
+
+        let traceroute_data = self.perform_traceroute_for_ip(target, target_ip).await?;
+        Ok(traceroute_data)
+    }
+
+    async fn perform_traceroute_for_ip(&self, target: &Target, target_ip: IpAddr) -> Result<TracerouteData> {
         log::debug!("[scan::traceroute] perform_traceroute: target={}", target.display_name());
 
         let start_time = Instant::now();
+        let ipv6 = target_ip.is_ipv6();
 
-        // Determine target IP and whether to use IPv6
-        let (target_ip, ipv6) = self.determine_target_ip(target)?;
         log::debug!("[scan::traceroute] target_determined: target={} ip={} ipv6={}",
             target.display_name(), target_ip, ipv6);
 
@@ -130,22 +207,7 @@ impl TracerouteScanner {
         Ok(result)
     }
 
-    fn determine_target_ip(&self, target: &Target) -> Result<(IpAddr, bool)> {
-        // Get primary IP from target
-        if let Some(ip) = target.primary_ip() {
-            let use_ipv6 = ip.is_ipv6();
-            return Ok((ip, use_ipv6));
-        }
 
-        // If no resolved IP, try to use the domain directly
-        if let Some(domain) = &target.domain {
-            // For now, default to IPv4. In a real implementation, we might
-            // want to check if the domain has AAAA records first
-            return Err(eyre::eyre!("No resolved IP available for domain: {}", domain));
-        }
-
-        Err(eyre::eyre!("No valid target IP found"))
-    }
 
     fn parse_traceroute_output(
         &self,
@@ -153,7 +215,7 @@ impl TracerouteScanner {
         target_ip: IpAddr,
         ipv6: bool,
         scan_duration: Duration,
-    ) -> Result<TracerouteResult> {
+    ) -> Result<TracerouteData> {
         let mut hops = Vec::new();
         let mut destination_reached = false;
         let mut total_hops = 0;
@@ -183,7 +245,7 @@ impl TracerouteScanner {
             }
         }
 
-        Ok(TracerouteResult {
+        Ok(TracerouteData {
             hops,
             destination_reached,
             total_hops,
@@ -299,20 +361,114 @@ impl Scanner for TracerouteScanner {
         log::debug!("[scan::traceroute] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
-        match self.perform_traceroute(target).await {
-            Ok(result) => {
-                let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::traceroute] traceroute_completed: target={} protocol={} duration={}ms hops={} complete={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), 
-                    result.hops.len(), result.destination_reached);
-                Ok(ScanResult::Traceroute(result))
+        let mut result = TracerouteResult::new();
+
+        match protocol {
+            Protocol::Ipv4 => {
+                match self.traceroute_protocol(target, Protocol::Ipv4).await {
+                    Ok(data) => {
+                        result.ipv4_result = Some(data.clone());
+                        result.ipv4_status = TracerouteStatus::Success(data.total_hops);
+                        log::trace!("[scan::traceroute] ipv4_traceroute_completed: target={} hops={} complete={}",
+                            target.display_name(), data.total_hops, data.destination_reached);
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv4_status = TracerouteStatus::NoAddress;
+                            log::warn!("[scan::traceroute] ipv4_traceroute_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv4_status = TracerouteStatus::Failed(error_str);
+                            log::error!("[scan::traceroute] ipv4_traceroute_failed: target={} error={}",
+                                target.display_name(), e);
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                let scan_duration = scan_start.elapsed();
-                log::error!("[scan::traceroute] traceroute_failed: target={} protocol={} duration={}ms error={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
-                Err(e.wrap_err("Traceroute scan failed"))
+            Protocol::Ipv6 => {
+                match self.traceroute_protocol(target, Protocol::Ipv6).await {
+                    Ok(data) => {
+                        result.ipv6_result = Some(data.clone());
+                        result.ipv6_status = TracerouteStatus::Success(data.total_hops);
+                        log::trace!("[scan::traceroute] ipv6_traceroute_completed: target={} hops={} complete={}",
+                            target.display_name(), data.total_hops, data.destination_reached);
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv6_status = TracerouteStatus::NoAddress;
+                            log::warn!("[scan::traceroute] ipv6_traceroute_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv6_status = TracerouteStatus::Failed(error_str);
+                            log::error!("[scan::traceroute] ipv6_traceroute_failed: target={} error={}",
+                                target.display_name(), e);
+                        }
+                    }
+                }
             }
+            Protocol::Both => {
+                // Run both IPv4 and IPv6 traceroutes concurrently
+                let (ipv4_result, ipv6_result) = tokio::join!(
+                    self.traceroute_protocol(target, Protocol::Ipv4),
+                    self.traceroute_protocol(target, Protocol::Ipv6)
+                );
+
+                match ipv4_result {
+                    Ok(data) => {
+                        result.ipv4_result = Some(data.clone());
+                        result.ipv4_status = TracerouteStatus::Success(data.total_hops);
+                        log::trace!("[scan::traceroute] ipv4_traceroute_completed: target={} hops={} complete={}",
+                            target.display_name(), data.total_hops, data.destination_reached);
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv4_status = TracerouteStatus::NoAddress;
+                            log::warn!("[scan::traceroute] ipv4_traceroute_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv4_status = TracerouteStatus::Failed(error_str);
+                            log::error!("[scan::traceroute] ipv4_traceroute_failed: target={} error={}",
+                                target.display_name(), e);
+                        }
+                    }
+                }
+
+                match ipv6_result {
+                    Ok(data) => {
+                        result.ipv6_result = Some(data.clone());
+                        result.ipv6_status = TracerouteStatus::Success(data.total_hops);
+                        log::trace!("[scan::traceroute] ipv6_traceroute_completed: target={} hops={} complete={}",
+                            target.display_name(), data.total_hops, data.destination_reached);
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv6_status = TracerouteStatus::NoAddress;
+                            log::warn!("[scan::traceroute] ipv6_traceroute_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv6_status = TracerouteStatus::Failed(error_str);
+                            log::error!("[scan::traceroute] ipv6_traceroute_failed: target={} error={}",
+                                target.display_name(), e);
+                        }
+                    }
+                }
+            }
+        }
+
+        result.total_duration = scan_start.elapsed();
+
+        // Return success if any protocol succeeded
+        if result.has_any_success() {
+            log::debug!("[scan::traceroute] scan_completed: target={} protocol={} duration={}ms ipv4_status={:?} ipv6_status={:?}",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis(),
+                result.ipv4_status, result.ipv6_status);
+            Ok(ScanResult::Traceroute(result))
+        } else {
+            let error_msg = format!("All traceroute protocols failed: IPv4={:?}, IPv6={:?}",
+                result.ipv4_status, result.ipv6_status);
+            log::error!("[scan::traceroute] scan_failed: target={} protocol={} duration={}ms error={}",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), error_msg);
+            Err(eyre::eyre!(error_msg))
         }
     }
 
@@ -433,7 +589,8 @@ mod tests {
     #[tokio::test]
     async fn test_traceroute_scan_localhost() {
         let scanner = TracerouteScanner::new();
-        let target = Target::parse("127.0.0.1").unwrap();
+        let mut target = Target::parse("127.0.0.1").unwrap();
+        target.resolve().await.expect("Failed to resolve target");
 
         // This test requires traceroute to be installed
         // Skip if not available
@@ -443,9 +600,12 @@ mod tests {
 
         match scanner.scan(&target, Protocol::Ipv4).await {
             Ok(ScanResult::Traceroute(result)) => {
-                assert!(!result.hops.is_empty());
-                assert_eq!(result.target_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-                assert!(!result.ipv6);
+                assert!(result.has_any_success());
+                if let Some(ipv4_data) = &result.ipv4_result {
+                    assert!(!ipv4_data.hops.is_empty());
+                    assert_eq!(ipv4_data.target_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+                    assert!(!ipv4_data.ipv6);
+                }
             }
             Ok(_) => panic!("Expected TracerouteResult"),
             Err(e) => {
@@ -457,7 +617,8 @@ mod tests {
 
     #[test]
     fn test_traceroute_result_structure() {
-        let result = TracerouteResult {
+        let mut result = TracerouteResult::new();
+        result.ipv4_result = Some(TracerouteData {
             hops: vec![],
             destination_reached: false,
             total_hops: 5,
@@ -465,13 +626,17 @@ mod tests {
             target_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             scan_duration: Duration::from_millis(500),
             ipv6: false,
-        };
+        });
+        result.ipv4_status = TracerouteStatus::Success(5);
+        result.total_duration = Duration::from_millis(500);
 
-        assert_eq!(result.total_hops, 5);
-        assert_eq!(result.max_hops, 30);
-        assert!(!result.destination_reached);
-        assert!(!result.ipv6);
-        assert!(result.hops.is_empty());
+        assert_eq!(result.total_hops(), 5);
+        assert!(!result.any_destination_reached());
+        if let Some(ipv4_data) = &result.ipv4_result {
+            assert_eq!(ipv4_data.max_hops, 30);
+            assert!(!ipv4_data.ipv6);
+            assert!(ipv4_data.hops.is_empty());
+        }
     }
 
     #[test]
@@ -589,34 +754,26 @@ mod tests {
     }
 
     #[test]
-    fn test_target_ip_determination() {
-        let scanner = TracerouteScanner::new();
+    fn test_traceroute_status_enum() {
+        // Test TracerouteStatus variants
+        match TracerouteStatus::Success(5) {
+            TracerouteStatus::Success(hops) => assert_eq!(hops, 5),
+            _ => panic!("Expected Success status"),
+        }
 
-        // Test IPv4 target
-        let ipv4_target = Target::parse("8.8.8.8").unwrap();
-        let (ip, is_ipv6) = scanner.determine_target_ip(&ipv4_target).unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(!is_ipv6);
+        match TracerouteStatus::Failed("Network unreachable".to_string()) {
+            TracerouteStatus::Failed(msg) => assert!(msg.contains("unreachable")),
+            _ => panic!("Expected Failed status"),
+        }
 
-        // Test domain name (should resolve to some IP)
-        let domain_target = Target::parse("localhost").unwrap();
-        match scanner.determine_target_ip(&domain_target) {
-            Ok((ip, is_ipv6)) => {
-                // Should resolve to localhost
-                match ip {
-                    IpAddr::V4(ipv4) => {
-                        assert!(ipv4.is_loopback());
-                        assert!(!is_ipv6);
-                    }
-                    IpAddr::V6(ipv6) => {
-                        assert!(ipv6.is_loopback());
-                        assert!(is_ipv6);
-                    }
-                }
-            }
-            Err(_) => {
-                // DNS resolution might fail in test environment
-            }
+        match TracerouteStatus::NoAddress {
+            TracerouteStatus::NoAddress => {},
+            _ => panic!("Expected NoAddress status"),
+        }
+
+        match TracerouteStatus::NotQueried {
+            TracerouteStatus::NotQueried => {},
+            _ => panic!("Expected NotQueried status"),
         }
     }
 

@@ -10,6 +10,8 @@ use ratatui::{
 use std::any::Any;
 use log;
 
+
+
 const SCROLL_STEP: u16 = 1;
 const MAX_CSP_ISSUES_DISPLAYED: usize = 3;
 const MAX_CORS_ISSUES_DISPLAYED: usize = 3;
@@ -101,24 +103,31 @@ impl SecurityPane {
         // Extract TLS data upfront
         let tls_data = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                Some((
-                    tls_result.connection_successful,
-                    tls_result.negotiated_version.as_ref().map(|v| v.as_str().to_string()),
-                    tls_result.negotiated_cipher.as_ref().map(|c| c.name.clone()),
-                    tls_result.perfect_forward_secrecy,
-                    tls_result.ocsp_stapling,
-                    tls_result.certificate_valid,
-                    tls_result.days_until_expiry,
-                    tls_result.security_grade.as_str().to_string(),
-                    tls_result.vulnerabilities.len(),
-                    tls_result.certificate_chain.first().map(|cert| (
-                        cert.subject.clone(),
-                        cert.issuer.clone(),
-                        cert.public_key_algorithm.clone(),
-                        cert.key_size,
-                        cert.san_domains.len()
+                if let Some(primary_data) = tls_result.get_primary_result() {
+                    Some((
+                        primary_data.connection_successful,
+                        primary_data.negotiated_version.as_ref().map(|v| v.as_str().to_string()),
+                        primary_data.negotiated_cipher.as_ref().map(|c| c.name.clone()),
+                        primary_data.perfect_forward_secrecy,
+                        primary_data.ocsp_stapling,
+                        primary_data.certificate_valid,
+                        primary_data.days_until_expiry,
+                        tls_result.get_best_security_grade().map(|g| g.as_str().to_string()).unwrap_or_else(|| "F".to_string()),
+                        tls_result.total_vulnerabilities(),
+                        primary_data.certificate_chain.first().map(|cert| (
+                            cert.subject.clone(),
+                            cert.issuer.clone(),
+                            cert.public_key_algorithm.clone(),
+                            cert.key_size,
+                            cert.san_domains.len()
+                        )),
+                        // Add protocol status data
+                        tls_result.ipv4_status.clone(),
+                        tls_result.ipv6_status.clone()
                     ))
-                ))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -129,46 +138,50 @@ impl SecurityPane {
         // Extract HTTP data upfront
         let http_data = if let Some(http_state) = state.scanners.get("http") {
             if let Some(crate::types::ScanResult::Http(http_result)) = http_state.result.as_ref() {
-                Some((
-                    http_result.security_headers.strict_transport_security.is_some(),
-                    http_result.security_headers.x_frame_options.clone().unwrap_or_else(|| "missing".to_string()),
-                    http_result.security_headers.x_content_type_options.clone().unwrap_or_else(|| "missing".to_string()),
-                    http_result.security_headers.x_xss_protection.clone().unwrap_or_else(|| "missing".to_string()),
-                    http_result.security_headers.referrer_policy.clone().unwrap_or_else(|| "missing".to_string()),
-                    http_result.security_headers.permissions_policy.clone().unwrap_or_else(|| "missing".to_string()),
-                    http_result.csp.as_ref().map(|csp| (
-                        csp.strength.clone(),
-                        csp.header_value.clone(),
-                        csp.issues.iter().take(MAX_CSP_ISSUES_DISPLAYED).map(|issue| match issue {
-                            crate::scan::http::CspIssue::UnsafeInline(directive) => format!("unsafe-inline in {}", directive),
-                            crate::scan::http::CspIssue::UnsafeEval(directive) => format!("unsafe-eval in {}", directive),
-                            crate::scan::http::CspIssue::WildcardSource(directive) => format!("wildcard in {}", directive),
-                            crate::scan::http::CspIssue::MissingDirective(directive) => format!("missing {}", directive),
-                        }).collect::<Vec<_>>()
-                    )),
-                    http_result.cors.as_ref().map(|cors| (
-                        cors.security_level.clone(),
-                        cors.access_control_allow_origin.clone(),
-                        cors.access_control_allow_methods.clone(),
-                        cors.access_control_allow_credentials,
-                        cors.issues.iter().take(MAX_CORS_ISSUES_DISPLAYED).map(|issue| match issue {
-                            crate::scan::http::CorsIssue::WildcardOrigin => "wildcard origin".to_string(),
-                            crate::scan::http::CorsIssue::WildcardMethods => "wildcard methods".to_string(),
-                            crate::scan::http::CorsIssue::WildcardHeaders => "wildcard headers".to_string(),
-                            crate::scan::http::CorsIssue::WildcardWithCredentials => "wildcard + credentials".to_string(),
-                        }).collect::<Vec<_>>()
-                    )),
-                    http_result.vulnerabilities.iter().take(MAX_HTTP_VULNERABILITIES_DISPLAYED).map(|vuln| match vuln {
-                        crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
-                        crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options".to_string(),
-                        crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options".to_string(),
-                        crate::scan::http::HttpVulnerability::MissingCsp => "Missing Content Security Policy".to_string(),
-                        crate::scan::http::HttpVulnerability::WeakCsp => "Weak Content Security Policy".to_string(),
-                        crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS configuration".to_string(),
-                        crate::scan::http::HttpVulnerability::InformationDisclosure => "Information disclosure risk".to_string(),
-                    }).collect::<Vec<_>>(),
-                    format!("{:?}", http_result.security_grade)
-                ))
+                if let Some(primary_data) = http_result.get_primary_result() {
+                    Some((
+                        primary_data.security_headers.strict_transport_security.is_some(),
+                        primary_data.security_headers.x_frame_options.clone().unwrap_or_else(|| "missing".to_string()),
+                        primary_data.security_headers.x_content_type_options.clone().unwrap_or_else(|| "missing".to_string()),
+                        primary_data.security_headers.x_xss_protection.clone().unwrap_or_else(|| "missing".to_string()),
+                        primary_data.security_headers.referrer_policy.clone().unwrap_or_else(|| "missing".to_string()),
+                        primary_data.security_headers.permissions_policy.clone().unwrap_or_else(|| "missing".to_string()),
+                        primary_data.csp.as_ref().map(|csp| (
+                            csp.strength.clone(),
+                            csp.header_value.clone(),
+                            csp.issues.iter().take(MAX_CSP_ISSUES_DISPLAYED).map(|issue| match issue {
+                                crate::scan::http::CspIssue::UnsafeInline(directive) => format!("unsafe-inline in {}", directive),
+                                crate::scan::http::CspIssue::UnsafeEval(directive) => format!("unsafe-eval in {}", directive),
+                                crate::scan::http::CspIssue::WildcardSource(directive) => format!("wildcard in {}", directive),
+                                crate::scan::http::CspIssue::MissingDirective(directive) => format!("missing {}", directive),
+                            }).collect::<Vec<_>>()
+                        )),
+                        primary_data.cors.as_ref().map(|cors| (
+                            cors.security_level.clone(),
+                            cors.access_control_allow_origin.clone(),
+                            cors.access_control_allow_methods.clone(),
+                            cors.access_control_allow_credentials,
+                            cors.issues.iter().take(MAX_CORS_ISSUES_DISPLAYED).map(|issue| match issue {
+                                crate::scan::http::CorsIssue::WildcardOrigin => "wildcard origin".to_string(),
+                                crate::scan::http::CorsIssue::WildcardMethods => "wildcard methods".to_string(),
+                                crate::scan::http::CorsIssue::WildcardHeaders => "wildcard headers".to_string(),
+                                crate::scan::http::CorsIssue::WildcardWithCredentials => "wildcard + credentials".to_string(),
+                            }).collect::<Vec<_>>()
+                        )),
+                        http_result.get_all_vulnerabilities().iter().take(MAX_HTTP_VULNERABILITIES_DISPLAYED).map(|vuln| match vuln {
+                            crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
+                            crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options".to_string(),
+                            crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options".to_string(),
+                            crate::scan::http::HttpVulnerability::MissingCsp => "Missing Content Security Policy".to_string(),
+                            crate::scan::http::HttpVulnerability::WeakCsp => "Weak Content Security Policy".to_string(),
+                            crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS configuration".to_string(),
+                            crate::scan::http::HttpVulnerability::InformationDisclosure => "Information disclosure risk".to_string(),
+                        }).collect::<Vec<_>>(),
+                        http_result.get_best_security_grade().map(|g| format!("{:?}", g)).unwrap_or_else(|| "N/A".to_string())
+                    ))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -196,7 +209,7 @@ impl SecurityPane {
         // Extract TLS vulnerability details
         let tls_vulnerabilities = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                Some(tls_result.vulnerabilities.iter().take(MAX_TLS_VULNERABILITIES_DISPLAYED).map(|vuln| match vuln {
+                Some(tls_result.get_all_vulnerabilities().iter().take(MAX_TLS_VULNERABILITIES_DISPLAYED).map(|vuln| match vuln {
                     crate::scan::tls::TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
                     crate::scan::tls::TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
                     crate::scan::tls::TlsVulnerability::Beast => "BEAST (CVE-2011-3389)".to_string(),
@@ -218,7 +231,7 @@ impl SecurityPane {
         };
 
         // Now build the UI with owned data
-        if let Some((connection_successful, negotiated_version, negotiated_cipher, pfs, ocsp, cert_valid, days_until_expiry, security_grade, vuln_count, cert_info)) = tls_data {
+        if let Some((connection_successful, negotiated_version, negotiated_cipher, pfs, ocsp, cert_valid, days_until_expiry, security_grade, vuln_count, cert_info, ipv4_status, ipv6_status)) = tls_data {
             // Update header based on status
             lines[0] = Line::from(vec![
                 Span::styled("🔒 SECURITY: ", Style::default().fg(Color::Cyan)),
@@ -255,6 +268,42 @@ impl SecurityPane {
                     ),
                 ]));
             }
+
+            // Add protocol status indicators
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("🌐 Protocols:", Style::default().fg(Color::Cyan)),
+            ]));
+
+            // IPv4 status
+            let (ipv4_icon, ipv4_text, ipv4_color) = match &ipv4_status {
+                crate::scan::tls::TlsStatus::Success(grade) => ("✅", format!("{}", grade.as_str()), Color::Green),
+                crate::scan::tls::TlsStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
+                crate::scan::tls::TlsStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
+                crate::scan::tls::TlsStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled("  IPv4: ", Style::default().fg(Color::White)),
+                Span::styled(ipv4_icon, Style::default().fg(ipv4_color)),
+                Span::styled(" ", Style::default()),
+                Span::styled(ipv4_text, Style::default().fg(ipv4_color)),
+            ]));
+
+            // IPv6 status
+            let (ipv6_icon, ipv6_text, ipv6_color) = match &ipv6_status {
+                crate::scan::tls::TlsStatus::Success(grade) => ("✅", format!("{}", grade.as_str()), Color::Green),
+                crate::scan::tls::TlsStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
+                crate::scan::tls::TlsStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
+                crate::scan::tls::TlsStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled("  IPv6: ", Style::default().fg(Color::White)),
+                Span::styled(ipv6_icon, Style::default().fg(ipv6_color)),
+                Span::styled(" ", Style::default()),
+                Span::styled(ipv6_text, Style::default().fg(ipv6_color)),
+            ]));
 
             // Security Features
             lines.push(Line::from(""));
@@ -795,8 +844,8 @@ impl Pane for SecurityPane {
 mod tests {
     use super::*;
     use crate::types::{AppState, ScanState, ScanStatus, ScanResult};
-    use crate::scan::tls::{TlsResult, TlsVersion, CertificateInfo, SecurityGrade, TlsVulnerability};
-    use crate::scan::http::{HttpResult, SecurityHeaders, CspPolicy, CspStrength, CspIssue, CorsPolicy, CorsSecurityLevel, CorsIssue, HttpVulnerability, SecurityGrade as HttpSecurityGrade};
+    use crate::scan::tls::{TlsResult, TlsData, TlsStatus, TlsVersion, CertificateInfo, SecurityGrade, TlsVulnerability};
+    use crate::scan::http::{SecurityHeaders, CspPolicy, CspStrength, CspIssue, CorsPolicy, CorsSecurityLevel, CorsIssue, HttpVulnerability, SecurityGrade as HttpSecurityGrade};
     use crate::scan::dns::{DnsResult, EmailSecurityAnalysis};
     use std::time::{Duration, Instant};
     use std::collections::HashMap;
@@ -833,7 +882,7 @@ mod tests {
             is_ca: false,
         };
 
-        let tls_result = TlsResult {
+        let tls_data = TlsData {
             connection_successful: true,
             handshake_time: Duration::from_millis(100),
             supported_versions: vec![TlsVersion::V1_3],
@@ -853,8 +902,13 @@ mod tests {
             ],
             security_grade: SecurityGrade::A,
             scan_time: Duration::from_millis(500),
+            target_ip: "192.168.1.1".to_string(),
             queried_at: Instant::now(),
         };
+
+        let mut tls_result = TlsResult::new();
+        tls_result.ipv4_result = Some(tls_data);
+        tls_result.ipv4_status = TlsStatus::Success(SecurityGrade::A);
 
         state.scanners.insert("tls".to_string(), ScanState {
             result: Some(ScanResult::Tls(tls_result)),
@@ -867,25 +921,29 @@ mod tests {
         // Test TLS data extraction
         if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                assert!(tls_result.connection_successful, "TLS connection should be successful");
-                assert_eq!(tls_result.negotiated_version.as_ref().unwrap().as_str(), "TLSv1.3");
-                assert!(tls_result.perfect_forward_secrecy, "PFS should be enabled");
-                assert!(tls_result.ocsp_stapling, "OCSP should be enabled");
-                assert!(tls_result.certificate_valid, "Certificate should be valid");
-                assert_eq!(tls_result.days_until_expiry, Some(90));
-                assert_eq!(tls_result.security_grade.as_str(), "A");
-                assert_eq!(tls_result.vulnerabilities.len(), 2);
+                assert!(tls_result.has_any_success(), "TLS should have successful results");
 
-                // Test certificate details
-                let cert = &tls_result.certificate_chain[0];
-                assert!(cert.subject.contains("example.com"));
-                assert!(cert.issuer.contains("Let's Encrypt"));
-                assert_eq!(cert.public_key_algorithm, "RSA");
-                assert_eq!(cert.key_size, Some(2048));
-                assert_eq!(cert.san_domains.len(), 2);
+                if let Some(primary_data) = tls_result.get_primary_result() {
+                    assert!(primary_data.connection_successful, "TLS connection should be successful");
+                    assert_eq!(primary_data.negotiated_version.as_ref().unwrap().as_str(), "TLSv1.3");
+                    assert!(primary_data.perfect_forward_secrecy, "PFS should be enabled");
+                    assert!(primary_data.ocsp_stapling, "OCSP should be enabled");
+                    assert!(primary_data.certificate_valid, "Certificate should be valid");
+                    assert_eq!(primary_data.days_until_expiry, Some(90));
+                    assert_eq!(primary_data.security_grade.as_str(), "A");
+                    assert_eq!(primary_data.vulnerabilities.len(), 2);
+
+                    // Test certificate details
+                    let cert = &primary_data.certificate_chain[0];
+                    assert!(cert.subject.contains("example.com"));
+                    assert!(cert.issuer.contains("Let's Encrypt"));
+                    assert_eq!(cert.public_key_algorithm, "RSA");
+                    assert_eq!(cert.key_size, Some(2048));
+                    assert_eq!(cert.san_domains.len(), 2);
+                }
 
                 // Test vulnerability extraction
-                let vuln_strings: Vec<String> = tls_result.vulnerabilities.iter().map(|vuln| match vuln {
+                let vuln_strings: Vec<String> = tls_result.get_all_vulnerabilities().iter().map(|vuln| match vuln {
                     TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
                     TlsVulnerability::WeakCipher(cipher) => format!("Weak cipher: {}", cipher),
                     _ => "Other vulnerability".to_string(),
@@ -932,7 +990,7 @@ mod tests {
             security_level: CorsSecurityLevel::Dangerous,
         };
 
-        let http_result = HttpResult {
+        let http_data = crate::scan::http::HttpData {
             url: "https://example.com".to_string(),
             status_code: 200,
             response_time: Duration::from_millis(200),
@@ -954,6 +1012,16 @@ mod tests {
             ],
             security_grade: HttpSecurityGrade::C,
             scan_duration: Duration::from_millis(300),
+            target_ip: "1.2.3.4".to_string(),
+        };
+
+        let http_result = crate::scan::http::HttpResult {
+            ipv4_result: Some(http_data.clone()),
+            ipv6_result: None,
+            ipv4_status: crate::scan::http::HttpStatus::Success(http_data.security_grade.clone()),
+            ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+            queried_at: Instant::now(),
+            total_duration: Duration::from_millis(300),
         };
 
         state.scanners.insert("http".to_string(), ScanState {
@@ -967,35 +1035,39 @@ mod tests {
         // Test HTTP data extraction
         if let Some(http_state) = state.scanners.get("http") {
             if let Some(ScanResult::Http(http_result)) = http_state.result.as_ref() {
+                // Get primary data for testing
+                let primary_data = http_result.get_primary_result().unwrap();
+
                 // Test security headers
-                assert!(http_result.security_headers.strict_transport_security.is_some());
-                assert_eq!(http_result.security_headers.x_frame_options.as_ref().unwrap(), "DENY");
-                assert_eq!(http_result.security_headers.x_content_type_options.as_ref().unwrap(), "nosniff");
-                assert_eq!(http_result.security_headers.x_xss_protection.as_ref().unwrap(), "1; mode=block");
-                assert!(http_result.security_headers.referrer_policy.is_some());
-                assert!(http_result.security_headers.permissions_policy.is_some());
+                assert!(primary_data.security_headers.strict_transport_security.is_some());
+                assert_eq!(primary_data.security_headers.x_frame_options.as_ref().unwrap(), "DENY");
+                assert_eq!(primary_data.security_headers.x_content_type_options.as_ref().unwrap(), "nosniff");
+                assert_eq!(primary_data.security_headers.x_xss_protection.as_ref().unwrap(), "1; mode=block");
+                assert!(primary_data.security_headers.referrer_policy.is_some());
+                assert!(primary_data.security_headers.permissions_policy.is_some());
 
                 // Test CSP
-                let csp = http_result.csp.as_ref().unwrap();
+                let csp = primary_data.csp.as_ref().unwrap();
                 assert_eq!(csp.strength, CspStrength::Moderate);
                 assert!(csp.header_value.contains("default-src 'self'"));
                 assert_eq!(csp.issues.len(), 1);
 
                 // Test CORS
-                let cors = http_result.cors.as_ref().unwrap();
+                let cors = primary_data.cors.as_ref().unwrap();
                 assert_eq!(cors.security_level, CorsSecurityLevel::Dangerous);
                 assert_eq!(cors.access_control_allow_origin.as_ref().unwrap(), "*");
                 assert_eq!(cors.access_control_allow_methods.len(), 2);
                 assert!(cors.access_control_allow_credentials);
                 assert_eq!(cors.issues.len(), 1);
 
-                // Test vulnerabilities
-                assert_eq!(http_result.vulnerabilities.len(), 2);
-                assert!(http_result.vulnerabilities.contains(&HttpVulnerability::WeakCsp));
-                assert!(http_result.vulnerabilities.contains(&HttpVulnerability::InsecureCors));
+                // Test vulnerabilities using helper methods
+                let all_vulnerabilities = http_result.get_all_vulnerabilities();
+                assert_eq!(all_vulnerabilities.len(), 2);
+                assert!(all_vulnerabilities.iter().any(|v| **v == HttpVulnerability::WeakCsp));
+                assert!(all_vulnerabilities.iter().any(|v| **v == HttpVulnerability::InsecureCors));
 
-                // Test grade
-                assert_eq!(http_result.security_grade, HttpSecurityGrade::C);
+                // Test grade using helper method
+                assert_eq!(*http_result.get_best_security_grade().unwrap(), HttpSecurityGrade::C);
             }
         }
     }
@@ -1091,7 +1163,7 @@ mod tests {
             is_ca: false,
         };
 
-        let tls_result = TlsResult {
+        let tls_data = TlsData {
             connection_successful: true,
             handshake_time: Duration::from_millis(100),
             supported_versions: vec![TlsVersion::V1_3],
@@ -1108,10 +1180,15 @@ mod tests {
             vulnerabilities: vec![],
             security_grade: SecurityGrade::APlus,
             scan_time: Duration::from_millis(500),
+            target_ip: "192.168.1.1".to_string(),
             queried_at: Instant::now(),
         };
 
-        let http_result = HttpResult {
+        let mut tls_result = TlsResult::new();
+        tls_result.ipv4_result = Some(tls_data);
+        tls_result.ipv4_status = TlsStatus::Success(SecurityGrade::APlus);
+
+        let http_data = crate::scan::http::HttpData {
             url: "https://comprehensive.com".to_string(),
             status_code: 200,
             response_time: Duration::from_millis(100),
@@ -1137,6 +1214,16 @@ mod tests {
             vulnerabilities: vec![HttpVulnerability::MissingCsp],
             security_grade: HttpSecurityGrade::B,
             scan_duration: Duration::from_millis(200),
+            target_ip: "1.2.3.4".to_string(),
+        };
+
+        let http_result = crate::scan::http::HttpResult {
+            ipv4_result: Some(http_data.clone()),
+            ipv6_result: None,
+            ipv4_status: crate::scan::http::HttpStatus::Success(http_data.security_grade.clone()),
+            ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+            queried_at: Instant::now(),
+            total_duration: Duration::from_millis(200),
         };
 
         let dns_result = DnsResult {
@@ -1201,9 +1288,12 @@ mod tests {
         // Verify TLS data is extractable
         if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                assert!(tls_result.connection_successful);
-                assert_eq!(tls_result.security_grade.as_str(), "A+");
-                assert!(!tls_result.certificate_chain.is_empty());
+                assert!(tls_result.has_any_success());
+                if let Some(primary_data) = tls_result.get_primary_result() {
+                    assert!(primary_data.connection_successful);
+                    assert_eq!(primary_data.security_grade.as_str(), "A+");
+                    assert!(!primary_data.certificate_chain.is_empty());
+                }
             } else {
                 panic!("TLS result should be extractable");
             }
@@ -1212,9 +1302,10 @@ mod tests {
         // Verify HTTP data is extractable
         if let Some(http_state) = state.scanners.get("http") {
             if let Some(ScanResult::Http(http_result)) = http_state.result.as_ref() {
-                assert!(http_result.security_headers.strict_transport_security.is_some());
-                assert_eq!(http_result.security_grade, HttpSecurityGrade::B);
-                assert!(!http_result.vulnerabilities.is_empty());
+                let primary_data = http_result.get_primary_result().unwrap();
+                assert!(primary_data.security_headers.strict_transport_security.is_some());
+                assert_eq!(*http_result.get_best_security_grade().unwrap(), HttpSecurityGrade::B);
+                assert!(!http_result.get_all_vulnerabilities().is_empty());
             } else {
                 panic!("HTTP result should be extractable");
             }

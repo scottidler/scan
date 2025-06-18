@@ -57,14 +57,14 @@ pub async fn spawn_scanner_tasks(
         let target_clone = target.clone();
         let state_clone = state.clone();
 
-        log::debug!("[scan] spawning_scanner_task: scanner={} protocol={}", 
+        log::debug!("[scan] spawning_scanner_task: scanner={} protocol={}",
             scanner_name, protocol.as_str());
 
         tokio::spawn(async move {
-            log::debug!("[scan] scanner_task_started: scanner={} protocol={}", 
+            log::debug!("[scan] scanner_task_started: scanner={} protocol={}",
                 scanner_name, protocol.as_str());
             scanner.run(target_clone, protocol, state_clone).await;
-            log::debug!("[scan] scanner_task_ended: scanner={} protocol={}", 
+            log::debug!("[scan] scanner_task_ended: scanner={} protocol={}",
                 scanner_name, protocol.as_str());
         });
     }

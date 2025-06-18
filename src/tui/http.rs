@@ -111,128 +111,172 @@ impl Pane for HttpPane {
             ]);
 
             if let Some(ScanResult::Http(http_result)) = &http_state.result {
-                // Status code
-                let status_color = match http_result.status_code {
-                    HTTP_SUCCESS_STATUS_MIN..=HTTP_SUCCESS_STATUS_MAX => Color::Green,
-                    HTTP_REDIRECT_STATUS_MIN..=HTTP_REDIRECT_STATUS_MAX => Color::Yellow,
-                    HTTP_CLIENT_ERROR_STATUS_MIN..=HTTP_CLIENT_ERROR_STATUS_MAX => Color::Red,
-                    HTTP_SERVER_ERROR_STATUS_MIN..=HTTP_SERVER_ERROR_STATUS_MAX => Color::Magenta,
-                    _ => Color::Gray,
-                };
+                if let Some(primary_data) = http_result.get_primary_result() {
+                    // Status code
+                    let status_color = match primary_data.status_code {
+                        HTTP_SUCCESS_STATUS_MIN..=HTTP_SUCCESS_STATUS_MAX => Color::Green,
+                        HTTP_REDIRECT_STATUS_MIN..=HTTP_REDIRECT_STATUS_MAX => Color::Yellow,
+                        HTTP_CLIENT_ERROR_STATUS_MIN..=HTTP_CLIENT_ERROR_STATUS_MAX => Color::Red,
+                        HTTP_SERVER_ERROR_STATUS_MIN..=HTTP_SERVER_ERROR_STATUS_MAX => Color::Magenta,
+                        _ => Color::Gray,
+                    };
 
-                lines.push(Line::from(vec![
-                    Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{}", http_result.status_code),
-                        Style::default().fg(status_color)
-                    ),
-                ]));
-
-                // Response time
-                let response_time_ms = http_result.response_time.as_millis();
-                let time_color = if response_time_ms < RESPONSE_TIME_FAST_THRESHOLD_MS {
-                    Color::Green
-                } else if response_time_ms < RESPONSE_TIME_SLOW_THRESHOLD_MS {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{}ms", response_time_ms),
-                        Style::default().fg(time_color)
-                    ),
-                ]));
-
-                // Content type
-                if let Some(content_type) = &http_result.content_type {
                     lines.push(Line::from(vec![
-                        Span::styled("📄 Type: ", Style::default().fg(Color::White)),
+                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
                         Span::styled(
-                            content_type.clone(),
-                            Style::default().fg(Color::Yellow)
-                        ),
-                    ]));
-                }
-
-                // Content length
-                lines.push(Line::from(vec![
-                    Span::styled("📏 Size: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{} bytes", http_result.content_length),
-                        Style::default().fg(Color::Green)
-                    ),
-                ]));
-
-                // Security grade
-                let grade_color = match http_result.security_grade {
-                    crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => Color::Green,
-                    crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
-                    crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{:?}", http_result.security_grade),
-                        Style::default().fg(grade_color)
-                    ),
-                ]));
-
-                // Redirect chain - show details
-                if !http_result.redirect_chain.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("🔗 Redirects: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            http_result.redirect_chain.len().to_string(),
-                            Style::default().fg(Color::Magenta)
+                            format!("{}", primary_data.status_code),
+                            Style::default().fg(status_color)
                         ),
                     ]));
 
-                    // Show each redirect in the chain
-                    for redirect in &http_result.redirect_chain {
-                        let from_url = Self::truncate_url(&redirect.from);
-                        let to_url = Self::truncate_url(&redirect.to);
+                    // Response time
+                    let response_time_ms = primary_data.response_time.as_millis();
+                    let time_color = if response_time_ms < RESPONSE_TIME_FAST_THRESHOLD_MS {
+                        Color::Green
+                    } else if response_time_ms < RESPONSE_TIME_SLOW_THRESHOLD_MS {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
 
+                    lines.push(Line::from(vec![
+                        Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("{}ms", response_time_ms),
+                            Style::default().fg(time_color)
+                        ),
+                    ]));
+
+                    // Content type
+                    if let Some(content_type) = &primary_data.content_type {
                         lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(from_url, Style::default().fg(Color::Gray)),
-                            Span::styled(" → ", Style::default().fg(Color::Magenta)),
-                            Span::styled(to_url, Style::default().fg(Color::Cyan)),
-                            Span::styled(format!(" ({})", redirect.status_code), Style::default().fg(Color::Yellow)),
+                            Span::styled("📄 Type: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                content_type.clone(),
+                                Style::default().fg(Color::Yellow)
+                            ),
                         ]));
                     }
-                }
 
-                // Vulnerabilities - show details
-                if !http_result.vulnerabilities.is_empty() {
+                    // Content length
                     lines.push(Line::from(vec![
-                        Span::styled("⚠️  Issues: ", Style::default().fg(Color::White)),
+                        Span::styled("📏 Size: ", Style::default().fg(Color::White)),
                         Span::styled(
-                            http_result.vulnerabilities.len().to_string(),
-                            Style::default().fg(Color::Red)
+                            format!("{} bytes", primary_data.content_length),
+                            Style::default().fg(Color::Green)
                         ),
                     ]));
 
-                    // Show each vulnerability
-                    for vulnerability in &http_result.vulnerabilities {
-                        let vuln_text = match vulnerability {
-                            crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS",
-                            crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options",
-                            crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options",
-                            crate::scan::http::HttpVulnerability::MissingCsp => "Missing CSP",
-                            crate::scan::http::HttpVulnerability::WeakCsp => "Weak CSP",
-                            crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS",
-                            crate::scan::http::HttpVulnerability::InformationDisclosure => "Information Disclosure",
+                    // Security grade - use the best grade from all protocols
+                    if let Some(security_grade) = http_result.get_best_security_grade() {
+                        let grade_color = match security_grade {
+                            crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => Color::Green,
+                            crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
+                            crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
                         };
 
                         lines.push(Line::from(vec![
-                            Span::styled("  • ", Style::default().fg(Color::Red)),
-                            Span::styled(vuln_text, Style::default().fg(Color::Red)),
+                            Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                format!("{:?}", security_grade),
+                                Style::default().fg(grade_color)
+                            ),
                         ]));
                     }
+
+                    // Protocol status
+                    lines.push(Line::from(vec![
+                        Span::styled("🌐 Protocols: ", Style::default().fg(Color::White)),
+                    ]));
+
+                    // IPv4 status
+                    let ipv4_status = match &http_result.ipv4_status {
+                        crate::scan::http::HttpStatus::Success(_) => ("✅", Color::Green, "success", Color::Gray),
+                        crate::scan::http::HttpStatus::Failed(_) => ("❌", Color::Red, "failed", Color::Red),
+                        crate::scan::http::HttpStatus::NoAddress => ("❌", Color::Red, "no address", Color::Red),
+                        crate::scan::http::HttpStatus::NotQueried => ("⚫", Color::Gray, "not queried", Color::Gray),
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled("  IPv4: ", Style::default().fg(Color::White)),
+                        Span::styled(ipv4_status.0, Style::default().fg(ipv4_status.1)),
+                        Span::styled(format!(" {}", ipv4_status.2), Style::default().fg(ipv4_status.3)),
+                    ]));
+
+                    // IPv6 status
+                    let ipv6_status = match &http_result.ipv6_status {
+                        crate::scan::http::HttpStatus::Success(_) => ("✅", Color::Green, "success", Color::Gray),
+                        crate::scan::http::HttpStatus::Failed(_) => ("❌", Color::Red, "failed", Color::Red),
+                        crate::scan::http::HttpStatus::NoAddress => ("❌", Color::Red, "no address", Color::Red),
+                        crate::scan::http::HttpStatus::NotQueried => ("⚫", Color::Gray, "not queried", Color::Gray),
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled("  IPv6: ", Style::default().fg(Color::White)),
+                        Span::styled(ipv6_status.0, Style::default().fg(ipv6_status.1)),
+                        Span::styled(format!(" {}", ipv6_status.2), Style::default().fg(ipv6_status.3)),
+                    ]));
+
+                    // Redirect chain - show details
+                    if !primary_data.redirect_chain.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled("🔗 Redirects: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                primary_data.redirect_chain.len().to_string(),
+                                Style::default().fg(Color::Magenta)
+                            ),
+                        ]));
+
+                        // Show each redirect in the chain
+                        for redirect in &primary_data.redirect_chain {
+                            let from_url = Self::truncate_url(&redirect.from);
+                            let to_url = Self::truncate_url(&redirect.to);
+
+                            lines.push(Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled(from_url, Style::default().fg(Color::Gray)),
+                                Span::styled(" → ", Style::default().fg(Color::Magenta)),
+                                Span::styled(to_url, Style::default().fg(Color::Cyan)),
+                                Span::styled(format!(" ({})", redirect.status_code), Style::default().fg(Color::Yellow)),
+                            ]));
+                        }
+                    }
+
+                    // Vulnerabilities - show total from all protocols
+                    let all_vulnerabilities = http_result.get_all_vulnerabilities();
+                    if !all_vulnerabilities.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled("⚠️  Issues: ", Style::default().fg(Color::White)),
+                            Span::styled(
+                                all_vulnerabilities.len().to_string(),
+                                Style::default().fg(Color::Red)
+                            ),
+                        ]));
+
+                        // Show each vulnerability
+                        for vulnerability in &all_vulnerabilities {
+                            let vuln_text = match vulnerability {
+                                crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS",
+                                crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options",
+                                crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options",
+                                crate::scan::http::HttpVulnerability::MissingCsp => "Missing CSP",
+                                crate::scan::http::HttpVulnerability::WeakCsp => "Weak CSP",
+                                crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS",
+                                crate::scan::http::HttpVulnerability::InformationDisclosure => "Information Disclosure",
+                            };
+
+                            lines.push(Line::from(vec![
+                                Span::styled("  • ", Style::default().fg(Color::Red)),
+                                Span::styled(vuln_text, Style::default().fg(Color::Red)),
+                            ]));
+                        }
+                    }
+                } else {
+                    // HTTP scan failed for all protocols
+                    lines.push(Line::from(vec![
+                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
+                        Span::styled("all protocols failed", Style::default().fg(Color::Red)),
+                    ]));
                 }
             } else {
                 // No HTTP data available yet

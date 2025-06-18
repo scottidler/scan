@@ -141,7 +141,7 @@ impl TuiApp {
                                     let new = state_guard.protocol;
                                     (old, new)
                                 };
-                                log::info!("[tui] protocol_changed: {} -> {} (scanner restart needed)", 
+                                log::info!("[tui] protocol_changed: {} -> {} (scanner restart needed)",
                                     old_protocol.as_str(), new_protocol.as_str());
                                 // TODO: Implement scanner restart when protocol changes
                             }

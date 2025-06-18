@@ -85,62 +85,95 @@ impl Pane for TraceroutePane {
             ]);
 
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
-                // Basic traceroute info
-                let hop_count = traceroute_result.hops.len();
-                let status_color = if traceroute_result.destination_reached {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                };
-
-                let protocol = if traceroute_result.ipv6 { "IPv6" } else { "IPv4" };
-
+                // Protocol status section
                 lines.push(Line::from(vec![
-                    Span::styled(format!("📍 {}: ", protocol), Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{} hops", hop_count),
-                        Style::default().fg(status_color)
-                    ),
-                    if traceroute_result.destination_reached {
-                        Span::styled(" ✓", Style::default().fg(Color::Green))
-                    } else {
-                        Span::styled(" ✗", Style::default().fg(Color::Red))
-                    },
+                    Span::styled("🌐 Protocols:", Style::default().fg(Color::Cyan)),
                 ]));
 
-                // Show all hops
-                for hop in &traceroute_result.hops {
-                    // Get first responding IP and best RTT
-                    let (ip_display, rtt_display, hop_color) = if let Some(response) = hop.responses.iter().find(|r| !r.timeout) {
-                        let ip_str = response.ip_address.as_ref()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_else(|| "*".to_string());
-                        let rtt_str = response.rtt.as_ref()
-                            .map(|rtt| format!("{}ms", rtt.as_millis()))
-                            .unwrap_or_else(|| "*".to_string());
-                        (ip_str, rtt_str, Color::Cyan)
-                    } else {
-                        ("*".to_string(), "timeout".to_string(), Color::Gray)
-                    };
+                // IPv4 status
+                let (ipv4_icon, ipv4_text, ipv4_color) = match &traceroute_result.ipv4_status {
+                    crate::scan::traceroute::TracerouteStatus::Success(hops) => ("✅", format!("{} hops", hops), Color::Green),
+                    crate::scan::traceroute::TracerouteStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
+                    crate::scan::traceroute::TracerouteStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
+                    crate::scan::traceroute::TracerouteStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
+                };
 
-                    // Color code hop number based on position
-                    let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
-                        Color::Green // Local/ISP hops
-                    } else if hop.hop_number <= MID_NETWORK_HOP_THRESHOLD {
-                        Color::Yellow // Mid-network
-                    } else {
-                        Color::Red // Far hops
-                    };
+                lines.push(Line::from(vec![
+                    Span::styled("  IPv4: ", Style::default().fg(Color::White)),
+                    Span::styled(ipv4_icon, Style::default().fg(ipv4_color)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(ipv4_text, Style::default().fg(ipv4_color)),
+                ]));
+
+                // IPv6 status
+                let (ipv6_icon, ipv6_text, ipv6_color) = match &traceroute_result.ipv6_status {
+                    crate::scan::traceroute::TracerouteStatus::Success(hops) => ("✅", format!("{} hops", hops), Color::Green),
+                    crate::scan::traceroute::TracerouteStatus::Failed(_) => ("❌", "failed".to_string(), Color::Red),
+                    crate::scan::traceroute::TracerouteStatus::NoAddress => ("❌", "no address".to_string(), Color::Red),
+                    crate::scan::traceroute::TracerouteStatus::NotQueried => ("⚫", "not queried".to_string(), Color::Gray),
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled("  IPv6: ", Style::default().fg(Color::White)),
+                    Span::styled(ipv6_icon, Style::default().fg(ipv6_color)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(ipv6_text, Style::default().fg(ipv6_color)),
+                ]));
+
+                lines.push(Line::from(""));
+
+                // Show traceroute data for the primary result
+                if let Some(primary_data) = traceroute_result.get_primary_result() {
+                    let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
 
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(hop_num_color)),
-                        Span::styled(ip_display, Style::default().fg(hop_color)),
-                        Span::styled(format!(" ({})", rtt_display), Style::default().fg(Color::Gray)),
+                        Span::styled(format!("📍 {} Route:", protocol), Style::default().fg(Color::White)),
+                        if primary_data.destination_reached {
+                            Span::styled(" ✓ reached", Style::default().fg(Color::Green))
+                        } else {
+                            Span::styled(" ✗ unreached", Style::default().fg(Color::Red))
+                        },
+                    ]));
+
+                    // Show all hops
+                    for hop in &primary_data.hops {
+                        // Get first responding IP and best RTT
+                        let (ip_display, rtt_display, hop_color) = if let Some(response) = hop.responses.iter().find(|r| !r.timeout) {
+                            let ip_str = response.ip_address.as_ref()
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_else(|| "*".to_string());
+                            let rtt_str = response.rtt.as_ref()
+                                .map(|rtt| format!("{}ms", rtt.as_millis()))
+                                .unwrap_or_else(|| "*".to_string());
+                            (ip_str, rtt_str, Color::Cyan)
+                        } else {
+                            ("*".to_string(), "timeout".to_string(), Color::Gray)
+                        };
+
+                        // Color code hop number based on position
+                        let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
+                            Color::Green // Local/ISP hops
+                        } else if hop.hop_number <= MID_NETWORK_HOP_THRESHOLD {
+                            Color::Yellow // Mid-network
+                        } else {
+                            Color::Red // Far hops
+                        };
+
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(hop_num_color)),
+                            Span::styled(ip_display, Style::default().fg(hop_color)),
+                            Span::styled(format!(" ({})", rtt_display), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("📍 Status: ", Style::default().fg(Color::White)),
+                        Span::styled("All protocols failed", Style::default().fg(Color::Red)),
                     ]));
                 }
 
                 // Total scan time
-                let scan_time_ms = traceroute_result.scan_duration.as_millis();
+                let scan_time_ms = traceroute_result.total_duration.as_millis();
                 lines.push(Line::from(vec![
                     Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
                     Span::styled(
@@ -241,10 +274,20 @@ impl ScrollablePane for TraceroutePane {
 
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
-                // Basic info line
+                // Protocol status section (3 lines: header + IPv4 + IPv6)
+                line_count += 3;
+                // Empty line
                 line_count += 1;
-                // Each hop line
-                line_count += traceroute_result.hops.len() as u16;
+
+                if let Some(primary_data) = traceroute_result.get_primary_result() {
+                    // Route header line
+                    line_count += 1;
+                    // Each hop line
+                    line_count += primary_data.hops.len() as u16;
+                } else {
+                    // Failed status line
+                    line_count += 1;
+                }
                 // Duration line
                 line_count += 1;
             } else {

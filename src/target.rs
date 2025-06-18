@@ -47,28 +47,7 @@ impl Protocol {
     }
 }
 
-/// IP version for protocol-specific data
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IpVersion {
-    V4,
-    V6,
-}
 
-impl IpVersion {
-    pub fn from_ip(ip: &IpAddr) -> Self {
-        match ip {
-            IpAddr::V4(_) => IpVersion::V4,
-            IpAddr::V6(_) => IpVersion::V6,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            IpVersion::V4 => "IPv4",
-            IpVersion::V6 => "IPv6",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -320,7 +299,7 @@ impl Target {
                 .collect(),
             Protocol::Both => self.resolved_ips.clone(),
         };
-        
+
         log::debug!("[target] ips_for_protocol: protocol={} total_ips={} filtered_ips={}",
             protocol.as_str(), self.resolved_ips.len(), ips.len());
         ips
@@ -333,7 +312,7 @@ impl Target {
             Protocol::Ipv6 => self.primary_ipv6().map(IpAddr::V6),
             Protocol::Both => self.primary_ip(),
         };
-        
+
         log::debug!("[target] primary_ip_for_protocol: protocol={} ip={:?}",
             protocol.as_str(), ip);
         ip
@@ -350,7 +329,7 @@ impl Target {
         } else {
             None
         };
-        
+
         log::debug!("[target] network_target_for_protocol: protocol={} target={:?}",
             protocol.as_str(), target);
         target
@@ -363,7 +342,7 @@ impl Target {
             Protocol::Ipv6 => self.has_ipv6(),
             Protocol::Both => self.has_ipv4() || self.has_ipv6(),
         };
-        
+
         log::debug!("[target] supports_protocol: protocol={} supports={}",
             protocol.as_str(), supports);
         supports
@@ -376,7 +355,7 @@ impl Target {
             Protocol::Ipv6 => self.ipv6_addresses().len(),
             Protocol::Both => self.resolved_ips.len(),
         };
-        
+
         log::debug!("[target] ip_count_for_protocol: protocol={} count={}",
             protocol.as_str(), count);
         count
@@ -390,7 +369,7 @@ impl Target {
         } else {
             format!("{} ({})", base_name, protocol.as_str())
         };
-        
+
         log::debug!("[target] display_name_with_protocol: protocol={} name={}",
             protocol.as_str(), name);
         name
@@ -402,12 +381,12 @@ impl Target {
             .filter(|ip| ip.is_ipv4())
             .copied()
             .collect();
-        
+
         if ipv4_ips.is_empty() {
             log::debug!("[target] ipv4_ips: no IPv4 addresses available for {}", self.display_name());
             eyre::bail!("No IPv4 addresses available for target: {}", self.display_name());
         }
-        
+
         log::debug!("[target] ipv4_ips: found {} IPv4 addresses for {}", ipv4_ips.len(), self.display_name());
         Ok(ipv4_ips)
     }
@@ -418,12 +397,12 @@ impl Target {
             .filter(|ip| ip.is_ipv6())
             .copied()
             .collect();
-        
+
         if ipv6_ips.is_empty() {
             log::debug!("[target] ipv6_ips: no IPv6 addresses available for {}", self.display_name());
             eyre::bail!("No IPv6 addresses available for target: {}", self.display_name());
         }
-        
+
         log::debug!("[target] ipv6_ips: found {} IPv6 addresses for {}", ipv6_ips.len(), self.display_name());
         Ok(ipv6_ips)
     }
@@ -716,34 +695,23 @@ mod tests {
         // Test Protocol enum methods
         assert!(Protocol::Ipv4.includes_ipv4());
         assert!(!Protocol::Ipv4.includes_ipv6());
-        
+
         assert!(!Protocol::Ipv6.includes_ipv4());
         assert!(Protocol::Ipv6.includes_ipv6());
-        
+
         assert!(Protocol::Both.includes_ipv4());
         assert!(Protocol::Both.includes_ipv6());
-        
+
         // Test string representations
         assert_eq!(Protocol::Ipv4.as_str(), "IPv4");
         assert_eq!(Protocol::Ipv6.as_str(), "IPv6");
         assert_eq!(Protocol::Both.as_str(), "IPv4+IPv6");
-        
+
         // Test default
         assert_eq!(Protocol::default(), Protocol::Both);
     }
 
-    #[test]
-    fn test_ip_version_enum() {
-        // Test IpVersion enum methods
-        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        
-        assert_eq!(IpVersion::from_ip(&ipv4), IpVersion::V4);
-        assert_eq!(IpVersion::from_ip(&ipv6), IpVersion::V6);
-        
-        assert_eq!(IpVersion::V4.as_str(), "IPv4");
-        assert_eq!(IpVersion::V6.as_str(), "IPv6");
-    }
+
 
     #[test]
     fn test_protocol_specific_methods() {
@@ -768,11 +736,11 @@ mod tests {
         assert_eq!(both_ips.len(), 3);
 
         // Test primary_ip_for_protocol
-        assert_eq!(target.primary_ip_for_protocol(Protocol::Ipv4), 
+        assert_eq!(target.primary_ip_for_protocol(Protocol::Ipv4),
                    Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
-        assert_eq!(target.primary_ip_for_protocol(Protocol::Ipv6), 
+        assert_eq!(target.primary_ip_for_protocol(Protocol::Ipv6),
                    Some(IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946))));
-        assert_eq!(target.primary_ip_for_protocol(Protocol::Both), 
+        assert_eq!(target.primary_ip_for_protocol(Protocol::Both),
                    Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
 
         // Test supports_protocol
@@ -786,18 +754,18 @@ mod tests {
         assert_eq!(target.ip_count_for_protocol(Protocol::Both), 3);
 
         // Test network_target_for_protocol
-        assert_eq!(target.network_target_for_protocol(Protocol::Ipv4), 
+        assert_eq!(target.network_target_for_protocol(Protocol::Ipv4),
                    Some("93.184.216.34".to_string()));
-        assert_eq!(target.network_target_for_protocol(Protocol::Ipv6), 
+        assert_eq!(target.network_target_for_protocol(Protocol::Ipv6),
                    Some("2606:2800:220:1:248:1893:25c8:1946".to_string()));
         assert!(target.network_target_for_protocol(Protocol::Both).is_some());
 
         // Test display_name_with_protocol
-        assert_eq!(target.display_name_with_protocol(Protocol::Ipv4), 
+        assert_eq!(target.display_name_with_protocol(Protocol::Ipv4),
                    "example.com (IPv4)");
-        assert_eq!(target.display_name_with_protocol(Protocol::Ipv6), 
+        assert_eq!(target.display_name_with_protocol(Protocol::Ipv6),
                    "example.com (IPv6)");
-        assert_eq!(target.display_name_with_protocol(Protocol::Both), 
+        assert_eq!(target.display_name_with_protocol(Protocol::Both),
                    "example.com");
     }
 
@@ -805,22 +773,22 @@ mod tests {
     fn test_protocol_specific_methods_ipv4_only() {
         // Test with IPv4-only target
         let target = Target::parse("192.168.1.1").unwrap();
-        
+
         // Should support IPv4 and Both, but not IPv6
         assert!(target.supports_protocol(Protocol::Ipv4));
         assert!(!target.supports_protocol(Protocol::Ipv6));
         assert!(target.supports_protocol(Protocol::Both));
-        
+
         // IPv4 methods should work
         assert!(target.primary_ip_for_protocol(Protocol::Ipv4).is_some());
         assert_eq!(target.ip_count_for_protocol(Protocol::Ipv4), 1);
         assert!(target.network_target_for_protocol(Protocol::Ipv4).is_some());
-        
+
         // IPv6 methods should return None/0
         assert!(target.primary_ip_for_protocol(Protocol::Ipv6).is_none());
         assert_eq!(target.ip_count_for_protocol(Protocol::Ipv6), 0);
         assert!(target.network_target_for_protocol(Protocol::Ipv6).is_none());
-        
+
         // Both should work (fallback to IPv4)
         assert!(target.primary_ip_for_protocol(Protocol::Both).is_some());
         assert_eq!(target.ip_count_for_protocol(Protocol::Both), 1);
@@ -830,22 +798,22 @@ mod tests {
     fn test_protocol_specific_methods_ipv6_only() {
         // Test with IPv6-only target
         let target = Target::parse("2001:db8::1").unwrap();
-        
+
         // Should support IPv6 and Both, but not IPv4
         assert!(!target.supports_protocol(Protocol::Ipv4));
         assert!(target.supports_protocol(Protocol::Ipv6));
         assert!(target.supports_protocol(Protocol::Both));
-        
+
         // IPv6 methods should work
         assert!(target.primary_ip_for_protocol(Protocol::Ipv6).is_some());
         assert_eq!(target.ip_count_for_protocol(Protocol::Ipv6), 1);
         assert!(target.network_target_for_protocol(Protocol::Ipv6).is_some());
-        
+
         // IPv4 methods should return None/0
         assert!(target.primary_ip_for_protocol(Protocol::Ipv4).is_none());
         assert_eq!(target.ip_count_for_protocol(Protocol::Ipv4), 0);
         assert!(target.network_target_for_protocol(Protocol::Ipv4).is_none());
-        
+
         // Both should work (fallback to IPv6)
         assert!(target.primary_ip_for_protocol(Protocol::Both).is_some());
         assert_eq!(target.ip_count_for_protocol(Protocol::Both), 1);
@@ -855,27 +823,27 @@ mod tests {
     fn test_protocol_specific_methods_unresolved_domain() {
         // Test with unresolved domain
         let target = Target::parse("unresolved.example").unwrap();
-        
+
         // Should not support any protocol since no IPs resolved
         assert!(!target.supports_protocol(Protocol::Ipv4));
         assert!(!target.supports_protocol(Protocol::Ipv6));
         assert!(!target.supports_protocol(Protocol::Both));
-        
+
         // All methods should return None/0
         assert!(target.primary_ip_for_protocol(Protocol::Ipv4).is_none());
         assert!(target.primary_ip_for_protocol(Protocol::Ipv6).is_none());
         assert!(target.primary_ip_for_protocol(Protocol::Both).is_none());
-        
+
         assert_eq!(target.ip_count_for_protocol(Protocol::Ipv4), 0);
         assert_eq!(target.ip_count_for_protocol(Protocol::Ipv6), 0);
         assert_eq!(target.ip_count_for_protocol(Protocol::Both), 0);
-        
+
         // network_target_for_protocol should fall back to domain name
-        assert_eq!(target.network_target_for_protocol(Protocol::Ipv4), 
+        assert_eq!(target.network_target_for_protocol(Protocol::Ipv4),
                    Some("unresolved.example".to_string()));
-        assert_eq!(target.network_target_for_protocol(Protocol::Ipv6), 
+        assert_eq!(target.network_target_for_protocol(Protocol::Ipv6),
                    Some("unresolved.example".to_string()));
-        assert_eq!(target.network_target_for_protocol(Protocol::Both), 
+        assert_eq!(target.network_target_for_protocol(Protocol::Both),
                    Some("unresolved.example".to_string()));
     }
 
@@ -892,21 +860,21 @@ mod tests {
         // IPv4 methods should succeed
         assert!(target.ipv4_ips().is_ok());
         assert_eq!(target.ipv4_ips().unwrap().len(), 2);
-        
+
         assert!(target.primary_ipv4_ip().is_ok());
         assert_eq!(target.primary_ipv4_ip().unwrap(), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
-        
+
         assert!(target.ipv4_network_target().is_ok());
         assert_eq!(target.ipv4_network_target().unwrap(), "93.184.216.34".to_string());
 
         // IPv6 methods should succeed
         assert!(target.ipv6_ips().is_ok());
         assert_eq!(target.ipv6_ips().unwrap().len(), 1);
-        
+
         assert!(target.primary_ipv6_ip().is_ok());
-        assert_eq!(target.primary_ipv6_ip().unwrap(), 
+        assert_eq!(target.primary_ipv6_ip().unwrap(),
                    IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946)));
-        
+
         assert!(target.ipv6_network_target().is_ok());
         assert_eq!(target.ipv6_network_target().unwrap(), "2606:2800:220:1:248:1893:25c8:1946".to_string());
     }
@@ -915,22 +883,22 @@ mod tests {
     fn test_explicit_protocol_methods_ipv4_only() {
         // Test with IPv4-only target
         let target = Target::parse("192.168.1.1").unwrap();
-        
+
         // IPv4 methods should succeed
         assert!(target.ipv4_ips().is_ok());
         assert_eq!(target.ipv4_ips().unwrap().len(), 1);
         assert!(target.primary_ipv4_ip().is_ok());
         assert!(target.ipv4_network_target().is_ok());
-        
+
         // IPv6 methods should fail
         assert!(target.ipv6_ips().is_err());
         assert!(target.primary_ipv6_ip().is_err());
         assert!(target.ipv6_network_target().is_err());
-        
+
         // Check error messages
         let ipv6_error = target.ipv6_ips().unwrap_err();
         assert!(ipv6_error.to_string().contains("No IPv6 addresses available"));
-        
+
         let primary_ipv6_error = target.primary_ipv6_ip().unwrap_err();
         assert!(primary_ipv6_error.to_string().contains("No IPv6 address available"));
     }
@@ -939,22 +907,22 @@ mod tests {
     fn test_explicit_protocol_methods_ipv6_only() {
         // Test with IPv6-only target
         let target = Target::parse("2001:db8::1").unwrap();
-        
+
         // IPv6 methods should succeed
         assert!(target.ipv6_ips().is_ok());
         assert_eq!(target.ipv6_ips().unwrap().len(), 1);
         assert!(target.primary_ipv6_ip().is_ok());
         assert!(target.ipv6_network_target().is_ok());
-        
+
         // IPv4 methods should fail
         assert!(target.ipv4_ips().is_err());
         assert!(target.primary_ipv4_ip().is_err());
         assert!(target.ipv4_network_target().is_err());
-        
+
         // Check error messages
         let ipv4_error = target.ipv4_ips().unwrap_err();
         assert!(ipv4_error.to_string().contains("No IPv4 addresses available"));
-        
+
         let primary_ipv4_error = target.primary_ipv4_ip().unwrap_err();
         assert!(primary_ipv4_error.to_string().contains("No IPv4 address available"));
     }
@@ -963,23 +931,23 @@ mod tests {
     fn test_explicit_protocol_methods_unresolved_domain() {
         // Test with unresolved domain
         let target = Target::parse("unresolved.example").unwrap();
-        
+
         // Both IPv4 and IPv6 IP methods should fail (no resolved IPs)
         assert!(target.ipv4_ips().is_err());
         assert!(target.ipv6_ips().is_err());
         assert!(target.primary_ipv4_ip().is_err());
         assert!(target.primary_ipv6_ip().is_err());
-        
+
         // Network target methods should succeed (fallback to domain)
         assert!(target.ipv4_network_target().is_ok());
         assert!(target.ipv6_network_target().is_ok());
         assert_eq!(target.ipv4_network_target().unwrap(), "unresolved.example".to_string());
         assert_eq!(target.ipv6_network_target().unwrap(), "unresolved.example".to_string());
-        
+
         // Check error messages for IP methods
         let ipv4_error = target.ipv4_ips().unwrap_err();
         assert!(ipv4_error.to_string().contains("No IPv4 addresses available"));
-        
+
         let ipv6_error = target.ipv6_ips().unwrap_err();
         assert!(ipv6_error.to_string().contains("No IPv6 addresses available"));
     }

@@ -28,13 +28,83 @@ pub struct GeoIpScanner {
     service: Arc<GeoIpService>,
 }
 
+// Dual-protocol GeoIP result structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoIpResult {
+    pub ipv4_result: Option<GeoIpData>,
+    pub ipv6_result: Option<GeoIpData>,
+    pub ipv4_status: GeoIpStatus,
+    pub ipv6_status: GeoIpStatus,
+    pub total_duration: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpData {
     pub target_ip: IpAddr,
     pub location: Option<GeoLocation>,
     pub network_info: Option<NetworkInfo>,
     pub scan_duration: Duration,
     pub data_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GeoIpStatus {
+    Success,              // GeoIP lookup succeeded
+    Failed(String),       // GeoIP lookup failed with error message
+    NoAddress,           // No address available for this protocol
+    NotQueried,          // Query was not attempted
+}
+
+impl GeoIpResult {
+    pub fn new() -> Self {
+        Self {
+            ipv4_result: None,
+            ipv6_result: None,
+            ipv4_status: GeoIpStatus::NotQueried,
+            ipv6_status: GeoIpStatus::NotQueried,
+            total_duration: Duration::from_millis(0),
+        }
+    }
+
+    pub fn get_primary_result(&self) -> Option<&GeoIpData> {
+        // Prefer IPv4, then IPv6
+        self.ipv4_result.as_ref().or(self.ipv6_result.as_ref())
+    }
+
+    pub fn has_any_success(&self) -> bool {
+        matches!(self.ipv4_status, GeoIpStatus::Success) ||
+        matches!(self.ipv6_status, GeoIpStatus::Success)
+    }
+
+    pub fn get_all_locations(&self) -> Vec<&GeoLocation> {
+        let mut locations = Vec::new();
+        if let Some(ipv4_data) = &self.ipv4_result {
+            if let Some(location) = &ipv4_data.location {
+                locations.push(location);
+            }
+        }
+        if let Some(ipv6_data) = &self.ipv6_result {
+            if let Some(location) = &ipv6_data.location {
+                locations.push(location);
+            }
+        }
+        locations
+    }
+
+    pub fn get_all_network_info(&self) -> Vec<&NetworkInfo> {
+        let mut network_infos = Vec::new();
+        if let Some(ipv4_data) = &self.ipv4_result {
+            if let Some(network_info) = &ipv4_data.network_info {
+                network_infos.push(network_info);
+            }
+        }
+        if let Some(ipv6_data) = &self.ipv6_result {
+            if let Some(network_info) = &ipv6_data.network_info {
+                network_infos.push(network_info);
+            }
+        }
+        network_infos
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,18 +201,37 @@ impl GeoIpScanner {
         self.service.clone()
     }
 
-    async fn perform_geoip_lookup(&self, target: &Target) -> Result<GeoIpResult> {
+    async fn geoip_protocol(&self, target: &Target, protocol: Protocol) -> Result<GeoIpData> {
+        log::debug!("[scan::geoip] geoip_protocol: target={} protocol={}", target.display_name(), protocol.as_str());
+
+        // Check if target supports this protocol
+        if !target.supports_protocol(protocol) {
+            log::warn!("[scan::geoip] no_address_for_protocol: target={} protocol={}",
+                target.display_name(), protocol.as_str());
+            return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+        }
+
+        // Get protocol-specific IP address
+        let target_ip = match target.primary_ip_for_protocol(protocol) {
+            Some(ip) => ip,
+            None => {
+                log::warn!("[scan::geoip] no_ip_for_protocol: target={} protocol={}",
+                    target.display_name(), protocol.as_str());
+                return Err(eyre::eyre!("No {} IP address available for target: {}", protocol.as_str(), target.display_name()));
+            }
+        };
+
+        log::debug!("[scan::geoip] protocol_target: {} -> {} ({})",
+            target.display_name(), target_ip, protocol.as_str());
+
+        let geoip_data = self.perform_geoip_lookup_for_ip(target, target_ip).await?;
+        Ok(geoip_data)
+    }
+
+    async fn perform_geoip_lookup_for_ip(&self, target: &Target, target_ip: IpAddr) -> Result<GeoIpData> {
         log::debug!("[scan::geoip] perform_geoip_lookup: target={}", target.display_name());
 
         let start_time = Instant::now();
-
-        // Get target IP
-        let target_ip = if let Some(ip) = target.primary_ip() {
-            ip
-        } else {
-            log::error!("[scan::geoip] no_ip_available: target={}", target.display_name());
-            return Err(eyre::eyre!("No IP address available for GeoIP lookup"));
-        };
 
         log::debug!("[scan::geoip] looking_up_ip: target={} ip={}", target.display_name(), target_ip);
 
@@ -152,7 +241,7 @@ impl GeoIpScanner {
                 let lookup_duration = lookup_start.elapsed();
                 let scan_duration = start_time.elapsed();
 
-                let result = GeoIpResult {
+                let result = GeoIpData {
                     target_ip,
                     location: location.clone(),
                     network_info: network_info.clone(),
@@ -468,20 +557,110 @@ impl Scanner for GeoIpScanner {
         log::debug!("[scan::geoip] scan: target={} protocol={}", target.display_name(), protocol.as_str());
 
         let scan_start = Instant::now();
-        match self.perform_geoip_lookup(target).await {
-            Ok(result) => {
-                let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::geoip] geoip_scan_completed: target={} protocol={} duration={}ms ip={} source={} has_location={} has_network_info={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.target_ip,
-                    result.data_source, result.location.is_some(), result.network_info.is_some());
-                Ok(ScanResult::GeoIp(result))
+        let mut result = GeoIpResult::new();
+
+        match protocol {
+            Protocol::Ipv4 => {
+                match self.geoip_protocol(target, Protocol::Ipv4).await {
+                    Ok(data) => {
+                        result.ipv4_result = Some(data.clone());
+                        result.ipv4_status = GeoIpStatus::Success;
+                        log::trace!("[scan::geoip] ipv4_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
+                            target.display_name(), data.target_ip, data.data_source, data.location.is_some(), data.network_info.is_some());
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv4_status = GeoIpStatus::NoAddress;
+                            log::warn!("[scan::geoip] ipv4_geoip_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv4_status = GeoIpStatus::Failed(error_str);
+                            log::error!("[scan::geoip] ipv4_geoip_failed: target={} error={}", target.display_name(), e);
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                let scan_duration = scan_start.elapsed();
-                log::error!("[scan::geoip] geoip_scan_failed: target={} protocol={} duration={}ms error={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
-                Err(e.wrap_err("GeoIP scan failed"))
+            Protocol::Ipv6 => {
+                match self.geoip_protocol(target, Protocol::Ipv6).await {
+                    Ok(data) => {
+                        result.ipv6_result = Some(data.clone());
+                        result.ipv6_status = GeoIpStatus::Success;
+                        log::trace!("[scan::geoip] ipv6_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
+                            target.display_name(), data.target_ip, data.data_source, data.location.is_some(), data.network_info.is_some());
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv6_status = GeoIpStatus::NoAddress;
+                            log::warn!("[scan::geoip] ipv6_geoip_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv6_status = GeoIpStatus::Failed(error_str);
+                            log::error!("[scan::geoip] ipv6_geoip_failed: target={} error={}", target.display_name(), e);
+                        }
+                    }
+                }
             }
+            Protocol::Both => {
+                // Run both IPv4 and IPv6 GeoIP lookups concurrently
+                let (ipv4_result, ipv6_result) = tokio::join!(
+                    self.geoip_protocol(target, Protocol::Ipv4),
+                    self.geoip_protocol(target, Protocol::Ipv6)
+                );
+
+                match ipv4_result {
+                    Ok(data) => {
+                        result.ipv4_result = Some(data.clone());
+                        result.ipv4_status = GeoIpStatus::Success;
+                        log::trace!("[scan::geoip] ipv4_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
+                            target.display_name(), data.target_ip, data.data_source, data.location.is_some(), data.network_info.is_some());
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv4_status = GeoIpStatus::NoAddress;
+                            log::warn!("[scan::geoip] ipv4_geoip_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv4_status = GeoIpStatus::Failed(error_str);
+                            log::error!("[scan::geoip] ipv4_geoip_failed: target={} error={}", target.display_name(), e);
+                        }
+                    }
+                }
+
+                match ipv6_result {
+                    Ok(data) => {
+                        result.ipv6_result = Some(data.clone());
+                        result.ipv6_status = GeoIpStatus::Success;
+                        log::trace!("[scan::geoip] ipv6_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
+                            target.display_name(), data.target_ip, data.data_source, data.location.is_some(), data.network_info.is_some());
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("address available") {
+                            result.ipv6_status = GeoIpStatus::NoAddress;
+                            log::warn!("[scan::geoip] ipv6_geoip_no_address: target={}", target.display_name());
+                        } else {
+                            result.ipv6_status = GeoIpStatus::Failed(error_str);
+                            log::error!("[scan::geoip] ipv6_geoip_failed: target={} error={}", target.display_name(), e);
+                        }
+                    }
+                }
+            }
+        }
+
+        result.total_duration = scan_start.elapsed();
+
+        // Return success if any protocol succeeded
+        if result.has_any_success() {
+            log::debug!("[scan::geoip] scan_completed: target={} protocol={} duration={}ms ipv4_status={:?} ipv6_status={:?}",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis(),
+                result.ipv4_status, result.ipv6_status);
+            Ok(ScanResult::GeoIp(result))
+        } else {
+            let error_msg = format!("All GeoIP protocols failed: IPv4={:?}, IPv6={:?}",
+                result.ipv4_status, result.ipv6_status);
+            log::error!("[scan::geoip] scan_failed: target={} protocol={} duration={}ms error={}",
+                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), error_msg);
+            Err(eyre::eyre!(error_msg))
         }
     }
 
@@ -654,7 +833,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_geoip_result_structure() {
-        let result = GeoIpResult {
+        let mut result = GeoIpResult::new();
+        result.ipv4_result = Some(GeoIpData {
             target_ip: "8.8.8.8".parse().unwrap(),
             location: Some(GeoLocation {
                 country: "United States".to_string(),
@@ -675,12 +855,18 @@ mod tests {
             }),
             scan_duration: Duration::from_millis(100),
             data_source: "ip-api.com".to_string(),
-        };
+        });
+        result.ipv4_status = GeoIpStatus::Success;
+        result.total_duration = Duration::from_millis(100);
 
-        assert!(result.location.is_some());
-        assert!(result.network_info.is_some());
-        assert_eq!(result.data_source, "ip-api.com");
-        assert!(result.scan_duration.as_millis() > 0);
+        assert!(result.has_any_success());
+        if let Some(ipv4_data) = &result.ipv4_result {
+            assert!(ipv4_data.location.is_some());
+            assert!(ipv4_data.network_info.is_some());
+            assert_eq!(ipv4_data.data_source, "ip-api.com");
+            assert!(ipv4_data.scan_duration.as_millis() > 0);
+        }
+        assert!(result.total_duration.as_millis() > 0);
     }
 
     #[tokio::test]
@@ -739,5 +925,111 @@ mod tests {
 
         // Should return results for both IPs (though they might be errors for test environment)
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_geoip_status_enum() {
+        let success = GeoIpStatus::Success;
+        let failed = GeoIpStatus::Failed("Network error".to_string());
+        let no_address = GeoIpStatus::NoAddress;
+        let not_queried = GeoIpStatus::NotQueried;
+
+        // Test enum variants exist and can be created
+        match success {
+            GeoIpStatus::Success => assert!(true),
+            _ => assert!(false, "Expected Success variant"),
+        }
+
+        match failed {
+            GeoIpStatus::Failed(msg) => assert_eq!(msg, "Network error"),
+            _ => assert!(false, "Expected Failed variant"),
+        }
+
+        match no_address {
+            GeoIpStatus::NoAddress => assert!(true),
+            _ => assert!(false, "Expected NoAddress variant"),
+        }
+
+        match not_queried {
+            GeoIpStatus::NotQueried => assert!(true),
+            _ => assert!(false, "Expected NotQueried variant"),
+        }
+    }
+
+    #[test]
+    fn test_geoip_result_helper_methods() {
+        let mut result = GeoIpResult::new();
+
+        // Test initial state
+        assert!(!result.has_any_success());
+        assert!(result.get_primary_result().is_none());
+        assert!(result.get_all_locations().is_empty());
+        assert!(result.get_all_network_info().is_empty());
+
+        // Add IPv4 result
+        result.ipv4_result = Some(GeoIpData {
+            target_ip: "8.8.8.8".parse().unwrap(),
+            location: Some(GeoLocation {
+                country: "United States".to_string(),
+                country_code: "US".to_string(),
+                region: "California".to_string(),
+                region_code: "CA".to_string(),
+                city: "Mountain View".to_string(),
+                latitude: 37.4056,
+                longitude: -122.0775,
+                timezone: "America/Los_Angeles".to_string(),
+            }),
+            network_info: Some(NetworkInfo {
+                isp: "Google LLC".to_string(),
+                organization: "Google LLC".to_string(),
+                asn: Some(15169),
+                asn_name: Some("GOOGLE".to_string()),
+                network_range: Some("8.8.8.0/24".to_string()),
+            }),
+            scan_duration: Duration::from_millis(100),
+            data_source: "ip-api.com".to_string(),
+        });
+        result.ipv4_status = GeoIpStatus::Success;
+
+        // Test with IPv4 success
+        assert!(result.has_any_success());
+        assert!(result.get_primary_result().is_some());
+        assert_eq!(result.get_all_locations().len(), 1);
+        assert_eq!(result.get_all_network_info().len(), 1);
+
+        // Add IPv6 result
+        result.ipv6_result = Some(GeoIpData {
+            target_ip: "2001:4860:4860::8888".parse().unwrap(),
+            location: Some(GeoLocation {
+                country: "United States".to_string(),
+                country_code: "US".to_string(),
+                region: "California".to_string(),
+                region_code: "CA".to_string(),
+                city: "Mountain View".to_string(),
+                latitude: 37.4056,
+                longitude: -122.0775,
+                timezone: "America/Los_Angeles".to_string(),
+            }),
+            network_info: Some(NetworkInfo {
+                isp: "Google LLC".to_string(),
+                organization: "Google LLC".to_string(),
+                asn: Some(15169),
+                asn_name: Some("GOOGLE".to_string()),
+                network_range: Some("2001:4860:4860::/48".to_string()),
+            }),
+            scan_duration: Duration::from_millis(120),
+            data_source: "ipinfo.io".to_string(),
+        });
+        result.ipv6_status = GeoIpStatus::Success;
+
+        // Test with both IPv4 and IPv6 success
+        assert!(result.has_any_success());
+        assert!(result.get_primary_result().is_some());
+        assert_eq!(result.get_all_locations().len(), 2);
+        assert_eq!(result.get_all_network_info().len(), 2);
+
+        // Primary result should prefer IPv4
+        let primary = result.get_primary_result().unwrap();
+        assert!(primary.target_ip.is_ipv4());
     }
 }

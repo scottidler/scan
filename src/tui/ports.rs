@@ -97,20 +97,26 @@ impl Pane for PortsPane {
                         ]);
 
                         // Extract the data we need to avoid lifetime issues
-                        let open_count = port_result.open_ports.len();
-                        let open_ports: Vec<_> = port_result.open_ports.iter().take(MAX_DISPLAYED_PORTS).cloned().collect();
-                        let filtered_ports = port_result.filtered_ports;
-                        let closed_ports = port_result.closed_ports;
-                        let scan_duration_ms = port_result.scan_duration.as_millis();
+                        let open_count = port_result.total_open_ports();
+                        let (filtered_ports, closed_ports) = if let Some(primary) = port_result.get_primary_result() {
+                            (primary.filtered_ports, primary.closed_ports)
+                        } else {
+                            (0, 0)
+                        };
+                        let scan_duration_ms = port_result.total_duration.as_millis();
 
                         // Calculate estimated progress (rough estimate based on duration and typical scan times)
                         let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
                             // Estimate progress based on scan duration and typical port scan timing
-                            let total_expected = match port_result.scan_mode {
-                                crate::scan::port::ScanMode::Minimal => crate::scan::port::get_minimal_ports().len(),
-                                crate::scan::port::ScanMode::Quick => QUICK_SCAN_EXPECTED_PORTS,
-                                crate::scan::port::ScanMode::Standard => STANDARD_SCAN_EXPECTED_PORTS,
-                                crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
+                            let total_expected = if let Some(primary) = port_result.get_primary_result() {
+                            match primary.scan_mode {
+                                    crate::scan::port::ScanMode::Minimal => crate::scan::port::get_minimal_ports().len(),
+                                    crate::scan::port::ScanMode::Quick => QUICK_SCAN_EXPECTED_PORTS,
+                                    crate::scan::port::ScanMode::Standard => STANDARD_SCAN_EXPECTED_PORTS,
+                                    crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
+                                }
+                            } else {
+                                QUICK_SCAN_EXPECTED_PORTS
                             };
                             let scanned_so_far = open_count + filtered_ports as usize + closed_ports as usize;
                             let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0).min(MAX_PROGRESS_PERCENT) as u32;
@@ -155,43 +161,157 @@ impl Pane for PortsPane {
                             Span::styled(" ports", Style::default().fg(Color::White)),
                         ]));
 
-                        // Show discovered open ports (up to 5)
-                        for (idx, open_port) in open_ports.iter().enumerate() {
-                            if idx >= MAX_DISPLAYED_PORTS { break; } // Limit display
+                        // Show protocol-specific status and ports
+                        // IPv4 status and ports
+                        match &port_result.ipv4_status {
+                            crate::scan::port::PortStatus::Success(_) => {
+                                result_lines.push(Line::from(vec![
+                                    Span::styled("   📡 IPv4: ", Style::default().fg(Color::White)),
+                                    Span::styled("✅ ", Style::default().fg(Color::Green)),
+                                ]));
 
-                            let service_name = open_port.service.as_ref()
-                                .map(|s| s.name.clone())
-                                .unwrap_or_else(|| "unknown".to_string());
+                                // Show IPv4 ports
+                                if let Some(ipv4_data) = &port_result.ipv4_result {
+                                    let mut ipv4_ports_shown = 0;
+                                    for open_port in &ipv4_data.open_ports {
+                                        if ipv4_ports_shown >= MAX_DISPLAYED_PORTS { break; }
 
-                            let protocol_str = match open_port.transport {
-                                crate::scan::port::Transport::Tcp => "tcp",
-                                crate::scan::port::Transport::Udp => "udp",
-                            };
+                                        let service_name = open_port.service.as_ref()
+                                            .map(|s| s.name.clone())
+                                            .unwrap_or_else(|| "unknown".to_string());
 
-                            result_lines.push(Line::from(vec![
-                                Span::styled("  ", Style::default()),
-                                Span::styled(
-                                    format!("{}/{}", open_port.port, protocol_str),
-                                    Style::default().fg(Color::Cyan)
-                                ),
-                                Span::styled(" (", Style::default().fg(Color::Gray)),
-                                Span::styled(
-                                    service_name,
-                                    Style::default().fg(Color::Yellow)
-                                ),
-                                Span::styled(")", Style::default().fg(Color::Gray)),
-                            ]));
+                                        let protocol_str = match open_port.transport {
+                                            crate::scan::port::Transport::Tcp => "tcp",
+                                            crate::scan::port::Transport::Udp => "udp",
+                                        };
+
+                                        result_lines.push(Line::from(vec![
+                                            Span::styled("      ", Style::default()),
+                                            Span::styled(
+                                                format!("{}/{}", open_port.port, protocol_str),
+                                                Style::default().fg(Color::Cyan)
+                                            ),
+                                            Span::styled(" (", Style::default().fg(Color::Gray)),
+                                            Span::styled(
+                                                service_name,
+                                                Style::default().fg(Color::Yellow)
+                                            ),
+                                            Span::styled(")", Style::default().fg(Color::Gray)),
+                                        ]));
+                                        ipv4_ports_shown += 1;
+                                    }
+
+                                    if ipv4_data.open_ports.len() > MAX_DISPLAYED_PORTS {
+                                        result_lines.push(Line::from(vec![
+                                            Span::styled("      ", Style::default()),
+                                            Span::styled(
+                                                format!("... and {} more", ipv4_data.open_ports.len() - MAX_DISPLAYED_PORTS),
+                                                Style::default().fg(Color::Gray)
+                                            ),
+                                        ]));
+                                    }
+                                }
+                            }
+                            crate::scan::port::PortStatus::Failed(err) => {
+                                result_lines.push(Line::from(vec![
+                                    Span::styled("   📡 IPv4: ", Style::default().fg(Color::White)),
+                                    Span::styled("❌ ", Style::default().fg(Color::Red)),
+                                    Span::styled(
+                                        if err.contains("No") && err.contains("address") {
+                                            "no address"
+                                        } else {
+                                            "failed"
+                                        },
+                                        Style::default().fg(Color::Red)
+                                    ),
+                                ]));
+                            }
+                            crate::scan::port::PortStatus::NoAddress => {
+                                result_lines.push(Line::from(vec![
+                                    Span::styled("   📡 IPv4: ", Style::default().fg(Color::White)),
+                                    Span::styled("❌ ", Style::default().fg(Color::Red)),
+                                    Span::styled("no address", Style::default().fg(Color::Red)),
+                                ]));
+                            }
+                            crate::scan::port::PortStatus::NotQueried => {
+                                // Don't show if not queried
+                            }
                         }
 
-                        // Show "more" indicator if there are more open ports
-                        if open_count > MAX_DISPLAYED_PORTS {
-                            result_lines.push(Line::from(vec![
-                                Span::styled("  ", Style::default()),
-                                Span::styled(
-                                    format!("... and {} more", open_count - MAX_DISPLAYED_PORTS),
-                                    Style::default().fg(Color::Gray)
-                                ),
-                            ]));
+                        // IPv6 status and ports
+                        match &port_result.ipv6_status {
+                            crate::scan::port::PortStatus::Success(_) => {
+                                result_lines.push(Line::from(vec![
+                                    Span::styled("   📡 IPv6: ", Style::default().fg(Color::White)),
+                                    Span::styled("✅ ", Style::default().fg(Color::Green)),
+                                ]));
+
+                                // Show IPv6 ports
+                                if let Some(ipv6_data) = &port_result.ipv6_result {
+                                    let mut ipv6_ports_shown = 0;
+                                    for open_port in &ipv6_data.open_ports {
+                                        if ipv6_ports_shown >= MAX_DISPLAYED_PORTS { break; }
+
+                                        let service_name = open_port.service.as_ref()
+                                            .map(|s| s.name.clone())
+                                            .unwrap_or_else(|| "unknown".to_string());
+
+                                        let protocol_str = match open_port.transport {
+                                            crate::scan::port::Transport::Tcp => "tcp",
+                                            crate::scan::port::Transport::Udp => "udp",
+                                        };
+
+                                        result_lines.push(Line::from(vec![
+                                            Span::styled("      ", Style::default()),
+                                            Span::styled(
+                                                format!("{}/{}", open_port.port, protocol_str),
+                                                Style::default().fg(Color::Cyan)
+                                            ),
+                                            Span::styled(" (", Style::default().fg(Color::Gray)),
+                                            Span::styled(
+                                                service_name,
+                                                Style::default().fg(Color::Yellow)
+                                            ),
+                                            Span::styled(")", Style::default().fg(Color::Gray)),
+                                        ]));
+                                        ipv6_ports_shown += 1;
+                                    }
+
+                                    if ipv6_data.open_ports.len() > MAX_DISPLAYED_PORTS {
+                                        result_lines.push(Line::from(vec![
+                                            Span::styled("      ", Style::default()),
+                                            Span::styled(
+                                                format!("... and {} more", ipv6_data.open_ports.len() - MAX_DISPLAYED_PORTS),
+                                                Style::default().fg(Color::Gray)
+                                            ),
+                                        ]));
+                                    }
+                                }
+                            }
+                            crate::scan::port::PortStatus::Failed(err) => {
+                                result_lines.push(Line::from(vec![
+                                    Span::styled("   📡 IPv6: ", Style::default().fg(Color::White)),
+                                    Span::styled("❌ ", Style::default().fg(Color::Red)),
+                                    Span::styled(
+                                        if err.contains("No") && err.contains("address") {
+                                            "no address"
+                                        } else {
+                                            "failed"
+                                        },
+                                        Style::default().fg(Color::Red)
+                                    ),
+                                ]));
+                            }
+                            crate::scan::port::PortStatus::NoAddress => {
+                                result_lines.push(Line::from(vec![
+                                    Span::styled("   📡 IPv6: ", Style::default().fg(Color::White)),
+                                    Span::styled("❌ ", Style::default().fg(Color::Red)),
+                                    Span::styled("no address", Style::default().fg(Color::Red)),
+                                ]));
+                            }
+                            crate::scan::port::PortStatus::NotQueried => {
+                                // Don't show if not queried
+                            }
                         }
 
                         // Filtered and closed ports summary
