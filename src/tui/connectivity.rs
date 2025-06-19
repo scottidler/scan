@@ -480,7 +480,7 @@ mod tests {
 
         // Add some test data to IPv4 sparkline
         {
-            let mut sparkline = pane.ipv4_sparkline.lock().unwrap();
+            let mut sparkline = pane.ipv4_sparkline.lock().expect("Failed to lock sparkline in test");
             sparkline.add_latency(Duration::from_millis(25));
             sparkline.add_latency(Duration::from_millis(30));
             sparkline.add_latency(Duration::from_millis(20));
@@ -489,11 +489,12 @@ mod tests {
             assert!(sparkline.average_value().is_some());
         }
 
-        // Test sparkline rendering
+        // Test sparkline data extraction
         {
-            let sparkline = pane.ipv4_sparkline.lock().unwrap();
-            let spans = sparkline.render_colored_sparkline(50, 50.0, 150.0);
-            assert!(!spans.is_empty());
+            let sparkline = pane.ipv4_sparkline.lock().expect("Failed to lock sparkline in test");
+            let data = sparkline.get_data_for_width(50);
+            assert!(!data.is_empty());
+            assert_eq!(data.len(), 3); // Should have 3 data points as added above
         }
     }
 }
