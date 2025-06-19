@@ -188,14 +188,19 @@ impl Scanner for PingScanner {
                 }
 
                 // Try IPv6
+                log::debug!("[scan::ping] attempting_ipv6_ping: target={}", target.display_name());
                 match self.ping_protocol(target, Protocol::Ipv6).await {
-                    Ok((ping_data, _)) => {
-                        result.ipv6_status = PingStatus::Success(ping_data.latency);
+                    Ok((ping_data, target_addr)) => {
+                        let latency = ping_data.latency;
+                        result.ipv6_status = PingStatus::Success(latency);
                         result.ipv6_result = Some(ping_data);
+                        log::debug!("[scan::ping] ipv6_ping_success: target={} addr={} latency={}ms", 
+                            target.display_name(), target_addr, latency.as_millis());
                     }
                     Err(e) => {
                         result.ipv6_status = Self::classify_ping_error(&e);
-                        log::debug!("[scan::ping] ipv6_ping_failed: error={}", e);
+                        log::debug!("[scan::ping] ipv6_ping_failed: target={} error={} classified_as={:?}", 
+                            target.display_name(), e, result.ipv6_status);
                     }
                 }
             }
@@ -222,11 +227,18 @@ impl Scanner for PingScanner {
 impl PingScanner {
     async fn ping_protocol(&self, target: &Target, protocol: Protocol) -> Result<(PingData, String)> {
         // Get protocol-specific target
+        log::debug!("[scan::ping] getting_network_target: target={} protocol={} has_ipv4={} has_ipv6={}", 
+            target.display_name(), protocol.as_str(), target.has_ipv4(), target.has_ipv6());
+        
         let ping_target = match target.network_target_for_protocol(protocol) {
-            Some(target_addr) => target_addr,
+            Some(target_addr) => {
+                log::debug!("[scan::ping] network_target_found: target={} protocol={} addr={}", 
+                    target.display_name(), protocol.as_str(), target_addr);
+                target_addr
+            }
             None => {
-                log::warn!("[scan::ping] no_target_for_protocol: target={} protocol={}",
-                    target.display_name(), protocol.as_str());
+                log::warn!("[scan::ping] no_target_for_protocol: target={} protocol={} has_ipv4={} has_ipv6={}",
+                    target.display_name(), protocol.as_str(), target.has_ipv4(), target.has_ipv6());
                 eyre::bail!("No {} address available for target: {}", protocol.as_str(), target.display_name());
             }
         };
@@ -242,10 +254,11 @@ impl PingScanner {
         let error_msg = error.to_string();
 
         if error_msg.contains("Command") && error_msg.contains("not found") {
-            let tool = if error_msg.contains("ping6") { "ping6" } else { "ping" };
-            PingStatus::ToolMissing(tool.to_string())
+            PingStatus::ToolMissing("ping".to_string())
         } else if error_msg.contains("No") && error_msg.contains("address available") {
             PingStatus::NoAddress
+        } else if error_msg.contains("Network is unreachable") || error_msg.contains("No route to host") {
+            PingStatus::Failed("Network unreachable".to_string())
         } else {
             PingStatus::Failed(error_msg)
         }
@@ -255,17 +268,37 @@ impl PingScanner {
         log::debug!("[scan::ping] do_ping: target={} protocol={} packet_count={} timeout={}ms",
             target, protocol.as_str(), self.packet_count, self.timeout.as_millis());
 
-        // Choose the appropriate ping command based on protocol
-        let ping_command = match protocol {
-            Protocol::Ipv4 => "ping",
-            Protocol::Ipv6 => "ping6",
+        // Modern ping command can handle both IPv4 and IPv6
+        // We'll use the unified 'ping' command with protocol-specific flags
+        let ping_command = "ping";
+        let mut args = Vec::new();
+
+        // Add protocol-specific flags
+        match protocol {
+            Protocol::Ipv4 => {
+                args.push("-4"); // Force IPv4
+            }
+            Protocol::Ipv6 => {
+                args.push("-6"); // Force IPv6
+            }
             Protocol::Both => {
                 log::error!("[scan::ping] invalid_protocol_for_ping: protocol={}", protocol.as_str());
                 eyre::bail!("Protocol::Both is not valid for individual ping operations");
             }
         };
 
-        log::debug!("[scan::ping] using_command: {} for protocol {}", ping_command, protocol.as_str());
+        // Create string values with proper lifetimes
+        let packet_count_str = self.packet_count.to_string();
+        let timeout_str = (self.timeout.as_millis() as u32).to_string();
+
+        // Add standard ping arguments
+        args.extend([
+            "-c", &packet_count_str,
+            "-W", &timeout_str,
+            target
+        ]);
+
+        log::debug!("[scan::ping] using_command: {} {:?} for protocol {}", ping_command, args, protocol.as_str());
 
         // Check if the ping command is available
         let command_check = Command::new("which")
@@ -277,8 +310,8 @@ impl PingScanner {
             Ok(output) if !output.status.success() => {
                 log::error!("[scan::ping] command_not_found: command={} protocol={}",
                     ping_command, protocol.as_str());
-                eyre::bail!("Command '{}' not found. Please install {} ping utilities.",
-                    ping_command, protocol.as_str());
+                eyre::bail!("Command '{}' not found. Please install ping utilities.",
+                    ping_command);
             }
             Err(e) => {
                 log::error!("[scan::ping] command_check_failed: command={} error={}", ping_command, e);
@@ -290,12 +323,9 @@ impl PingScanner {
         }
 
         let ping_start = Instant::now();
+        log::debug!("[scan::ping] executing_ping_command: {} {:?}", ping_command, args);
         let output = Command::new(ping_command)
-            .args([
-                "-c", &self.packet_count.to_string(),
-                "-W", &(self.timeout.as_millis() as u32).to_string(),
-                target
-            ])
+            .args(&args)
             .output()
             .await;
 
@@ -318,7 +348,15 @@ impl PingScanner {
             let stderr = String::from_utf8_lossy(&output.stderr);
             log::error!("[scan::ping] ping_command_unsuccessful: command={} target={} status={} stderr={}",
                 ping_command, target, output.status, stderr.trim());
-            eyre::bail!("Ping failed for target: {} (using {})", target, ping_command);
+            
+            // Check for specific IPv6 errors and provide better error messages
+            if stderr.contains("Network is unreachable") || stderr.contains("connect: Network is unreachable") {
+                eyre::bail!("Network is unreachable for target: {} (using {})", target, ping_command);
+            } else if stderr.contains("invalid option") || stderr.contains("unrecognized option") {
+                eyre::bail!("Ping command does not support IPv6 options: {} (stderr: {})", ping_command, stderr.trim());
+            } else {
+                eyre::bail!("Ping failed for target: {} (using {}) - stderr: {}", target, ping_command, stderr.trim());
+            }
         }
 
         let stdout = match String::from_utf8(output.stdout) {

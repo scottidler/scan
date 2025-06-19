@@ -1,6 +1,7 @@
 pub mod pane;
 pub mod layout;
 pub mod scrollable;
+pub mod sparkline;
 pub mod target;
 pub mod connectivity;
 pub mod security;
@@ -14,6 +15,7 @@ pub mod geoip;
 pub use pane::{Pane, PaneConfig, PanePosition};
 pub use layout::PaneLayout;
 pub use scrollable::ScrollablePane;
+pub use sparkline::SparklineData;
 pub use target::TargetPane;
 pub use connectivity::ConnectivityPane;
 pub use security::SecurityPane;
@@ -261,6 +263,8 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -
 
 /// Create the default pane layout for the dashboard
 pub fn create_default_layout() -> PaneLayout {
+    // This function is deprecated - use TuiApp::new() instead
+    // Kept for test compatibility
     let mut layout = PaneLayout::default_dashboard();
 
     // Row 0: TARGET, CONNECTIVITY
@@ -295,7 +299,7 @@ pub fn create_default_layout() -> PaneLayout {
         PaneConfig::new(1, 3)
     );
 
-    // Row 2: DNS, TRACEROUTE, SECURITY (bigger panes on bottom)
+    // Row 2: DNS, TRACEROUTE, SECURITY
     layout.add_pane(
         Box::new(DnsPane::new()),
         PaneConfig::new(2, 0)

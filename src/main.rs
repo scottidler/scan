@@ -41,7 +41,11 @@ async fn main() -> Result<()> {
     // Parse the target
     let mut target = scan::target::Target::parse(&args.target)?;
     log::debug!("[main] target_parsed: {}", target.display_name());
-    println!("Resolving domain: {}", target.display_name());
+    
+    // Only show resolution messages in debug/no-tui mode
+    if args.debug || args.no_tui {
+        println!("Resolving domain: {}", target.display_name());
+    }
 
     // Resolve the target to get IP addresses
     let resolve_start = Instant::now();
@@ -49,9 +53,20 @@ async fn main() -> Result<()> {
     let resolve_duration = resolve_start.elapsed();
     log::debug!("[main] target_resolved: duration={}ms", resolve_duration.as_millis());
 
+    // Show resolved addresses in debug/no-tui mode
+    if args.debug || args.no_tui {
+        if let Some(ipv4) = target.primary_ipv4() {
+            println!("IPv4: {}", ipv4);
+        }
+        if let Some(ipv6) = target.primary_ipv6() {
+            println!("IPv6: {}", ipv6);
+        } else if target.has_ipv4() {
+            println!("IPv6: no address");
+        }
+    }
+    
     if let Some(ip) = target.primary_ip() {
         log::debug!("[main] primary_ip: {}", ip);
-        println!("Resolved to: {}", ip);
     }
 
     // Create shared application state (wrapped in Mutex for protocol changes)
