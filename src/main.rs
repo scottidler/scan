@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // Parse the target
     let mut target = scan::target::Target::parse(&args.target)?;
     log::debug!("[main] target_parsed: {}", target.display_name());
-    
+
     // Only show resolution messages in debug/no-tui mode
     if args.debug || args.no_tui {
         println!("Resolving domain: {}", target.display_name());
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
             println!("IPv6: no address");
         }
     }
-    
+
     if let Some(ip) = target.primary_ip() {
         log::debug!("[main] primary_ip: {}", ip);
     }

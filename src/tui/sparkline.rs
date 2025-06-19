@@ -12,7 +12,7 @@ const SPARKLINE_CHARS: [char; 9] = [
     ' ',   // 0/8 - empty
     '⠁',   // 1/8 - bottom dot
     '⠃',   // 2/8 - bottom two dots
-    '⠇',   // 3/8 - bottom three dots  
+    '⠇',   // 3/8 - bottom three dots
     '⠏',   // 4/8 - bottom four dots (half height)
     '⠟',   // 5/8 - bottom five dots
     '⠿',   // 6/8 - bottom six dots
@@ -75,7 +75,7 @@ impl SparklineData {
         self.min_value = self.points.iter().map(|p| p.value).fold(f64::INFINITY, f64::min);
         self.max_value = self.points.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max);
     }
-    
+
     // Get bounds optimized for latency visualization (always start from 0)
     fn get_latency_bounds(&self) -> (f64, f64) {
         if self.points.is_empty() {
@@ -84,10 +84,10 @@ impl SparklineData {
 
         let raw_max = self.points.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max);
         let raw_min = self.points.iter().map(|p| p.value).fold(f64::INFINITY, f64::min);
-        
+
         // For latency, always start from 0 for better relative performance visualization
         let min_value = 0.0;
-        
+
         // Add some padding to the max for better visual scaling
         let range = raw_max - raw_min;
         let max_value = if range > 0.0 {
@@ -218,7 +218,7 @@ impl SparklineData {
         }
 
         let mut result = Vec::new();
-        
+
         // Use latency-optimized bounds for better visualization
         let (min_value, max_value) = self.get_latency_bounds();
         let range = max_value - min_value;
@@ -229,7 +229,7 @@ impl SparklineData {
         // Create height number of rows, top to bottom
         for row in 0..height {
             let mut row_spans = Vec::new();
-            
+
             for i in 0..width {
                 let point_index = if self.points.len() <= width {
                     if i < self.points.len() {
@@ -253,11 +253,11 @@ impl SparklineData {
 
                     // Calculate total height in levels (0 to total_levels)
                     let value_levels = (normalized * total_levels as f64).round() as usize;
-                    
+
                     // Current row's level range (top row = highest levels)
                     let row_top_level = total_levels - (row * 8);
                     let row_bottom_level = row_top_level.saturating_sub(8);
-                    
+
                     // Determine what to show in this row
                     let char_to_show = if value_levels >= row_top_level {
                         // Full block - value extends above this row
@@ -299,7 +299,7 @@ impl SparklineData {
                     row_spans.push(Span::styled(" ".to_string(), Style::default().fg(Color::Gray)));
                 }
             }
-            
+
             result.push(row_spans);
         }
 
@@ -365,7 +365,7 @@ impl SparklineData {
         if self.points.is_empty() {
             return vec![];
         }
-        
+
         if self.points.len() <= width {
             // Not enough data to fill width, return what we have
             self.points.iter().map(|p| p.value as u64).collect()
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn test_add_points() {
         let mut sparkline = SparklineData::new(Some(5));
-        
+
         sparkline.add_point(10.0);
         sparkline.add_point(20.0);
         sparkline.add_point(15.0);
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn test_max_points_limit() {
         let mut sparkline = SparklineData::new(Some(3));
-        
+
         for i in 0..5 {
             sparkline.add_point(i as f64);
         }
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn test_render_sparkline() {
         let mut sparkline = SparklineData::new(Some(10));
-        
+
         sparkline.add_point(0.0);
         sparkline.add_point(50.0);
         sparkline.add_point(100.0);
@@ -433,11 +433,11 @@ mod tests {
     #[test]
     fn test_latency_addition() {
         let mut sparkline = SparklineData::new(Some(5));
-        
+
         sparkline.add_latency(Duration::from_millis(50));
         sparkline.add_latency(Duration::from_millis(100));
 
         assert_eq!(sparkline.len(), 2);
         assert_eq!(sparkline.current_value(), Some(100.0));
     }
-} 
+}

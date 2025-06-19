@@ -194,12 +194,12 @@ impl Scanner for PingScanner {
                         let latency = ping_data.latency;
                         result.ipv6_status = PingStatus::Success(latency);
                         result.ipv6_result = Some(ping_data);
-                        log::debug!("[scan::ping] ipv6_ping_success: target={} addr={} latency={}ms", 
+                        log::debug!("[scan::ping] ipv6_ping_success: target={} addr={} latency={}ms",
                             target.display_name(), target_addr, latency.as_millis());
                     }
                     Err(e) => {
                         result.ipv6_status = Self::classify_ping_error(&e);
-                        log::debug!("[scan::ping] ipv6_ping_failed: target={} error={} classified_as={:?}", 
+                        log::debug!("[scan::ping] ipv6_ping_failed: target={} error={} classified_as={:?}",
                             target.display_name(), e, result.ipv6_status);
                     }
                 }
@@ -227,12 +227,12 @@ impl Scanner for PingScanner {
 impl PingScanner {
     async fn ping_protocol(&self, target: &Target, protocol: Protocol) -> Result<(PingData, String)> {
         // Get protocol-specific target
-        log::debug!("[scan::ping] getting_network_target: target={} protocol={} has_ipv4={} has_ipv6={}", 
+        log::debug!("[scan::ping] getting_network_target: target={} protocol={} has_ipv4={} has_ipv6={}",
             target.display_name(), protocol.as_str(), target.has_ipv4(), target.has_ipv6());
-        
+
         let ping_target = match target.network_target_for_protocol(protocol) {
             Some(target_addr) => {
-                log::debug!("[scan::ping] network_target_found: target={} protocol={} addr={}", 
+                log::debug!("[scan::ping] network_target_found: target={} protocol={} addr={}",
                     target.display_name(), protocol.as_str(), target_addr);
                 target_addr
             }
@@ -348,7 +348,7 @@ impl PingScanner {
             let stderr = String::from_utf8_lossy(&output.stderr);
             log::error!("[scan::ping] ping_command_unsuccessful: command={} target={} status={} stderr={}",
                 ping_command, target, output.status, stderr.trim());
-            
+
             // Check for specific IPv6 errors and provide better error messages
             if stderr.contains("Network is unreachable") || stderr.contains("connect: Network is unreachable") {
                 eyre::bail!("Network is unreachable for target: {} (using {})", target, ping_command);

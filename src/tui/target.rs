@@ -119,7 +119,7 @@ impl Pane for TargetPane {
                         // IPv4 status
                         let ipv4_selected = state.protocol.includes_ipv4();
                         let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " }; // Chevron or 2 spaces for alignment
-                        
+
                         if ipv4_selected {
                             if !dns_result.A.is_empty() {
                                 let ip = &dns_result.A[0].value;
@@ -148,7 +148,7 @@ impl Pane for TargetPane {
                         // IPv6 status
                         let ipv6_selected = state.protocol.includes_ipv6();
                         let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " }; // Chevron or 2 spaces for alignment
-                        
+
                         if ipv6_selected {
                             if !dns_result.AAAA.is_empty() {
                                 let ip = &dns_result.AAAA[0].value;
@@ -178,11 +178,11 @@ impl Pane for TargetPane {
                         match dns_state.status {
                             ScanStatus::Running => {
                                 log::trace!("[tui::target] dns_resolving:");
-                                
+
                                 // IPv4 status during resolution
                                 let ipv4_selected = state.protocol.includes_ipv4();
                                 let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-                                
+
                                 if ipv4_selected {
                                     lines.push(Line::from(vec![
                                         Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
@@ -196,11 +196,11 @@ impl Pane for TargetPane {
                                         Span::styled("disabled", Style::default().fg(Color::Gray)),
                                     ]));
                                 }
-                                
+
                                 // IPv6 status during resolution
                                 let ipv6_selected = state.protocol.includes_ipv6();
                                 let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-                                
+
                                 if ipv6_selected {
                                     lines.push(Line::from(vec![
                                         Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
@@ -217,11 +217,11 @@ impl Pane for TargetPane {
                             }
                             ScanStatus::Failed => {
                                 log::trace!("[tui::target] dns_failed:");
-                                
+
                                 // IPv4 status during failure
                                 let ipv4_selected = state.protocol.includes_ipv4();
                                 let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-                                
+
                                 if ipv4_selected {
                                     lines.push(Line::from(vec![
                                         Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
@@ -235,11 +235,11 @@ impl Pane for TargetPane {
                                         Span::styled("disabled", Style::default().fg(Color::Gray)),
                                     ]));
                                 }
-                                
+
                                 // IPv6 status during failure
                                 let ipv6_selected = state.protocol.includes_ipv6();
                                 let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-                                
+
                                 if ipv6_selected {
                                     lines.push(Line::from(vec![
                                         Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
@@ -256,11 +256,11 @@ impl Pane for TargetPane {
                             }
                             _ => {
                                 log::trace!("[tui::target] dns_waiting:");
-                                
+
                                 // IPv4 status while waiting
                                 let ipv4_selected = state.protocol.includes_ipv4();
                                 let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-                                
+
                                 if ipv4_selected {
                                     lines.push(Line::from(vec![
                                         Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
@@ -274,11 +274,11 @@ impl Pane for TargetPane {
                                         Span::styled("disabled", Style::default().fg(Color::Gray)),
                                     ]));
                                 }
-                                
+
                                 // IPv6 status while waiting
                                 let ipv6_selected = state.protocol.includes_ipv6();
                                 let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-                                
+
                                 if ipv6_selected {
                                     lines.push(Line::from(vec![
                                         Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
@@ -298,11 +298,11 @@ impl Pane for TargetPane {
                     Some(_) => {
                         // Non-DNS result (shouldn't happen)
                         log::warn!("[tui::target] dns_unexpected_result_type:");
-                        
+
                         // IPv4 status during error
                         let ipv4_selected = state.protocol.includes_ipv4();
                         let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-                        
+
                         if ipv4_selected {
                             lines.push(Line::from(vec![
                                 Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
@@ -316,11 +316,11 @@ impl Pane for TargetPane {
                                 Span::styled("disabled", Style::default().fg(Color::Gray)),
                             ]));
                         }
-                        
+
                         // IPv6 status during error
                         let ipv6_selected = state.protocol.includes_ipv6();
                         let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-                        
+
                         if ipv6_selected {
                             lines.push(Line::from(vec![
                                 Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
@@ -340,11 +340,11 @@ impl Pane for TargetPane {
             None => {
                 // No DNS scanner state yet
                 log::trace!("[tui::target] dns_no_state:");
-                
+
                 // IPv4 status when no DNS state
                 let ipv4_selected = state.protocol.includes_ipv4();
                 let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-                
+
                 if ipv4_selected {
                     lines.push(Line::from(vec![
                         Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
@@ -358,11 +358,11 @@ impl Pane for TargetPane {
                         Span::styled("disabled", Style::default().fg(Color::Gray)),
                     ]));
                 }
-                
+
                 // IPv6 status when no DNS state
                 let ipv6_selected = state.protocol.includes_ipv6();
                 let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-                
+
                 if ipv6_selected {
                     lines.push(Line::from(vec![
                         Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
