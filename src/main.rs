@@ -3,11 +3,15 @@ use eyre::Result;
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration, Instant};
 
+// Include the generated git version
+include!(concat!(env!("OUT_DIR"), "/git_describe.rs"));
+
 const DEBUG_REFRESH_INTERVAL_SECS: u64 = 5;
 
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(about = "A comprehensive network scanner")]
+#[command(version = GIT_DESCRIBE)]
 struct Args {
     /// Target to scan (domain, IP, or URL)
     target: String,
