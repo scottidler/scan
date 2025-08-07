@@ -38,7 +38,7 @@ The scan application currently uses a generic approach where:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Ipv4,    // IPv4 only
-    Ipv6,    // IPv6 only 
+    Ipv6,    // IPv6 only
     Both,    // Both IPv4 and IPv6 (default)
 }
 ```
@@ -113,7 +113,7 @@ For `Protocol::Both`:
 - Populate both old and new fields during transition
 - TUI displays old fields initially
 
-**Phase 2: Migration**  
+**Phase 2: Migration**
 - Update TUI to use new protocol-aware fields
 - Add user controls for protocol selection
 - Test thoroughly with dual-stack environments
@@ -233,11 +233,11 @@ For `Protocol::Both`:
 
 ### DNS Scanner
 - **Protocol::Ipv4**: Query only A records
-- **Protocol::Ipv6**: Query only AAAA records  
+- **Protocol::Ipv6**: Query only AAAA records
 - **Protocol::Both**: Query both, populate separate fields
 - **Complexity**: Low (already has A/AAAA separation)
 
-### Ping Scanner  
+### Ping Scanner
 - **Protocol::Ipv4**: `ping -4 <target>`
 - **Protocol::Ipv6**: `ping -6 <target>`
 - **Protocol::Both**: Concurrent pings, compare latencies
@@ -245,7 +245,7 @@ For `Protocol::Both`:
 
 ### Port Scanner
 - **Protocol::Ipv4**: Scan target.primary_ipv4()
-- **Protocol::Ipv6**: Scan target.primary_ipv6()  
+- **Protocol::Ipv6**: Scan target.primary_ipv6()
 - **Protocol::Both**: Scan both IPs, compare open ports
 - **Complexity**: High (multiple IPs × multiple ports)
 
@@ -260,14 +260,14 @@ For `Protocol::Both`:
 ### High Risk Items
 1. **Performance Impact**: Dual-stack scanning may double scan times
    - *Mitigation*: Concurrent scanning, user-configurable timeouts
-   
+
 2. **Complex Result Structures**: New result types may be confusing
    - *Mitigation*: Clear documentation, backward compatibility period
 
 3. **TUI Complexity**: Displaying dual results may clutter interface
    - *Mitigation*: Thoughtful UI design, progressive disclosure
 
-### Medium Risk Items  
+### Medium Risk Items
 4. **Backward Compatibility**: Breaking changes may affect users
    - *Mitigation*: Phased migration, deprecated field warnings
 
@@ -287,7 +287,7 @@ For `Protocol::Both`:
 - [ ] Error messages are clear when protocol is unavailable
 - [ ] Performance is acceptable for dual-stack scanning
 
-### Non-Functional Requirements  
+### Non-Functional Requirements
 - [ ] No regression in single-protocol performance
 - [ ] TUI remains responsive during dual scans
 - [ ] Memory usage scales reasonably with dual results
@@ -305,7 +305,7 @@ For `Protocol::Both`:
 |-------|----------|------------------|
 | 1 | 2 weeks | Protocol enum, Target methods, Scanner trait |
 | 2 | 2 weeks | DNS, Ping, Port scanner implementations |
-| 3 | 2 weeks | HTTP, TLS, Traceroute implementations |  
+| 3 | 2 weeks | HTTP, TLS, Traceroute implementations |
 | 4 | 1 week | GeoIP, Whois scanner updates |
 | 5 | 2 weeks | TUI and CLI interface updates |
 | 6 | 1 week | Testing, documentation, cleanup |
@@ -316,8 +316,8 @@ For `Protocol::Both`:
 
 This implementation plan transforms the scan application from a protocol-agnostic tool to a dual-stack networking diagnostic platform. The phased approach ensures stability while delivering incremental value. The emphasis on concurrent scanning and clear result presentation will significantly improve the user experience for network troubleshooting in modern dual-stack environments.
 
-**Next Steps**: 
+**Next Steps**:
 1. Review and approve this plan
 2. Set up development environment for dual-stack testing
 3. Begin Phase 1 implementation
-4. Establish regular progress reviews 
+4. Establish regular progress reviews

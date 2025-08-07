@@ -12,7 +12,7 @@
 
 ### WARN
 - **Purpose**: Issues that don't stop execution but should be noted
-- **Usage**: 
+- **Usage**:
   - Timeouts with retries
   - Partial failures
   - Configuration issues
@@ -72,7 +72,7 @@ ERROR [module::submodule] Detailed error with context - operation, target, timin
 - Always use `[scan::module]` or `[tui::module]` format
 - Examples:
   - `[scan::tls]`
-  - `[scan::http]` 
+  - `[scan::http]`
   - `[tui::security]`
   - `[tui::layout]`
 
@@ -153,7 +153,7 @@ log::trace!("[scan::tls] TLS handshake to {}:{} completed in {}ms", host, port, 
 
 ### Error with Context
 ```rust
-log::error!("[scan::tls] Failed TLS handshake to {}:{} - timeout after {}s, attempt {}/{}", 
+log::error!("[scan::tls] Failed TLS handshake to {}:{} - timeout after {}s, attempt {}/{}",
     host, port, timeout_secs, attempt, max_attempts);
 ```
 
@@ -165,4 +165,4 @@ log::debug!("[tui::security] scroll_down: offset={} max_scroll={}", offset, max_
 ### Scan Result
 ```rust
 log::trace!("[scan::tls] TLS scan completed: {:#?}", tls_result);
-``` 
+```

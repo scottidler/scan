@@ -59,11 +59,11 @@ impl SparklineData {
         self.max_value = self.points.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max);
     }
 
-    
 
 
 
-    
+
+
 
     pub fn current_value(&self) -> Option<f64> {
         self.points.back().map(|p| p.value)
@@ -169,14 +169,14 @@ mod tests {
         #[test]
     fn test_get_data_for_width() {
         let mut sparkline = SparklineData::new(Some(10));
-        
+
         sparkline.add_point(10.0);
         sparkline.add_point(20.0);
         sparkline.add_point(30.0);
 
         let data = sparkline.get_data_for_width(5);
         assert_eq!(data, vec![10, 20, 30]);
-        
+
         let data = sparkline.get_data_for_width(2);
         assert_eq!(data, vec![20, 30]); // Should get most recent 2
     }

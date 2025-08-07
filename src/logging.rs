@@ -46,7 +46,7 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Get the system-specific log file path
-fn get_log_file_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn get_log_file_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let log_dir = if cfg!(target_os = "macos") {
         // macOS: ~/Library/Logs/scan/
         dirs::home_dir()

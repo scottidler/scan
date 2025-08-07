@@ -9,7 +9,7 @@ Scan is a Rust CLI/TUI application that provides a `btop`-like display for compr
 ### Core Principles
 
 1. **Decoupled Scanner and UI Logic**: Scanners focus on data collection, TUI focuses on user-meaningful information presentation
-2. **User-Centric Information Grouping**: TUI panels are organized around user needs (security, performance, connectivity) rather than technical scanner boundaries  
+2. **User-Centric Information Grouping**: TUI panels are organized around user needs (security, performance, connectivity) rather than technical scanner boundaries
 3. **Concurrent by Design**: All network operations run concurrently with a smooth UI render loop
 4. **Extensible Scanner Architecture**: Adding new scanners should be straightforward and require minimal changes to existing code
 
@@ -68,7 +68,7 @@ pub struct TimestampedResult {
 }
 ```
 
-**Rationale**: 
+**Rationale**:
 - `DashMap` provides lock-free concurrent HashMap access
 - Each scanner gets its own `ScanState` with current result, error, and history
 - History is stored directly with scanner state for locality
@@ -90,20 +90,20 @@ use std::time::Duration;
 pub trait Scanner {
     /// Scanner identifier for state storage
     fn name(&self) -> &'static str;
-    
+
     /// How frequently this scanner should run
     fn interval(&self) -> Duration;
-    
+
     /// Perform the actual scan operation
     async fn scan(&self, target: &str) -> Result<ScanResult, eyre::Error>;
-    
+
     /// Default implementation of the scanner loop
     async fn run(&self, target: String, state: Arc<AppState>) {
         let mut ticker = tokio::time::interval(self.interval());
-        
+
         loop {
             ticker.tick().await;
-            
+
             // Update status to running
             {
                 let mut scan_state = ScanState {
@@ -115,7 +115,7 @@ pub trait Scanner {
                 };
                 state.scanners.insert(self.name().to_string(), scan_state);
             }
-            
+
             // Perform scan
             match self.scan(&target).await {
                 Ok(result) => {
@@ -124,14 +124,14 @@ pub trait Scanner {
                         timestamp,
                         result: result.clone(),
                     };
-                    
+
                     if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
                         scan_state.result = Some(result);
                         scan_state.error = None;
                         scan_state.status = ScanStatus::Complete;
                         scan_state.last_updated = timestamp;
                         scan_state.history.push_back(timestamped);
-                        
+
                         // Keep last 100 results
                         if scan_state.history.len() > 100 {
                             scan_state.history.pop_front();
@@ -233,11 +233,11 @@ impl PingScanner {
             .output()
             .await
             .wrap_err("Failed to execute ping command")?;
-            
+
         if !output.status.success() {
             eyre::bail!("Ping command failed with status: {}", output.status);
         }
-        
+
         // Parse output and return result
         self.parse_ping_output(&output.stdout)
     }
@@ -287,7 +287,7 @@ impl SecurityPanel {
         let http_data = state.scanners.get("http");
         let tls_data = state.scanners.get("tls");
         let dns_data = state.scanners.get("dns");
-        
+
         match (http_data, tls_data, dns_data) {
             (Some(http), Some(tls), Some(dns)) => {
                 self.render_full_security_assessment(http, tls, dns)
@@ -300,11 +300,11 @@ impl SecurityPanel {
             }
         }
     }
-    
+
     fn render_full_security_assessment(
-        &self, 
-        http: &ScanState, 
-        tls: &ScanState, 
+        &self,
+        http: &ScanState,
+        tls: &ScanState,
         dns: &ScanState
     ) -> Widget {
         // Extract security-relevant data from multiple scanners:
@@ -374,11 +374,11 @@ impl Scanner for PingScanner {
     fn name(&self) -> &'static str {
         "ping"
     }
-    
+
     fn interval(&self) -> Duration {
         self.interval
     }
-    
+
     async fn scan(&self, target: &str) -> Result<ScanResult, eyre::Error> {
         let result = self.do_ping(target).await
             .wrap_err_with(|| format!("Failed to ping target: {}", target))?;
@@ -397,18 +397,18 @@ impl PingScanner {
             .output()
             .await
             .wrap_err("Failed to execute ping command")?;
-            
+
         if !output.status.success() {
             eyre::bail!("Ping failed for target: {}", target);
         }
-        
+
         let stdout = String::from_utf8(output.stdout)
             .wrap_err("Invalid UTF-8 in ping output")?;
-            
+
         self.parse_ping_output(&stdout)
             .wrap_err("Failed to parse ping output")
     }
-    
+
     fn parse_ping_output(&self, output: &str) -> Result<PingResult> {
         // Simplified parsing - real implementation would be more robust
         for line in output.lines() {
@@ -418,7 +418,7 @@ impl PingScanner {
                     if let Some(time_str) = time_part.split_whitespace().next() {
                         let latency_ms: f64 = time_str.parse()
                             .wrap_err("Failed to parse latency")?;
-                        
+
                         return Ok(PingResult {
                             latency: Duration::from_millis(latency_ms as u64),
                             packet_loss: 0.0, // Would calculate from summary
@@ -430,7 +430,7 @@ impl PingScanner {
                 }
             }
         }
-        
+
         eyre::bail!("Could not find timing information in ping output");
     }
 }
@@ -468,7 +468,7 @@ pub async fn spawn_scanner_tasks(
     for scanner in scanners {
         let target_clone = target.clone();
         let state_clone = state.clone();
-        
+
         tokio::spawn(async move {
             scanner.run(target_clone, state_clone).await;
         });
@@ -496,22 +496,22 @@ use types::AppState;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = cli::parse();
-    
+
     if cli.verbose {
         env_logger::init();
     }
 
     // Initialize shared application state
     let state = Arc::new(AppState::new(cli.target.clone()));
-    
+
     // Create and spawn scanner tasks
     let scanners = scan::create_default_scanners();
     scan::spawn_scanner_tasks(scanners, cli.target.clone(), state.clone()).await;
-    
+
     // Run the TUI application
     let mut app = tui::App::new(state, Duration::from_millis(cli.refresh_rate));
     app.run().await?;
-    
+
     Ok(())
 }
 ```
@@ -543,4 +543,4 @@ async fn main() -> Result<()> {
 - **Configuration Management**: TOML-based configuration for scanner intervals and behavior
 - **Plugin System**: Runtime loading of scanners for extensibility
 - **Data Persistence**: Optional storage of scan history across application runs
-- **Distributed Scanning**: Architecture considerations for scanning from multiple viewpoints 
+- **Distributed Scanning**: Architecture considerations for scanning from multiple viewpoints

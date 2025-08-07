@@ -73,4 +73,4 @@ jobs:
           tag_name: ${{ needs.create-release.outputs.tag_name }}
           files: |
             dist/scan-${{ needs.create-release.outputs.tag_name }}-${{ matrix.target }}.tar.gz
-            dist/scan-${{ needs.create-release.outputs.tag_name }}-${{ matrix.target }}.zip 
+            dist/scan-${{ needs.create-release.outputs.tag_name }}-${{ matrix.target }}.zip

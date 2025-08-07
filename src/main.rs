@@ -8,10 +8,19 @@ include!(concat!(env!("OUT_DIR"), "/git_describe.rs"));
 
 const DEBUG_REFRESH_INTERVAL_SECS: u64 = 5;
 
+fn get_after_help() -> String {
+    let log_path = scan::get_log_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "Unable to determine log file path".to_string());
+
+    format!("Logs are written to: {}", log_path)
+}
+
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(about = "A comprehensive network scanner")]
 #[command(version = GIT_DESCRIBE)]
+#[command(after_help = get_after_help())]
 struct Args {
     /// Target to scan (domain, IP, or URL)
     target: String,

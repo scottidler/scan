@@ -44,4 +44,4 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=GIT_DESCRIBE");
-} 
+}
