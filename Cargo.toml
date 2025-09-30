@@ -2,6 +2,7 @@
 name = "scan"
 version = "0.5.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 async-trait = "0.1.88"
