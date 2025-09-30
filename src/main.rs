@@ -19,7 +19,7 @@ fn get_after_help() -> String {
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(about = "A comprehensive network scanner")]
-#[command(version = GIT_DESCRIBE)]
+#[command(version = env!("GIT_DESCRIBE"))]
 #[command(after_help = get_after_help())]
 struct Args {
     /// Target to scan (domain, IP, or URL)
