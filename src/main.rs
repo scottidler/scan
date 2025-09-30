@@ -3,8 +3,7 @@ use eyre::Result;
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration, Instant};
 
-// Include the generated git version
-include!(concat!(env!("OUT_DIR"), "/git_describe.rs"));
+// Built-in version from build.rs via env!("GIT_DESCRIBE")
 
 const DEBUG_REFRESH_INTERVAL_SECS: u64 = 5;
 
