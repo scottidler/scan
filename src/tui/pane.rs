@@ -44,7 +44,7 @@ pub trait Pane {
 }
 
 /// Helper function to create a standard bordered block for panes
-pub fn create_block(title: &str, focused: bool) -> Block {
+pub fn create_block(title: &str, focused: bool) -> Block<'_> {
     log::trace!("[tui::pane] create_block: title={} focused={}", title, focused);
 
     Block::default()

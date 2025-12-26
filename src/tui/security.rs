@@ -86,7 +86,7 @@ impl SecurityPane {
 
     /// Build the actual content lines - SINGLE SOURCE OF TRUTH
     /// This method is used by both scroll calculation and rendering
-    fn build_content_lines(&self, state: &AppState) -> Vec<Line> {
+    fn build_content_lines(&self, state: &AppState) -> Vec<Line<'_>> {
         log::trace!("[tui::security] build_content_lines: building security analysis content");
 
         let mut lines = Vec::new();

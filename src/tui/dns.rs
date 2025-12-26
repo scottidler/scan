@@ -90,7 +90,7 @@ impl DnsPane {
 
     /// Build the actual content lines - SINGLE SOURCE OF TRUTH
     /// This method is used by both scroll calculation and rendering
-    fn build_content_lines(&self, state: &AppState) -> Vec<Line> {
+    fn build_content_lines(&self, state: &AppState) -> Vec<Line<'_>> {
         log::trace!("[tui::dns] build_content_lines: building DNS resolution content");
 
         let mut lines = Vec::new();
