@@ -1,5 +1,5 @@
 use crate::scanner::Scanner;
-use crate::target::{Target, Protocol};
+use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -62,10 +62,7 @@ impl HttpScanner {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self {
-            client,
-            timeout,
-        }
+        Self { client, timeout }
     }
 
     pub fn timeout(&self) -> Duration {
@@ -73,27 +70,49 @@ impl HttpScanner {
     }
 
     async fn http_protocol(&self, target: &Target, protocol: Protocol) -> eyre::Result<HttpData> {
-        log::debug!("[scan::http] http_protocol: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::http] http_protocol: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         // Check if target supports this protocol
         if !target.supports_protocol(protocol) {
-            log::debug!("[scan::http] protocol_not_supported: target={} protocol={}",
-                target.display_name(), protocol.as_str());
-            return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+            log::debug!(
+                "[scan::http] protocol_not_supported: target={} protocol={}",
+                target.display_name(),
+                protocol.as_str()
+            );
+            return Err(eyre::eyre!(
+                "No {} address available for target: {}",
+                protocol.as_str(),
+                target.display_name()
+            ));
         }
 
         // Get protocol-specific network target
         let network_target = match target.network_target_for_protocol(protocol) {
             Some(target_addr) => target_addr,
             None => {
-                log::warn!("[scan::http] no_target_for_protocol: target={} protocol={}",
-                    target.display_name(), protocol.as_str());
-                return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+                log::warn!(
+                    "[scan::http] no_target_for_protocol: target={} protocol={}",
+                    target.display_name(),
+                    protocol.as_str()
+                );
+                return Err(eyre::eyre!(
+                    "No {} address available for target: {}",
+                    protocol.as_str(),
+                    target.display_name()
+                ));
             }
         };
 
-        log::debug!("[scan::http] protocol_target: {} -> {} ({})",
-            target.display_name(), network_target, protocol.as_str());
+        log::debug!(
+            "[scan::http] protocol_target: {} -> {} ({})",
+            target.display_name(),
+            network_target,
+            protocol.as_str()
+        );
 
         let http_data = self.perform_http_scan_for_target(target, &network_target).await?;
         Ok(http_data)
@@ -110,7 +129,11 @@ impl HttpScanner {
     }
 
     async fn perform_http_scan_for_target(&self, target: &Target, target_addr: &str) -> eyre::Result<HttpData> {
-        log::debug!("[scan::http] perform_http_scan_for_target: target={} target_addr={}", target.display_name(), target_addr);
+        log::debug!(
+            "[scan::http] perform_http_scan_for_target: target={} target_addr={}",
+            target.display_name(),
+            target_addr
+        );
 
         let scan_start = Instant::now();
 
@@ -121,7 +144,7 @@ impl HttpScanner {
                 let mut parsed_url = url.clone();
                 parsed_url.set_host(Some(target_addr))?;
                 parsed_url.to_string()
-            },
+            }
             _ => {
                 // For domains and IPs, try both HTTPS and HTTP with the specific address
                 let https_url = format!("https://{}", target_addr);
@@ -133,22 +156,38 @@ impl HttpScanner {
                 match self.perform_scan(&https_url, target_addr).await {
                     Ok(mut result) => {
                         result.scan_duration = scan_start.elapsed();
-                        log::trace!("[scan::http] https_scan_successful: url={} status={} duration={}ms",
-                            https_url, result.status_code, result.scan_duration.as_millis());
+                        log::trace!(
+                            "[scan::http] https_scan_successful: url={} status={} duration={}ms",
+                            https_url,
+                            result.status_code,
+                            result.scan_duration.as_millis()
+                        );
                         return Ok(result);
                     }
                     Err(e) => {
-                        log::debug!("[scan::http] https_failed_trying_http: https_error={} http_url={}", e, http_url);
+                        log::debug!(
+                            "[scan::http] https_failed_trying_http: https_error={} http_url={}",
+                            e,
+                            http_url
+                        );
                         // Fall back to HTTP
                         match self.perform_scan(&http_url, target_addr).await {
                             Ok(mut result) => {
                                 result.scan_duration = scan_start.elapsed();
-                                log::trace!("[scan::http] http_scan_successful: url={} status={} duration={}ms",
-                                    http_url, result.status_code, result.scan_duration.as_millis());
+                                log::trace!(
+                                    "[scan::http] http_scan_successful: url={} status={} duration={}ms",
+                                    http_url,
+                                    result.status_code,
+                                    result.scan_duration.as_millis()
+                                );
                                 return Ok(result);
                             }
                             Err(http_err) => {
-                                log::error!("[scan::http] both_protocols_failed: https_error={} http_error={}", e, http_err);
+                                log::error!(
+                                    "[scan::http] both_protocols_failed: https_error={} http_error={}",
+                                    e,
+                                    http_err
+                                );
                                 return Err(http_err);
                             }
                         }
@@ -160,8 +199,13 @@ impl HttpScanner {
         let mut result = self.perform_scan(&url, target_addr).await?;
         result.scan_duration = scan_start.elapsed();
 
-        log::debug!("[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}",
-            url, result.status_code, result.scan_duration.as_millis(), result.security_grade);
+        log::debug!(
+            "[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}",
+            url,
+            result.status_code,
+            result.scan_duration.as_millis(),
+            result.security_grade
+        );
 
         Ok(result)
     }
@@ -181,12 +225,21 @@ impl HttpScanner {
         let final_url = response.url().clone();
         let headers = response.headers().clone();
 
-        log::trace!("[scan::http] response_received: url={} status={} request_duration={}ms final_url={}",
-            url, status_code, request_duration.as_millis(), final_url);
+        log::trace!(
+            "[scan::http] response_received: url={} status={} request_duration={}ms final_url={}",
+            url,
+            status_code,
+            request_duration.as_millis(),
+            final_url
+        );
 
         // Analyze redirects
         let redirect_chain = self.analyze_redirects(&original_url, &final_url);
-        log::trace!("[scan::http] redirect_analysis: url={} redirect_count={}", url, redirect_chain.len());
+        log::trace!(
+            "[scan::http] redirect_analysis: url={} redirect_count={}",
+            url,
+            redirect_chain.len()
+        );
 
         // Get response body for content analysis
         let body_start = Instant::now();
@@ -194,8 +247,12 @@ impl HttpScanner {
         let body_duration = body_start.elapsed();
         let content_length = body.len();
 
-        log::trace!("[scan::http] body_received: url={} content_length={} body_duration={}ms",
-            url, content_length, body_duration.as_millis());
+        log::trace!(
+            "[scan::http] body_received: url={} content_length={} body_duration={}ms",
+            url,
+            content_length,
+            body_duration.as_millis()
+        );
 
         // Extract content type
         let content_type = headers
@@ -216,8 +273,13 @@ impl HttpScanner {
         let security_grade = self.calculate_security_grade(&security_headers, &csp, &cors, &vulnerabilities);
 
         let security_duration = security_start.elapsed();
-        log::trace!("[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}",
-            url, security_duration.as_micros(), security_grade, vulnerabilities.len());
+        log::trace!(
+            "[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}",
+            url,
+            security_duration.as_micros(),
+            security_grade,
+            vulnerabilities.len()
+        );
 
         let result = HttpData {
             url: final_url.to_string(),
@@ -236,8 +298,13 @@ impl HttpScanner {
             target_ip: target_ip.to_string(),
         };
 
-        log::debug!("[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}",
-            result.url, result.status_code, result.content_length, result.security_grade);
+        log::debug!(
+            "[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}",
+            result.url,
+            result.status_code,
+            result.content_length,
+            result.security_grade
+        );
 
         Ok(result)
     }
@@ -373,12 +440,12 @@ impl HttpScanner {
             .map(|s| s.to_string());
 
         // Check for any CORS-related headers, not just allow-origin
-        let has_cors_headers = access_control_allow_origin.is_some() ||
-            headers.contains_key("access-control-allow-methods") ||
-            headers.contains_key("access-control-allow-headers") ||
-            headers.contains_key("access-control-allow-credentials") ||
-            headers.contains_key("access-control-expose-headers") ||
-            headers.contains_key("access-control-max-age");
+        let has_cors_headers = access_control_allow_origin.is_some()
+            || headers.contains_key("access-control-allow-methods")
+            || headers.contains_key("access-control-allow-headers")
+            || headers.contains_key("access-control-allow-credentials")
+            || headers.contains_key("access-control-expose-headers")
+            || headers.contains_key("access-control-max-age");
 
         if !has_cors_headers {
             return None;
@@ -430,13 +497,13 @@ impl HttpScanner {
     ) -> Vec<CorsIssue> {
         let mut issues = Vec::new();
 
-        if let Some(origin) = origin {
-            if origin == "*" {
-                if credentials {
-                    issues.push(CorsIssue::WildcardWithCredentials);
-                } else {
-                    issues.push(CorsIssue::WildcardOrigin);
-                }
+        if let Some(origin) = origin
+            && origin == "*"
+        {
+            if credentials {
+                issues.push(CorsIssue::WildcardWithCredentials);
+            } else {
+                issues.push(CorsIssue::WildcardOrigin);
             }
         }
 
@@ -475,10 +542,7 @@ impl HttpScanner {
                 .get("expires")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string()),
-            etag: headers
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string()),
+            etag: headers.get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
             last_modified: headers
                 .get("last-modified")
                 .and_then(|v| v.to_str().ok())
@@ -508,17 +572,17 @@ impl HttpScanner {
         // CSP issues
         if csp.is_none() {
             vulnerabilities.push(HttpVulnerability::MissingCsp);
-        } else if let Some(csp_policy) = csp {
-            if matches!(csp_policy.strength, CspStrength::Weak | CspStrength::None) {
-                vulnerabilities.push(HttpVulnerability::WeakCsp);
-            }
+        } else if let Some(csp_policy) = csp
+            && matches!(csp_policy.strength, CspStrength::Weak | CspStrength::None)
+        {
+            vulnerabilities.push(HttpVulnerability::WeakCsp);
         }
 
         // CORS issues
-        if let Some(cors_policy) = cors {
-            if matches!(cors_policy.security_level, CorsSecurityLevel::Dangerous) {
-                vulnerabilities.push(HttpVulnerability::InsecureCors);
-            }
+        if let Some(cors_policy) = cors
+            && matches!(cors_policy.security_level, CorsSecurityLevel::Dangerous)
+        {
+            vulnerabilities.push(HttpVulnerability::InsecureCors);
         }
 
         vulnerabilities
@@ -600,7 +664,11 @@ impl Scanner for HttpScanner {
     }
 
     async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
-        log::debug!("[scan::http] scan: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::http] scan: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         let scan_start = Instant::now();
         let mut result = HttpResult::new();
@@ -663,15 +731,27 @@ impl Scanner for HttpScanner {
 
         // Return success if at least one protocol succeeded, or error if all failed
         if result.has_any_success() {
-            log::trace!("[scan::http] http_completed: target={} protocol={} duration={}ms best_grade={:?}",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), result.get_best_security_grade());
+            log::trace!(
+                "[scan::http] http_completed: target={} protocol={} duration={}ms best_grade={:?}",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis(),
+                result.get_best_security_grade()
+            );
             Ok(ScanResult::Http(result))
         } else {
             // All protocols failed
-            let error_msg = format!("All HTTP attempts failed for target: {} ({})",
-                target.display_name(), protocol.as_str());
-            log::error!("[scan::http] all_http_failed: target={} protocol={} duration={}ms",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis());
+            let error_msg = format!(
+                "All HTTP attempts failed for target: {} ({})",
+                target.display_name(),
+                protocol.as_str()
+            );
+            log::error!(
+                "[scan::http] all_http_failed: target={} protocol={} duration={}ms",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis()
+            );
             Err(eyre::eyre!(error_msg))
         }
     }
@@ -699,10 +779,10 @@ pub struct HttpData {
 
 #[derive(Debug, Clone)]
 pub enum HttpStatus {
-    NotQueried,           // Protocol not attempted (due to protocol restrictions)
+    NotQueried,             // Protocol not attempted (due to protocol restrictions)
     Success(SecurityGrade), // HTTP scan succeeded with security grade
-    Failed(String),       // HTTP scan failed with error message
-    NoAddress,           // No address available for this protocol
+    Failed(String),         // HTTP scan failed with error message
+    NoAddress,              // No address available for this protocol
 }
 
 impl HttpStatus {
@@ -735,6 +815,12 @@ pub struct HttpResult {
     // Metadata
     pub queried_at: Instant,
     pub total_duration: Duration,
+}
+
+impl Default for HttpResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpResult {
@@ -927,7 +1013,10 @@ mod tests {
         let directives = scanner.parse_csp_directives(csp);
 
         assert_eq!(directives.get("default-src"), Some(&vec!["'self'".to_string()]));
-        assert_eq!(directives.get("script-src"), Some(&vec!["'self'".to_string(), "'unsafe-inline'".to_string()]));
+        assert_eq!(
+            directives.get("script-src"),
+            Some(&vec!["'self'".to_string(), "'unsafe-inline'".to_string()])
+        );
         assert_eq!(directives.get("object-src"), Some(&vec!["'none'".to_string()]));
     }
 
@@ -935,7 +1024,10 @@ mod tests {
     fn test_csp_issue_detection() {
         let scanner = HttpScanner::new();
         let mut directives = HashMap::new();
-        directives.insert("script-src".to_string(), vec!["'self'".to_string(), "'unsafe-inline'".to_string()]);
+        directives.insert(
+            "script-src".to_string(),
+            vec!["'self'".to_string(), "'unsafe-inline'".to_string()],
+        );
         directives.insert("style-src".to_string(), vec!["*".to_string()]);
 
         let issues = scanner.analyze_csp_issues(&directives);
@@ -1034,7 +1126,10 @@ mod tests {
 
         // Weak CSP with unsafe-inline
         let mut weak_directives = HashMap::new();
-        weak_directives.insert("script-src".to_string(), vec!["'self'".to_string(), "'unsafe-inline'".to_string()]);
+        weak_directives.insert(
+            "script-src".to_string(),
+            vec!["'self'".to_string(), "'unsafe-inline'".to_string()],
+        );
 
         let weak_issues = vec![CspIssue::UnsafeInline("script-src".to_string())];
         let weakness = scanner.calculate_csp_strength(&weak_directives, &weak_issues);
@@ -1065,7 +1160,10 @@ mod tests {
         let weak_issues = vec![CorsIssue::WildcardOrigin];
         let weak_level = scanner.calculate_cors_security(&Some("*".to_string()), &weak_issues);
         // Implementation might classify this as Moderate rather than Weak
-        assert!(matches!(weak_level, CorsSecurityLevel::Weak | CorsSecurityLevel::Moderate));
+        assert!(matches!(
+            weak_level,
+            CorsSecurityLevel::Weak | CorsSecurityLevel::Moderate
+        ));
     }
 
     #[test]
@@ -1074,7 +1172,10 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
 
         // Add security headers
-        headers.insert("strict-transport-security", "max-age=31536000; includeSubDomains".parse().unwrap());
+        headers.insert(
+            "strict-transport-security",
+            "max-age=31536000; includeSubDomains".parse().unwrap(),
+        );
         headers.insert("x-frame-options", "DENY".parse().unwrap());
         headers.insert("x-content-type-options", "nosniff".parse().unwrap());
         headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());

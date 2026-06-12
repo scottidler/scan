@@ -1,15 +1,15 @@
-pub mod scanner;
-pub mod scan;
-pub mod target;
-pub mod types;
-pub mod pretty;
-pub mod tui;
 pub mod logging;
+pub mod pretty;
+pub mod scan;
+pub mod scanner;
+pub mod target;
+pub mod tui;
+pub mod types;
 
 // Re-export key types and functions at the crate root
+pub use logging::{get_log_file_path, init_logging};
+pub use scan::{create_default_scanners, spawn_scanner_tasks};
 pub use scanner::Scanner;
 pub use target::Target;
-pub use types::{AppState, ScanResult, ScanState, ScanStatus};
 pub use tui::{TuiApp, init_terminal, restore_terminal};
-pub use scan::{create_default_scanners, spawn_scanner_tasks};
-pub use logging::{init_logging, get_log_file_path};
+pub use types::{AppState, ScanResult, ScanState, ScanStatus};

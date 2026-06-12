@@ -1,14 +1,14 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::types::AppState;
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const TXT_TRUNCATE_SUFFIX_LENGTH: usize = 3;
 const MAX_A_RECORDS_DISPLAYED: usize = 1000;
@@ -52,8 +52,11 @@ impl DnsPane {
     pub fn scroll_up(&mut self) {
         let old_offset = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_STEP);
-        log::debug!("[tui::dns] scroll_up: old_offset={} new_offset={}",
-            old_offset, self.scroll_offset);
+        log::debug!(
+            "[tui::dns] scroll_up: old_offset={} new_offset={}",
+            old_offset,
+            self.scroll_offset
+        );
     }
 
     pub fn scroll_down_smart(&mut self, state: &AppState, visible_height: u16) {
@@ -69,9 +72,14 @@ impl DnsPane {
             }
         }
 
-        log::debug!("[tui::dns] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
-            old_offset, self.scroll_offset, actual_lines, visible_height,
-            actual_lines.saturating_sub(visible_height));
+        log::debug!(
+            "[tui::dns] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
+            old_offset,
+            self.scroll_offset,
+            actual_lines,
+            visible_height,
+            actual_lines.saturating_sub(visible_height)
+        );
     }
 
     pub fn reset_scroll(&mut self) {
@@ -109,7 +117,7 @@ impl DnsPane {
                         crate::types::ScanStatus::Running => Color::Yellow,
                         crate::types::ScanStatus::Complete => Color::Green,
                         crate::types::ScanStatus::Failed => Color::Red,
-                    })
+                    }),
                 ),
             ]));
         } else {
@@ -170,20 +178,14 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("  TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
             ]));
 
             // Show A records
             for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(
-                        record.value.to_string(),
-                        Style::default().fg(Color::Cyan)
-                    ),
+                    Span::styled(record.value.to_string(), Style::default().fg(Color::Cyan)),
                 ]));
             }
         }
@@ -207,10 +209,7 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("  TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
             ]));
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
@@ -223,10 +222,7 @@ impl DnsPane {
 
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(
-                        display_str,
-                        Style::default().fg(Color::Cyan)
-                    ),
+                    Span::styled(display_str, Style::default().fg(Color::Cyan)),
                 ]));
             }
         }
@@ -244,25 +240,16 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("CNAME: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.CNAME.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
+                Span::styled(dns_result.CNAME.len().to_string(), Style::default().fg(Color::Green)),
                 Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
             for record in dns_result.CNAME.iter().take(MAX_CNAME_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(
-                        record.value.clone(),
-                        Style::default().fg(Color::Magenta)
-                    ),
+                    Span::styled(record.value.clone(), Style::default().fg(Color::Magenta)),
                 ]));
             }
         }
@@ -280,25 +267,16 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("NS: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.NS.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
+                Span::styled(dns_result.NS.len().to_string(), Style::default().fg(Color::Green)),
                 Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
             for record in dns_result.NS.iter().take(MAX_NS_RECORDS_DISPLAYED) {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(
-                        record.value.clone(),
-                        Style::default().fg(Color::Blue)
-                    ),
+                    Span::styled(record.value.clone(), Style::default().fg(Color::Blue)),
                 ]));
             }
         }
@@ -316,15 +294,9 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("TXT: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.TXT.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
+                Span::styled(dns_result.TXT.len().to_string(), Style::default().fg(Color::Green)),
                 Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
@@ -333,17 +305,20 @@ impl DnsPane {
                 let display_value = if value.starts_with("google-site-verification") {
                     "google-site-verification=...".to_string()
                 } else if value.starts_with("MS=") {
-                    format!("MS={}...", &value[MS_RECORD_PREFIX_LENGTH..].chars().take(MS_RECORD_PREVIEW_LENGTH).collect::<String>())
+                    format!(
+                        "MS={}...",
+                        &value[MS_RECORD_PREFIX_LENGTH..]
+                            .chars()
+                            .take(MS_RECORD_PREVIEW_LENGTH)
+                            .collect::<String>()
+                    )
                 } else {
                     Self::truncate_txt(&value, TXT_DISPLAY_MAX_LENGTH)
                 };
 
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(
-                        display_value,
-                        Style::default().fg(Color::Yellow)
-                    ),
+                    Span::styled(display_value, Style::default().fg(Color::Yellow)),
                 ]));
             }
         }
@@ -361,15 +336,9 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("CAA: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.CAA.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
+                Span::styled(dns_result.CAA.len().to_string(), Style::default().fg(Color::Green)),
                 Span::styled(" cert auth (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
@@ -378,7 +347,7 @@ impl DnsPane {
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         format!("{} {}", record.value.tag, record.value.value),
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(Color::Green),
                     ),
                 ]));
             }
@@ -397,15 +366,9 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("MX: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.MX.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
+                Span::styled(dns_result.MX.len().to_string(), Style::default().fg(Color::Green)),
                 Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
@@ -420,14 +383,11 @@ impl DnsPane {
 
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(
-                        record.value.exchange.clone(),
-                        Style::default().fg(Color::Magenta)
-                    ),
+                    Span::styled(record.value.exchange.clone(), Style::default().fg(Color::Magenta)),
                     Span::styled(" (pri: ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         format!("{}", record.value.priority),
-                        Style::default().fg(priority_color)
+                        Style::default().fg(priority_color),
                     ),
                     Span::styled(")", Style::default().fg(Color::Gray)),
                 ]));
@@ -448,10 +408,7 @@ impl DnsPane {
             lines.push(Line::from(vec![
                 Span::styled("SOA: ", Style::default().fg(Color::White)),
                 Span::styled("authority (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
@@ -460,14 +417,14 @@ impl DnsPane {
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         format!("NS: {}", soa.value.primary_ns),
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(Color::Cyan),
                     ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         format!("Serial: {}", soa.value.serial),
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(Color::Gray),
                     ),
                 ]));
             }
@@ -486,15 +443,9 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("SRV: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    dns_result.SRV.len().to_string(),
-                    Style::default().fg(Color::Green)
-                ),
+                Span::styled(dns_result.SRV.len().to_string(), Style::default().fg(Color::Green)),
                 Span::styled(" services (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}s", ttl),
-                    Style::default().fg(ttl_color)
-                ),
+                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
                 Span::styled(")", Style::default().fg(Color::White)),
             ]));
 
@@ -502,13 +453,11 @@ impl DnsPane {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        format!("{}:{} (p:{}, w:{})",
-                            record.value.target,
-                            record.value.port,
-                            record.value.priority,
-                            record.value.weight
+                        format!(
+                            "{}:{} (p:{}, w:{})",
+                            record.value.target, record.value.port, record.value.priority, record.value.weight
                         ),
-                        Style::default().fg(Color::Blue)
+                        Style::default().fg(Color::Blue),
                     ),
                 ]));
             }
@@ -535,12 +484,10 @@ impl DnsPane {
     }
 
     fn build_dns_unavailable_lines() -> Vec<Line<'static>> {
-        vec![
-            Line::from(vec![
-                Span::styled("DNS: ", Style::default().fg(Color::White)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
-            ])
-        ]
+        vec![Line::from(vec![
+            Span::styled("DNS: ", Style::default().fg(Color::White)),
+            Span::styled("scanner not available", Style::default().fg(Color::Red)),
+        ])]
     }
 }
 
@@ -552,8 +499,13 @@ impl Default for DnsPane {
 
 impl Pane for DnsPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::dns] render: area={}x{} focused={} scroll_offset={}",
-            area.width, area.height, focused, self.scroll_offset);
+        log::trace!(
+            "[tui::dns] render: area={}x{} focused={} scroll_offset={}",
+            area.width,
+            area.height,
+            focused,
+            self.scroll_offset
+        );
 
         let block = create_block(self.title, focused);
 
@@ -576,8 +528,13 @@ impl Pane for DnsPane {
         };
         let safe_scroll_offset = self.scroll_offset.min(max_scroll_offset);
 
-        log::trace!("[tui::dns] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
-            total_lines, visible_area_height, max_scroll_offset, safe_scroll_offset);
+        log::trace!(
+            "[tui::dns] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
+            total_lines,
+            visible_area_height,
+            max_scroll_offset,
+            safe_scroll_offset
+        );
 
         // Apply scroll offset - skip lines from the beginning
         let visible_lines = if safe_scroll_offset < total_lines {
@@ -588,8 +545,7 @@ impl Pane for DnsPane {
 
         log::trace!("[tui::dns] render_content: visible_lines={}", visible_lines.len());
 
-        let paragraph = Paragraph::new(visible_lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(visible_lines).alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
 

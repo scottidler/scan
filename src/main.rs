@@ -1,7 +1,7 @@
 use clap::Parser;
 use eyre::Result;
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 
 // Built-in version from build.rs via env!("GIT_DESCRIBE")
 
@@ -48,7 +48,12 @@ async fn main() -> Result<()> {
     log::info!("================================================================================");
 
     let args = Args::parse();
-    log::debug!("[main] main: target={} debug={} no_tui={}", args.target, args.debug, args.no_tui);
+    log::debug!(
+        "[main] main: target={} debug={} no_tui={}",
+        args.target,
+        args.debug,
+        args.no_tui
+    );
 
     // Parse the target
     let mut target = scan::target::Target::parse(&args.target)?;
@@ -121,7 +126,7 @@ async fn main() -> Result<()> {
                     let scanner_name = scanner_state.key();
                     let scan_state = scanner_state.value();
 
-                    scan::pretty::print_scan_state(scanner_name, &scan_state);
+                    scan::pretty::print_scan_state(scanner_name, scan_state);
                 }
             }
 
@@ -141,7 +146,10 @@ async fn main() -> Result<()> {
         let terminal_init_start = Instant::now();
         let mut terminal = scan::tui::init_terminal()?;
         let terminal_init_duration = terminal_init_start.elapsed();
-        log::debug!("[main] terminal_initialized: duration={}ms", terminal_init_duration.as_millis());
+        log::debug!(
+            "[main] terminal_initialized: duration={}ms",
+            terminal_init_duration.as_millis()
+        );
 
         let app_create_start = Instant::now();
         let app = scan::tui::TuiApp::new()?;
@@ -155,7 +163,10 @@ async fn main() -> Result<()> {
 
         // Log first render timing (INFO level as requested)
         let total_startup_duration = app_start.elapsed();
-        log::info!("[main] First TUI render completed: startup_to_render={}ms", total_startup_duration.as_millis());
+        log::info!(
+            "[main] First TUI render completed: startup_to_render={}ms",
+            total_startup_duration.as_millis()
+        );
 
         // Restore terminal
         let restore_start = Instant::now();
@@ -163,14 +174,20 @@ async fn main() -> Result<()> {
         let restore_duration = restore_start.elapsed();
         log::debug!("[main] terminal_restored: duration={}ms", restore_duration.as_millis());
 
-        log::debug!("[main] tui_session_completed: total_duration={}ms", tui_duration.as_millis());
+        log::debug!(
+            "[main] tui_session_completed: total_duration={}ms",
+            tui_duration.as_millis()
+        );
 
         // Handle any TUI errors
         result?;
     }
 
     let total_duration = app_start.elapsed();
-    log::info!("[main] Scan session completed: total_duration={}ms", total_duration.as_millis());
+    log::info!(
+        "[main] Scan session completed: total_duration={}ms",
+        total_duration.as_millis()
+    );
     log::info!("================================================================================");
     log::info!("🏁 SCAN SESSION ENDED");
     log::info!("================================================================================");

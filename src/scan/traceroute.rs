@@ -1,12 +1,12 @@
 use crate::scanner::Scanner;
-use crate::target::{Target, Protocol};
+use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use log;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use log;
 
 const TRACEROUTE_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes - traceroute is slow and noisy if too frequent
 const TRACEROUTE_TIMEOUT_SECS: u64 = 3; // 3 seconds per hop (much faster like your example)
@@ -47,10 +47,16 @@ pub struct TracerouteData {
 
 #[derive(Debug, Clone)]
 pub enum TracerouteStatus {
-    Success(u8),           // Traceroute succeeded with N hops
-    Failed(String),        // Traceroute failed with error message
-    NoAddress,            // No address available for this protocol
-    NotQueried,           // Query was not attempted
+    Success(u8),    // Traceroute succeeded with N hops
+    Failed(String), // Traceroute failed with error message
+    NoAddress,      // No address available for this protocol
+    NotQueried,     // Query was not attempted
+}
+
+impl Default for TracerouteResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TracerouteResult {
@@ -70,8 +76,8 @@ impl TracerouteResult {
     }
 
     pub fn has_any_success(&self) -> bool {
-        matches!(self.ipv4_status, TracerouteStatus::Success(_)) ||
-        matches!(self.ipv6_status, TracerouteStatus::Success(_))
+        matches!(self.ipv4_status, TracerouteStatus::Success(_))
+            || matches!(self.ipv6_status, TracerouteStatus::Success(_))
     }
 
     pub fn total_hops(&self) -> u8 {
@@ -81,8 +87,15 @@ impl TracerouteResult {
     }
 
     pub fn any_destination_reached(&self) -> bool {
-        self.ipv4_result.as_ref().map(|r| r.destination_reached).unwrap_or(false) ||
-        self.ipv6_result.as_ref().map(|r| r.destination_reached).unwrap_or(false)
+        self.ipv4_result
+            .as_ref()
+            .map(|r| r.destination_reached)
+            .unwrap_or(false)
+            || self
+                .ipv6_result
+                .as_ref()
+                .map(|r| r.destination_reached)
+                .unwrap_or(false)
     }
 }
 
@@ -121,93 +134,149 @@ impl TracerouteScanner {
     }
 
     async fn traceroute_protocol(&self, target: &Target, protocol: Protocol) -> Result<TracerouteData> {
-        log::debug!("[scan::traceroute] traceroute_protocol: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::traceroute] traceroute_protocol: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         // Check if target supports this protocol
         if !target.supports_protocol(protocol) {
-            log::warn!("[scan::traceroute] no_address_for_protocol: target={} protocol={}",
-                target.display_name(), protocol.as_str());
-            return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+            log::warn!(
+                "[scan::traceroute] no_address_for_protocol: target={} protocol={}",
+                target.display_name(),
+                protocol.as_str()
+            );
+            return Err(eyre::eyre!(
+                "No {} address available for target: {}",
+                protocol.as_str(),
+                target.display_name()
+            ));
         }
 
         // Get protocol-specific IP address
         let target_ip = match target.primary_ip_for_protocol(protocol) {
             Some(ip) => ip,
             None => {
-                log::warn!("[scan::traceroute] no_ip_for_protocol: target={} protocol={}",
-                    target.display_name(), protocol.as_str());
-                return Err(eyre::eyre!("No {} IP address available for target: {}", protocol.as_str(), target.display_name()));
+                log::warn!(
+                    "[scan::traceroute] no_ip_for_protocol: target={} protocol={}",
+                    target.display_name(),
+                    protocol.as_str()
+                );
+                return Err(eyre::eyre!(
+                    "No {} IP address available for target: {}",
+                    protocol.as_str(),
+                    target.display_name()
+                ));
             }
         };
 
-        log::debug!("[scan::traceroute] protocol_target: {} -> {} ({})",
-            target.display_name(), target_ip, protocol.as_str());
+        log::debug!(
+            "[scan::traceroute] protocol_target: {} -> {} ({})",
+            target.display_name(),
+            target_ip,
+            protocol.as_str()
+        );
 
         let traceroute_data = self.perform_traceroute_for_ip(target, target_ip).await?;
         Ok(traceroute_data)
     }
 
     async fn perform_traceroute_for_ip(&self, target: &Target, target_ip: IpAddr) -> Result<TracerouteData> {
-        log::debug!("[scan::traceroute] perform_traceroute: target={}", target.display_name());
+        log::debug!(
+            "[scan::traceroute] perform_traceroute: target={}",
+            target.display_name()
+        );
 
         let start_time = Instant::now();
         let ipv6 = target_ip.is_ipv6();
 
-        log::debug!("[scan::traceroute] target_determined: target={} ip={} ipv6={}",
-            target.display_name(), target_ip, ipv6);
+        log::debug!(
+            "[scan::traceroute] target_determined: target={} ip={} ipv6={}",
+            target.display_name(),
+            target_ip,
+            ipv6
+        );
 
         // Build traceroute command
         let mut cmd = Command::new(if ipv6 { "traceroute6" } else { "traceroute" });
         cmd.args([
             "-n", // Don't resolve hostnames
-            "-w", &self.timeout.as_secs().to_string(), // Wait time
-            "-m", &self.max_hops.to_string(), // Max hops
-            "-q", &self.probes_per_hop.to_string(), // Probes per hop
+            "-w",
+            &self.timeout.as_secs().to_string(), // Wait time
+            "-m",
+            &self.max_hops.to_string(), // Max hops
+            "-q",
+            &self.probes_per_hop.to_string(), // Probes per hop
             &target_ip.to_string(),
         ]);
 
-        log::trace!("[scan::traceroute] executing_command: target={} cmd={:?}",
-            target.display_name(), cmd);
+        log::trace!(
+            "[scan::traceroute] executing_command: target={} cmd={:?}",
+            target.display_name(),
+            cmd
+        );
 
         let command_start = Instant::now();
-        let output = cmd.output().await
-            .wrap_err("Failed to execute traceroute command")?;
+        let output = cmd.output().await.wrap_err("Failed to execute traceroute command")?;
         let command_duration = command_start.elapsed();
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("[scan::traceroute] command_failed: target={} duration={}ms status={} stderr={}",
-                target.display_name(), command_duration.as_millis(), output.status, stderr.trim());
+            log::error!(
+                "[scan::traceroute] command_failed: target={} duration={}ms status={} stderr={}",
+                target.display_name(),
+                command_duration.as_millis(),
+                output.status,
+                stderr.trim()
+            );
             return Err(eyre::eyre!("Traceroute command failed: {}", stderr));
         }
 
-        let stdout = String::from_utf8(output.stdout)
-            .wrap_err("Invalid UTF-8 in traceroute output")?;
+        let stdout = String::from_utf8(output.stdout).wrap_err("Invalid UTF-8 in traceroute output")?;
 
-        log::trace!("[scan::traceroute] command_completed: target={} duration={}ms output_len={}",
-            target.display_name(), command_duration.as_millis(), stdout.len());
+        log::trace!(
+            "[scan::traceroute] command_completed: target={} duration={}ms output_len={}",
+            target.display_name(),
+            command_duration.as_millis(),
+            stdout.len()
+        );
 
         let parse_start = Instant::now();
         let result = self.parse_traceroute_output(&stdout, target_ip, ipv6, start_time.elapsed())?;
         let parse_duration = parse_start.elapsed();
 
-        log::debug!("[scan::traceroute] traceroute_completed: target={} duration={}ms parse_duration={}μs hops={} destination_reached={}",
-            target.display_name(), result.scan_duration.as_millis(), parse_duration.as_micros(),
-            result.hops.len(), result.destination_reached);
+        log::debug!(
+            "[scan::traceroute] traceroute_completed: target={} duration={}ms parse_duration={}μs hops={} destination_reached={}",
+            target.display_name(),
+            result.scan_duration.as_millis(),
+            parse_duration.as_micros(),
+            result.hops.len(),
+            result.destination_reached
+        );
 
         if !result.hops.is_empty() {
-            let hop_summary: Vec<String> = result.hops.iter().take(HOP_SUMMARY_DISPLAY_COUNT).map(|h| {
-                format!("{}:{:.1}ms", h.hop_number,
-                    h.best_rtt.map(|d| d.as_millis() as f32).unwrap_or(-1.0))
-            }).collect();
-            log::trace!("[scan::traceroute] hop_summary: target={} first_5_hops=[{}]",
-                target.display_name(), hop_summary.join(", "));
+            let hop_summary: Vec<String> = result
+                .hops
+                .iter()
+                .take(HOP_SUMMARY_DISPLAY_COUNT)
+                .map(|h| {
+                    format!(
+                        "{}:{:.1}ms",
+                        h.hop_number,
+                        h.best_rtt.map(|d| d.as_millis() as f32).unwrap_or(-1.0)
+                    )
+                })
+                .collect();
+            log::trace!(
+                "[scan::traceroute] hop_summary: target={} first_5_hops=[{}]",
+                target.display_name(),
+                hop_summary.join(", ")
+            );
         }
 
         Ok(result)
     }
-
-
 
     fn parse_traceroute_output(
         &self,
@@ -233,12 +302,11 @@ impl TracerouteScanner {
                 total_hops = hop.hop_number;
 
                 // Check if this hop reached the destination
-                if let Some(response) = hop.responses.first() {
-                    if let Some(ip) = response.ip_address {
-                        if ip == target_ip {
-                            destination_reached = true;
-                        }
-                    }
+                if let Some(response) = hop.responses.first()
+                    && let Some(ip) = response.ip_address
+                    && ip == target_ip
+                {
+                    destination_reached = true;
                 }
 
                 hops.push(hop);
@@ -292,7 +360,9 @@ impl TracerouteScanner {
                 let rtt_str = parts[i + 1];
 
                 let ip_address = ip_str.parse::<IpAddr>().ok();
-                let rtt = rtt_str.parse::<f64>().ok()
+                let rtt = rtt_str
+                    .parse::<f64>()
+                    .ok()
                     .map(|ms| Duration::from_micros((ms * MS_TO_MICROSECONDS_MULTIPLIER) as u64));
 
                 responses.push(HopResponse {
@@ -305,12 +375,13 @@ impl TracerouteScanner {
             } else if i + 1 < parts.len() && parts[i + 1] == "ms" {
                 // Additional RTT for same IP: "2.345 ms"
                 let rtt_str = parts[i];
-                let rtt = rtt_str.parse::<f64>().ok()
+                let rtt = rtt_str
+                    .parse::<f64>()
+                    .ok()
                     .map(|ms| Duration::from_micros((ms * MS_TO_MICROSECONDS_MULTIPLIER) as u64));
 
                 // Use the same IP as the previous response
-                let ip_address = responses.last()
-                    .and_then(|r| r.ip_address);
+                let ip_address = responses.last().and_then(|r| r.ip_address);
 
                 responses.push(HopResponse {
                     ip_address,
@@ -325,9 +396,7 @@ impl TracerouteScanner {
         }
 
         // Calculate statistics
-        let rtts: Vec<Duration> = responses.iter()
-            .filter_map(|r| r.rtt)
-            .collect();
+        let rtts: Vec<Duration> = responses.iter().filter_map(|r| r.rtt).collect();
 
         let best_rtt = rtts.iter().min().copied();
         let worst_rtt = rtts.iter().max().copied();
@@ -358,54 +427,74 @@ impl TracerouteScanner {
 #[async_trait]
 impl Scanner for TracerouteScanner {
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
-        log::debug!("[scan::traceroute] scan: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::traceroute] scan: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         let scan_start = Instant::now();
         let mut result = TracerouteResult::new();
 
         match protocol {
-            Protocol::Ipv4 => {
-                match self.traceroute_protocol(target, Protocol::Ipv4).await {
-                    Ok(data) => {
-                        result.ipv4_result = Some(data.clone());
-                        result.ipv4_status = TracerouteStatus::Success(data.total_hops);
-                        log::trace!("[scan::traceroute] ipv4_traceroute_completed: target={} hops={} complete={}",
-                            target.display_name(), data.total_hops, data.destination_reached);
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        if error_str.contains("address available") {
-                            result.ipv4_status = TracerouteStatus::NoAddress;
-                            log::warn!("[scan::traceroute] ipv4_traceroute_no_address: target={}", target.display_name());
-                        } else {
-                            result.ipv4_status = TracerouteStatus::Failed(error_str);
-                            log::error!("[scan::traceroute] ipv4_traceroute_failed: target={} error={}",
-                                target.display_name(), e);
-                        }
+            Protocol::Ipv4 => match self.traceroute_protocol(target, Protocol::Ipv4).await {
+                Ok(data) => {
+                    result.ipv4_result = Some(data.clone());
+                    result.ipv4_status = TracerouteStatus::Success(data.total_hops);
+                    log::trace!(
+                        "[scan::traceroute] ipv4_traceroute_completed: target={} hops={} complete={}",
+                        target.display_name(),
+                        data.total_hops,
+                        data.destination_reached
+                    );
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("address available") {
+                        result.ipv4_status = TracerouteStatus::NoAddress;
+                        log::warn!(
+                            "[scan::traceroute] ipv4_traceroute_no_address: target={}",
+                            target.display_name()
+                        );
+                    } else {
+                        result.ipv4_status = TracerouteStatus::Failed(error_str);
+                        log::error!(
+                            "[scan::traceroute] ipv4_traceroute_failed: target={} error={}",
+                            target.display_name(),
+                            e
+                        );
                     }
                 }
-            }
-            Protocol::Ipv6 => {
-                match self.traceroute_protocol(target, Protocol::Ipv6).await {
-                    Ok(data) => {
-                        result.ipv6_result = Some(data.clone());
-                        result.ipv6_status = TracerouteStatus::Success(data.total_hops);
-                        log::trace!("[scan::traceroute] ipv6_traceroute_completed: target={} hops={} complete={}",
-                            target.display_name(), data.total_hops, data.destination_reached);
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        if error_str.contains("address available") {
-                            result.ipv6_status = TracerouteStatus::NoAddress;
-                            log::warn!("[scan::traceroute] ipv6_traceroute_no_address: target={}", target.display_name());
-                        } else {
-                            result.ipv6_status = TracerouteStatus::Failed(error_str);
-                            log::error!("[scan::traceroute] ipv6_traceroute_failed: target={} error={}",
-                                target.display_name(), e);
-                        }
+            },
+            Protocol::Ipv6 => match self.traceroute_protocol(target, Protocol::Ipv6).await {
+                Ok(data) => {
+                    result.ipv6_result = Some(data.clone());
+                    result.ipv6_status = TracerouteStatus::Success(data.total_hops);
+                    log::trace!(
+                        "[scan::traceroute] ipv6_traceroute_completed: target={} hops={} complete={}",
+                        target.display_name(),
+                        data.total_hops,
+                        data.destination_reached
+                    );
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("address available") {
+                        result.ipv6_status = TracerouteStatus::NoAddress;
+                        log::warn!(
+                            "[scan::traceroute] ipv6_traceroute_no_address: target={}",
+                            target.display_name()
+                        );
+                    } else {
+                        result.ipv6_status = TracerouteStatus::Failed(error_str);
+                        log::error!(
+                            "[scan::traceroute] ipv6_traceroute_failed: target={} error={}",
+                            target.display_name(),
+                            e
+                        );
                     }
                 }
-            }
+            },
             Protocol::Both => {
                 // Run both IPv4 and IPv6 traceroutes concurrently
                 let (ipv4_result, ipv6_result) = tokio::join!(
@@ -417,18 +506,28 @@ impl Scanner for TracerouteScanner {
                     Ok(data) => {
                         result.ipv4_result = Some(data.clone());
                         result.ipv4_status = TracerouteStatus::Success(data.total_hops);
-                        log::trace!("[scan::traceroute] ipv4_traceroute_completed: target={} hops={} complete={}",
-                            target.display_name(), data.total_hops, data.destination_reached);
+                        log::trace!(
+                            "[scan::traceroute] ipv4_traceroute_completed: target={} hops={} complete={}",
+                            target.display_name(),
+                            data.total_hops,
+                            data.destination_reached
+                        );
                     }
                     Err(e) => {
                         let error_str = e.to_string();
                         if error_str.contains("address available") {
                             result.ipv4_status = TracerouteStatus::NoAddress;
-                            log::warn!("[scan::traceroute] ipv4_traceroute_no_address: target={}", target.display_name());
+                            log::warn!(
+                                "[scan::traceroute] ipv4_traceroute_no_address: target={}",
+                                target.display_name()
+                            );
                         } else {
                             result.ipv4_status = TracerouteStatus::Failed(error_str);
-                            log::error!("[scan::traceroute] ipv4_traceroute_failed: target={} error={}",
-                                target.display_name(), e);
+                            log::error!(
+                                "[scan::traceroute] ipv4_traceroute_failed: target={} error={}",
+                                target.display_name(),
+                                e
+                            );
                         }
                     }
                 }
@@ -437,18 +536,28 @@ impl Scanner for TracerouteScanner {
                     Ok(data) => {
                         result.ipv6_result = Some(data.clone());
                         result.ipv6_status = TracerouteStatus::Success(data.total_hops);
-                        log::trace!("[scan::traceroute] ipv6_traceroute_completed: target={} hops={} complete={}",
-                            target.display_name(), data.total_hops, data.destination_reached);
+                        log::trace!(
+                            "[scan::traceroute] ipv6_traceroute_completed: target={} hops={} complete={}",
+                            target.display_name(),
+                            data.total_hops,
+                            data.destination_reached
+                        );
                     }
                     Err(e) => {
                         let error_str = e.to_string();
                         if error_str.contains("address available") {
                             result.ipv6_status = TracerouteStatus::NoAddress;
-                            log::warn!("[scan::traceroute] ipv6_traceroute_no_address: target={}", target.display_name());
+                            log::warn!(
+                                "[scan::traceroute] ipv6_traceroute_no_address: target={}",
+                                target.display_name()
+                            );
                         } else {
                             result.ipv6_status = TracerouteStatus::Failed(error_str);
-                            log::error!("[scan::traceroute] ipv6_traceroute_failed: target={} error={}",
-                                target.display_name(), e);
+                            log::error!(
+                                "[scan::traceroute] ipv6_traceroute_failed: target={} error={}",
+                                target.display_name(),
+                                e
+                            );
                         }
                     }
                 }
@@ -459,15 +568,27 @@ impl Scanner for TracerouteScanner {
 
         // Return success if any protocol succeeded
         if result.has_any_success() {
-            log::debug!("[scan::traceroute] scan_completed: target={} protocol={} duration={}ms ipv4_status={:?} ipv6_status={:?}",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis(),
-                result.ipv4_status, result.ipv6_status);
+            log::debug!(
+                "[scan::traceroute] scan_completed: target={} protocol={} duration={}ms ipv4_status={:?} ipv6_status={:?}",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis(),
+                result.ipv4_status,
+                result.ipv6_status
+            );
             Ok(ScanResult::Traceroute(result))
         } else {
-            let error_msg = format!("All traceroute protocols failed: IPv4={:?}, IPv6={:?}",
-                result.ipv4_status, result.ipv6_status);
-            log::error!("[scan::traceroute] scan_failed: target={} protocol={} duration={}ms error={}",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), error_msg);
+            let error_msg = format!(
+                "All traceroute protocols failed: IPv4={:?}, IPv6={:?}",
+                result.ipv4_status, result.ipv6_status
+            );
+            log::error!(
+                "[scan::traceroute] scan_failed: target={} protocol={} duration={}ms error={}",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis(),
+                error_msg
+            );
             Err(eyre::eyre!(error_msg))
         }
     }
@@ -546,7 +667,10 @@ mod tests {
         assert_eq!(hop.responses.len(), 3);
 
         // First response should have IP and RTT
-        assert_eq!(hop.responses[0].ip_address, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 7, 1))));
+        assert_eq!(
+            hop.responses[0].ip_address,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 7, 1)))
+        );
         assert!(!hop.responses[0].timeout);
 
         // Second response should be timeout
@@ -580,7 +704,12 @@ mod tests {
         assert!(scanner.parse_hop_line("").unwrap().is_none());
 
         // Header line
-        assert!(scanner.parse_hop_line("traceroute to 8.8.8.8 (8.8.8.8), 30 hops max").unwrap().is_none());
+        assert!(
+            scanner
+                .parse_hop_line("traceroute to 8.8.8.8 (8.8.8.8), 30 hops max")
+                .unwrap()
+                .is_none()
+        );
 
         // Invalid format
         assert!(scanner.parse_hop_line("not a hop line").unwrap().is_none());
@@ -714,7 +843,10 @@ mod tests {
         let multi_hop = scanner.parse_hop_line(multi_ip_line).unwrap().unwrap();
         assert_eq!(multi_hop.hop_number, 2);
         assert_eq!(multi_hop.responses.len(), 3);
-        assert_eq!(multi_hop.responses[0].ip_address, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert_eq!(
+            multi_hop.responses[0].ip_address,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
     }
 
     #[test]
@@ -767,12 +899,12 @@ mod tests {
         }
 
         match TracerouteStatus::NoAddress {
-            TracerouteStatus::NoAddress => {},
+            TracerouteStatus::NoAddress => {}
             _ => panic!("Expected NoAddress status"),
         }
 
         match TracerouteStatus::NotQueried {
-            TracerouteStatus::NotQueried => {},
+            TracerouteStatus::NotQueried => {}
             _ => panic!("Expected NotQueried status"),
         }
     }

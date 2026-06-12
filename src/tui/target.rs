@@ -1,14 +1,14 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::types::{AppState, ScanStatus};
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * 60; // 3600
@@ -38,7 +38,11 @@ impl TargetPane {
         } else if secs < SECONDS_PER_HOUR {
             format!("{}m {}s", secs / SECONDS_PER_MINUTE, secs % SECONDS_PER_MINUTE)
         } else {
-            format!("{}h {}m", secs / SECONDS_PER_HOUR, (secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE)
+            format!(
+                "{}h {}m",
+                secs / SECONDS_PER_HOUR,
+                (secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE
+            )
         }
     }
 
@@ -66,8 +70,13 @@ impl TargetPane {
             }
         }
 
-        log::trace!("[tui::target] calculate_stats: total={} running={} complete={} failed={}",
-            total, running, complete, failed);
+        log::trace!(
+            "[tui::target] calculate_stats: total={} running={} complete={} failed={}",
+            total,
+            running,
+            complete,
+            failed
+        );
 
         (total, running, complete, failed)
     }
@@ -81,8 +90,13 @@ impl Default for TargetPane {
 
 impl Pane for TargetPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::target] render: area={}x{} focused={} target={}",
-            area.width, area.height, focused, state.target);
+        log::trace!(
+            "[tui::target] render: area={}x{} focused={} target={}",
+            area.width,
+            area.height,
+            focused,
+            state.target
+        );
 
         let block = create_block(self.title, focused);
 
@@ -107,7 +121,7 @@ impl Pane for TargetPane {
             Span::styled("Protocol: ", Style::default().fg(Color::White)),
             Span::styled(
                 format!("{} (Press 'p' to cycle)", state.protocol_display()),
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(Color::Cyan),
             ),
         ]));
 
@@ -395,7 +409,7 @@ impl Pane for TargetPane {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default().fg(Color::Green)
-                }
+                },
             ),
         ]));
 
@@ -408,21 +422,20 @@ impl Pane for TargetPane {
                 Span::styled(format!("{} ", icon), Style::default().fg(color)),
                 Span::styled(
                     format!("{}: ", scanner.key().to_uppercase()),
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::White),
                 ),
-                Span::styled(
-                    Self::format_elapsed(elapsed),
-                    Style::default().fg(Color::Gray)
-                ),
+                Span::styled(Self::format_elapsed(elapsed), Style::default().fg(Color::Gray)),
             ]));
         }
 
-        log::trace!("[tui::target] content_prepared: lines={} scanners={}",
-            lines.len(), state.scanners.len());
+        log::trace!(
+            "[tui::target] content_prepared: lines={} scanners={}",
+            lines.len(),
+            state.scanners.len()
+        );
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
 
         paragraph.render(inner_area, frame.buffer_mut());
     }
@@ -451,8 +464,8 @@ impl Pane for TargetPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ScanState, ScanStatus};
     use crate::target::Protocol;
+    use crate::types::{ScanState, ScanStatus};
     use dashmap::DashMap;
     use std::time::Instant;
 
@@ -499,29 +512,38 @@ mod tests {
         };
 
         // Add some test scanner states
-        state.scanners.insert("ping".to_string(), ScanState {
-            result: None,
-            error: None,
-            status: ScanStatus::Complete,
-            last_updated: Instant::now(),
-            history: Default::default(),
-        });
+        state.scanners.insert(
+            "ping".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
 
-        state.scanners.insert("dns".to_string(), ScanState {
-            result: None,
-            error: None,
-            status: ScanStatus::Running,
-            last_updated: Instant::now(),
-            history: Default::default(),
-        });
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
 
-        state.scanners.insert("http".to_string(), ScanState {
-            result: None,
-            error: Some(eyre::eyre!("Connection failed")),
-            status: ScanStatus::Failed,
-            last_updated: Instant::now(),
-            history: Default::default(),
-        });
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: None,
+                error: Some(eyre::eyre!("Connection failed")),
+                status: ScanStatus::Failed,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
 
         let (total, running, complete, failed) = TargetPane::calculate_stats(&state);
         assert_eq!(total, 3);

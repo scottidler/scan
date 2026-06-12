@@ -1,14 +1,14 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::types::{AppState, ScanResult};
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const EXPIRY_WARNING_DAYS: i64 = 30;
 const EXPIRY_CAUTION_DAYS: i64 = 90;
@@ -39,8 +39,12 @@ impl Default for WhoisPane {
 
 impl Pane for WhoisPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::whois] render: area={}x{} focused={}",
-            area.width, area.height, focused);
+        log::trace!(
+            "[tui::whois] render: area={}x{} focused={}",
+            area.width,
+            area.height,
+            focused
+        );
 
         let block = create_block(self.title, focused);
 
@@ -77,7 +81,7 @@ impl Pane for WhoisPane {
                         crate::types::ScanStatus::Running => Color::Yellow,
                         crate::types::ScanStatus::Complete => Color::Green,
                         crate::types::ScanStatus::Failed => Color::Red,
-                    })
+                    }),
                 ),
             ]);
 
@@ -85,20 +89,14 @@ impl Pane for WhoisPane {
                 // Domain name
                 lines.push(Line::from(vec![
                     Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        whois_result.domain.clone(),
-                        Style::default().fg(Color::Cyan)
-                    ),
+                    Span::styled(whois_result.domain.clone(), Style::default().fg(Color::Cyan)),
                 ]));
 
                 // Registrar
                 if let Some(registrar) = &whois_result.registrar {
                     lines.push(Line::from(vec![
                         Span::styled("🏢 Registrar: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            registrar.name.clone(),
-                            Style::default().fg(Color::Green)
-                        ),
+                        Span::styled(registrar.name.clone(), Style::default().fg(Color::Green)),
                     ]));
                 }
 
@@ -108,7 +106,7 @@ impl Pane for WhoisPane {
                         Span::styled("📅 Created: ", Style::default().fg(Color::White)),
                         Span::styled(
                             created.format("%Y-%m-%d").to_string(),
-                            Style::default().fg(Color::Yellow)
+                            Style::default().fg(Color::Yellow),
                         ),
                     ]));
                 }
@@ -131,7 +129,7 @@ impl Pane for WhoisPane {
                         Span::styled("⏰ Expires: ", Style::default().fg(Color::White)),
                         Span::styled(
                             format!("{} ({}d)", expires.format("%Y-%m-%d"), days_until_expiry),
-                            Style::default().fg(expiry_color)
+                            Style::default().fg(expiry_color),
                         ),
                     ]));
                 }
@@ -139,18 +137,11 @@ impl Pane for WhoisPane {
                 // Name servers (show all)
                 if !whois_result.nameservers.is_empty() {
                     for (i, nameserver) in whois_result.nameservers.iter().enumerate() {
-                        let prefix = if i == 0 {
-                            "🔗 NS: "
-                        } else {
-                            "     "
-                        };
+                        let prefix = if i == 0 { "🔗 NS: " } else { "     " };
 
                         lines.push(Line::from(vec![
                             Span::styled(prefix, Style::default().fg(Color::White)),
-                            Span::styled(
-                                nameserver.clone(),
-                                Style::default().fg(Color::Magenta)
-                            ),
+                            Span::styled(nameserver.clone(), Style::default().fg(Color::Magenta)),
                         ]));
                     }
                 }
@@ -166,18 +157,11 @@ impl Pane for WhoisPane {
                             Color::Red
                         };
 
-                        let prefix = if i == 0 {
-                            "📊 Status: "
-                        } else {
-                            "         "
-                        };
+                        let prefix = if i == 0 { "📊 Status: " } else { "         " };
 
                         lines.push(Line::from(vec![
                             Span::styled(prefix, Style::default().fg(Color::White)),
-                            Span::styled(
-                                status.clone(),
-                                Style::default().fg(status_color)
-                            ),
+                            Span::styled(status.clone(), Style::default().fg(status_color)),
                         ]));
                     }
                 }
@@ -194,7 +178,7 @@ impl Pane for WhoisPane {
                     Span::styled("🔐 Privacy: ", Style::default().fg(Color::White)),
                     Span::styled(
                         format!("{:?}", whois_result.privacy_score),
-                        Style::default().fg(privacy_color)
+                        Style::default().fg(privacy_color),
                     ),
                 ]));
 
@@ -204,7 +188,7 @@ impl Pane for WhoisPane {
                         Span::styled("⚠️  Risks: ", Style::default().fg(Color::White)),
                         Span::styled(
                             whois_result.risk_indicators.len().to_string(),
-                            Style::default().fg(Color::Red)
+                            Style::default().fg(Color::Red),
                         ),
                         Span::styled(" indicators", Style::default().fg(Color::Red)),
                     ]));
@@ -223,10 +207,7 @@ impl Pane for WhoisPane {
 
                         lines.push(Line::from(vec![
                             Span::styled("     • ", Style::default().fg(Color::Red)),
-                            Span::styled(
-                                risk_text,
-                                Style::default().fg(Color::Red)
-                            ),
+                            Span::styled(risk_text, Style::default().fg(Color::Red)),
                         ]));
                     }
                 }
@@ -242,10 +223,9 @@ impl Pane for WhoisPane {
                     Span::styled("📡 Source: ", Style::default().fg(Color::White)),
                     Span::styled(
                         format!("{:?}", whois_result.data_source),
-                        Style::default().fg(source_color)
+                        Style::default().fg(source_color),
                     ),
                 ]));
-
             } else {
                 // No WHOIS data available yet - check scanner status
                 match whois_state.status {
@@ -288,8 +268,7 @@ impl Pane for WhoisPane {
         }
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
 

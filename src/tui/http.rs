@@ -1,14 +1,14 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::types::{AppState, ScanResult};
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const URL_DISPLAY_MAX_LENGTH: usize = 35;
 const URL_TRUNCATE_LENGTH: usize = 32;
@@ -68,8 +68,12 @@ impl Default for HttpPane {
 
 impl Pane for HttpPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::http] render: area={}x{} focused={}",
-            area.width, area.height, focused);
+        log::trace!(
+            "[tui::http] render: area={}x{} focused={}",
+            area.width,
+            area.height,
+            focused
+        );
 
         let block = create_block(self.title, focused);
 
@@ -106,7 +110,7 @@ impl Pane for HttpPane {
                         crate::types::ScanStatus::Running => Color::Yellow,
                         crate::types::ScanStatus::Complete => Color::Green,
                         crate::types::ScanStatus::Failed => Color::Red,
-                    })
+                    }),
                 ),
             ]);
 
@@ -125,7 +129,7 @@ impl Pane for HttpPane {
                         Span::styled("📊 Status: ", Style::default().fg(Color::White)),
                         Span::styled(
                             format!("{}", primary_data.status_code),
-                            Style::default().fg(status_color)
+                            Style::default().fg(status_color),
                         ),
                     ]));
 
@@ -141,20 +145,14 @@ impl Pane for HttpPane {
 
                     lines.push(Line::from(vec![
                         Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            format!("{}ms", response_time_ms),
-                            Style::default().fg(time_color)
-                        ),
+                        Span::styled(format!("{}ms", response_time_ms), Style::default().fg(time_color)),
                     ]));
 
                     // Content type
                     if let Some(content_type) = &primary_data.content_type {
                         lines.push(Line::from(vec![
                             Span::styled("📄 Type: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                content_type.clone(),
-                                Style::default().fg(Color::Yellow)
-                            ),
+                            Span::styled(content_type.clone(), Style::default().fg(Color::Yellow)),
                         ]));
                     }
 
@@ -163,24 +161,23 @@ impl Pane for HttpPane {
                         Span::styled("📏 Size: ", Style::default().fg(Color::White)),
                         Span::styled(
                             format!("{} bytes", primary_data.content_length),
-                            Style::default().fg(Color::Green)
+                            Style::default().fg(Color::Green),
                         ),
                     ]));
 
                     // Security grade - use the best grade from all protocols
                     if let Some(security_grade) = http_result.get_best_security_grade() {
                         let grade_color = match security_grade {
-                            crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => Color::Green,
+                            crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => {
+                                Color::Green
+                            }
                             crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
                             crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
                         };
 
                         lines.push(Line::from(vec![
                             Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                format!("{:?}", security_grade),
-                                Style::default().fg(grade_color)
-                            ),
+                            Span::styled(format!("{:?}", security_grade), Style::default().fg(grade_color)),
                         ]));
                     }
 
@@ -190,7 +187,7 @@ impl Pane for HttpPane {
                             Span::styled("🔗 Redirects: ", Style::default().fg(Color::White)),
                             Span::styled(
                                 primary_data.redirect_chain.len().to_string(),
-                                Style::default().fg(Color::Magenta)
+                                Style::default().fg(Color::Magenta),
                             ),
                         ]));
 
@@ -204,7 +201,10 @@ impl Pane for HttpPane {
                                 Span::styled(from_url, Style::default().fg(Color::Gray)),
                                 Span::styled(" → ", Style::default().fg(Color::Magenta)),
                                 Span::styled(to_url, Style::default().fg(Color::Cyan)),
-                                Span::styled(format!(" ({})", redirect.status_code), Style::default().fg(Color::Yellow)),
+                                Span::styled(
+                                    format!(" ({})", redirect.status_code),
+                                    Style::default().fg(Color::Yellow),
+                                ),
                             ]));
                         }
                     }
@@ -214,10 +214,7 @@ impl Pane for HttpPane {
                     if !all_vulnerabilities.is_empty() {
                         lines.push(Line::from(vec![
                             Span::styled("⚠️  Issues: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                all_vulnerabilities.len().to_string(),
-                                Style::default().fg(Color::Red)
-                            ),
+                            Span::styled(all_vulnerabilities.len().to_string(), Style::default().fg(Color::Red)),
                         ]));
 
                         // Show each vulnerability
@@ -225,7 +222,9 @@ impl Pane for HttpPane {
                             let vuln_text = match vulnerability {
                                 crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS",
                                 crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options",
-                                crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options",
+                                crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => {
+                                    "Missing X-Content-Type-Options"
+                                }
                                 crate::scan::http::HttpVulnerability::MissingCsp => "Missing CSP",
                                 crate::scan::http::HttpVulnerability::WeakCsp => "Weak CSP",
                                 crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS",
@@ -276,8 +275,7 @@ impl Pane for HttpPane {
         }
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
 

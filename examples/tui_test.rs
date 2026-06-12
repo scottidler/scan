@@ -1,5 +1,5 @@
-use scan::types::{AppState, ScanState, ScanStatus};
 use scan::tui::{TuiApp, init_terminal, restore_terminal};
+use scan::types::{AppState, ScanState, ScanStatus};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -12,29 +12,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         #[allow(unused_mut)]
         let mut state_guard = state.lock().unwrap();
-        state_guard.scanners.insert("ping".to_string(), ScanState {
-            result: None,
-            error: None,
-            status: ScanStatus::Complete,
-            last_updated: Instant::now(),
-            history: Default::default(),
-        });
+        state_guard.scanners.insert(
+            "ping".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
 
-        state_guard.scanners.insert("dns".to_string(), ScanState {
-            result: None,
-            error: None,
-            status: ScanStatus::Running,
-            last_updated: Instant::now(),
-            history: Default::default(),
-        });
+        state_guard.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
 
-        state_guard.scanners.insert("http".to_string(), ScanState {
-            result: None,
-            error: Some(eyre::eyre!("Connection timeout")),
-            status: ScanStatus::Failed,
-            last_updated: Instant::now(),
-            history: Default::default(),
-        });
+        state_guard.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: None,
+                error: Some(eyre::eyre!("Connection timeout")),
+                status: ScanStatus::Failed,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
     }
 
     // Initialize terminal

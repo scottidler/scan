@@ -1,14 +1,14 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::types::{AppState, ScanResult};
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const MIN_GEOIP_PANE_WIDTH: u16 = 30;
 const MIN_GEOIP_PANE_HEIGHT: u16 = 10;
@@ -37,8 +37,12 @@ impl Default for GeoIpPane {
 
 impl Pane for GeoIpPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::geoip] render: area={}x{} focused={}",
-            area.width, area.height, focused);
+        log::trace!(
+            "[tui::geoip] render: area={}x{} focused={}",
+            area.width,
+            area.height,
+            focused
+        );
 
         let block = create_block(self.title, focused);
 
@@ -75,7 +79,7 @@ impl Pane for GeoIpPane {
                         crate::types::ScanStatus::Running => Color::Yellow,
                         crate::types::ScanStatus::Complete => Color::Green,
                         crate::types::ScanStatus::Failed => Color::Red,
-                    })
+                    }),
                 ),
             ]);
 
@@ -88,10 +92,7 @@ impl Pane for GeoIpPane {
 
                         lines.push(Line::from(vec![
                             Span::styled("📍 Location: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                location_text,
-                                Style::default().fg(Color::Green)
-                            ),
+                            Span::styled(location_text, Style::default().fg(Color::Green)),
                         ]));
 
                         // Coordinates
@@ -99,17 +100,14 @@ impl Pane for GeoIpPane {
                             Span::styled("📐 Coords: ", Style::default().fg(Color::White)),
                             Span::styled(
                                 format!("{:.4}, {:.4}", location.latitude, location.longitude),
-                                Style::default().fg(Color::Yellow)
+                                Style::default().fg(Color::Yellow),
                             ),
                         ]));
 
                         // Timezone
                         lines.push(Line::from(vec![
                             Span::styled("🕐 TZ: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                location.timezone.clone(),
-                                Style::default().fg(Color::Yellow)
-                            ),
+                            Span::styled(location.timezone.clone(), Style::default().fg(Color::Yellow)),
                         ]));
                     }
 
@@ -118,10 +116,7 @@ impl Pane for GeoIpPane {
                         // ISP/Organization
                         lines.push(Line::from(vec![
                             Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                network_info.isp.clone(),
-                                Style::default().fg(Color::Cyan)
-                            ),
+                            Span::styled(network_info.isp.clone(), Style::default().fg(Color::Cyan)),
                         ]));
 
                         // AS Number
@@ -134,10 +129,7 @@ impl Pane for GeoIpPane {
 
                             lines.push(Line::from(vec![
                                 Span::styled("🔗 ASN: ", Style::default().fg(Color::White)),
-                                Span::styled(
-                                    as_text,
-                                    Style::default().fg(Color::Magenta)
-                                ),
+                                Span::styled(as_text, Style::default().fg(Color::Magenta)),
                             ]));
                         }
 
@@ -145,10 +137,7 @@ impl Pane for GeoIpPane {
                         if network_info.organization != network_info.isp {
                             lines.push(Line::from(vec![
                                 Span::styled("🏛️  Org: ", Style::default().fg(Color::White)),
-                                Span::styled(
-                                    network_info.organization.clone(),
-                                    Style::default().fg(Color::Blue)
-                                ),
+                                Span::styled(network_info.organization.clone(), Style::default().fg(Color::Blue)),
                             ]));
                         }
                     }
@@ -156,10 +145,7 @@ impl Pane for GeoIpPane {
                     // Data source
                     lines.push(Line::from(vec![
                         Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            primary_data.data_source.clone(),
-                            Style::default().fg(Color::Gray)
-                        ),
+                        Span::styled(primary_data.data_source.clone(), Style::default().fg(Color::Gray)),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
@@ -167,7 +153,6 @@ impl Pane for GeoIpPane {
                         Span::styled("All protocols failed", Style::default().fg(Color::Red)),
                     ]));
                 }
-
             } else {
                 // No GeoIP data available yet - check scanner status
                 match geoip_state.status {
@@ -210,8 +195,7 @@ impl Pane for GeoIpPane {
         }
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
 

@@ -1,12 +1,12 @@
 use crate::scanner::Scanner;
-use crate::target::{Target, Protocol};
+use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use hickory_resolver::Resolver;
+use log;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
-use log;
 
 const DNS_SCAN_INTERVAL_SECS: u64 = 60;
 const DNS_TIMEOUT_SECS: u64 = 5;
@@ -83,11 +83,11 @@ pub struct EmailSecurityAnalysis {
 
 #[derive(Debug, Clone)]
 pub enum QueryStatus {
-    NotQueried,      // Query was not attempted (due to protocol restrictions)
-    Success(usize),  // Query succeeded with N records
-    NoRecords,       // Query succeeded but returned no records
-    Failed(String),  // Query failed with error message
-    Timeout,         // Query timed out
+    NotQueried,     // Query was not attempted (due to protocol restrictions)
+    Success(usize), // Query succeeded with N records
+    NoRecords,      // Query succeeded but returned no records
+    Failed(String), // Query failed with error message
+    Timeout,        // Query timed out
 }
 
 impl QueryStatus {
@@ -136,6 +136,12 @@ pub struct DnsResult {
     pub queried_at: Instant,
 }
 
+impl Default for DnsResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DnsResult {
     pub fn new() -> Self {
         Self {
@@ -174,6 +180,12 @@ pub struct DnsScanner {
     timeout: Duration,
 }
 
+impl Default for DnsScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DnsScanner {
     pub fn new() -> Self {
         log::debug!("[scan::dns] new: interval=60s timeout=5s");
@@ -183,9 +195,16 @@ impl DnsScanner {
         }
     }
 
-    async fn analyze_email_security(&self, txt_records: &[DnsRecord<String>], mx_records: &[DnsRecord<MxRecord>]) -> EmailSecurityAnalysis {
-        log::debug!("[scan::dns] analyze_email_security: txt_count={} mx_count={}",
-            txt_records.len(), mx_records.len());
+    async fn analyze_email_security(
+        &self,
+        txt_records: &[DnsRecord<String>],
+        mx_records: &[DnsRecord<MxRecord>],
+    ) -> EmailSecurityAnalysis {
+        log::debug!(
+            "[scan::dns] analyze_email_security: txt_count={} mx_count={}",
+            txt_records.len(),
+            mx_records.len()
+        );
 
         let mut spf_record = None;
         let mut dmarc_record = None;
@@ -211,7 +230,10 @@ impl DnsScanner {
         for selector in common_selectors {
             // We would implement DKIM lookup here
             // For now, just add to the list if we find evidence of DKIM usage
-            if txt_records.iter().any(|r| r.value.contains("k=rsa") || r.value.contains("p=")) {
+            if txt_records
+                .iter()
+                .any(|r| r.value.contains("k=rsa") || r.value.contains("p="))
+            {
                 dkim_domains.push(format!("{}._domainkey", selector));
                 log::trace!("[scan::dns] found_dkim_evidence: selector={}", selector);
                 break; // Only add one entry to avoid duplicates
@@ -226,16 +248,24 @@ impl DnsScanner {
             dkim_domains: dkim_domains.clone(),
         };
 
-        log::debug!("[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={} dkim_count={}",
-            analysis.spf_record.is_some(), analysis.dmarc_record.is_some(),
-            analysis.mx_count, analysis.dkim_domains.len());
+        log::debug!(
+            "[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={} dkim_count={}",
+            analysis.spf_record.is_some(),
+            analysis.dmarc_record.is_some(),
+            analysis.mx_count,
+            analysis.dkim_domains.len()
+        );
 
         analysis
     }
 
     async fn perform_dns_lookup(&self, target: &Target, protocol: Protocol) -> Result<DnsResult> {
-        log::debug!("[scan::dns] perform_dns_lookup: target={} domain={:?} protocol={}",
-            target.display_name(), target.domain, protocol.as_str());
+        log::debug!(
+            "[scan::dns] perform_dns_lookup: target={} domain={:?} protocol={}",
+            target.display_name(),
+            target.domain,
+            protocol.as_str()
+        );
 
         let start_time = Instant::now();
         let mut result = DnsResult::new();
@@ -244,8 +274,12 @@ impl DnsScanner {
         let resolver = match Resolver::builder_tokio() {
             Ok(builder) => {
                 let r = builder.build();
-                log::trace!("[scan::dns] resolver_created: duration={}μs timeout={}ms protocol={}",
-                    start_time.elapsed().as_micros(), self.timeout.as_millis(), protocol.as_str());
+                log::trace!(
+                    "[scan::dns] resolver_created: duration={}μs timeout={}ms protocol={}",
+                    start_time.elapsed().as_micros(),
+                    self.timeout.as_millis(),
+                    protocol.as_str()
+                );
                 r
             }
             Err(e) => {
@@ -256,7 +290,11 @@ impl DnsScanner {
 
         // Forward DNS lookups (for domains)
         if let Some(domain) = &target.domain {
-            log::debug!("[scan::dns] starting_forward_lookups: domain={} protocol={}", domain, protocol.as_str());
+            log::debug!(
+                "[scan::dns] starting_forward_lookups: domain={} protocol={}",
+                domain,
+                protocol.as_str()
+            );
 
             // A records (IPv4) - only query if protocol supports IPv4
             if matches!(protocol, Protocol::Ipv4 | Protocol::Both) {
@@ -265,7 +303,10 @@ impl DnsScanner {
                     Ok(Ok(response)) => {
                         let a_duration = a_start.elapsed();
                         for ip in response.iter() {
-                            let ttl = response.as_lookup().records().first()
+                            let ttl = response
+                                .as_lookup()
+                                .records()
+                                .first()
                                 .map(|record| record.ttl())
                                 .unwrap_or(DEFAULT_DNS_TTL);
                             result.A.push(DnsRecord::new(ip.0, ttl));
@@ -275,25 +316,44 @@ impl DnsScanner {
                         } else {
                             QueryStatus::Success(result.A.len())
                         };
-                        log::trace!("[scan::dns] a_records_found: domain={} count={} duration={}ms protocol={}",
-                            domain, result.A.len(), a_duration.as_millis(), protocol.as_str());
+                        log::trace!(
+                            "[scan::dns] a_records_found: domain={} count={} duration={}ms protocol={}",
+                            domain,
+                            result.A.len(),
+                            a_duration.as_millis(),
+                            protocol.as_str()
+                        );
                     }
                     Ok(Err(e)) => {
                         let a_duration = a_start.elapsed();
                         result.A_status = QueryStatus::Failed(e.to_string());
-                        log::trace!("[scan::dns] a_records_failed: domain={} duration={}ms error={} protocol={}",
-                            domain, a_duration.as_millis(), e, protocol.as_str());
+                        log::trace!(
+                            "[scan::dns] a_records_failed: domain={} duration={}ms error={} protocol={}",
+                            domain,
+                            a_duration.as_millis(),
+                            e,
+                            protocol.as_str()
+                        );
                     }
                     Err(_) => {
                         let a_duration = a_start.elapsed();
                         result.A_status = QueryStatus::Timeout;
-                        log::warn!("[scan::dns] a_records_timeout: domain={} duration={}ms timeout={}ms protocol={}",
-                            domain, a_duration.as_millis(), self.timeout.as_millis(), protocol.as_str());
+                        log::warn!(
+                            "[scan::dns] a_records_timeout: domain={} duration={}ms timeout={}ms protocol={}",
+                            domain,
+                            a_duration.as_millis(),
+                            self.timeout.as_millis(),
+                            protocol.as_str()
+                        );
                     }
                 }
             } else {
                 result.A_status = QueryStatus::NotQueried;
-                log::trace!("[scan::dns] skipping_a_records: domain={} protocol={}", domain, protocol.as_str());
+                log::trace!(
+                    "[scan::dns] skipping_a_records: domain={} protocol={}",
+                    domain,
+                    protocol.as_str()
+                );
             }
 
             // AAAA records (IPv6) - only query if protocol supports IPv6
@@ -303,7 +363,10 @@ impl DnsScanner {
                     Ok(Ok(response)) => {
                         let aaaa_duration = aaaa_start.elapsed();
                         for ip in response.iter() {
-                            let ttl = response.as_lookup().records().first()
+                            let ttl = response
+                                .as_lookup()
+                                .records()
+                                .first()
                                 .map(|record| record.ttl())
                                 .unwrap_or(DEFAULT_DNS_TTL);
                             result.AAAA.push(DnsRecord::new(ip.0, ttl));
@@ -313,40 +376,69 @@ impl DnsScanner {
                         } else {
                             QueryStatus::Success(result.AAAA.len())
                         };
-                        log::trace!("[scan::dns] aaaa_records_found: domain={} count={} duration={}ms protocol={}",
-                            domain, result.AAAA.len(), aaaa_duration.as_millis(), protocol.as_str());
+                        log::trace!(
+                            "[scan::dns] aaaa_records_found: domain={} count={} duration={}ms protocol={}",
+                            domain,
+                            result.AAAA.len(),
+                            aaaa_duration.as_millis(),
+                            protocol.as_str()
+                        );
                     }
                     Ok(Err(e)) => {
                         let aaaa_duration = aaaa_start.elapsed();
                         // Check if this is a "no records" type error vs a real failure
                         let error_str = e.to_string().to_lowercase();
-                        if error_str.contains("no records found") || error_str.contains("nxdomain") || error_str.contains("name not found") {
+                        if error_str.contains("no records found")
+                            || error_str.contains("nxdomain")
+                            || error_str.contains("name not found")
+                        {
                             result.AAAA_status = QueryStatus::NoRecords;
-                            log::trace!("[scan::dns] aaaa_records_none: domain={} duration={}ms protocol={}",
-                                domain, aaaa_duration.as_millis(), protocol.as_str());
+                            log::trace!(
+                                "[scan::dns] aaaa_records_none: domain={} duration={}ms protocol={}",
+                                domain,
+                                aaaa_duration.as_millis(),
+                                protocol.as_str()
+                            );
                         } else {
                             result.AAAA_status = QueryStatus::Failed(e.to_string());
-                            log::trace!("[scan::dns] aaaa_records_failed: domain={} duration={}ms error={} protocol={}",
-                                domain, aaaa_duration.as_millis(), e, protocol.as_str());
+                            log::trace!(
+                                "[scan::dns] aaaa_records_failed: domain={} duration={}ms error={} protocol={}",
+                                domain,
+                                aaaa_duration.as_millis(),
+                                e,
+                                protocol.as_str()
+                            );
                         }
                     }
                     Err(_) => {
                         let aaaa_duration = aaaa_start.elapsed();
                         result.AAAA_status = QueryStatus::Timeout;
-                        log::warn!("[scan::dns] aaaa_records_timeout: domain={} duration={}ms timeout={}ms protocol={}",
-                            domain, aaaa_duration.as_millis(), self.timeout.as_millis(), protocol.as_str());
+                        log::warn!(
+                            "[scan::dns] aaaa_records_timeout: domain={} duration={}ms timeout={}ms protocol={}",
+                            domain,
+                            aaaa_duration.as_millis(),
+                            self.timeout.as_millis(),
+                            protocol.as_str()
+                        );
                     }
                 }
             } else {
                 result.AAAA_status = QueryStatus::NotQueried;
-                log::trace!("[scan::dns] skipping_aaaa_records: domain={} protocol={}", domain, protocol.as_str());
+                log::trace!(
+                    "[scan::dns] skipping_aaaa_records: domain={} protocol={}",
+                    domain,
+                    protocol.as_str()
+                );
             }
 
             // MX records (protocol-independent, but log protocol for consistency)
             match resolver.mx_lookup(domain).await {
                 Ok(response) => {
                     for mx in response.iter() {
-                        let ttl = response.as_lookup().records().first()
+                        let ttl = response
+                            .as_lookup()
+                            .records()
+                            .first()
                             .map(|record| record.ttl())
                             .unwrap_or(DEFAULT_DNS_TTL);
                         result.MX.push(DnsRecord::new(
@@ -362,13 +454,21 @@ impl DnsScanner {
                     } else {
                         QueryStatus::Success(result.MX.len())
                     };
-                    log::trace!("[scan::dns] mx_records_found: domain={} count={} protocol={}",
-                        domain, result.MX.len(), protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] mx_records_found: domain={} count={} protocol={}",
+                        domain,
+                        result.MX.len(),
+                        protocol.as_str()
+                    );
                 }
                 Err(e) => {
                     result.MX_status = QueryStatus::Failed(e.to_string());
-                    log::trace!("[scan::dns] mx_records_failed: domain={} error={} protocol={}",
-                        domain, e, protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] mx_records_failed: domain={} error={} protocol={}",
+                        domain,
+                        e,
+                        protocol.as_str()
+                    );
                 }
             }
 
@@ -376,10 +476,14 @@ impl DnsScanner {
             match resolver.txt_lookup(domain).await {
                 Ok(response) => {
                     for txt in response.iter() {
-                        let ttl = response.as_lookup().records().first()
+                        let ttl = response
+                            .as_lookup()
+                            .records()
+                            .first()
                             .map(|record| record.ttl())
                             .unwrap_or(DEFAULT_DNS_TTL);
-                        let txt_string = txt.iter()
+                        let txt_string = txt
+                            .iter()
                             .map(|bytes| String::from_utf8_lossy(bytes))
                             .collect::<Vec<_>>()
                             .join("");
@@ -390,13 +494,21 @@ impl DnsScanner {
                     } else {
                         QueryStatus::Success(result.TXT.len())
                     };
-                    log::trace!("[scan::dns] txt_records_found: domain={} count={} protocol={}",
-                        domain, result.TXT.len(), protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] txt_records_found: domain={} count={} protocol={}",
+                        domain,
+                        result.TXT.len(),
+                        protocol.as_str()
+                    );
                 }
                 Err(e) => {
                     result.TXT_status = QueryStatus::Failed(e.to_string());
-                    log::trace!("[scan::dns] txt_records_failed: domain={} error={} protocol={}",
-                        domain, e, protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] txt_records_failed: domain={} error={} protocol={}",
+                        domain,
+                        e,
+                        protocol.as_str()
+                    );
                 }
             }
 
@@ -404,7 +516,10 @@ impl DnsScanner {
             match resolver.ns_lookup(domain).await {
                 Ok(response) => {
                     for ns in response.iter() {
-                        let ttl = response.as_lookup().records().first()
+                        let ttl = response
+                            .as_lookup()
+                            .records()
+                            .first()
                             .map(|record| record.ttl())
                             .unwrap_or(DEFAULT_DNS_TTL);
                         result.NS.push(DnsRecord::new(ns.0.to_string(), ttl));
@@ -414,13 +529,21 @@ impl DnsScanner {
                     } else {
                         QueryStatus::Success(result.NS.len())
                     };
-                    log::trace!("[scan::dns] ns_records_found: domain={} count={} protocol={}",
-                        domain, result.NS.len(), protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] ns_records_found: domain={} count={} protocol={}",
+                        domain,
+                        result.NS.len(),
+                        protocol.as_str()
+                    );
                 }
                 Err(e) => {
                     result.NS_status = QueryStatus::Failed(e.to_string());
-                    log::trace!("[scan::dns] ns_records_failed: domain={} error={} protocol={}",
-                        domain, e, protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] ns_records_failed: domain={} error={} protocol={}",
+                        domain,
+                        e,
+                        protocol.as_str()
+                    );
                 }
             }
 
@@ -449,13 +572,21 @@ impl DnsScanner {
                     } else {
                         QueryStatus::Success(result.SOA.len())
                     };
-                    log::trace!("[scan::dns] soa_records_found: domain={} count={} protocol={}",
-                        domain, result.SOA.len(), protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] soa_records_found: domain={} count={} protocol={}",
+                        domain,
+                        result.SOA.len(),
+                        protocol.as_str()
+                    );
                 }
                 Err(e) => {
                     result.SOA_status = QueryStatus::Failed(e.to_string());
-                    log::trace!("[scan::dns] soa_records_failed: domain={} error={} protocol={}",
-                        domain, e, protocol.as_str());
+                    log::trace!(
+                        "[scan::dns] soa_records_failed: domain={} error={} protocol={}",
+                        domain,
+                        e,
+                        protocol.as_str()
+                    );
                 }
             }
 
@@ -509,20 +640,36 @@ impl DnsScanner {
             } else if srv_queries_successful > 0 {
                 QueryStatus::NoRecords
             } else {
-                QueryStatus::Failed(format!("All {} SRV queries failed: {:?}", srv_queries_attempted, srv_errors))
+                QueryStatus::Failed(format!(
+                    "All {} SRV queries failed: {:?}",
+                    srv_queries_attempted, srv_errors
+                ))
             };
 
             if !result.SRV.is_empty() {
-                log::trace!("[scan::dns] srv_records_found: domain={} count={} protocol={}",
-                    domain, result.SRV.len(), protocol.as_str());
+                log::trace!(
+                    "[scan::dns] srv_records_found: domain={} count={} protocol={}",
+                    domain,
+                    result.SRV.len(),
+                    protocol.as_str()
+                );
             } else {
-                log::trace!("[scan::dns] srv_records_none: domain={} attempted={} successful={} protocol={}",
-                    domain, srv_queries_attempted, srv_queries_successful, protocol.as_str());
+                log::trace!(
+                    "[scan::dns] srv_records_none: domain={} attempted={} successful={} protocol={}",
+                    domain,
+                    srv_queries_attempted,
+                    srv_queries_successful,
+                    protocol.as_str()
+                );
             }
 
             // Email Security Analysis (protocol-independent, but log protocol for consistency)
             result.email_security = Some(self.analyze_email_security(&result.TXT, &result.MX).await);
-            log::trace!("[scan::dns] email_security_analyzed: domain={} protocol={}", domain, protocol.as_str());
+            log::trace!(
+                "[scan::dns] email_security_analyzed: domain={} protocol={}",
+                domain,
+                protocol.as_str()
+            );
         }
 
         // Reverse DNS lookups (for IP addresses) - filter by protocol
@@ -550,18 +697,29 @@ impl DnsScanner {
                     Ok(response) => {
                         ptr_queries_successful += 1;
                         for ptr in response.iter() {
-                            let ttl = response.as_lookup().records().first()
+                            let ttl = response
+                                .as_lookup()
+                                .records()
+                                .first()
                                 .map(|record| record.ttl())
                                 .unwrap_or(DEFAULT_DNS_TTL);
                             result.PTR.push(DnsRecord::new(ptr.to_string(), ttl));
                         }
-                        log::trace!("[scan::dns] ptr_records_found: ip={} count={} protocol={}",
-                            ip, result.PTR.len(), protocol.as_str());
+                        log::trace!(
+                            "[scan::dns] ptr_records_found: ip={} count={} protocol={}",
+                            ip,
+                            result.PTR.len(),
+                            protocol.as_str()
+                        );
                     }
                     Err(e) => {
                         ptr_errors.push(format!("{}: {}", ip, e));
-                        log::trace!("[scan::dns] ptr_records_failed: ip={} error={} protocol={}",
-                            ip, e, protocol.as_str());
+                        log::trace!(
+                            "[scan::dns] ptr_records_failed: ip={} error={} protocol={}",
+                            ip,
+                            e,
+                            protocol.as_str()
+                        );
                     }
                 }
             }
@@ -574,16 +732,27 @@ impl DnsScanner {
             } else if ptr_queries_successful > 0 {
                 QueryStatus::NoRecords
             } else {
-                QueryStatus::Failed(format!("All {} PTR queries failed: {:?}", ptr_queries_attempted, ptr_errors))
+                QueryStatus::Failed(format!(
+                    "All {} PTR queries failed: {:?}",
+                    ptr_queries_attempted, ptr_errors
+                ))
             };
         }
 
         result.response_time = start_time.elapsed();
         result.queried_at = start_time;
 
-        log::debug!("[scan::dns] dns_lookup_completed: target={} protocol={} duration={}ms a_status={:?} aaaa_status={:?} mx_status={:?} txt_status={:?} ptr_status={:?}",
-            target.display_name(), protocol.as_str(), result.response_time.as_millis(),
-            result.A_status, result.AAAA_status, result.MX_status, result.TXT_status, result.PTR_status);
+        log::debug!(
+            "[scan::dns] dns_lookup_completed: target={} protocol={} duration={}ms a_status={:?} aaaa_status={:?} mx_status={:?} txt_status={:?} ptr_status={:?}",
+            target.display_name(),
+            protocol.as_str(),
+            result.response_time.as_millis(),
+            result.A_status,
+            result.AAAA_status,
+            result.MX_status,
+            result.TXT_status,
+            result.PTR_status
+        );
 
         Ok(result)
     }
@@ -592,21 +761,39 @@ impl DnsScanner {
 #[async_trait]
 impl Scanner for DnsScanner {
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
-        log::debug!("[scan::dns] scan: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::dns] scan: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         let scan_start = Instant::now();
         match self.perform_dns_lookup(target, protocol).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::dns] dns_scan_completed: target={} protocol={} duration={}ms response_time={}ms records_found=A:{} AAAA:{} MX:{} TXT:{} NS:{}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.response_time.as_millis(),
-                    result.A.len(), result.AAAA.len(), result.MX.len(), result.TXT.len(), result.NS.len());
+                log::trace!(
+                    "[scan::dns] dns_scan_completed: target={} protocol={} duration={}ms response_time={}ms records_found=A:{} AAAA:{} MX:{} TXT:{} NS:{}",
+                    target.display_name(),
+                    protocol.as_str(),
+                    scan_duration.as_millis(),
+                    result.response_time.as_millis(),
+                    result.A.len(),
+                    result.AAAA.len(),
+                    result.MX.len(),
+                    result.TXT.len(),
+                    result.NS.len()
+                );
                 Ok(ScanResult::Dns(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::dns] dns_scan_failed: target={} protocol={} duration={}ms error={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
+                log::error!(
+                    "[scan::dns] dns_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(),
+                    protocol.as_str(),
+                    scan_duration.as_millis(),
+                    e
+                );
                 Err(e.wrap_err("DNS lookup failed"))
             }
         }

@@ -1,13 +1,13 @@
 use crate::scanner::Scanner;
-use crate::target::{Target, Protocol};
+use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use whois_rust::{WhoIs, WhoIsLookupOptions};
-use log;
 
 const WHOIS_TIMEOUT_SECS: u64 = 30;
 const WHOIS_SCAN_INTERVAL_SECS: u64 = 60 * 60; // 1 hour
@@ -37,12 +37,14 @@ impl WhoisScanner {
             .build()
             .expect("Failed to create HTTP client");
 
-        let whois_client = WhoIs::from_path("/usr/bin/whois")
-            .unwrap_or_else(|_| WhoIs::from_path("/bin/whois")
-                .unwrap_or_else(|_| WhoIs::from_string("whois").unwrap_or_else(|_| {
+        let whois_client = WhoIs::from_path("/usr/bin/whois").unwrap_or_else(|_| {
+            WhoIs::from_path("/bin/whois").unwrap_or_else(|_| {
+                WhoIs::from_string("whois").unwrap_or_else(|_| {
                     // Fallback to a basic whois client if system whois is not available
                     WhoIs::from_host("whois.iana.org").unwrap()
-                })));
+                })
+            })
+        });
 
         Self {
             client,
@@ -71,14 +73,21 @@ impl WhoisScanner {
             Ok(mut result) => {
                 let rdap_duration = rdap_start.elapsed();
                 result.data_source = DataSource::Rdap;
-                log::trace!("[scan::whois] rdap_successful: domain={} duration={}ms",
-                    domain, rdap_duration.as_millis());
+                log::trace!(
+                    "[scan::whois] rdap_successful: domain={} duration={}ms",
+                    domain,
+                    rdap_duration.as_millis()
+                );
                 return Ok(result);
             }
             Err(e) => {
                 let rdap_duration = rdap_start.elapsed();
-                log::debug!("[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={}",
-                    domain, rdap_duration.as_millis(), e);
+                log::debug!(
+                    "[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={}",
+                    domain,
+                    rdap_duration.as_millis(),
+                    e
+                );
             }
         }
 
@@ -89,14 +98,21 @@ impl WhoisScanner {
             Ok(mut result) => {
                 let whois_duration = whois_start.elapsed();
                 result.data_source = DataSource::Whois;
-                log::trace!("[scan::whois] whois_successful: domain={} duration={}ms",
-                    domain, whois_duration.as_millis());
+                log::trace!(
+                    "[scan::whois] whois_successful: domain={} duration={}ms",
+                    domain,
+                    whois_duration.as_millis()
+                );
                 Ok(result)
             }
             Err(e) => {
                 let whois_duration = whois_start.elapsed();
-                log::error!("[scan::whois] both_methods_failed: domain={} whois_duration={}ms error={}",
-                    domain, whois_duration.as_millis(), e);
+                log::error!(
+                    "[scan::whois] both_methods_failed: domain={} whois_duration={}ms error={}",
+                    domain,
+                    whois_duration.as_millis(),
+                    e
+                );
 
                 // Return a failed result rather than error
                 let mut result = WhoisResult {
@@ -129,15 +145,11 @@ impl WhoisScanner {
 
     async fn query_rdap(&self, domain: &str) -> eyre::Result<WhoisResult> {
         let start_time = Instant::now();
-        let tld = domain.split('.').last().unwrap_or("");
+        let tld = domain.split('.').next_back().unwrap_or("");
 
         let rdap_url = self.get_rdap_endpoint(tld, domain);
 
-        let response = self.client
-            .get(&rdap_url)
-            .timeout(self.timeout)
-            .send()
-            .await?;
+        let response = self.client.get(&rdap_url).timeout(self.timeout).send().await?;
 
         if !response.status().is_success() {
             return Err(eyre::eyre!("RDAP query failed with status: {}", response.status()));
@@ -169,7 +181,12 @@ impl WhoisScanner {
         }
     }
 
-    async fn parse_rdap_response(&self, domain: &str, data: serde_json::Value, duration: Duration) -> eyre::Result<WhoisResult> {
+    async fn parse_rdap_response(
+        &self,
+        domain: &str,
+        data: serde_json::Value,
+        duration: Duration,
+    ) -> eyre::Result<WhoisResult> {
         let mut result = WhoisResult {
             domain: domain.to_string(),
             registration_date: None,
@@ -197,16 +214,15 @@ impl WhoisScanner {
             for event in events {
                 if let (Some(action), Some(date)) = (
                     event.get("eventAction").and_then(|a| a.as_str()),
-                    event.get("eventDate").and_then(|d| d.as_str())
-                ) {
-                    if let Ok(parsed_date) = DateTime::parse_from_rfc3339(date) {
-                        let utc_date = parsed_date.with_timezone(&Utc);
-                        match action {
-                            "registration" => result.registration_date = Some(utc_date),
-                            "expiration" => result.expiry_date = Some(utc_date),
-                            "last changed" | "last update of RDAP database" => result.last_updated = Some(utc_date),
-                            _ => {}
-                        }
+                    event.get("eventDate").and_then(|d| d.as_str()),
+                ) && let Ok(parsed_date) = DateTime::parse_from_rfc3339(date)
+                {
+                    let utc_date = parsed_date.with_timezone(&Utc);
+                    match action {
+                        "registration" => result.registration_date = Some(utc_date),
+                        "expiration" => result.expiry_date = Some(utc_date),
+                        "last changed" | "last update of RDAP database" => result.last_updated = Some(utc_date),
+                        _ => {}
                     }
                 }
             }
@@ -362,25 +378,18 @@ impl WhoisScanner {
         };
 
         // Parse vCard data
-        if let Some(vcard) = entity.get("vcardArray").and_then(|v| v.as_array()) {
-            if vcard.len() > 1 {
-                if let Some(properties) = vcard[1].as_array() {
-                    for prop in properties {
-                        if let Some(prop_array) = prop.as_array() {
-                            if prop_array.len() >= 4 {
-                                if let Some(prop_name) = prop_array[0].as_str() {
-                                    match prop_name {
-                                        "fn" => {
-                                            if let Some(name) = prop_array[3].as_str() {
-                                                registrar.name = name.to_string();
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
+        if let Some(vcard) = entity.get("vcardArray").and_then(|v| v.as_array())
+            && vcard.len() > 1
+            && let Some(properties) = vcard[1].as_array()
+        {
+            for prop in properties {
+                if let Some(prop_array) = prop.as_array()
+                    && prop_array.len() >= 4
+                    && let Some(prop_name) = prop_array[0].as_str()
+                    && prop_name == "fn"
+                    && let Some(name) = prop_array[3].as_str()
+                {
+                    registrar.name = name.to_string();
                 }
             }
         }
@@ -390,11 +399,10 @@ impl WhoisScanner {
             for id in public_ids {
                 if let (Some(id_type), Some(identifier)) = (
                     id.get("type").and_then(|t| t.as_str()),
-                    id.get("identifier").and_then(|i| i.as_str())
-                ) {
-                    if id_type == "IANA Registrar ID" {
-                        registrar.iana_id = identifier.parse().ok();
-                    }
+                    id.get("identifier").and_then(|i| i.as_str()),
+                ) && id_type == "IANA Registrar ID"
+                {
+                    registrar.iana_id = identifier.parse().ok();
                 }
             }
         }
@@ -413,28 +421,24 @@ impl WhoisScanner {
             }
         }
 
-        if registrar.name.is_empty() {
-            None
-        } else {
-            Some(registrar)
-        }
+        if registrar.name.is_empty() { None } else { Some(registrar) }
     }
 
     fn parse_contact_info(&self, entity: &serde_json::Value) -> Option<ContactInfo> {
         // Check if contact is redacted
         if let Some(remarks) = entity.get("remarks").and_then(|r| r.as_array()) {
             for remark in remarks {
-                if let Some(title) = remark.get("title").and_then(|t| t.as_str()) {
-                    if title.contains("REDACTED FOR PRIVACY") {
-                        return Some(ContactInfo {
-                            name: None,
-                            organization: None,
-                            email: None,
-                            phone: None,
-                            address: None,
-                            is_redacted: true,
-                        });
-                    }
+                if let Some(title) = remark.get("title").and_then(|t| t.as_str())
+                    && title.contains("REDACTED FOR PRIVACY")
+                {
+                    return Some(ContactInfo {
+                        name: None,
+                        organization: None,
+                        email: None,
+                        phone: None,
+                        address: None,
+                        is_redacted: true,
+                    });
                 }
             }
         }
@@ -449,39 +453,37 @@ impl WhoisScanner {
         };
 
         // Parse vCard data
-        if let Some(vcard) = entity.get("vcardArray").and_then(|v| v.as_array()) {
-            if vcard.len() > 1 {
-                if let Some(properties) = vcard[1].as_array() {
-                    for prop in properties {
-                        if let Some(prop_array) = prop.as_array() {
-                            if prop_array.len() >= 4 {
-                                if let Some(prop_name) = prop_array[0].as_str() {
-                                    match prop_name {
-                                        "fn" => {
-                                            if let Some(name) = prop_array[3].as_str() {
-                                                contact.name = Some(name.to_string());
-                                            }
-                                        }
-                                        "org" => {
-                                            if let Some(org) = prop_array[3].as_str() {
-                                                contact.organization = Some(org.to_string());
-                                            }
-                                        }
-                                        "email" => {
-                                            if let Some(email) = prop_array[3].as_str() {
-                                                contact.email = Some(email.to_string());
-                                            }
-                                        }
-                                        "tel" => {
-                                            if let Some(tel) = prop_array[3].as_str() {
-                                                contact.phone = Some(tel.to_string());
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
+        if let Some(vcard) = entity.get("vcardArray").and_then(|v| v.as_array())
+            && vcard.len() > 1
+            && let Some(properties) = vcard[1].as_array()
+        {
+            for prop in properties {
+                if let Some(prop_array) = prop.as_array()
+                    && prop_array.len() >= 4
+                    && let Some(prop_name) = prop_array[0].as_str()
+                {
+                    match prop_name {
+                        "fn" => {
+                            if let Some(name) = prop_array[3].as_str() {
+                                contact.name = Some(name.to_string());
                             }
                         }
+                        "org" => {
+                            if let Some(org) = prop_array[3].as_str() {
+                                contact.organization = Some(org.to_string());
+                            }
+                        }
+                        "email" => {
+                            if let Some(email) = prop_array[3].as_str() {
+                                contact.email = Some(email.to_string());
+                            }
+                        }
+                        "tel" => {
+                            if let Some(tel) = prop_array[3].as_str() {
+                                contact.phone = Some(tel.to_string());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -497,12 +499,12 @@ impl WhoisScanner {
     fn parse_whois_date(&self, date_str: &str) -> Option<DateTime<Utc>> {
         // Try various date formats commonly used in WHOIS
         let formats = [
-            "%Y-%m-%dT%H:%M:%SZ",           // ISO 8601
-            "%Y-%m-%d %H:%M:%S",            // Common format
-            "%Y-%m-%d",                     // Date only
-            "%d-%b-%Y",                     // DD-MMM-YYYY
-            "%d.%m.%Y",                     // DD.MM.YYYY
-            "%Y/%m/%d",                     // YYYY/MM/DD
+            "%Y-%m-%dT%H:%M:%SZ", // ISO 8601
+            "%Y-%m-%d %H:%M:%S",  // Common format
+            "%Y-%m-%d",           // Date only
+            "%d-%b-%Y",           // DD-MMM-YYYY
+            "%d.%m.%Y",           // DD.MM.YYYY
+            "%Y/%m/%d",           // YYYY/MM/DD
         ];
 
         for format in &formats {
@@ -515,7 +517,7 @@ impl WhoisScanner {
             if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_str, format) {
                 return Some(DateTime::from_naive_utc_and_offset(
                     naive_date.and_hms_opt(0, 0, 0).unwrap(),
-                    Utc
+                    Utc,
                 ));
             }
         }
@@ -546,11 +548,15 @@ impl WhoisScanner {
     }
 
     fn assess_privacy_level(&self, result: &WhoisResult) -> PrivacyLevel {
-        let has_contact_info = result.registrant.as_ref()
+        let has_contact_info = result
+            .registrant
+            .as_ref()
             .map(|c| !c.is_redacted && (c.name.is_some() || c.email.is_some()))
             .unwrap_or(false);
 
-        let has_org_info = result.registrant.as_ref()
+        let has_org_info = result
+            .registrant
+            .as_ref()
             .and_then(|c| c.organization.as_ref())
             .is_some();
 
@@ -571,21 +577,28 @@ impl WhoisScanner {
         let mut indicators = Vec::new();
 
         // Recent registration (< 30 days)
-        if let Some(age_days) = result.domain_age_days {
-            if age_days < RECENT_REGISTRATION_THRESHOLD_DAYS {
-                indicators.push(RiskIndicator::RecentRegistration);
-            }
+        if let Some(age_days) = result.domain_age_days
+            && age_days < RECENT_REGISTRATION_THRESHOLD_DAYS
+        {
+            indicators.push(RiskIndicator::RecentRegistration);
         }
 
         // Near expiry (< 30 days)
-        if let Some(expires_in) = result.expires_in_days {
-            if expires_in < NEAR_EXPIRY_THRESHOLD_DAYS && expires_in > 0 {
-                indicators.push(RiskIndicator::NearExpiry);
-            }
+        if let Some(expires_in) = result.expires_in_days
+            && expires_in < NEAR_EXPIRY_THRESHOLD_DAYS
+            && expires_in > 0
+        {
+            indicators.push(RiskIndicator::NearExpiry);
         }
 
         // No abuse contact
-        if result.abuse_contact.is_none() && result.registrar.as_ref().and_then(|r| r.abuse_contact.as_ref()).is_none() {
+        if result.abuse_contact.is_none()
+            && result
+                .registrar
+                .as_ref()
+                .and_then(|r| r.abuse_contact.as_ref())
+                .is_none()
+        {
             indicators.push(RiskIndicator::NoAbuseContact);
         }
 
@@ -617,28 +630,48 @@ impl Scanner for WhoisScanner {
     }
 
     async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
-        log::debug!("[scan::whois] scan: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::whois] scan: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         let scan_start = Instant::now();
         match self.scan_whois(target).await {
             Ok(result) => {
                 let scan_duration = scan_start.elapsed();
-                log::trace!("[scan::whois] whois_scan_completed: target={} protocol={} duration={}ms source={:?} privacy={:?} risks={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), result.data_source,
-                    result.privacy_score, result.risk_indicators.len());
+                log::trace!(
+                    "[scan::whois] whois_scan_completed: target={} protocol={} duration={}ms source={:?} privacy={:?} risks={}",
+                    target.display_name(),
+                    protocol.as_str(),
+                    scan_duration.as_millis(),
+                    result.data_source,
+                    result.privacy_score,
+                    result.risk_indicators.len()
+                );
 
                 if let Some(reg_date) = result.registration_date {
-                    log::trace!("[scan::whois] domain_info: target={} protocol={} registered={} age_days={:?} expires_in_days={:?}",
-                        target.display_name(), protocol.as_str(), reg_date.format("%Y-%m-%d"),
-                        result.domain_age_days, result.expires_in_days);
+                    log::trace!(
+                        "[scan::whois] domain_info: target={} protocol={} registered={} age_days={:?} expires_in_days={:?}",
+                        target.display_name(),
+                        protocol.as_str(),
+                        reg_date.format("%Y-%m-%d"),
+                        result.domain_age_days,
+                        result.expires_in_days
+                    );
                 }
 
                 Ok(ScanResult::Whois(result))
             }
             Err(e) => {
                 let scan_duration = scan_start.elapsed();
-                log::error!("[scan::whois] whois_scan_failed: target={} protocol={} duration={}ms error={}",
-                    target.display_name(), protocol.as_str(), scan_duration.as_millis(), e);
+                log::error!(
+                    "[scan::whois] whois_scan_failed: target={} protocol={} duration={}ms error={}",
+                    target.display_name(),
+                    protocol.as_str(),
+                    scan_duration.as_millis(),
+                    e
+                );
                 Err(e)
             }
         }
@@ -689,28 +722,28 @@ pub struct ContactInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PrivacyLevel {
-    Open,           // Contact info visible
-    Corporate,      // Organization visible, contacts hidden
-    Protected,      // Full privacy protection
-    Unknown,        // Cannot determine privacy level
+    Open,      // Contact info visible
+    Corporate, // Organization visible, contacts hidden
+    Protected, // Full privacy protection
+    Unknown,   // Cannot determine privacy level
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RiskIndicator {
-    RecentRegistration,     // < 30 days old
-    NearExpiry,            // < 30 days to expiry
-    FrequentUpdates,       // Updated > 3x in 90 days (would need historical data)
-    SuspiciousRegistrar,   // Known problematic registrar (would need reputation data)
-    NoAbuseContact,        // Missing abuse contact
-    WeakDnssec,           // DNSSEC not enabled
-    QueryFailed,          // Could not retrieve WHOIS data
+    RecentRegistration,  // < 30 days old
+    NearExpiry,          // < 30 days to expiry
+    FrequentUpdates,     // Updated > 3x in 90 days (would need historical data)
+    SuspiciousRegistrar, // Known problematic registrar (would need reputation data)
+    NoAbuseContact,      // Missing abuse contact
+    WeakDnssec,          // DNSSEC not enabled
+    QueryFailed,         // Could not retrieve WHOIS data
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataSource {
-    Rdap,           // Modern RDAP protocol
-    Whois,          // Traditional WHOIS protocol
-    Failed,         // Query failed
+    Rdap,   // Modern RDAP protocol
+    Whois,  // Traditional WHOIS protocol
+    Failed, // Query failed
 }
 
 // Tests
@@ -793,7 +826,7 @@ mod tests {
         let result = WhoisResult {
             domain: "test.com".to_string(),
             registration_date: Some(Utc::now() - chrono::Duration::days(15)), // Recent registration
-            expiry_date: Some(Utc::now() + chrono::Duration::days(15)), // Near expiry
+            expiry_date: Some(Utc::now() + chrono::Duration::days(15)),       // Near expiry
             last_updated: None,
             nameservers: Vec::new(),
             status: Vec::new(),
@@ -825,7 +858,11 @@ mod tests {
         let scanner = WhoisScanner::new();
 
         assert!(scanner.get_rdap_endpoint("com", "example.com").contains("verisign"));
-        assert!(scanner.get_rdap_endpoint("org", "example.org").contains("publicinterestregistry"));
+        assert!(
+            scanner
+                .get_rdap_endpoint("org", "example.org")
+                .contains("publicinterestregistry")
+        );
         assert!(scanner.get_rdap_endpoint("tv", "example.tv").contains("nic.tv"));
         assert!(scanner.get_rdap_endpoint("xyz", "example.xyz").contains("iana.org"));
     }
@@ -943,11 +980,7 @@ mod tests {
 
     #[test]
     fn test_data_source_types() {
-        let sources = vec![
-            DataSource::Rdap,
-            DataSource::Whois,
-            DataSource::Failed,
-        ];
+        let sources = [DataSource::Rdap, DataSource::Whois, DataSource::Failed];
 
         assert_eq!(sources.len(), 3);
         assert!(matches!(sources[0], DataSource::Rdap));
@@ -963,7 +996,7 @@ mod tests {
         let result = WhoisResult {
             domain: "suspicious.com".to_string(),
             registration_date: Some(chrono::Utc::now() - chrono::Duration::days(5)), // Very recent
-            expiry_date: Some(chrono::Utc::now() + chrono::Duration::days(10)), // Soon expiring
+            expiry_date: Some(chrono::Utc::now() + chrono::Duration::days(10)),      // Soon expiring
             last_updated: Some(chrono::Utc::now() - chrono::Duration::days(1)),
             nameservers: vec![],
             status: vec![],
@@ -1001,19 +1034,23 @@ mod tests {
 
         // Test various common date formats
         let test_dates = vec![
-            "2023-01-15T10:30:00Z",           // ISO 8601 with Z
-            "2023-01-15T10:30:00.000Z",       // ISO 8601 with milliseconds
-            "2023-01-15 10:30:00 UTC",        // Space separated with timezone
-            "2023-01-15",                     // Date only
-            "15-Jan-2023",                    // Month name format
-            "Jan 15 2023",                    // US format
-            "2023/01/15",                     // Slash format
+            "2023-01-15T10:30:00Z",     // ISO 8601 with Z
+            "2023-01-15T10:30:00.000Z", // ISO 8601 with milliseconds
+            "2023-01-15 10:30:00 UTC",  // Space separated with timezone
+            "2023-01-15",               // Date only
+            "15-Jan-2023",              // Month name format
+            "Jan 15 2023",              // US format
+            "2023/01/15",               // Slash format
         ];
 
         for date_str in test_dates {
             let parsed = scanner.parse_whois_date(date_str);
             // Some date formats might not be supported - that's okay
-            if date_str.contains("2023/01/15") || date_str.contains("Jan 15 2023") || date_str.contains(".000Z") || date_str.contains("UTC") {
+            if date_str.contains("2023/01/15")
+                || date_str.contains("Jan 15 2023")
+                || date_str.contains(".000Z")
+                || date_str.contains("UTC")
+            {
                 // These formats might not be implemented
                 continue;
             }
@@ -1023,9 +1060,9 @@ mod tests {
         // Test invalid dates
         let invalid_dates = vec![
             "not-a-date",
-            "2023-13-40",  // Invalid month/day
+            "2023-13-40", // Invalid month/day
             "",
-            "2023",        // Year only
+            "2023", // Year only
         ];
 
         for invalid_date in invalid_dates {
@@ -1097,6 +1134,9 @@ mod tests {
         let privacy_level = scanner.assess_privacy_level(&mixed_result);
 
         // Should handle mixed privacy information gracefully
-        assert!(matches!(privacy_level, PrivacyLevel::Protected | PrivacyLevel::Corporate));
+        assert!(matches!(
+            privacy_level,
+            PrivacyLevel::Protected | PrivacyLevel::Corporate
+        ));
     }
 }

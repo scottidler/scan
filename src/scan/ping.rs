@@ -1,6 +1,6 @@
 use crate::scanner::Scanner;
+use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
-use crate::target::{Target, Protocol};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use std::time::{Duration, Instant};
@@ -23,9 +23,9 @@ pub struct PingData {
 
 #[derive(Debug, Clone)]
 pub enum PingStatus {
-    NotQueried,           // Protocol not attempted (due to protocol restrictions)
-    Success(Duration),    // Ping succeeded with latency
-    Failed(String),       // Ping failed with error message
+    NotQueried,          // Protocol not attempted (due to protocol restrictions)
+    Success(Duration),   // Ping succeeded with latency
+    Failed(String),      // Ping failed with error message
     NoAddress,           // No address available for this protocol
     ToolMissing(String), // Required tool (ping/ping6) not available
 }
@@ -60,6 +60,12 @@ pub struct PingResult {
     // Metadata
     pub queried_at: Instant,
     pub total_duration: Duration,
+}
+
+impl Default for PingResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PingResult {
@@ -104,8 +110,12 @@ pub struct PingScanner {
 
 impl PingScanner {
     pub fn new(interval: Duration, timeout: Duration, packet_count: u8) -> Self {
-        log::debug!("[scan::ping] new: interval={}ms timeout={}ms packet_count={}",
-            interval.as_millis(), timeout.as_millis(), packet_count);
+        log::debug!(
+            "[scan::ping] new: interval={}ms timeout={}ms packet_count={}",
+            interval.as_millis(),
+            timeout.as_millis(),
+            packet_count
+        );
 
         Self {
             interval,
@@ -118,9 +128,9 @@ impl PingScanner {
 impl Default for PingScanner {
     fn default() -> Self {
         Self::new(
-            Duration::from_secs(DEFAULT_PING_INTERVAL_SECS),    // Ping every second
-            Duration::from_secs(DEFAULT_PING_TIMEOUT_SECS),    // 5 second timeout
-            DEFAULT_PING_PACKET_COUNT,                         // Send 1 packet per scan
+            Duration::from_secs(DEFAULT_PING_INTERVAL_SECS), // Ping every second
+            Duration::from_secs(DEFAULT_PING_TIMEOUT_SECS),  // 5 second timeout
+            DEFAULT_PING_PACKET_COUNT,                       // Send 1 packet per scan
         )
     }
 }
@@ -136,7 +146,11 @@ impl Scanner for PingScanner {
     }
 
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error> {
-        log::debug!("[scan::ping] scan: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::ping] scan: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         let scan_start = Instant::now();
         let mut result = PingResult::new();
@@ -194,13 +208,21 @@ impl Scanner for PingScanner {
                         let latency = ping_data.latency;
                         result.ipv6_status = PingStatus::Success(latency);
                         result.ipv6_result = Some(ping_data);
-                        log::debug!("[scan::ping] ipv6_ping_success: target={} addr={} latency={}ms",
-                            target.display_name(), target_addr, latency.as_millis());
+                        log::debug!(
+                            "[scan::ping] ipv6_ping_success: target={} addr={} latency={}ms",
+                            target.display_name(),
+                            target_addr,
+                            latency.as_millis()
+                        );
                     }
                     Err(e) => {
                         result.ipv6_status = Self::classify_ping_error(&e);
-                        log::debug!("[scan::ping] ipv6_ping_failed: target={} error={} classified_as={:?}",
-                            target.display_name(), e, result.ipv6_status);
+                        log::debug!(
+                            "[scan::ping] ipv6_ping_failed: target={} error={} classified_as={:?}",
+                            target.display_name(),
+                            e,
+                            result.ipv6_status
+                        );
                     }
                 }
             }
@@ -210,15 +232,27 @@ impl Scanner for PingScanner {
 
         // Return success if at least one protocol succeeded, or error if all failed
         if result.has_any_success() {
-            log::trace!("[scan::ping] ping_completed: target={} protocol={} duration={}ms best_latency={:?}",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), result.get_best_latency());
+            log::trace!(
+                "[scan::ping] ping_completed: target={} protocol={} duration={}ms best_latency={:?}",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis(),
+                result.get_best_latency()
+            );
             Ok(ScanResult::Ping(result))
         } else {
             // All protocols failed
-            let error_msg = format!("All ping attempts failed for target: {} ({})",
-                target.display_name(), protocol.as_str());
-            log::error!("[scan::ping] all_pings_failed: target={} protocol={} duration={}ms",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis());
+            let error_msg = format!(
+                "All ping attempts failed for target: {} ({})",
+                target.display_name(),
+                protocol.as_str()
+            );
+            log::error!(
+                "[scan::ping] all_pings_failed: target={} protocol={} duration={}ms",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis()
+            );
             Err(eyre::eyre!(error_msg))
         }
     }
@@ -227,24 +261,46 @@ impl Scanner for PingScanner {
 impl PingScanner {
     async fn ping_protocol(&self, target: &Target, protocol: Protocol) -> Result<(PingData, String)> {
         // Get protocol-specific target
-        log::debug!("[scan::ping] getting_network_target: target={} protocol={} has_ipv4={} has_ipv6={}",
-            target.display_name(), protocol.as_str(), target.has_ipv4(), target.has_ipv6());
+        log::debug!(
+            "[scan::ping] getting_network_target: target={} protocol={} has_ipv4={} has_ipv6={}",
+            target.display_name(),
+            protocol.as_str(),
+            target.has_ipv4(),
+            target.has_ipv6()
+        );
 
         let ping_target = match target.network_target_for_protocol(protocol) {
             Some(target_addr) => {
-                log::debug!("[scan::ping] network_target_found: target={} protocol={} addr={}",
-                    target.display_name(), protocol.as_str(), target_addr);
+                log::debug!(
+                    "[scan::ping] network_target_found: target={} protocol={} addr={}",
+                    target.display_name(),
+                    protocol.as_str(),
+                    target_addr
+                );
                 target_addr
             }
             None => {
-                log::warn!("[scan::ping] no_target_for_protocol: target={} protocol={} has_ipv4={} has_ipv6={}",
-                    target.display_name(), protocol.as_str(), target.has_ipv4(), target.has_ipv6());
-                eyre::bail!("No {} address available for target: {}", protocol.as_str(), target.display_name());
+                log::warn!(
+                    "[scan::ping] no_target_for_protocol: target={} protocol={} has_ipv4={} has_ipv6={}",
+                    target.display_name(),
+                    protocol.as_str(),
+                    target.has_ipv4(),
+                    target.has_ipv6()
+                );
+                eyre::bail!(
+                    "No {} address available for target: {}",
+                    protocol.as_str(),
+                    target.display_name()
+                );
             }
         };
 
-        log::debug!("[scan::ping] protocol_target: {} -> {} ({})",
-            target.display_name(), ping_target, protocol.as_str());
+        log::debug!(
+            "[scan::ping] protocol_target: {} -> {} ({})",
+            target.display_name(),
+            ping_target,
+            protocol.as_str()
+        );
 
         let ping_data = self.do_ping(&ping_target, protocol).await?;
         Ok((ping_data, ping_target))
@@ -265,8 +321,13 @@ impl PingScanner {
     }
 
     async fn do_ping(&self, target: &str, protocol: Protocol) -> Result<PingData> {
-        log::debug!("[scan::ping] do_ping: target={} protocol={} packet_count={} timeout={}ms",
-            target, protocol.as_str(), self.packet_count, self.timeout.as_millis());
+        log::debug!(
+            "[scan::ping] do_ping: target={} protocol={} packet_count={} timeout={}ms",
+            target,
+            protocol.as_str(),
+            self.packet_count,
+            self.timeout.as_millis()
+        );
 
         // Modern ping command can handle both IPv4 and IPv6
         // We'll use the unified 'ping' command with protocol-specific flags
@@ -292,29 +353,33 @@ impl PingScanner {
         let timeout_str = (self.timeout.as_millis() as u32).to_string();
 
         // Add standard ping arguments
-        args.extend([
-            "-c", &packet_count_str,
-            "-W", &timeout_str,
-            target
-        ]);
+        args.extend(["-c", &packet_count_str, "-W", &timeout_str, target]);
 
-        log::debug!("[scan::ping] using_command: {} {:?} for protocol {}", ping_command, args, protocol.as_str());
+        log::debug!(
+            "[scan::ping] using_command: {} {:?} for protocol {}",
+            ping_command,
+            args,
+            protocol.as_str()
+        );
 
         // Check if the ping command is available
-        let command_check = Command::new("which")
-            .arg(ping_command)
-            .output()
-            .await;
+        let command_check = Command::new("which").arg(ping_command).output().await;
 
         match command_check {
             Ok(output) if !output.status.success() => {
-                log::error!("[scan::ping] command_not_found: command={} protocol={}",
-                    ping_command, protocol.as_str());
-                eyre::bail!("Command '{}' not found. Please install ping utilities.",
-                    ping_command);
+                log::error!(
+                    "[scan::ping] command_not_found: command={} protocol={}",
+                    ping_command,
+                    protocol.as_str()
+                );
+                eyre::bail!("Command '{}' not found. Please install ping utilities.", ping_command);
             }
             Err(e) => {
-                log::error!("[scan::ping] command_check_failed: command={} error={}", ping_command, e);
+                log::error!(
+                    "[scan::ping] command_check_failed: command={} error={}",
+                    ping_command,
+                    e
+                );
                 eyre::bail!("Failed to check for '{}' command availability: {}", ping_command, e);
             }
             Ok(_) => {
@@ -324,50 +389,79 @@ impl PingScanner {
 
         let ping_start = Instant::now();
         log::debug!("[scan::ping] executing_ping_command: {} {:?}", ping_command, args);
-        let output = Command::new(ping_command)
-            .args(&args)
-            .output()
-            .await;
+        let output = Command::new(ping_command).args(&args).output().await;
 
         let command_duration = ping_start.elapsed();
 
         let output = match output {
             Ok(out) => {
-                log::trace!("[scan::ping] ping_command_completed: command={} target={} duration={}ms status={}",
-                    ping_command, target, command_duration.as_millis(), out.status);
+                log::trace!(
+                    "[scan::ping] ping_command_completed: command={} target={} duration={}ms status={}",
+                    ping_command,
+                    target,
+                    command_duration.as_millis(),
+                    out.status
+                );
                 out
             }
             Err(e) => {
-                log::error!("[scan::ping] ping_command_failed: command={} target={} duration={}ms error={}",
-                    ping_command, target, command_duration.as_millis(), e);
+                log::error!(
+                    "[scan::ping] ping_command_failed: command={} target={} duration={}ms error={}",
+                    ping_command,
+                    target,
+                    command_duration.as_millis(),
+                    e
+                );
                 return Err(e).wrap_err(format!("Failed to execute {} command", ping_command));
             }
         };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("[scan::ping] ping_command_unsuccessful: command={} target={} status={} stderr={}",
-                ping_command, target, output.status, stderr.trim());
+            log::error!(
+                "[scan::ping] ping_command_unsuccessful: command={} target={} status={} stderr={}",
+                ping_command,
+                target,
+                output.status,
+                stderr.trim()
+            );
 
             // Check for specific IPv6 errors and provide better error messages
             if stderr.contains("Network is unreachable") || stderr.contains("connect: Network is unreachable") {
                 eyre::bail!("Network is unreachable for target: {} (using {})", target, ping_command);
             } else if stderr.contains("invalid option") || stderr.contains("unrecognized option") {
-                eyre::bail!("Ping command does not support IPv6 options: {} (stderr: {})", ping_command, stderr.trim());
+                eyre::bail!(
+                    "Ping command does not support IPv6 options: {} (stderr: {})",
+                    ping_command,
+                    stderr.trim()
+                );
             } else {
-                eyre::bail!("Ping failed for target: {} (using {}) - stderr: {}", target, ping_command, stderr.trim());
+                eyre::bail!(
+                    "Ping failed for target: {} (using {}) - stderr: {}",
+                    target,
+                    ping_command,
+                    stderr.trim()
+                );
             }
         }
 
         let stdout = match String::from_utf8(output.stdout) {
             Ok(s) => {
-                log::trace!("[scan::ping] ping_output_decoded: command={} target={} output_len={}",
-                    ping_command, target, s.len());
+                log::trace!(
+                    "[scan::ping] ping_output_decoded: command={} target={} output_len={}",
+                    ping_command,
+                    target,
+                    s.len()
+                );
                 s
             }
             Err(e) => {
-                log::error!("[scan::ping] ping_output_decode_failed: command={} target={} error={}",
-                    ping_command, target, e);
+                log::error!(
+                    "[scan::ping] ping_output_decode_failed: command={} target={} error={}",
+                    ping_command,
+                    target,
+                    e
+                );
                 return Err(e).wrap_err("Invalid UTF-8 in ping output");
             }
         };
@@ -376,16 +470,30 @@ impl PingScanner {
         match self.parse_ping_output(&stdout, protocol, target) {
             Ok(result) => {
                 let parse_duration = parse_start.elapsed();
-                log::trace!("[scan::ping] ping_output_parsed: command={} target={} parse_duration={}μs latency={}ms",
-                    ping_command, target, parse_duration.as_micros(), result.latency.as_millis());
+                log::trace!(
+                    "[scan::ping] ping_output_parsed: command={} target={} parse_duration={}μs latency={}ms",
+                    ping_command,
+                    target,
+                    parse_duration.as_micros(),
+                    result.latency.as_millis()
+                );
                 Ok(result)
             }
             Err(e) => {
                 let parse_duration = parse_start.elapsed();
-                log::error!("[scan::ping] ping_output_parse_failed: command={} target={} parse_duration={}μs error={}",
-                    ping_command, target, parse_duration.as_micros(), e);
-                log::trace!("[scan::ping] ping_output_content: command={} target={} stdout={}",
-                    ping_command, target, stdout);
+                log::error!(
+                    "[scan::ping] ping_output_parse_failed: command={} target={} parse_duration={}μs error={}",
+                    ping_command,
+                    target,
+                    parse_duration.as_micros(),
+                    e
+                );
+                log::trace!(
+                    "[scan::ping] ping_output_content: command={} target={} stdout={}",
+                    ping_command,
+                    target,
+                    stdout
+                );
                 Err(e.wrap_err(format!("Failed to parse {} output", ping_command)))
             }
         }
@@ -403,31 +511,31 @@ impl PingScanner {
                 let mut ttl = None;
 
                 // Parse latency
-                if let Some(time_part) = line.split("time=").nth(1) {
-                    if let Some(time_str) = time_part.split_whitespace().next() {
-                        match time_str.parse::<f64>() {
-                            Ok(latency_ms) => {
-                                latency = Some(Duration::from_millis(latency_ms.round() as u64));
-                                log::trace!("[scan::ping] parsed_latency: {}ms", latency_ms);
-                            }
-                            Err(e) => {
-                                log::warn!("[scan::ping] latency_parse_failed: time_str={} error={}", time_str, e);
-                            }
+                if let Some(time_part) = line.split("time=").nth(1)
+                    && let Some(time_str) = time_part.split_whitespace().next()
+                {
+                    match time_str.parse::<f64>() {
+                        Ok(latency_ms) => {
+                            latency = Some(Duration::from_millis(latency_ms.round() as u64));
+                            log::trace!("[scan::ping] parsed_latency: {}ms", latency_ms);
+                        }
+                        Err(e) => {
+                            log::warn!("[scan::ping] latency_parse_failed: time_str={} error={}", time_str, e);
                         }
                     }
                 }
 
                 // Parse TTL
-                if let Some(ttl_part) = line.split("ttl=").nth(1) {
-                    if let Some(ttl_str) = ttl_part.split_whitespace().next() {
-                        match ttl_str.parse::<u8>() {
-                            Ok(ttl_value) => {
-                                ttl = Some(ttl_value);
-                                log::trace!("[scan::ping] parsed_ttl: {}", ttl_value);
-                            }
-                            Err(e) => {
-                                log::warn!("[scan::ping] ttl_parse_failed: ttl_str={} error={}", ttl_str, e);
-                            }
+                if let Some(ttl_part) = line.split("ttl=").nth(1)
+                    && let Some(ttl_str) = ttl_part.split_whitespace().next()
+                {
+                    match ttl_str.parse::<u8>() {
+                        Ok(ttl_value) => {
+                            ttl = Some(ttl_value);
+                            log::trace!("[scan::ping] parsed_ttl: {}", ttl_value);
+                        }
+                        Err(e) => {
+                            log::warn!("[scan::ping] ttl_parse_failed: ttl_str={} error={}", ttl_str, e);
                         }
                     }
                 }
@@ -442,15 +550,22 @@ impl PingScanner {
                         target_ip: target_ip.to_string(),
                     };
 
-                    log::debug!("[scan::ping] parse_successful: latency={}ms ttl={:?} packets_sent={}",
-                        result.latency.as_millis(), result.ttl, result.packets_sent);
+                    log::debug!(
+                        "[scan::ping] parse_successful: latency={}ms ttl={:?} packets_sent={}",
+                        result.latency.as_millis(),
+                        result.ttl,
+                        result.packets_sent
+                    );
 
                     return Ok(result);
                 }
             }
         }
 
-        log::error!("[scan::ping] no_timing_info_found: output_lines={}", output.lines().count());
+        log::error!(
+            "[scan::ping] no_timing_info_found: output_lines={}",
+            output.lines().count()
+        );
         eyre::bail!("Could not find timing information in ping output");
     }
 }
@@ -464,7 +579,9 @@ mod tests {
         let scanner = PingScanner::default();
         let output = "PING google.com (142.250.80.238) 56(84) bytes of data.\n64 bytes from lga25s62-in-f14.1e100.net (142.250.80.238): icmp_seq=1 ttl=118 time=15.2 ms\n\n--- google.com ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 0ms\nrtt min/avg/max/mdev = 15.210/15.210/15.210/0.000 ms";
 
-        let result = scanner.parse_ping_output(output, Protocol::Ipv4, "142.250.80.238").unwrap();
+        let result = scanner
+            .parse_ping_output(output, Protocol::Ipv4, "142.250.80.238")
+            .unwrap();
         assert_eq!(result.latency, Duration::from_millis(15));
         assert_eq!(result.ttl, Some(118));
         assert_eq!(result.packets_sent, 1);
@@ -492,11 +609,7 @@ mod tests {
 
     #[test]
     fn test_ping_scanner_configuration() {
-        let custom_scanner = PingScanner::new(
-            Duration::from_secs(2),
-            Duration::from_secs(10),
-            5,
-        );
+        let custom_scanner = PingScanner::new(Duration::from_secs(2), Duration::from_secs(10), 5);
 
         assert_eq!(custom_scanner.interval(), Duration::from_secs(2));
         assert_eq!(custom_scanner.timeout, Duration::from_secs(10));
@@ -510,19 +623,25 @@ mod tests {
         // Test IPv6 ping output
         let ipv6_output = "PING google.com(2607:f8b0:4004:c1b::71) 56 data bytes\n64 bytes from 2607:f8b0:4004:c1b::71: icmp_seq=1 ttl=118 time=12.3 ms\n\n--- google.com ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 0ms";
 
-        let ipv6_result = scanner.parse_ping_output(ipv6_output, Protocol::Ipv6, "2607:f8b0:4004:c1b::71").unwrap();
+        let ipv6_result = scanner
+            .parse_ping_output(ipv6_output, Protocol::Ipv6, "2607:f8b0:4004:c1b::71")
+            .unwrap();
         assert_eq!(ipv6_result.latency, Duration::from_millis(12));
         assert_eq!(ipv6_result.ttl, Some(118));
 
         // Test ping with different TTL
         let ttl_output = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=64 time=8.123 ms";
-        let ttl_result = scanner.parse_ping_output(ttl_output, Protocol::Ipv4, "8.8.8.8").unwrap();
+        let ttl_result = scanner
+            .parse_ping_output(ttl_output, Protocol::Ipv4, "8.8.8.8")
+            .unwrap();
         assert_eq!(ttl_result.latency, Duration::from_millis(8));
         assert_eq!(ttl_result.ttl, Some(64));
 
         // Test ping with microsecond precision
         let precise_output = "64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.123 ms";
-        let precise_result = scanner.parse_ping_output(precise_output, Protocol::Ipv4, "127.0.0.1").unwrap();
+        let precise_result = scanner
+            .parse_ping_output(precise_output, Protocol::Ipv4, "127.0.0.1")
+            .unwrap();
         assert_eq!(precise_result.latency, Duration::from_millis(0));
     }
 
@@ -532,14 +651,22 @@ mod tests {
 
         // Test output with no timing information
         let no_time_output = "PING google.com (142.250.80.238) 56(84) bytes of data.\n--- google.com ping statistics ---\n1 packets transmitted, 0 received, 100% packet loss, time 1000ms";
-        assert!(scanner.parse_ping_output(no_time_output, Protocol::Ipv4, "142.250.80.238").is_err());
+        assert!(
+            scanner
+                .parse_ping_output(no_time_output, Protocol::Ipv4, "142.250.80.238")
+                .is_err()
+        );
 
         // Test empty output
         assert!(scanner.parse_ping_output("", Protocol::Ipv4, "127.0.0.1").is_err());
 
         // Test malformed timing line
         let malformed_output = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=invalid time=malformed ms";
-        assert!(scanner.parse_ping_output(malformed_output, Protocol::Ipv4, "8.8.8.8").is_err());
+        assert!(
+            scanner
+                .parse_ping_output(malformed_output, Protocol::Ipv4, "8.8.8.8")
+                .is_err()
+        );
     }
 
     #[test]
@@ -611,17 +738,23 @@ mod tests {
 
         // Test with extra whitespace
         let whitespace_output = "  64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=15.2 ms  ";
-        let result = scanner.parse_ping_output(whitespace_output, Protocol::Ipv4, "8.8.8.8").unwrap();
+        let result = scanner
+            .parse_ping_output(whitespace_output, Protocol::Ipv4, "8.8.8.8")
+            .unwrap();
         assert_eq!(result.latency, Duration::from_millis(15));
 
         // Test with multiple timing lines (should use first one)
         let multi_output = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=15.2 ms\n64 bytes from 8.8.8.8: icmp_seq=2 ttl=118 time=20.5 ms";
-        let multi_result = scanner.parse_ping_output(multi_output, Protocol::Ipv4, "8.8.8.8").unwrap();
+        let multi_result = scanner
+            .parse_ping_output(multi_output, Protocol::Ipv4, "8.8.8.8")
+            .unwrap();
         assert_eq!(multi_result.latency, Duration::from_millis(15)); // Should use first line
 
         // Test with no TTL
         let no_ttl_output = "64 bytes from 8.8.8.8: icmp_seq=1 time=15.2 ms";
-        let no_ttl_result = scanner.parse_ping_output(no_ttl_output, Protocol::Ipv4, "8.8.8.8").unwrap();
+        let no_ttl_result = scanner
+            .parse_ping_output(no_ttl_output, Protocol::Ipv4, "8.8.8.8")
+            .unwrap();
         assert_eq!(no_ttl_result.latency, Duration::from_millis(15));
         assert!(no_ttl_result.ttl.is_none());
     }

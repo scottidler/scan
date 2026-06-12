@@ -1,7 +1,7 @@
+use crate::target::Protocol;
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::time::Instant;
-use crate::target::Protocol;
 
 pub struct AppState {
     pub target: String,
@@ -54,6 +54,10 @@ pub struct TimestampedResult {
     pub result: ScanResult,
 }
 
+// Boxing the large variants to equalize size would be a structural change to every
+// construction/match site; the enum is small in count and not stored in bulk, so the
+// size difference is accepted rather than refactored.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ScanResult {
     Ping(crate::scan::ping::PingResult),

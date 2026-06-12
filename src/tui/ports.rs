@@ -1,14 +1,14 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::types::{AppState, ScanResult};
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const MAX_DISPLAYED_PORTS: usize = 5;
 const QUICK_SCAN_EXPECTED_PORTS: usize = 100;
@@ -34,8 +34,6 @@ impl PortsPane {
             id: "ports",
         }
     }
-
-
 }
 
 impl Default for PortsPane {
@@ -46,8 +44,12 @@ impl Default for PortsPane {
 
 impl Pane for PortsPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::ports] render: area={}x{} focused={}",
-            area.width, area.height, focused);
+        log::trace!(
+            "[tui::ports] render: area={}x{} focused={}",
+            area.width,
+            area.height,
+            focused
+        );
 
         let block = create_block(self.title, focused);
 
@@ -92,7 +94,7 @@ impl Pane for PortsPane {
                                     crate::types::ScanStatus::Running => Color::Yellow,
                                     crate::types::ScanStatus::Complete => Color::Green,
                                     crate::types::ScanStatus::Failed => Color::Red,
-                                })
+                                }),
                             ),
                         ]);
 
@@ -109,8 +111,10 @@ impl Pane for PortsPane {
                         let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
                             // Estimate progress based on scan duration and typical port scan timing
                             let total_expected = if let Some(primary) = port_result.get_primary_result() {
-                            match primary.scan_mode {
-                                    crate::scan::port::ScanMode::Minimal => crate::scan::port::get_minimal_ports().len(),
+                                match primary.scan_mode {
+                                    crate::scan::port::ScanMode::Minimal => {
+                                        crate::scan::port::get_minimal_ports().len()
+                                    }
                                     crate::scan::port::ScanMode::Quick => QUICK_SCAN_EXPECTED_PORTS,
                                     crate::scan::port::ScanMode::Standard => STANDARD_SCAN_EXPECTED_PORTS,
                                     crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
@@ -119,7 +123,8 @@ impl Pane for PortsPane {
                                 QUICK_SCAN_EXPECTED_PORTS
                             };
                             let scanned_so_far = open_count + filtered_ports as usize + closed_ports as usize;
-                            let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0).min(MAX_PROGRESS_PERCENT) as u32;
+                            let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0)
+                                .min(MAX_PROGRESS_PERCENT) as u32;
                             Some((scanned_so_far, total_expected, progress_percent))
                         } else {
                             None
@@ -133,7 +138,7 @@ impl Pane for PortsPane {
                                 Span::styled("📊 Progress: ", Style::default().fg(Color::White)),
                                 Span::styled(
                                     format!("{}% ({}/{})", percent, scanned, total),
-                                    Style::default().fg(Color::Yellow)
+                                    Style::default().fg(Color::Yellow),
                                 ),
                             ]));
                         } else {
@@ -154,20 +159,24 @@ impl Pane for PortsPane {
 
                         result_lines.push(Line::from(vec![
                             Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
-                            Span::styled(
-                                open_count.to_string(),
-                                Style::default().fg(port_color)
-                            ),
+                            Span::styled(open_count.to_string(), Style::default().fg(port_color)),
                             Span::styled(" ports", Style::default().fg(Color::White)),
                         ]));
 
                         // Show open ports from all protocols (clean display)
                         let all_open_ports = port_result.get_all_open_ports();
                         let mut ports_shown = 0;
+                        // `ports_shown` gates an early break (display cap), not just an
+                        // index, so `.enumerate()` would not preserve the loop semantics.
+                        #[allow(clippy::explicit_counter_loop)]
                         for open_port in all_open_ports.iter() {
-                            if ports_shown >= MAX_DISPLAYED_PORTS { break; }
+                            if ports_shown >= MAX_DISPLAYED_PORTS {
+                                break;
+                            }
 
-                            let service_name = open_port.service.as_ref()
+                            let service_name = open_port
+                                .service
+                                .as_ref()
                                 .map(|s| s.name.clone())
                                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -180,13 +189,10 @@ impl Pane for PortsPane {
                                 Span::styled("   ", Style::default()),
                                 Span::styled(
                                     format!("{}/{}", open_port.port, protocol_str),
-                                    Style::default().fg(Color::Cyan)
+                                    Style::default().fg(Color::Cyan),
                                 ),
                                 Span::styled(" (", Style::default().fg(Color::Gray)),
-                                Span::styled(
-                                    service_name,
-                                    Style::default().fg(Color::Yellow)
-                                ),
+                                Span::styled(service_name, Style::default().fg(Color::Yellow)),
                                 Span::styled(")", Style::default().fg(Color::Gray)),
                             ]));
                             ports_shown += 1;
@@ -197,31 +203,23 @@ impl Pane for PortsPane {
                                 Span::styled("   ", Style::default()),
                                 Span::styled(
                                     format!("... and {} more", all_open_ports.len() - MAX_DISPLAYED_PORTS),
-                                    Style::default().fg(Color::Gray)
+                                    Style::default().fg(Color::Gray),
                                 ),
                             ]));
                         }
-
-
 
                         // Filtered and closed ports summary
                         if filtered_ports > 0 {
                             result_lines.push(Line::from(vec![
                                 Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
-                                Span::styled(
-                                    filtered_ports.to_string(),
-                                    Style::default().fg(Color::Yellow)
-                                ),
+                                Span::styled(filtered_ports.to_string(), Style::default().fg(Color::Yellow)),
                             ]));
                         }
 
                         if closed_ports > 0 {
                             result_lines.push(Line::from(vec![
                                 Span::styled("🔴 Closed: ", Style::default().fg(Color::White)),
-                                Span::styled(
-                                    closed_ports.to_string(),
-                                    Style::default().fg(Color::Gray)
-                                ),
+                                Span::styled(closed_ports.to_string(), Style::default().fg(Color::Gray)),
                             ]));
                         }
 
@@ -230,11 +228,14 @@ impl Pane for PortsPane {
                             Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
                             Span::styled(
                                 if scan_duration_ms > MILLISECONDS_THRESHOLD_FOR_SECONDS {
-                                    format!("{:.1}s", scan_duration_ms as f32 / MILLISECONDS_THRESHOLD_FOR_SECONDS as f32)
+                                    format!(
+                                        "{:.1}s",
+                                        scan_duration_ms as f32 / MILLISECONDS_THRESHOLD_FOR_SECONDS as f32
+                                    )
                                 } else {
                                     format!("{}ms", scan_duration_ms)
                                 },
-                                Style::default().fg(Color::Gray)
+                                Style::default().fg(Color::Gray),
                             ),
                         ]));
 
@@ -307,8 +308,7 @@ impl Pane for PortsPane {
         lines.extend(port_lines);
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
 

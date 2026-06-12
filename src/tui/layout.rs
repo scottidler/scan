@@ -1,12 +1,12 @@
 use crate::tui::pane::{Pane, PaneConfig};
 use crate::tui::scrollable::ScrollablePane;
 use crate::types::AppState;
+use log;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
     Frame,
+    layout::{Constraint, Direction, Layout, Rect},
 };
 use std::collections::HashMap;
-use log;
 
 const DEFAULT_GRID_ROWS: usize = 3;
 const DEFAULT_GRID_COLS: usize = 4;
@@ -66,8 +66,13 @@ impl PaneLayout {
     /// Add a pane to the layout with its configuration
     pub fn add_pane(&mut self, pane: Box<dyn Pane>, config: PaneConfig) {
         let pane_id = pane.id().to_string();
-        log::debug!("[tui::layout] add_pane: pane_id={} position=({},{}) visible={}",
-            pane_id, config.position.row, config.position.col, config.visible);
+        log::debug!(
+            "[tui::layout] add_pane: pane_id={} position=({},{}) visible={}",
+            pane_id,
+            config.position.row,
+            config.position.col,
+            config.visible
+        );
 
         self.config.insert(pane_id, config);
         self.panes.push(pane);
@@ -77,8 +82,11 @@ impl PaneLayout {
 
     /// Set the focused pane by ID
     pub fn set_focus(&mut self, pane_id: Option<String>) {
-        log::debug!("[tui::layout] set_focus: old_focus={:?} new_focus={:?}",
-            self.focused_pane, pane_id);
+        log::debug!(
+            "[tui::layout] set_focus: old_focus={:?} new_focus={:?}",
+            self.focused_pane,
+            pane_id
+        );
         self.focused_pane = pane_id;
     }
 
@@ -89,13 +97,21 @@ impl PaneLayout {
 
     /// Render all panes in the layout
     pub fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
-        log::trace!("[tui::layout] render: area={}x{} panes={} focused={:?}",
-            area.width, area.height, self.panes.len(), self.focused_pane);
+        log::trace!(
+            "[tui::layout] render: area={}x{} panes={} focused={:?}",
+            area.width,
+            area.height,
+            self.panes.len(),
+            self.focused_pane
+        );
 
         // Create the grid layout
         let grid_areas = self.create_grid_layout(area);
-        log::trace!("[tui::layout] grid_created: rows={} cols={}",
-            grid_areas.len(), grid_areas.first().map(|r| r.len()).unwrap_or(0));
+        log::trace!(
+            "[tui::layout] grid_created: rows={} cols={}",
+            grid_areas.len(),
+            grid_areas.first().map(|r| r.len()).unwrap_or(0)
+        );
 
         let mut rendered_count = 0;
         let mut skipped_count = 0;
@@ -107,26 +123,41 @@ impl PaneLayout {
             if let Some(config) = self.config.get(pane_id) {
                 if !config.visible || !pane.is_visible() {
                     skipped_count += 1;
-                    log::trace!("[tui::layout] pane_skipped: pane_id={} config_visible={} pane_visible={}",
-                        pane_id, config.visible, pane.is_visible());
+                    log::trace!(
+                        "[tui::layout] pane_skipped: pane_id={} config_visible={} pane_visible={}",
+                        pane_id,
+                        config.visible,
+                        pane.is_visible()
+                    );
                     continue;
                 }
 
                 if let Some(pane_area) = self.get_pane_area(&grid_areas, config) {
                     // Check if this pane is focused
-                    let is_focused = self.focused_pane.as_ref()
+                    let is_focused = self
+                        .focused_pane
+                        .as_ref()
                         .map(|focused_id| focused_id == pane_id)
                         .unwrap_or(false);
 
-                    log::trace!("[tui::layout] rendering_pane: pane_id={} area={}x{} focused={}",
-                        pane_id, pane_area.width, pane_area.height, is_focused);
+                    log::trace!(
+                        "[tui::layout] rendering_pane: pane_id={} area={}x{} focused={}",
+                        pane_id,
+                        pane_area.width,
+                        pane_area.height,
+                        is_focused
+                    );
 
                     pane.render(frame, pane_area, state, is_focused);
                     rendered_count += 1;
                 } else {
                     skipped_count += 1;
-                    log::warn!("[tui::layout] pane_area_not_found: pane_id={} position=({},{})",
-                        pane_id, config.position.row, config.position.col);
+                    log::warn!(
+                        "[tui::layout] pane_area_not_found: pane_id={} position=({},{})",
+                        pane_id,
+                        config.position.row,
+                        config.position.col
+                    );
                 }
             } else {
                 skipped_count += 1;
@@ -134,8 +165,11 @@ impl PaneLayout {
             }
         }
 
-        log::trace!("[tui::layout] render_completed: rendered={} skipped={}",
-            rendered_count, skipped_count);
+        log::trace!(
+            "[tui::layout] render_completed: rendered={} skipped={}",
+            rendered_count,
+            skipped_count
+        );
     }
 
     /// Create the grid layout areas with custom proportions (public version)
@@ -234,8 +268,12 @@ impl PaneLayout {
         if let Some(config) = self.config.get_mut(pane_id) {
             let old_visible = config.visible;
             config.visible = !config.visible;
-            log::debug!("[tui::layout] toggle_pane_visibility: pane_id={} old={} new={}",
-                pane_id, old_visible, config.visible);
+            log::debug!(
+                "[tui::layout] toggle_pane_visibility: pane_id={} old={} new={}",
+                pane_id,
+                old_visible,
+                config.visible
+            );
         } else {
             log::warn!("[tui::layout] toggle_visibility_failed: pane_id={} not_found", pane_id);
         }
@@ -243,14 +281,18 @@ impl PaneLayout {
 
     /// Get the next focusable pane ID
     pub fn next_focusable_pane(&self, current: Option<&str>) -> Option<String> {
-        let focusable_panes: Vec<_> = self.panes
+        let focusable_panes: Vec<_> = self
+            .panes
             .iter()
             .filter(|p| p.is_focusable())
             .map(|p| p.id().to_string())
             .collect();
 
-        log::trace!("[tui::layout] next_focusable_pane: current={:?} focusable_count={}",
-            current, focusable_panes.len());
+        log::trace!(
+            "[tui::layout] next_focusable_pane: current={:?} focusable_count={}",
+            current,
+            focusable_panes.len()
+        );
 
         if focusable_panes.is_empty() {
             log::debug!("[tui::layout] no_focusable_panes:");
@@ -269,14 +311,18 @@ impl PaneLayout {
             }
         };
 
-        log::debug!("[tui::layout] next_focusable_result: current={:?} next={:?}",
-            current, next_pane);
+        log::debug!(
+            "[tui::layout] next_focusable_result: current={:?} next={:?}",
+            current,
+            next_pane
+        );
         next_pane
     }
 
     /// Get the previous focusable pane ID
     pub fn prev_focusable_pane(&self, current: Option<&str>) -> Option<String> {
-        let focusable_panes: Vec<_> = self.panes
+        let focusable_panes: Vec<_> = self
+            .panes
             .iter()
             .filter(|p| p.is_focusable())
             .map(|p| p.id().to_string())
@@ -290,11 +336,7 @@ impl PaneLayout {
             None => Some(focusable_panes[focusable_panes.len() - 1].clone()),
             Some(current_id) => {
                 if let Some(current_index) = focusable_panes.iter().position(|id| id == current_id) {
-                    let prev_index = if current_index == 0 {
-                        focusable_panes.len() - 1
-                    } else {
-                        current_index - 1
-                    };
+                    let prev_index = if current_index == 0 { focusable_panes.len() - 1 } else { current_index - 1 };
                     Some(focusable_panes[prev_index].clone())
                 } else {
                     Some(focusable_panes[focusable_panes.len() - 1].clone())
@@ -304,9 +346,17 @@ impl PaneLayout {
     }
 
     /// Handle keyboard events for the focused pane
-    pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent, state: &AppState, pane_areas: &[Vec<ratatui::layout::Rect>]) -> bool {
-        log::debug!("[tui::layout] handle_key_event: focused_pane={:?} key={:?}",
-            self.focused_pane, key.code);
+    pub fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        state: &AppState,
+        pane_areas: &[Vec<ratatui::layout::Rect>],
+    ) -> bool {
+        log::debug!(
+            "[tui::layout] handle_key_event: focused_pane={:?} key={:?}",
+            self.focused_pane,
+            key.code
+        );
 
         if let Some(focused_id) = &self.focused_pane {
             match key.code {
@@ -315,7 +365,9 @@ impl PaneLayout {
                     for pane in &mut self.panes {
                         if pane.id() == focused_id {
                             if focused_id == "security" {
-                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                if let Some(security_pane) =
+                                    pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>()
+                                {
                                     security_pane.scroll_up();
                                     return true;
                                 }
@@ -324,11 +376,13 @@ impl PaneLayout {
                                     dns_pane.scroll_up();
                                     return true;
                                 }
-                            } else if focused_id == "traceroute" {
-                                if let Some(traceroute_pane) = pane.as_any_mut().downcast_mut::<crate::tui::traceroute::TraceroutePane>() {
-                                    traceroute_pane.scroll_up();
-                                    return true;
-                                }
+                            } else if focused_id == "traceroute"
+                                && let Some(traceroute_pane) = pane
+                                    .as_any_mut()
+                                    .downcast_mut::<crate::tui::traceroute::TraceroutePane>()
+                            {
+                                traceroute_pane.scroll_up();
+                                return true;
                             }
                         }
                     }
@@ -338,7 +392,9 @@ impl PaneLayout {
                     for pane in &mut self.panes {
                         if pane.id() == focused_id {
                             if focused_id == "security" {
-                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                if let Some(security_pane) =
+                                    pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>()
+                                {
                                     // Get the security pane area (bottom-right: row 2, col 2)
                                     let visible_lines = if pane_areas.len() > 2 && pane_areas[2].len() > 2 {
                                         // Subtract 2 for borders
@@ -358,28 +414,32 @@ impl PaneLayout {
                                         let row = config.position.row;
                                         let col = config.position.col;
                                         if pane_areas.len() > row && pane_areas[row].len() > col {
-                                            visible_lines = pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
+                                            visible_lines =
+                                                pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
                                         }
                                     }
 
                                     dns_pane.scroll_down_smart(state, visible_lines);
                                     return true;
                                 }
-                            } else if focused_id == "traceroute" {
-                                if let Some(traceroute_pane) = pane.as_any_mut().downcast_mut::<crate::tui::traceroute::TraceroutePane>() {
-                                    // Get the TraceroutePane area
-                                    let mut visible_lines = FALLBACK_VISIBLE_LINES;
-                                    if let Some(config) = self.config.get("traceroute") {
-                                        let row = config.position.row;
-                                        let col = config.position.col;
-                                        if pane_areas.len() > row && pane_areas[row].len() > col {
-                                            visible_lines = pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
-                                        }
+                            } else if focused_id == "traceroute"
+                                && let Some(traceroute_pane) = pane
+                                    .as_any_mut()
+                                    .downcast_mut::<crate::tui::traceroute::TraceroutePane>()
+                            {
+                                // Get the TraceroutePane area
+                                let mut visible_lines = FALLBACK_VISIBLE_LINES;
+                                if let Some(config) = self.config.get("traceroute") {
+                                    let row = config.position.row;
+                                    let col = config.position.col;
+                                    if pane_areas.len() > row && pane_areas[row].len() > col {
+                                        visible_lines =
+                                            pane_areas[row][col].height.saturating_sub(BORDER_HEIGHT_OFFSET);
                                     }
-
-                                    traceroute_pane.scroll_down_smart(state, visible_lines);
-                                    return true;
                                 }
+
+                                traceroute_pane.scroll_down_smart(state, visible_lines);
+                                return true;
                             }
                         }
                     }
@@ -389,7 +449,9 @@ impl PaneLayout {
                     for pane in &mut self.panes {
                         if pane.id() == focused_id {
                             if focused_id == "security" {
-                                if let Some(security_pane) = pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>() {
+                                if let Some(security_pane) =
+                                    pane.as_any_mut().downcast_mut::<crate::tui::security::SecurityPane>()
+                                {
                                     security_pane.reset_scroll();
                                     return true;
                                 }
@@ -398,17 +460,23 @@ impl PaneLayout {
                                     dns_pane.reset_scroll();
                                     return true;
                                 }
-                            } else if focused_id == "traceroute" {
-                                if let Some(traceroute_pane) = pane.as_any_mut().downcast_mut::<crate::tui::traceroute::TraceroutePane>() {
-                                    traceroute_pane.reset_scroll();
-                                    return true;
-                                }
+                            } else if focused_id == "traceroute"
+                                && let Some(traceroute_pane) = pane
+                                    .as_any_mut()
+                                    .downcast_mut::<crate::tui::traceroute::TraceroutePane>()
+                            {
+                                traceroute_pane.reset_scroll();
+                                return true;
                             }
                         }
                     }
                 }
                 _ => {
-                    log::trace!("[tui::layout] unhandled_key_in_pane: pane={} key={:?}", focused_id, key.code);
+                    log::trace!(
+                        "[tui::layout] unhandled_key_in_pane: pane={} key={:?}",
+                        focused_id,
+                        key.code
+                    );
                 }
             }
         } else {

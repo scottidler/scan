@@ -1,9 +1,10 @@
 use crate::scanner::Scanner;
-use crate::target::{Target, Protocol};
+use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use eyre::{Result, WrapErr};
+use log;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use rustls::ClientConfig;
@@ -12,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
 use webpki_roots;
-use log;
 
 const TLS_SCAN_INTERVAL_SECS: u64 = 300;
 const TLS_CONNECTION_TIMEOUT_SECS: u64 = 10;
@@ -104,8 +104,6 @@ impl SecurityGrade {
     }
 }
 
-
-
 // New IPv4/IPv6 first-class support structures
 #[derive(Debug, Clone)]
 pub struct TlsData {
@@ -165,10 +163,10 @@ impl TlsData {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TlsStatus {
-    NotQueried,           // Protocol not attempted (due to protocol restrictions)
+    NotQueried,             // Protocol not attempted (due to protocol restrictions)
     Success(SecurityGrade), // TLS scan succeeded with security grade
-    Failed(String),       // TLS scan failed with error message
-    NoAddress,           // No address available for this protocol
+    Failed(String),         // TLS scan failed with error message
+    NoAddress,              // No address available for this protocol
 }
 
 impl TlsStatus {
@@ -202,6 +200,12 @@ pub struct TlsResult {
     // Metadata
     pub queried_at: Instant,
     pub total_duration: Duration,
+}
+
+impl Default for TlsResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TlsResult {
@@ -285,6 +289,12 @@ pub struct TlsScanner {
     total_scan_timeout: Duration,
 }
 
+impl Default for TlsScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TlsScanner {
     pub fn new() -> Self {
         log::debug!("[scan::tls] new: interval=300s connection_timeout=10s handshake_timeout=5s");
@@ -297,27 +307,49 @@ impl TlsScanner {
     }
 
     async fn tls_protocol(&self, target: &Target, protocol: Protocol) -> Result<TlsData> {
-        log::debug!("[scan::tls] tls_protocol: target={} protocol={}", target.display_name(), protocol.as_str());
+        log::debug!(
+            "[scan::tls] tls_protocol: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
 
         // Check if target supports this protocol
         if !target.supports_protocol(protocol) {
-            log::debug!("[scan::tls] protocol_not_supported: target={} protocol={}",
-                target.display_name(), protocol.as_str());
-            return Err(eyre::eyre!("No {} address available for target: {}", protocol.as_str(), target.display_name()));
+            log::debug!(
+                "[scan::tls] protocol_not_supported: target={} protocol={}",
+                target.display_name(),
+                protocol.as_str()
+            );
+            return Err(eyre::eyre!(
+                "No {} address available for target: {}",
+                protocol.as_str(),
+                target.display_name()
+            ));
         }
 
         // Get protocol-specific target
         let tls_target = match target.network_target_for_protocol(protocol) {
             Some(target_addr) => target_addr,
             None => {
-                log::warn!("[scan::tls] no_target_for_protocol: target={} protocol={}",
-                    target.display_name(), protocol.as_str());
-                eyre::bail!("No {} address available for target: {}", protocol.as_str(), target.display_name());
+                log::warn!(
+                    "[scan::tls] no_target_for_protocol: target={} protocol={}",
+                    target.display_name(),
+                    protocol.as_str()
+                );
+                eyre::bail!(
+                    "No {} address available for target: {}",
+                    protocol.as_str(),
+                    target.display_name()
+                );
             }
         };
 
-        log::debug!("[scan::tls] protocol_target: {} -> {} ({})",
-            target.display_name(), tls_target, protocol.as_str());
+        log::debug!(
+            "[scan::tls] protocol_target: {} -> {} ({})",
+            target.display_name(),
+            tls_target,
+            protocol.as_str()
+        );
 
         let tls_data = self.perform_tls_scan_for_ip(target, &tls_target).await?;
         Ok(tls_data)
@@ -334,6 +366,9 @@ impl TlsScanner {
     }
 
     fn get_tls_ports(&self, target: &Target) -> Vec<u16> {
+        // The https-scheme and fallback branches intentionally both default to the
+        // HTTPS port; kept as separate branches for readability of intent.
+        #[allow(clippy::if_same_then_else)]
         let ports = if let Some(port) = target.port {
             vec![port]
         } else if target.scheme.as_deref() == Some("https") {
@@ -342,13 +377,23 @@ impl TlsScanner {
             vec![DEFAULT_HTTPS_PORT] // Default to HTTPS port
         };
 
-        log::debug!("[scan::tls] get_tls_ports: target={} ports={:?}",
-            target.display_name(), ports);
+        log::debug!(
+            "[scan::tls] get_tls_ports: target={} ports={:?}",
+            target.display_name(),
+            ports
+        );
         ports
     }
 
-    async fn test_basic_connection(&self, target: &Target, target_ip: &str, port: u16) -> Result<(bool, Duration, Option<TlsVersion>)> {
-        let domain = target.domain.as_ref()
+    async fn test_basic_connection(
+        &self,
+        target: &Target,
+        target_ip: &str,
+        port: u16,
+    ) -> Result<(bool, Duration, Option<TlsVersion>)> {
+        let domain = target
+            .domain
+            .as_ref()
             .ok_or_else(|| eyre::eyre!("Domain required for TLS scanning"))?;
 
         let start_time = Instant::now();
@@ -367,8 +412,7 @@ impl TlsScanner {
         let connector = TlsConnector::from(Arc::new(config));
 
         // Parse server name for SNI
-        let server_name = ServerName::try_from(domain.clone())
-            .wrap_err("Invalid domain name for TLS")?;
+        let server_name = ServerName::try_from(domain.clone()).wrap_err("Invalid domain name for TLS")?;
 
         // Connect to target
         let addr = format!("{}:{}", target_ip, port);
@@ -376,7 +420,8 @@ impl TlsScanner {
         match tokio::time::timeout(self.connection_timeout, async {
             let socket = tokio::net::TcpStream::connect(&addr).await?;
             // Use handshake_timeout for the TLS handshake specifically
-            let tls_stream = tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await??;
+            let tls_stream =
+                tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await??;
 
             // Get TLS version from the connection
             let (_, connection) = tls_stream.into_inner();
@@ -389,7 +434,9 @@ impl TlsScanner {
             };
 
             Ok::<(bool, Option<TlsVersion>), eyre::Error>((true, tls_version))
-        }).await {
+        })
+        .await
+        {
             Ok(Ok((success, version))) => {
                 let _handshake_time = start_time.elapsed();
                 Ok((success, _handshake_time, version))
@@ -400,7 +447,10 @@ impl TlsScanner {
             }
             Err(_) => {
                 let _handshake_time = start_time.elapsed();
-                Err(eyre::eyre!("TLS connection timeout after {:?}", self.connection_timeout))
+                Err(eyre::eyre!(
+                    "TLS connection timeout after {:?}",
+                    self.connection_timeout
+                ))
             }
         }
     }
@@ -409,12 +459,11 @@ impl TlsScanner {
         let mut supported_versions = Vec::new();
 
         // Test TLS 1.2 and 1.3 with rustls (modern versions)
-        if let Ok((success, _, version)) = self.test_basic_connection(target, target_ip, port).await {
-            if success {
-                if let Some(v) = version {
-                    supported_versions.push(v);
-                }
-            }
+        if let Ok((success, _, version)) = self.test_basic_connection(target, target_ip, port).await
+            && success
+            && let Some(v) = version
+        {
+            supported_versions.push(v);
         }
 
         // For older TLS versions (1.0, 1.1), we'd need OpenSSL
@@ -423,13 +472,19 @@ impl TlsScanner {
         Ok(supported_versions)
     }
 
-    fn analyze_certificate_with_openssl(&self, target: &Target, target_ip: &str, port: u16) -> Result<Vec<CertificateInfo>> {
-        let domain = target.domain.as_ref()
+    fn analyze_certificate_with_openssl(
+        &self,
+        target: &Target,
+        target_ip: &str,
+        port: u16,
+    ) -> Result<Vec<CertificateInfo>> {
+        let domain = target
+            .domain
+            .as_ref()
             .ok_or_else(|| eyre::eyre!("Domain required for certificate analysis"))?;
 
         // Create OpenSSL connector for detailed certificate analysis
-        let mut builder = SslConnector::builder(SslMethod::tls())
-            .wrap_err("Failed to create SSL connector")?;
+        let mut builder = SslConnector::builder(SslMethod::tls()).wrap_err("Failed to create SSL connector")?;
 
         // Disable verification to get certificate details even for invalid certs
         builder.set_verify(SslVerifyMode::NONE);
@@ -437,13 +492,11 @@ impl TlsScanner {
 
         // Connect and get certificate chain
         let addr = format!("{}:{}", target_ip, port);
-        let stream = std::net::TcpStream::connect_timeout(
-            &addr.parse().wrap_err("Invalid address")?,
-            self.connection_timeout,
-        ).wrap_err("TCP connection failed")?;
+        let stream =
+            std::net::TcpStream::connect_timeout(&addr.parse().wrap_err("Invalid address")?, self.connection_timeout)
+                .wrap_err("TCP connection failed")?;
 
-        let ssl_stream = connector.connect(domain, stream)
-            .wrap_err("SSL connection failed")?;
+        let ssl_stream = connector.connect(domain, stream).wrap_err("SSL connection failed")?;
 
         let mut cert_chain = Vec::new();
 
@@ -465,23 +518,43 @@ impl TlsScanner {
     }
 
     fn parse_certificate(&self, cert: &X509) -> Result<CertificateInfo> {
-        let subject = cert.subject_name().entries()
-            .map(|entry| format!("{}={}",
-                entry.object().nid().short_name().unwrap_or("?"),
-                entry.data().as_utf8().map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string())
-            ))
+        let subject = cert
+            .subject_name()
+            .entries()
+            .map(|entry| {
+                format!(
+                    "{}={}",
+                    entry.object().nid().short_name().unwrap_or("?"),
+                    entry
+                        .data()
+                        .as_utf8()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "?".to_string())
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
-        let issuer = cert.issuer_name().entries()
-            .map(|entry| format!("{}={}",
-                entry.object().nid().short_name().unwrap_or("?"),
-                entry.data().as_utf8().map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string())
-            ))
+        let issuer = cert
+            .issuer_name()
+            .entries()
+            .map(|entry| {
+                format!(
+                    "{}={}",
+                    entry.object().nid().short_name().unwrap_or("?"),
+                    entry
+                        .data()
+                        .as_utf8()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "?".to_string())
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
-        let serial_number = cert.serial_number().to_bn()
+        let serial_number = cert
+            .serial_number()
+            .to_bn()
             .wrap_err("Failed to get serial number")?
             .to_hex_str()
             .wrap_err("Failed to convert serial to hex")?
@@ -491,8 +564,13 @@ impl TlsScanner {
         let not_before = self.asn1_time_to_datetime(cert.not_before())?;
         let not_after = self.asn1_time_to_datetime(cert.not_after())?;
 
-        let signature_algorithm = cert.signature_algorithm().object().nid()
-            .short_name().unwrap_or("Unknown").to_string();
+        let signature_algorithm = cert
+            .signature_algorithm()
+            .object()
+            .nid()
+            .short_name()
+            .unwrap_or("Unknown")
+            .to_string();
 
         let public_key = cert.public_key().wrap_err("Failed to get public key")?;
         let (public_key_algorithm, key_size) = match public_key.id() {
@@ -552,7 +630,8 @@ impl TlsScanner {
             let minute: u32 = time_str[8..10].parse().wrap_err("Invalid minute")?;
             let second: u32 = time_str[10..12].parse().wrap_err("Invalid second")?;
 
-            chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+            chrono::Utc
+                .with_ymd_and_hms(year, month, day, hour, minute, second)
                 .single()
                 .ok_or_else(|| eyre::eyre!("Invalid datetime"))?
         } else if time_str.len() == 15 && time_str.ends_with('Z') {
@@ -564,7 +643,8 @@ impl TlsScanner {
             let minute: u32 = time_str[10..12].parse().wrap_err("Invalid minute")?;
             let second: u32 = time_str[12..14].parse().wrap_err("Invalid second")?;
 
-            chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+            chrono::Utc
+                .with_ymd_and_hms(year, month, day, hour, minute, second)
                 .single()
                 .ok_or_else(|| eyre::eyre!("Invalid datetime"))?
         } else {
@@ -578,10 +658,10 @@ impl TlsScanner {
         let mut vulnerabilities = Vec::new();
 
         // Check for expired certificates
-        if let Some(expiry) = result.expiry_date {
-            if expiry < chrono::Utc::now() {
-                vulnerabilities.push(TlsVulnerability::ExpiredCertificate);
-            }
+        if let Some(expiry) = result.expiry_date
+            && expiry < chrono::Utc::now()
+        {
+            vulnerabilities.push(TlsVulnerability::ExpiredCertificate);
         }
 
         // Check for self-signed certificates
@@ -595,7 +675,9 @@ impl TlsScanner {
         // Check for weak signature algorithms
         for cert in &result.certificate_chain {
             if cert.signature_algorithm.contains("md5") || cert.signature_algorithm.contains("sha1") {
-                vulnerabilities.push(TlsVulnerability::WeakSignatureAlgorithm(cert.signature_algorithm.clone()));
+                vulnerabilities.push(TlsVulnerability::WeakSignatureAlgorithm(
+                    cert.signature_algorithm.clone(),
+                ));
             }
         }
 
@@ -663,7 +745,11 @@ impl TlsScanner {
     }
 
     async fn perform_tls_scan_for_ip(&self, target: &Target, target_ip: &str) -> Result<TlsData> {
-        log::debug!("[scan::tls] perform_tls_scan_for_ip: target={} ip={}", target.display_name(), target_ip);
+        log::debug!(
+            "[scan::tls] perform_tls_scan_for_ip: target={} ip={}",
+            target.display_name(),
+            target_ip
+        );
 
         let start_time = Instant::now();
         let mut result = TlsData::new(target_ip.to_string());
@@ -673,7 +759,12 @@ impl TlsScanner {
         log::debug!("[scan::tls] using_port: target={} port={}", target.display_name(), port);
 
         // Phase 1: Basic connectivity test
-        log::debug!("[scan::tls] phase1_basic_connection: target={} ip={} port={}", target.display_name(), target_ip, port);
+        log::debug!(
+            "[scan::tls] phase1_basic_connection: target={} ip={} port={}",
+            target.display_name(),
+            target_ip,
+            port
+        );
         let phase1_start = Instant::now();
         match self.test_basic_connection(target, target_ip, port).await {
             Ok((success, handshake_time, version)) => {
@@ -684,13 +775,25 @@ impl TlsScanner {
                     result.negotiated_version = Some(v.clone());
                     result.supported_versions.push(v);
                 }
-                log::trace!("[scan::tls] phase1_completed: target={} port={} success={} handshake_time={}ms phase_duration={}ms version={:?}",
-                    target.display_name(), port, success, handshake_time.as_millis(), phase1_duration.as_millis(), result.negotiated_version);
+                log::trace!(
+                    "[scan::tls] phase1_completed: target={} port={} success={} handshake_time={}ms phase_duration={}ms version={:?}",
+                    target.display_name(),
+                    port,
+                    success,
+                    handshake_time.as_millis(),
+                    phase1_duration.as_millis(),
+                    result.negotiated_version
+                );
             }
             Err(e) => {
                 let phase1_duration = phase1_start.elapsed();
-                log::error!("[scan::tls] phase1_failed: target={} port={} duration={}ms error={}",
-                    target.display_name(), port, phase1_duration.as_millis(), e);
+                log::error!(
+                    "[scan::tls] phase1_failed: target={} port={} duration={}ms error={}",
+                    target.display_name(),
+                    port,
+                    phase1_duration.as_millis(),
+                    e
+                );
                 result.certificate_errors.push(format!("Connection failed: {}", e));
                 result.scan_time = start_time.elapsed();
                 return Ok(result);
@@ -698,25 +801,47 @@ impl TlsScanner {
         }
 
         // Phase 2: TLS version enumeration
-        log::debug!("[scan::tls] phase2_version_enumeration: target={} ip={} port={}", target.display_name(), target_ip, port);
+        log::debug!(
+            "[scan::tls] phase2_version_enumeration: target={} ip={} port={}",
+            target.display_name(),
+            target_ip,
+            port
+        );
         let phase2_start = Instant::now();
         match self.test_tls_versions(target, target_ip, port).await {
             Ok(versions) => {
                 let phase2_duration = phase2_start.elapsed();
                 result.supported_versions = versions.clone();
-                log::trace!("[scan::tls] phase2_completed: target={} port={} duration={}ms versions={:?}",
-                    target.display_name(), port, phase2_duration.as_millis(), versions);
+                log::trace!(
+                    "[scan::tls] phase2_completed: target={} port={} duration={}ms versions={:?}",
+                    target.display_name(),
+                    port,
+                    phase2_duration.as_millis(),
+                    versions
+                );
             }
             Err(e) => {
                 let phase2_duration = phase2_start.elapsed();
-                log::warn!("[scan::tls] phase2_failed: target={} port={} duration={}ms error={}",
-                    target.display_name(), port, phase2_duration.as_millis(), e);
-                result.certificate_errors.push(format!("Version enumeration failed: {}", e));
+                log::warn!(
+                    "[scan::tls] phase2_failed: target={} port={} duration={}ms error={}",
+                    target.display_name(),
+                    port,
+                    phase2_duration.as_millis(),
+                    e
+                );
+                result
+                    .certificate_errors
+                    .push(format!("Version enumeration failed: {}", e));
             }
         }
 
         // Phase 3: Certificate analysis
-        log::debug!("[scan::tls] phase3_certificate_analysis: target={} ip={} port={}", target.display_name(), target_ip, port);
+        log::debug!(
+            "[scan::tls] phase3_certificate_analysis: target={} ip={} port={}",
+            target.display_name(),
+            target_ip,
+            port
+        );
         let phase3_start = Instant::now();
         match self.analyze_certificate_with_openssl(target, target_ip, port) {
             Ok(cert_chain) => {
@@ -728,38 +853,68 @@ impl TlsScanner {
                     result.days_until_expiry = Some(days_until_expiry);
                 }
                 result.certificate_chain = cert_chain.clone();
-                log::trace!("[scan::tls] phase3_completed: target={} port={} duration={}ms cert_count={} valid={} days_until_expiry={:?}",
-                    target.display_name(), port, phase3_duration.as_millis(), cert_chain.len(), result.certificate_valid, result.days_until_expiry);
+                log::trace!(
+                    "[scan::tls] phase3_completed: target={} port={} duration={}ms cert_count={} valid={} days_until_expiry={:?}",
+                    target.display_name(),
+                    port,
+                    phase3_duration.as_millis(),
+                    cert_chain.len(),
+                    result.certificate_valid,
+                    result.days_until_expiry
+                );
             }
             Err(e) => {
                 let phase3_duration = phase3_start.elapsed();
-                log::error!("[scan::tls] phase3_failed: target={} port={} duration={}ms error={}",
-                    target.display_name(), port, phase3_duration.as_millis(), e);
-                result.certificate_errors.push(format!("Certificate analysis failed: {}", e));
+                log::error!(
+                    "[scan::tls] phase3_failed: target={} port={} duration={}ms error={}",
+                    target.display_name(),
+                    port,
+                    phase3_duration.as_millis(),
+                    e
+                );
+                result
+                    .certificate_errors
+                    .push(format!("Certificate analysis failed: {}", e));
             }
         }
 
         // Phase 4: Vulnerability detection
-        log::debug!("[scan::tls] phase4_vulnerability_detection: target={}", target.display_name());
+        log::debug!(
+            "[scan::tls] phase4_vulnerability_detection: target={}",
+            target.display_name()
+        );
         let phase4_start = Instant::now();
         result.vulnerabilities = self.detect_vulnerabilities(&result);
         let phase4_duration = phase4_start.elapsed();
-        log::trace!("[scan::tls] phase4_completed: target={} duration={}μs vulnerabilities={:?}",
-            target.display_name(), phase4_duration.as_micros(), result.vulnerabilities);
+        log::trace!(
+            "[scan::tls] phase4_completed: target={} duration={}μs vulnerabilities={:?}",
+            target.display_name(),
+            phase4_duration.as_micros(),
+            result.vulnerabilities
+        );
 
         // Phase 5: Security grading
         log::debug!("[scan::tls] phase5_security_grading: target={}", target.display_name());
         let phase5_start = Instant::now();
         result.security_grade = self.calculate_security_grade(&result);
         let phase5_duration = phase5_start.elapsed();
-        log::trace!("[scan::tls] phase5_completed: target={} duration={}μs grade={:?}",
-            target.display_name(), phase5_duration.as_micros(), result.security_grade);
+        log::trace!(
+            "[scan::tls] phase5_completed: target={} duration={}μs grade={:?}",
+            target.display_name(),
+            phase5_duration.as_micros(),
+            result.security_grade
+        );
 
         result.scan_time = start_time.elapsed();
         result.queried_at = start_time;
 
-        log::debug!("[scan::tls] tls_scan_completed: target={} total_duration={}ms grade={:?} vulnerabilities={}",
-            target.display_name(), result.scan_time.as_millis(), result.security_grade, result.vulnerabilities.len());
+        log::debug!(
+            "[scan::tls] tls_scan_completed: target={} total_duration={}ms grade={:?} vulnerabilities={}",
+            target.display_name(),
+            result.scan_time.as_millis(),
+            result.security_grade,
+            result.vulnerabilities.len()
+        );
 
         Ok(result)
     }
@@ -768,8 +923,12 @@ impl TlsScanner {
 #[async_trait]
 impl Scanner for TlsScanner {
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
-        log::debug!("[scan::tls] scan: target={} protocol={} total_timeout={}s",
-            target.display_name(), protocol.as_str(), self.total_scan_timeout.as_secs());
+        log::debug!(
+            "[scan::tls] scan: target={} protocol={} total_timeout={}s",
+            target.display_name(),
+            protocol.as_str(),
+            self.total_scan_timeout.as_secs()
+        );
 
         let scan_start = Instant::now();
         let mut result = TlsResult::new();
@@ -832,15 +991,27 @@ impl Scanner for TlsScanner {
 
         // Return success if at least one protocol succeeded, or error if all failed
         if result.has_any_success() {
-            log::trace!("[scan::tls] tls_completed: target={} protocol={} duration={}ms best_grade={:?}",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis(), result.get_best_security_grade());
+            log::trace!(
+                "[scan::tls] tls_completed: target={} protocol={} duration={}ms best_grade={:?}",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis(),
+                result.get_best_security_grade()
+            );
             Ok(ScanResult::Tls(result))
         } else {
             // All protocols failed
-            let error_msg = format!("All TLS attempts failed for target: {} ({})",
-                target.display_name(), protocol.as_str());
-            log::error!("[scan::tls] all_tls_failed: target={} protocol={} duration={}ms",
-                target.display_name(), protocol.as_str(), result.total_duration.as_millis());
+            let error_msg = format!(
+                "All TLS attempts failed for target: {} ({})",
+                target.display_name(),
+                protocol.as_str()
+            );
+            log::error!(
+                "[scan::tls] all_tls_failed: target={} protocol={} duration={}ms",
+                target.display_name(),
+                protocol.as_str(),
+                result.total_duration.as_millis()
+            );
             Err(eyre::eyre!(error_msg))
         }
     }
@@ -1044,12 +1215,15 @@ mod tests {
         assert_eq!(vulnerabilities.len(), 12);
         assert!(matches!(vulnerabilities[0], TlsVulnerability::Heartbleed));
         assert!(matches!(vulnerabilities[4], TlsVulnerability::WeakCipher(_)));
-        assert!(matches!(vulnerabilities[7], TlsVulnerability::WeakSignatureAlgorithm(_)));
+        assert!(matches!(
+            vulnerabilities[7],
+            TlsVulnerability::WeakSignatureAlgorithm(_)
+        ));
     }
 
     #[test]
     fn test_security_grade_comparison() {
-        let grades = vec![
+        let grades = [
             SecurityGrade::APlus,
             SecurityGrade::A,
             SecurityGrade::B,
@@ -1111,10 +1285,7 @@ mod tests {
         // Set up a result with critical vulnerabilities
         tls_data.connection_successful = true;
         tls_data.supported_versions = vec![TlsVersion::V1_0, TlsVersion::V1_1]; // Old versions
-        tls_data.vulnerabilities = vec![
-            TlsVulnerability::Heartbleed,
-            TlsVulnerability::ExpiredCertificate,
-        ];
+        tls_data.vulnerabilities = vec![TlsVulnerability::Heartbleed, TlsVulnerability::ExpiredCertificate];
 
         let grade = scanner.calculate_security_grade(&tls_data);
         assert_eq!(grade, SecurityGrade::F);
@@ -1151,12 +1322,7 @@ mod tests {
 
     #[test]
     fn test_tls_version_ordering() {
-        let versions = vec![
-            TlsVersion::V1_0,
-            TlsVersion::V1_1,
-            TlsVersion::V1_2,
-            TlsVersion::V1_3,
-        ];
+        let versions = [TlsVersion::V1_0, TlsVersion::V1_1, TlsVersion::V1_2, TlsVersion::V1_3];
 
         assert_eq!(versions[0].as_str(), "TLSv1.0");
         assert_eq!(versions[1].as_str(), "TLSv1.1");

@@ -1,15 +1,15 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::tui::scrollable::ScrollablePane;
 use crate::types::{AppState, ScanResult};
+use log;
 use ratatui::{
+    Frame,
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const LOCAL_ISP_HOP_THRESHOLD: u8 = 3;
 const MID_NETWORK_HOP_THRESHOLD: u8 = 10;
@@ -42,8 +42,12 @@ impl Default for TraceroutePane {
 
 impl Pane for TraceroutePane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::traceroute] render: area={}x{} focused={}",
-            area.width, area.height, focused);
+        log::trace!(
+            "[tui::traceroute] render: area={}x{} focused={}",
+            area.width,
+            area.height,
+            focused
+        );
 
         let block = create_block(self.title, focused);
 
@@ -80,7 +84,7 @@ impl Pane for TraceroutePane {
                         crate::types::ScanStatus::Running => Color::Yellow,
                         crate::types::ScanStatus::Complete => Color::Green,
                         crate::types::ScanStatus::Failed => Color::Red,
-                    })
+                    }),
                 ),
             ]);
 
@@ -101,17 +105,22 @@ impl Pane for TraceroutePane {
                     // Show all hops
                     for hop in &primary_data.hops {
                         // Get first responding IP and best RTT
-                        let (ip_display, rtt_display, hop_color) = if let Some(response) = hop.responses.iter().find(|r| !r.timeout) {
-                            let ip_str = response.ip_address.as_ref()
-                                .map(|ip| ip.to_string())
-                                .unwrap_or_else(|| "*".to_string());
-                            let rtt_str = response.rtt.as_ref()
-                                .map(|rtt| format!("{}ms", rtt.as_millis()))
-                                .unwrap_or_else(|| "*".to_string());
-                            (ip_str, rtt_str, Color::Cyan)
-                        } else {
-                            ("*".to_string(), "timeout".to_string(), Color::Gray)
-                        };
+                        let (ip_display, rtt_display, hop_color) =
+                            if let Some(response) = hop.responses.iter().find(|r| !r.timeout) {
+                                let ip_str = response
+                                    .ip_address
+                                    .as_ref()
+                                    .map(|ip| ip.to_string())
+                                    .unwrap_or_else(|| "*".to_string());
+                                let rtt_str = response
+                                    .rtt
+                                    .as_ref()
+                                    .map(|rtt| format!("{}ms", rtt.as_millis()))
+                                    .unwrap_or_else(|| "*".to_string());
+                                (ip_str, rtt_str, Color::Cyan)
+                            } else {
+                                ("*".to_string(), "timeout".to_string(), Color::Gray)
+                            };
 
                         // Color code hop number based on position
                         let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
@@ -139,12 +148,8 @@ impl Pane for TraceroutePane {
                 let scan_time_ms = traceroute_result.total_duration.as_millis();
                 lines.push(Line::from(vec![
                     Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{}ms", scan_time_ms),
-                        Style::default().fg(Color::Yellow)
-                    ),
+                    Span::styled(format!("{}ms", scan_time_ms), Style::default().fg(Color::Yellow)),
                 ]));
-
             } else {
                 // No traceroute data available yet - check scanner status
                 match traceroute_state.status {
@@ -186,8 +191,7 @@ impl Pane for TraceroutePane {
         let visible_lines = self.apply_scroll_to_lines(lines, visible_height);
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(visible_lines)
-            .alignment(Alignment::Left);
+        let paragraph = Paragraph::new(visible_lines).alignment(Alignment::Left);
         paragraph.render(inner_area, frame.buffer_mut());
     }
 

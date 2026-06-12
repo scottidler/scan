@@ -19,7 +19,11 @@ pub trait ScrollablePane {
         let old_offset = self.scroll_offset();
         let new_offset = old_offset.saturating_sub(SCROLL_STEP);
         self.set_scroll_offset(new_offset);
-        log::debug!("[tui::scrollable] scroll_up: old_offset={} new_offset={}", old_offset, new_offset);
+        log::debug!(
+            "[tui::scrollable] scroll_up: old_offset={} new_offset={}",
+            old_offset,
+            new_offset
+        );
     }
 
     /// Scroll down intelligently based on content size and visible area
@@ -34,8 +38,14 @@ pub trait ScrollablePane {
             self.set_scroll_offset(new_offset);
         }
 
-        log::debug!("[tui::scrollable] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
-            old_offset, self.scroll_offset(), actual_lines, visible_height, max_scroll);
+        log::debug!(
+            "[tui::scrollable] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
+            old_offset,
+            self.scroll_offset(),
+            actual_lines,
+            visible_height,
+            max_scroll
+        );
     }
 
     /// Reset scroll to top
@@ -50,16 +60,17 @@ pub trait ScrollablePane {
         let total_lines = lines.len() as u16;
 
         // Calculate safe scroll offset
-        let max_scroll_offset = if total_lines > visible_height {
-            total_lines - visible_height
-        } else {
-            0
-        };
+        let max_scroll_offset = total_lines.saturating_sub(visible_height);
 
         let safe_scroll_offset = self.scroll_offset().min(max_scroll_offset);
 
-        log::trace!("[tui::scrollable] apply_scroll: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
-            total_lines, visible_height, max_scroll_offset, safe_scroll_offset);
+        log::trace!(
+            "[tui::scrollable] apply_scroll: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
+            total_lines,
+            visible_height,
+            max_scroll_offset,
+            safe_scroll_offset
+        );
 
         // Apply scroll offset - skip lines from the beginning
         if safe_scroll_offset < total_lines {

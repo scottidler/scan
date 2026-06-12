@@ -1,21 +1,18 @@
-use crate::tui::pane::{create_block, Pane};
+use crate::tui::pane::{Pane, create_block};
 use crate::tui::sparkline::SparklineData;
 use crate::types::{AppState, ScanResult};
+use log;
 use ratatui::{
-    layout::{Alignment, Rect, Layout, Constraint, Direction},
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget, Sparkline},
-    Frame,
+    widgets::{Paragraph, Sparkline, Widget},
 };
 use std::any::Any;
-use std::sync::Mutex;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::time::Instant;
-use log;
-
-
-
 
 const MIN_CONNECTIVITY_PANE_WIDTH: u16 = 25;
 const MIN_CONNECTIVITY_PANE_HEIGHT: u16 = 12; // Double-height sparklines like btop
@@ -93,7 +90,8 @@ impl ConnectivityHistory {
         }
 
         let recent_count = results.len().min(5); // Look at last 5 results
-        let recent_results: Vec<bool> = results.iter()
+        let recent_results: Vec<bool> = results
+            .iter()
             .rev()
             .take(recent_count)
             .map(|(_, success)| *success)
@@ -103,10 +101,10 @@ impl ConnectivityHistory {
         let failure_count = recent_results.len() - success_count;
 
         match (success_count, failure_count) {
-            (s, 0) if s >= 2 => ConnectivityState::Connected,     // All recent pings successful
-            (0, f) if f >= 3 => ConnectivityState::Disconnected,  // Multiple recent failures
+            (s, 0) if s >= 2 => ConnectivityState::Connected, // All recent pings successful
+            (0, f) if f >= 3 => ConnectivityState::Disconnected, // Multiple recent failures
             (s, f) if s > 0 && f > 0 => ConnectivityState::Intermittent, // Mixed results
-            _ => ConnectivityState::Checking, // Not enough data
+            _ => ConnectivityState::Checking,                 // Not enough data
         }
     }
 }
@@ -124,18 +122,15 @@ pub struct ConnectivityPane {
 impl ConnectivityPane {
     pub fn new() -> Self {
         log::debug!("[tui::connectivity] new:");
-        let pane = Self {
+
+        Self {
             title: "connectivity",
             id: "connectivity",
             ipv4_sparkline: Mutex::new(SparklineData::new(Some(200))), // Store more data for wider sparklines
             ipv6_sparkline: Mutex::new(SparklineData::new(Some(200))),
             last_ping_timestamp: Mutex::new(None),
             connectivity_history: Mutex::new(ConnectivityHistory::new()),
-        };
-
-
-
-        pane
+        }
     }
 
     fn update_sparklines(&self, ping_result: &crate::scan::ping::PingResult) {
@@ -145,7 +140,11 @@ impl ConnectivityPane {
             match *last_timestamp {
                 Some(last) if last >= current_timestamp => {
                     // This is old data, don't update sparklines
-                    log::trace!("[tui::connectivity] skipping_old_data: last={:?} current={:?}", last, current_timestamp);
+                    log::trace!(
+                        "[tui::connectivity] skipping_old_data: last={:?} current={:?}",
+                        last,
+                        current_timestamp
+                    );
                     return;
                 }
                 _ => {
@@ -169,25 +168,27 @@ impl ConnectivityPane {
         let ipv4_attempted = ping_result.ipv4_status.was_attempted();
         let ipv6_attempted = ping_result.ipv6_status.was_attempted();
 
-        log::debug!("[tui::connectivity] updating_sparklines: ipv4_success={} ipv6_success={}",
-            ipv4_success, ipv6_success);
+        log::debug!(
+            "[tui::connectivity] updating_sparklines: ipv4_success={} ipv6_success={}",
+            ipv4_success,
+            ipv6_success
+        );
 
         // Update connectivity history - treat any attempt as a result to track
         if let Ok(mut history) = self.connectivity_history.lock() {
-            let ipv4_result = if ipv4_attempted {
-                Some(ipv4_success)
-            } else {
-                None
-            };
-            let ipv6_result = if ipv6_attempted {
-                Some(ipv6_success)
-            } else {
-                None
-            };
+            let ipv4_result = if ipv4_attempted { Some(ipv4_success) } else { None };
+            let ipv6_result = if ipv6_attempted { Some(ipv6_success) } else { None };
 
             history.add_result(ipv4_result, ipv6_result);
-            log::debug!("[tui::connectivity] connectivity_history_updated: ipv4_attempted={} ipv4_success={} ipv4_state={:?} ipv6_attempted={} ipv6_success={} ipv6_state={:?}",
-                ipv4_attempted, ipv4_success, history.ipv4_state, ipv6_attempted, ipv6_success, history.ipv6_state);
+            log::debug!(
+                "[tui::connectivity] connectivity_history_updated: ipv4_attempted={} ipv4_success={} ipv4_state={:?} ipv6_attempted={} ipv6_success={} ipv6_state={:?}",
+                ipv4_attempted,
+                ipv4_success,
+                history.ipv4_state,
+                ipv6_attempted,
+                ipv6_success,
+                history.ipv6_state
+            );
         } else {
             log::warn!("[tui::connectivity] failed_to_lock_connectivity_history");
         }
@@ -196,30 +197,49 @@ impl ConnectivityPane {
         if let Some(latency) = ping_result.ipv4_status.latency() {
             if let Ok(mut sparkline) = self.ipv4_sparkline.lock() {
                 sparkline.add_latency(latency);
-                log::debug!("[tui::connectivity] ipv4_sparkline_updated: latency={}ms points={} min={:?} max={:?} avg={:?}",
-                    latency.as_millis(), sparkline.len(), sparkline.min_value(), sparkline.max_value(), sparkline.average_value());
+                log::debug!(
+                    "[tui::connectivity] ipv4_sparkline_updated: latency={}ms points={} min={:?} max={:?} avg={:?}",
+                    latency.as_millis(),
+                    sparkline.len(),
+                    sparkline.min_value(),
+                    sparkline.max_value(),
+                    sparkline.average_value()
+                );
             } else {
                 log::warn!("[tui::connectivity] failed_to_lock_ipv4_sparkline");
             }
         } else {
-            log::debug!("[tui::connectivity] no_ipv4_latency: status={:?}", ping_result.ipv4_status);
+            log::debug!(
+                "[tui::connectivity] no_ipv4_latency: status={:?}",
+                ping_result.ipv4_status
+            );
         }
 
         // Update IPv6 sparkline
-        log::debug!("[tui::connectivity] ipv6_ping_status_check: status={:?} was_attempted={} is_success={}",
-            ping_result.ipv6_status, ipv6_attempted, ipv6_success);
+        log::debug!(
+            "[tui::connectivity] ipv6_ping_status_check: status={:?} was_attempted={} is_success={}",
+            ping_result.ipv6_status,
+            ipv6_attempted,
+            ipv6_success
+        );
 
         if let Some(latency) = ping_result.ipv6_status.latency() {
             if let Ok(mut sparkline) = self.ipv6_sparkline.lock() {
                 sparkline.add_latency(latency);
-                log::debug!("[tui::connectivity] ipv6_sparkline_updated: latency={}ms points={}",
-                    latency.as_millis(), sparkline.len());
+                log::debug!(
+                    "[tui::connectivity] ipv6_sparkline_updated: latency={}ms points={}",
+                    latency.as_millis(),
+                    sparkline.len()
+                );
             } else {
                 log::warn!("[tui::connectivity] failed_to_lock_ipv6_sparkline");
             }
         } else {
-            log::debug!("[tui::connectivity] no_ipv6_latency: status={:?} attempted={}",
-                ping_result.ipv6_status, ipv6_attempted);
+            log::debug!(
+                "[tui::connectivity] no_ipv6_latency: status={:?} attempted={}",
+                ping_result.ipv6_status,
+                ipv6_attempted
+            );
 
             // Log detailed IPv6 status for debugging
             match &ping_result.ipv6_status {
@@ -251,8 +271,12 @@ impl Default for ConnectivityPane {
 
 impl Pane for ConnectivityPane {
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!("[tui::connectivity] render: area={}x{} focused={}",
-            area.width, area.height, focused);
+        log::trace!(
+            "[tui::connectivity] render: area={}x{} focused={}",
+            area.width,
+            area.height,
+            focused
+        );
 
         let block = create_block(self.title, focused);
 
@@ -274,17 +298,33 @@ impl Pane for ConnectivityPane {
                 (ConnectivityState::Connected, ConnectivityState::Connected) => ("dual-stack", Color::Green),
                 (ConnectivityState::Connected, ConnectivityState::Disconnected) => ("ipv4 only", Color::Yellow),
                 (ConnectivityState::Disconnected, ConnectivityState::Connected) => ("ipv6 only", Color::Yellow),
-                (ConnectivityState::Connected, ConnectivityState::Intermittent) => ("ipv4 stable, ipv6 intermittent", Color::Yellow),
-                (ConnectivityState::Intermittent, ConnectivityState::Connected) => ("ipv4 intermittent, ipv6 stable", Color::Yellow),
-                (ConnectivityState::Intermittent, ConnectivityState::Intermittent) => ("intermittent connectivity", Color::Yellow),
-                (ConnectivityState::Intermittent, ConnectivityState::Disconnected) => ("ipv4 intermittent", Color::Yellow),
-                (ConnectivityState::Disconnected, ConnectivityState::Intermittent) => ("ipv6 intermittent", Color::Yellow),
+                (ConnectivityState::Connected, ConnectivityState::Intermittent) => {
+                    ("ipv4 stable, ipv6 intermittent", Color::Yellow)
+                }
+                (ConnectivityState::Intermittent, ConnectivityState::Connected) => {
+                    ("ipv4 intermittent, ipv6 stable", Color::Yellow)
+                }
+                (ConnectivityState::Intermittent, ConnectivityState::Intermittent) => {
+                    ("intermittent connectivity", Color::Yellow)
+                }
+                (ConnectivityState::Intermittent, ConnectivityState::Disconnected) => {
+                    ("ipv4 intermittent", Color::Yellow)
+                }
+                (ConnectivityState::Disconnected, ConnectivityState::Intermittent) => {
+                    ("ipv6 intermittent", Color::Yellow)
+                }
                 (ConnectivityState::Disconnected, ConnectivityState::Disconnected) => ("no connectivity", Color::Red),
-                (ConnectivityState::Checking, _) | (_, ConnectivityState::Checking) => ("checking connectivity", Color::Gray),
+                (ConnectivityState::Checking, _) | (_, ConnectivityState::Checking) => {
+                    ("checking connectivity", Color::Gray)
+                }
             };
 
-            log::trace!("[tui::connectivity] stable_states: ipv4={:?} ipv6={:?} text={}",
-                history.ipv4_state, history.ipv6_state, text);
+            log::trace!(
+                "[tui::connectivity] stable_states: ipv4={:?} ipv6={:?} text={}",
+                history.ipv4_state,
+                history.ipv6_state,
+                text
+            );
 
             (ipv4_connected, ipv6_connected, text, color)
         } else {
@@ -293,11 +333,11 @@ impl Pane for ConnectivityPane {
         };
 
         // Update sparklines if we have ping results
-        if let Some(ping_state) = state.scanners.get("ping") {
-            if let Some(ScanResult::Ping(ping)) = &ping_state.result {
-                log::trace!("[tui::connectivity] updating_sparklines_from_render");
-                self.update_sparklines(ping);
-            }
+        if let Some(ping_state) = state.scanners.get("ping")
+            && let Some(ScanResult::Ping(ping)) = &ping_state.result
+        {
+            log::trace!("[tui::connectivity] updating_sparklines_from_render");
+            self.update_sparklines(ping);
         }
 
         // Status line
@@ -313,11 +353,23 @@ impl Pane for ConnectivityPane {
 
         // Get sparkline data for native Ratatui Sparkline widgets
         let (ipv4_current, ipv4_avg, ipv4_data) = if let Ok(sparkline) = self.ipv4_sparkline.lock() {
-            let current = sparkline.current_value().map(|v| format!("{}ms", v as u32)).unwrap_or_else(|| "---".to_string());
-            let avg = sparkline.average_value().map(|v| format!("{}ms", v as u32)).unwrap_or_else(|| "---".to_string());
+            let current = sparkline
+                .current_value()
+                .map(|v| format!("{}ms", v as u32))
+                .unwrap_or_else(|| "---".to_string());
+            let avg = sparkline
+                .average_value()
+                .map(|v| format!("{}ms", v as u32))
+                .unwrap_or_else(|| "---".to_string());
             let data = sparkline.get_data_for_width(sparkline_width);
-            log::trace!("[tui::connectivity] ipv4_sparkline_render: points={} width={} data_len={} current={} avg={}",
-                sparkline.len(), sparkline_width, data.len(), current, avg);
+            log::trace!(
+                "[tui::connectivity] ipv4_sparkline_render: points={} width={} data_len={} current={} avg={}",
+                sparkline.len(),
+                sparkline_width,
+                data.len(),
+                current,
+                avg
+            );
             (current, avg, data)
         } else {
             log::trace!("[tui::connectivity] ipv4_sparkline_lock_failed");
@@ -325,11 +377,23 @@ impl Pane for ConnectivityPane {
         };
 
         let (ipv6_current, ipv6_avg, ipv6_data) = if let Ok(sparkline) = self.ipv6_sparkline.lock() {
-            let current = sparkline.current_value().map(|v| format!("{}ms", v as u32)).unwrap_or_else(|| "---".to_string());
-            let avg = sparkline.average_value().map(|v| format!("{}ms", v as u32)).unwrap_or_else(|| "---".to_string());
+            let current = sparkline
+                .current_value()
+                .map(|v| format!("{}ms", v as u32))
+                .unwrap_or_else(|| "---".to_string());
+            let avg = sparkline
+                .average_value()
+                .map(|v| format!("{}ms", v as u32))
+                .unwrap_or_else(|| "---".to_string());
             let data = sparkline.get_data_for_width(sparkline_width);
-            log::trace!("[tui::connectivity] ipv6_sparkline_render: points={} width={} data_len={} current={} avg={}",
-                sparkline.len(), sparkline_width, data.len(), current, avg);
+            log::trace!(
+                "[tui::connectivity] ipv6_sparkline_render: points={} width={} data_len={} current={} avg={}",
+                sparkline.len(),
+                sparkline_width,
+                data.len(),
+                current,
+                avg
+            );
             (current, avg, data)
         } else {
             log::trace!("[tui::connectivity] ipv6_sparkline_lock_failed");
@@ -351,8 +415,7 @@ impl Pane for ConnectivityPane {
             .split(inner_area);
 
         // Render status paragraph
-        let status_paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
+        let status_paragraph = Paragraph::new(lines).alignment(Alignment::Left);
         status_paragraph.render(chunks[0], frame.buffer_mut());
 
         // IPv4 section - use connectivity state for consistent display
@@ -369,7 +432,10 @@ impl Pane for ConnectivityPane {
 
         let ipv4_title = Paragraph::new(Line::from(vec![
             Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-            Span::styled(ipv4_status_text, Style::default().fg(if has_ipv4 { Color::Green } else { Color::Red })),
+            Span::styled(
+                ipv4_status_text,
+                Style::default().fg(if has_ipv4 { Color::Green } else { Color::Red }),
+            ),
         ]));
         ipv4_title.render(chunks[2], frame.buffer_mut());
 
@@ -410,7 +476,10 @@ impl Pane for ConnectivityPane {
 
         let ipv6_title = Paragraph::new(Line::from(vec![
             Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-            Span::styled(ipv6_status_text, Style::default().fg(if has_ipv6 { Color::Green } else { Color::Red })),
+            Span::styled(
+                ipv6_status_text,
+                Style::default().fg(if has_ipv6 { Color::Green } else { Color::Red }),
+            ),
         ]));
         ipv6_title.render(chunks[5], frame.buffer_mut());
 
@@ -469,7 +538,10 @@ mod tests {
         let pane = ConnectivityPane::new();
         assert_eq!(pane.title(), "connectivity");
         assert_eq!(pane.id(), "connectivity");
-        assert_eq!(pane.min_size(), (MIN_CONNECTIVITY_PANE_WIDTH, MIN_CONNECTIVITY_PANE_HEIGHT));
+        assert_eq!(
+            pane.min_size(),
+            (MIN_CONNECTIVITY_PANE_WIDTH, MIN_CONNECTIVITY_PANE_HEIGHT)
+        );
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
     }

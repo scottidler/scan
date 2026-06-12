@@ -59,12 +59,6 @@ impl SparklineData {
         self.max_value = self.points.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max);
     }
 
-
-
-
-
-
-
     pub fn current_value(&self) -> Option<f64> {
         self.points.back().map(|p| p.value)
     }
@@ -79,19 +73,11 @@ impl SparklineData {
     }
 
     pub fn min_value(&self) -> Option<f64> {
-        if self.points.is_empty() {
-            None
-        } else {
-            Some(self.min_value)
-        }
+        if self.points.is_empty() { None } else { Some(self.min_value) }
     }
 
     pub fn max_value(&self) -> Option<f64> {
-        if self.points.is_empty() {
-            None
-        } else {
-            Some(self.max_value)
-        }
+        if self.points.is_empty() { None } else { Some(self.max_value) }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -119,7 +105,8 @@ impl SparklineData {
             self.points.iter().map(|p| p.value as u64).collect()
         } else {
             // Take the most recent `width` points
-            self.points.iter()
+            self.points
+                .iter()
                 .rev()
                 .take(width)
                 .rev()
@@ -166,7 +153,7 @@ mod tests {
         assert_eq!(sparkline.current_value(), Some(4.0));
     }
 
-        #[test]
+    #[test]
     fn test_get_data_for_width() {
         let mut sparkline = SparklineData::new(Some(10));
 

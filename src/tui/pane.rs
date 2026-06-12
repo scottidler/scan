@@ -1,12 +1,12 @@
 use crate::types::AppState;
+use log;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Style},
     widgets::{Block, Borders},
-    Frame,
 };
 use std::any::Any;
-use log;
 
 const DEFAULT_MIN_PANE_WIDTH: u16 = 20;
 const DEFAULT_MIN_PANE_HEIGHT: u16 = 6;

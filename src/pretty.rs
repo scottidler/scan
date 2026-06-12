@@ -49,15 +49,15 @@ fn print_scan_result(result: &ScanResult) {
 
                 // Show protocol-specific results
                 let mut protocol_results = Vec::new();
-                if ping.ipv4_status.is_success() {
-                    if let Some(latency) = ping.ipv4_status.latency() {
-                        protocol_results.push(format!("IPv4: {}ms", latency.as_millis()));
-                    }
+                if ping.ipv4_status.is_success()
+                    && let Some(latency) = ping.ipv4_status.latency()
+                {
+                    protocol_results.push(format!("IPv4: {}ms", latency.as_millis()));
                 }
-                if ping.ipv6_status.is_success() {
-                    if let Some(latency) = ping.ipv6_status.latency() {
-                        protocol_results.push(format!("IPv6: {}ms", latency.as_millis()));
-                    }
+                if ping.ipv6_status.is_success()
+                    && let Some(latency) = ping.ipv6_status.latency()
+                {
+                    protocol_results.push(format!("IPv6: {}ms", latency.as_millis()));
                 }
 
                 let protocol_str = if protocol_results.is_empty() {
@@ -66,7 +66,8 @@ fn print_scan_result(result: &ScanResult) {
                     protocol_results.join(", ")
                 };
 
-                println!("{}ms best latency ({}, TTL: {}, Loss: {:.1}%)",
+                println!(
+                    "{}ms best latency ({}, TTL: {}, Loss: {:.1}%)",
                     best_latency.as_millis(),
                     protocol_str,
                     ttl_str,
@@ -85,13 +86,23 @@ fn print_scan_result(result: &ScanResult) {
             let txt_count = dns.TXT.len();
 
             print!("{} A records", a_count);
-            if aaaa_count > 0 { print!(", {} AAAA", aaaa_count); }
-            if mx_count > 0 { print!(", {} MX", mx_count); }
-            if txt_count > 0 { print!(", {} TXT", txt_count); }
+            if aaaa_count > 0 {
+                print!(", {} AAAA", aaaa_count);
+            }
+            if mx_count > 0 {
+                print!(", {} MX", mx_count);
+            }
+            if txt_count > 0 {
+                print!(", {} TXT", txt_count);
+            }
 
             if let Some(email_sec) = &dns.email_security {
-                if email_sec.spf_record.is_some() { print!(", SPF✓"); }
-                if email_sec.dmarc_record.is_some() { print!(", DMARC✓"); }
+                if email_sec.spf_record.is_some() {
+                    print!(", SPF✓");
+                }
+                if email_sec.dmarc_record.is_some() {
+                    print!(", DMARC✓");
+                }
             }
 
             println!(" ({}ms)", dns.response_time.as_millis());
@@ -100,7 +111,8 @@ fn print_scan_result(result: &ScanResult) {
         ScanResult::Tls(tls) => {
             if tls.has_any_success() {
                 if let Some(primary_data) = tls.get_primary_result() {
-                    let version = primary_data.negotiated_version
+                    let version = primary_data
+                        .negotiated_version
                         .as_ref()
                         .map(|v| format!("{:?}", v))
                         .unwrap_or_else(|| "Unknown".to_string());
@@ -119,12 +131,18 @@ fn print_scan_result(result: &ScanResult) {
                         "cert invalid".to_string()
                     };
 
-                    let best_grade = tls.get_best_security_grade()
+                    let best_grade = tls
+                        .get_best_security_grade()
                         .map(|g| format!("{:?}", g))
                         .unwrap_or_else(|| "F".to_string());
 
-                    println!("{}, {}, grade {} ({}ms)",
-                        version, cert_status, best_grade, primary_data.handshake_time.as_millis());
+                    println!(
+                        "{}, {}, grade {} ({}ms)",
+                        version,
+                        cert_status,
+                        best_grade,
+                        primary_data.handshake_time.as_millis()
+                    );
                 }
             } else {
                 println!("Connection failed");
@@ -136,12 +154,15 @@ fn print_scan_result(result: &ScanResult) {
                 let security_features = count_security_features(primary_data);
                 let vuln_count = http.total_vulnerabilities();
 
-                println!("{} {}, {} security features, {} vulnerabilities, grade {:?} ({}ms)",
+                println!(
+                    "{} {}, {} security features, {} vulnerabilities, grade {:?} ({}ms)",
                     primary_data.status_code,
                     primary_data.content_type.as_deref().unwrap_or("unknown"),
                     security_features,
                     vuln_count,
-                    http.get_best_security_grade().map(|g| format!("{:?}", g)).unwrap_or_else(|| "N/A".to_string()),
+                    http.get_best_security_grade()
+                        .map(|g| format!("{:?}", g))
+                        .unwrap_or_else(|| "N/A".to_string()),
                     primary_data.response_time.as_millis()
                 );
             } else {
@@ -150,7 +171,8 @@ fn print_scan_result(result: &ScanResult) {
         }
 
         ScanResult::Whois(whois) => {
-            let age_str = whois.domain_age_days
+            let age_str = whois
+                .domain_age_days
                 .map(|days| {
                     if days < DAYS_PER_YEAR {
                         format!("{}d old", days)
@@ -160,7 +182,13 @@ fn print_scan_result(result: &ScanResult) {
                 })
                 .unwrap_or_else(|| "unknown age".to_string());
 
-            let expiry_str = whois.expires_in_days
+            // NOTE: the first two branches are identical; this looks like a latent
+            // bug (the `< EXPIRY_WARNING_DAYS` branch was likely meant to format
+            // differently). Preserving authored behavior; allow the lint rather than
+            // silently collapse the branches.
+            #[allow(clippy::if_same_then_else)]
+            let expiry_str = whois
+                .expires_in_days
                 .map(|days| {
                     if days < EXPIRY_WARNING_DAYS {
                         format!("expires in {}d", days)
@@ -172,21 +200,23 @@ fn print_scan_result(result: &ScanResult) {
                 })
                 .unwrap_or_else(|| "unknown expiry".to_string());
 
-            let registrar = whois.registrar
+            let registrar = whois
+                .registrar
                 .as_ref()
                 .map(|r| r.name.as_str())
                 .unwrap_or("unknown registrar");
 
             let risk_count = whois.risk_indicators.len();
-            let risk_str = if risk_count > 0 {
-                format!(", {} risks", risk_count)
-            } else {
-                String::new()
-            };
+            let risk_str = if risk_count > 0 { format!(", {} risks", risk_count) } else { String::new() };
 
-            println!("{}, {}, {:?} privacy, {} ({}ms{})",
-                age_str, expiry_str, whois.privacy_score, registrar,
-                whois.scan_duration.as_millis(), risk_str
+            println!(
+                "{}, {}, {:?} privacy, {} ({}ms{})",
+                age_str,
+                expiry_str,
+                whois.privacy_score,
+                registrar,
+                whois.scan_duration.as_millis(),
+                risk_str
             );
         }
 
@@ -196,13 +226,17 @@ fn print_scan_result(result: &ScanResult) {
                 let reached = if primary_data.destination_reached { "reached" } else { "unreached" };
 
                 // Calculate average RTT from last hop
-                let last_hop_rtt = primary_data.hops.last()
+                let last_hop_rtt = primary_data
+                    .hops
+                    .last()
                     .and_then(|hop| hop.avg_rtt)
                     .map(|rtt| format!("{}ms", rtt.as_millis()))
                     .unwrap_or_else(|| "timeout".to_string());
 
                 // Count timeouts
-                let timeout_hops = primary_data.hops.iter()
+                let timeout_hops = primary_data
+                    .hops
+                    .iter()
                     .filter(|hop| hop.packet_loss > PACKET_LOSS_TIMEOUT_THRESHOLD)
                     .count();
 
@@ -219,7 +253,8 @@ fn print_scan_result(result: &ScanResult) {
                     protocol.to_string()
                 };
 
-                println!("{} {} hops, {} ({}{}, {}ms)",
+                println!(
+                    "{} {} hops, {} ({}{}, {}ms)",
                     protocol_info,
                     traceroute.total_hops(),
                     reached,
@@ -228,7 +263,8 @@ fn print_scan_result(result: &ScanResult) {
                     traceroute.total_duration.as_millis()
                 );
             } else {
-                println!("Traceroute failed for all protocols ({}ms)",
+                println!(
+                    "Traceroute failed for all protocols ({}ms)",
                     traceroute.total_duration.as_millis()
                 );
             }
@@ -265,7 +301,8 @@ fn print_scan_result(result: &ScanResult) {
                     protocol.to_string()
                 };
 
-                println!("{} - {} ({}ms, {}, {})",
+                println!(
+                    "{} - {} ({}ms, {}, {})",
                     location_str,
                     network_str,
                     geoip.total_duration.as_millis(),
@@ -273,7 +310,8 @@ fn print_scan_result(result: &ScanResult) {
                     protocol_info
                 );
             } else {
-                println!("GeoIP lookup failed for all protocols ({}ms)",
+                println!(
+                    "GeoIP lookup failed for all protocols ({}ms)",
                     geoip.total_duration.as_millis()
                 );
             }
@@ -283,9 +321,7 @@ fn print_scan_result(result: &ScanResult) {
             let open_count = port.total_open_ports();
 
             if open_count == 0 {
-                println!("No open ports found ({}ms)",
-                    port.total_duration.as_millis()
-                );
+                println!("No open ports found ({}ms)", port.total_duration.as_millis());
             } else {
                 // Show first few ports with services
                 let mut port_descriptions = Vec::new();
@@ -300,7 +336,11 @@ fn print_scan_result(result: &ScanResult) {
                 }
 
                 let ports_str = if open_count > MAX_PORTS_DISPLAY {
-                    format!("{}, +{} more", port_descriptions.join(", "), open_count - MAX_PORTS_DISPLAY)
+                    format!(
+                        "{}, +{} more",
+                        port_descriptions.join(", "),
+                        open_count - MAX_PORTS_DISPLAY
+                    )
                 } else {
                     port_descriptions.join(", ")
                 };
@@ -316,7 +356,8 @@ fn print_scan_result(result: &ScanResult) {
                     "unknown"
                 };
 
-                println!("{} open ({}) ({}ms, {} scan)",
+                println!(
+                    "{} open ({}) ({}ms, {} scan)",
                     open_count,
                     ports_str,
                     port.total_duration.as_millis(),
@@ -330,13 +371,27 @@ fn print_scan_result(result: &ScanResult) {
 fn count_security_features(http_data: &crate::scan::http::HttpData) -> usize {
     let mut count = 0;
 
-    if http_data.security_headers.strict_transport_security.is_some() { count += 1; }
-    if http_data.security_headers.x_frame_options.is_some() { count += 1; }
-    if http_data.security_headers.x_content_type_options.is_some() { count += 1; }
-    if http_data.security_headers.x_xss_protection.is_some() { count += 1; }
-    if http_data.security_headers.referrer_policy.is_some() { count += 1; }
-    if http_data.security_headers.permissions_policy.is_some() { count += 1; }
-    if http_data.csp.is_some() { count += 1; }
+    if http_data.security_headers.strict_transport_security.is_some() {
+        count += 1;
+    }
+    if http_data.security_headers.x_frame_options.is_some() {
+        count += 1;
+    }
+    if http_data.security_headers.x_content_type_options.is_some() {
+        count += 1;
+    }
+    if http_data.security_headers.x_xss_protection.is_some() {
+        count += 1;
+    }
+    if http_data.security_headers.referrer_policy.is_some() {
+        count += 1;
+    }
+    if http_data.security_headers.permissions_policy.is_some() {
+        count += 1;
+    }
+    if http_data.csp.is_some() {
+        count += 1;
+    }
 
     count
 }
@@ -347,7 +402,11 @@ fn format_duration(duration: Duration) -> String {
     if total_secs < SECONDS_PER_MINUTE {
         format!("{}s", total_secs)
     } else if total_secs < SECONDS_PER_HOUR {
-        format!("{}m{}s", total_secs / SECONDS_PER_MINUTE, total_secs % SECONDS_PER_MINUTE)
+        format!(
+            "{}m{}s",
+            total_secs / SECONDS_PER_MINUTE,
+            total_secs % SECONDS_PER_MINUTE
+        )
     } else {
         let hours = total_secs / SECONDS_PER_HOUR;
         let minutes = (total_secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
