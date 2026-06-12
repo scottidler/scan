@@ -1,7 +1,7 @@
+use log::LevelFilter;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use log::LevelFilter;
 
 /// Initialize logging to a system-specific log file
 pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,10 +32,7 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .target(env_logger::Target::Pipe(Box::new(
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)?
+            fs::OpenOptions::new().create(true).append(true).open(&log_path)?,
         )))
         .init();
 
@@ -59,20 +56,36 @@ pub fn get_log_file_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         if nix::unistd::getuid().is_root() {
             PathBuf::from("/var/log/scan")
         } else {
-            dirs::data_local_dir()
+            xdg_data_dir()
                 .ok_or("Could not find local data directory")?
                 .join("scan")
                 .join("logs")
         }
     } else {
         // Fallback for other systems
-        dirs::data_local_dir()
+        xdg_data_dir()
             .ok_or("Could not find local data directory")?
             .join("scan")
             .join("logs")
     };
 
     Ok(log_dir.join("scan.log"))
+}
+
+/// XDG data dir, honoring `$XDG_DATA_HOME` and falling back to `$HOME/.local/share`.
+///
+/// We deliberately do NOT use the `dirs` config/data helpers: those honor
+/// `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` only on Linux. On macOS they resolve via system
+/// APIs and return `~/Library/...`, ignoring the env vars. These helpers resolve to the
+/// same XDG layout on every platform.
+pub fn xdg_data_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".local").join("share"))
 }
 
 #[cfg(test)]
