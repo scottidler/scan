@@ -1,0 +1,4 @@
+# bump.yml -- repo-local release facts read by bump.
+# Only the tag-driven release workflow exists, so no CI runs on push.
+ci: none
+install: cargo install --path .
