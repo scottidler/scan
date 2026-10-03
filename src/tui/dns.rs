@@ -307,7 +307,7 @@ impl DnsPane {
                 } else if value.starts_with("MS=") {
                     format!(
                         "MS={}...",
-                        &value[MS_RECORD_PREFIX_LENGTH..]
+                        value[MS_RECORD_PREFIX_LENGTH..]
                             .chars()
                             .take(MS_RECORD_PREVIEW_LENGTH)
                             .collect::<String>()
