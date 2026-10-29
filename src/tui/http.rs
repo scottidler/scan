@@ -98,20 +98,10 @@ impl Pane for HttpPane {
         // Get HTTP results and render them
         if let Some(http_state) = state.scanners.get("http") {
             // Update header with current status
+            let (label, label_color) = crate::tui::status_label(&http_state, "scanning...", "completed");
             lines[0] = Line::from(vec![
                 Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    match http_state.status {
-                        crate::types::ScanStatus::Running => "scanning...",
-                        crate::types::ScanStatus::Complete => "completed",
-                        crate::types::ScanStatus::Failed => "failed",
-                    },
-                    Style::default().fg(match http_state.status {
-                        crate::types::ScanStatus::Running => Color::Yellow,
-                        crate::types::ScanStatus::Complete => Color::Green,
-                        crate::types::ScanStatus::Failed => Color::Red,
-                    }),
-                ),
+                Span::styled(label, Style::default().fg(label_color)),
             ]);
 
             if let Some(ScanResult::Http(http_result)) = &http_state.result {

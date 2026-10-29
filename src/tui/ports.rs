@@ -82,20 +82,10 @@ impl Pane for PortsPane {
                 match result {
                     Some(ScanResult::Port(port_result)) => {
                         // Update header with current status
+                        let (label, label_color) = crate::tui::status_label(&port_state, "scanning...", "completed");
                         lines[0] = Line::from(vec![
                             Span::styled("🔌 Status: ", Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                match status {
-                                    crate::types::ScanStatus::Running => "scanning...",
-                                    crate::types::ScanStatus::Complete => "completed",
-                                    crate::types::ScanStatus::Failed => "failed",
-                                },
-                                Style::default().fg(match status {
-                                    crate::types::ScanStatus::Running => Color::Yellow,
-                                    crate::types::ScanStatus::Complete => Color::Green,
-                                    crate::types::ScanStatus::Failed => Color::Red,
-                                }),
-                            ),
+                            Span::styled(label, Style::default().fg(label_color)),
                         ]);
 
                         // Extract the data we need to avoid lifetime issues

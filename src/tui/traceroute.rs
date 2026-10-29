@@ -72,20 +72,10 @@ impl Pane for TraceroutePane {
         // Get traceroute results and render them
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
             // Update header with current status
+            let (label, label_color) = crate::tui::status_label(&traceroute_state, "tracing...", "traced");
             lines[0] = Line::from(vec![
                 Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    match traceroute_state.status {
-                        crate::types::ScanStatus::Running => "tracing...",
-                        crate::types::ScanStatus::Complete => "traced",
-                        crate::types::ScanStatus::Failed => "failed",
-                    },
-                    Style::default().fg(match traceroute_state.status {
-                        crate::types::ScanStatus::Running => Color::Yellow,
-                        crate::types::ScanStatus::Complete => Color::Green,
-                        crate::types::ScanStatus::Failed => Color::Red,
-                    }),
-                ),
+                Span::styled(label, Style::default().fg(label_color)),
             ]);
 
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {

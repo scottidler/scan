@@ -69,20 +69,10 @@ impl Pane for WhoisPane {
         // Get WHOIS results and render them
         if let Some(whois_state) = state.scanners.get("whois") {
             // Update header with current status
+            let (label, label_color) = crate::tui::status_label(&whois_state, "querying...", "retrieved");
             lines[0] = Line::from(vec![
                 Span::styled("📋 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    match whois_state.status {
-                        crate::types::ScanStatus::Running => "querying...",
-                        crate::types::ScanStatus::Complete => "retrieved",
-                        crate::types::ScanStatus::Failed => "failed",
-                    },
-                    Style::default().fg(match whois_state.status {
-                        crate::types::ScanStatus::Running => Color::Yellow,
-                        crate::types::ScanStatus::Complete => Color::Green,
-                        crate::types::ScanStatus::Failed => Color::Red,
-                    }),
-                ),
+                Span::styled(label, Style::default().fg(label_color)),
             ]);
 
             if let Some(ScanResult::Whois(whois_result)) = &whois_state.result {

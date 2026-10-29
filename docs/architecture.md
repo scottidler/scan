@@ -104,16 +104,21 @@ pub trait Scanner {
         loop {
             ticker.tick().await;
 
-            // Update status to running
-            {
-                let mut scan_state = ScanState {
-                    result: None,
-                    error: None,
-                    status: ScanStatus::Running,
-                    last_updated: Instant::now(),
-                    history: VecDeque::new(),
-                };
-                state.scanners.insert(self.name().to_string(), scan_state);
+            // Flip to Running in place: result, error and history survive the cycle
+            match state.scanners.get_mut(self.name()) {
+                Some(mut scan_state) => scan_state.status = ScanStatus::Running,
+                None => {
+                    state.scanners.insert(
+                        self.name().to_string(),
+                        ScanState {
+                            result: None,
+                            error: None,
+                            status: ScanStatus::Running,
+                            last_updated: Instant::now(),
+                            history: VecDeque::new(),
+                        },
+                    );
+                }
             }
 
             // Perform scan
@@ -132,8 +137,8 @@ pub trait Scanner {
                         scan_state.last_updated = timestamp;
                         scan_state.history.push_back(timestamped);
 
-                        // Keep last 100 results
-                        if scan_state.history.len() > 100 {
+                        // Keep last N results (`max_history()`, default 10)
+                        while scan_state.history.len() > self.max_history() {
                             scan_state.history.pop_front();
                         }
                     }
@@ -156,6 +161,7 @@ pub trait Scanner {
 - `eyre::Error` provides rich error context without custom error types
 - Default `run()` implementation ensures consistent behavior
 - History management is handled uniformly across all scanners
+- A running scan never clears the previous result; panes mark retained data `↻ refreshing` via `status_label`
 
 ### 3. Scanner Result Types
 

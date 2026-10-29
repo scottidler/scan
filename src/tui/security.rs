@@ -106,6 +106,12 @@ impl SecurityPane {
         // Empty line for spacing
         lines.push(Line::from(""));
 
+        let (tls_status_label, tls_status_color) = state
+            .scanners
+            .get("tls")
+            .map(|tls_state| crate::tui::status_label(&tls_state, "analyzing...", "analyzed"))
+            .unwrap_or(("analyzing...", Color::Yellow));
+
         // Extract TLS data upfront
         let tls_data = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
@@ -330,7 +336,7 @@ impl SecurityPane {
             // Update header based on status
             lines[0] = Line::from(vec![
                 Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled("analyzed", Style::default().fg(Color::Green)),
+                Span::styled(tls_status_label, Style::default().fg(tls_status_color)),
             ]);
 
             // TLS Connection
@@ -1527,5 +1533,58 @@ mod tests {
         assert!(http_vuln_strings.contains(&"Missing HSTS header".to_string()));
         assert!(http_vuln_strings.contains(&"Weak Content Security Policy".to_string()));
         assert!(http_vuln_strings.contains(&"Insecure CORS configuration".to_string()));
+    }
+
+    fn state_with_tls(status: ScanStatus) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        let mut tls_result = TlsResult::new();
+        tls_result.ipv4_result = Some(TlsData {
+            connection_successful: true,
+            handshake_time: Duration::from_millis(100),
+            supported_versions: vec![TlsVersion::V1_3],
+            negotiated_version: Some(TlsVersion::V1_3),
+            certificate_chain: vec![],
+            certificate_valid: true,
+            certificate_errors: vec![],
+            expiry_date: None,
+            days_until_expiry: Some(90),
+            supported_ciphers: vec![],
+            negotiated_cipher: None,
+            perfect_forward_secrecy: true,
+            ocsp_stapling: true,
+            vulnerabilities: vec![],
+            security_grade: SecurityGrade::A,
+            scan_time: Duration::from_millis(500),
+            target_ip: "192.168.1.1".to_string(),
+            queried_at: Instant::now(),
+        });
+        tls_result.ipv4_status = TlsStatus::Success(SecurityGrade::A);
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: Some(ScanResult::Tls(tls_result)),
+                error: None,
+                status,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn render_running_state_with_result_shows_refreshing_not_analyzed() {
+        let state = state_with_tls(ScanStatus::Running);
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(out.contains("refreshing"), "missing refreshing marker:\n{}", out);
+        assert!(!out.contains("analyzed"), "stale result claims analyzed:\n{}", out);
+    }
+
+    #[test]
+    fn render_complete_state_shows_analyzed() {
+        let state = state_with_tls(ScanStatus::Complete);
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(out.contains("analyzed"), "missing analyzed:\n{}", out);
+        assert!(!out.contains("refreshing"), "unexpected refreshing marker:\n{}", out);
     }
 }

@@ -67,20 +67,10 @@ impl Pane for GeoIpPane {
         // Get GeoIP results and render them
         if let Some(geoip_state) = state.scanners.get("geoip") {
             // Update header with current status
+            let (label, label_color) = crate::tui::status_label(&geoip_state, "locating...", "located");
             lines[0] = Line::from(vec![
                 Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    match geoip_state.status {
-                        crate::types::ScanStatus::Running => "locating...",
-                        crate::types::ScanStatus::Complete => "located",
-                        crate::types::ScanStatus::Failed => "failed",
-                    },
-                    Style::default().fg(match geoip_state.status {
-                        crate::types::ScanStatus::Running => Color::Yellow,
-                        crate::types::ScanStatus::Complete => Color::Green,
-                        crate::types::ScanStatus::Failed => Color::Red,
-                    }),
-                ),
+                Span::styled(label, Style::default().fg(label_color)),
             ]);
 
             if let Some(ScanResult::GeoIp(geoip_result)) = &geoip_state.result {

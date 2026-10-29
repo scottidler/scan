@@ -105,20 +105,10 @@ impl DnsPane {
 
         // DNS status header
         if let Some(dns_state) = state.scanners.get("dns") {
+            let (label, label_color) = crate::tui::status_label(&dns_state, "resolving...", "resolved");
             lines.push(Line::from(vec![
                 Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    match dns_state.status {
-                        crate::types::ScanStatus::Running => "resolving...",
-                        crate::types::ScanStatus::Complete => "resolved",
-                        crate::types::ScanStatus::Failed => "failed",
-                    },
-                    Style::default().fg(match dns_state.status {
-                        crate::types::ScanStatus::Running => Color::Yellow,
-                        crate::types::ScanStatus::Complete => Color::Green,
-                        crate::types::ScanStatus::Failed => Color::Red,
-                    }),
-                ),
+                Span::styled(label, Style::default().fg(label_color)),
             ]));
         } else {
             lines.push(Line::from(vec![

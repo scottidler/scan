@@ -8,6 +8,7 @@ pub mod ports;
 pub mod scrollable;
 pub mod security;
 pub mod sparkline;
+pub mod status;
 pub mod target;
 #[cfg(test)]
 pub mod testing;
@@ -24,6 +25,7 @@ pub use ports::PortsPane;
 pub use scrollable::ScrollablePane;
 pub use security::SecurityPane;
 pub use sparkline::SparklineData;
+pub use status::status_label;
 pub use target::TargetPane;
 pub use traceroute::TraceroutePane;
 pub use whois::WhoisPane;
