@@ -1,15 +1,15 @@
 use crate::scan::Family;
 use crate::scan::ping::PingStatus;
 use crate::tui::pane::{Pane, create_block};
-use crate::tui::sparkline::SparklineData;
+use crate::tui::sparkline::{Sample, SparklineData, average_us, bars_newest_first, scale_max_us, span};
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Sparkline, Widget},
+    widgets::{Paragraph, RenderDirection, Sparkline, Widget},
 };
 use std::any::Any;
 use std::collections::VecDeque;
@@ -18,6 +18,8 @@ use std::time::Instant;
 
 const MIN_CONNECTIVITY_PANE_WIDTH: u16 = 25;
 const NO_REPLY_LABEL: &str = "no echo reply";
+/// Ping cycles kept per family, enough for the widest pane.
+const SPARKLINE_CAPACITY: usize = 200;
 const MIN_CONNECTIVITY_PANE_HEIGHT: u16 = 12; // Double-height sparklines like btop
 
 /// The label for a family's latest ping failure, or `no ping reply` when none is on record.
@@ -36,6 +38,128 @@ fn family_failure_label(state: &AppState, family: Family) -> String {
         Some(PingStatus::Failed(failure)) => failure.label(family),
         _ => "no ping reply".to_string(),
     }
+}
+
+/// Drawn, in red, for a ping cycle that got no reply.
+const FAILED_SAMPLE_SYMBOL: &str = "░";
+/// Average latency, in µs, above which a family's graph turns yellow, then red.
+const SLOW_LATENCY_US: u64 = 50_000;
+const VERY_SLOW_LATENCY_US: u64 = 150_000;
+const FAMILY_COUNT: u16 = 2;
+
+/// Where the status line and each family's rows sit inside the pane border.
+#[derive(Debug, Clone, PartialEq)]
+enum ConnectivityRows {
+    /// Per family, a title row over a graph at least one row tall.
+    Full { status: Rect, families: [(Rect, Rect); 2] },
+    /// Per family, one row: short label, then graph. A family with no row left is not drawn.
+    Compact { status: Rect, families: [Option<Rect>; 2] },
+}
+
+impl ConnectivityRows {
+    fn status(&self) -> Rect {
+        match self {
+            ConnectivityRows::Full { status, .. } | ConnectivityRows::Compact { status, .. } => *status,
+        }
+    }
+}
+
+/// Full mode when `inner` has the status row plus a title and a graph row per family, extra rows
+/// going to the graphs (IPv4 takes the odd one); compact mode otherwise.
+fn connectivity_rows(inner: Rect) -> ConnectivityRows {
+    let row = |offset: u16, height: u16| Rect {
+        y: inner.y + offset,
+        height,
+        ..inner
+    };
+    let status = row(0, inner.height.min(1));
+    if inner.height > 2 * FAMILY_COUNT {
+        let graph_rows = inner.height - 1 - FAMILY_COUNT;
+        let ipv4_graph = graph_rows.div_ceil(2);
+        let ipv6_graph = graph_rows - ipv4_graph;
+        ConnectivityRows::Full {
+            status,
+            families: [
+                (row(1, 1), row(2, ipv4_graph)),
+                (row(2 + ipv4_graph, 1), row(3 + ipv4_graph, ipv6_graph)),
+            ],
+        }
+    } else {
+        let family_row = |index: u16| (inner.height > 1 + index).then(|| row(1 + index, 1));
+        ConnectivityRows::Compact {
+            status,
+            families: [family_row(0), family_row(1)],
+        }
+    }
+}
+
+/// A latency in µs as ms: one decimal below 1ms, whole ms above.
+fn format_latency(micros: u64) -> String {
+    if micros < 1000 {
+        format!("{:.1}ms", micros as f64 / 1000.0)
+    } else {
+        format!("{}ms", (micros + 500) / 1000)
+    }
+}
+
+/// The latest sample: its latency, `✗` when it failed, `---` with no samples.
+fn latest_text(latest: Option<Option<u64>>) -> String {
+    match latest {
+        Some(Some(micros)) => format_latency(micros),
+        Some(None) => "✗".to_string(),
+        None => "---".to_string(),
+    }
+}
+
+/// One family's state and history, snapshotted for a render.
+struct FamilyView {
+    family: Family,
+    short: &'static str,
+    state: ConnectivityState,
+    connected: bool,
+    data: SparklineData,
+}
+
+impl FamilyView {
+    /// `12ms avg 11ms`, prefixed `intermittent` when the family is.
+    fn latency_text(&self, visible: &[Sample]) -> String {
+        let average = average_us(visible)
+            .map(format_latency)
+            .unwrap_or_else(|| "---".to_string());
+        let text = format!("{} avg {}", latest_text(self.data.latest()), average);
+        if self.state == ConnectivityState::Intermittent {
+            format!("intermittent {text}")
+        } else {
+            text
+        }
+    }
+
+    fn title_color(&self) -> Color {
+        if self.connected { Color::Green } else { Color::Red }
+    }
+
+    fn graph_color(&self, visible: &[Sample]) -> Color {
+        if !self.connected {
+            return Color::Red;
+        }
+        match average_us(visible) {
+            Some(average) if average > VERY_SLOW_LATENCY_US => Color::Red,
+            Some(average) if average > SLOW_LATENCY_US => Color::Yellow,
+            _ => Color::Green,
+        }
+    }
+}
+
+/// Draw `visible` newest at the right edge, against a 0..`max_us` scale, failures in red.
+fn render_graph(frame: &mut Frame, area: Rect, visible: &[Sample], max_us: u64, color: Color) {
+    Sparkline::default()
+        .data(bars_newest_first(visible, area.height, max_us))
+        .max(max_us)
+        .direction(RenderDirection::RightToLeft)
+        .style(Style::default().fg(color))
+        .absent_value_symbol(FAILED_SAMPLE_SYMBOL)
+        .absent_value_style(Style::default().fg(Color::Red))
+        .render(area, frame.buffer_mut());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,8 +271,8 @@ impl ConnectivityPane {
         Self {
             title: "connectivity",
             id: "connectivity",
-            ipv4_sparkline: Mutex::new(SparklineData::new(Some(200))), // Store more data for wider sparklines
-            ipv6_sparkline: Mutex::new(SparklineData::new(Some(200))),
+            ipv4_sparkline: Mutex::new(SparklineData::new(SPARKLINE_CAPACITY)),
+            ipv6_sparkline: Mutex::new(SparklineData::new(SPARKLINE_CAPACITY)),
             last_ping_timestamp: Mutex::new(None),
             connectivity_history: Mutex::new(ConnectivityHistory::new()),
         }
@@ -214,71 +338,30 @@ impl ConnectivityPane {
             log::warn!("[tui::connectivity] failed_to_lock_connectivity_history");
         }
 
-        // Update IPv4 sparkline
-        if let Some(latency) = ping_result.ipv4_status.latency() {
-            if let Ok(mut sparkline) = self.ipv4_sparkline.lock() {
-                sparkline.add_latency(latency);
+        let at = ping_result.queried_at;
+        for (family, status, sparkline) in [
+            (Family::Ipv4, &ping_result.ipv4_status, &self.ipv4_sparkline),
+            (Family::Ipv6, &ping_result.ipv6_status, &self.ipv6_sparkline),
+        ] {
+            let sample = match status {
+                PingStatus::Success(latency) => Some(Some(*latency)),
+                PingStatus::Failed(_) | PingStatus::ToolMissing(_) => Some(None),
+                PingStatus::NoAddress | PingStatus::NotQueried => None,
+            };
+            let Some(latency) = sample else {
+                log::debug!("[tui::connectivity] no_sample: family={:?} status={:?}", family, status);
+                continue;
+            };
+            if let Ok(mut sparkline) = sparkline.lock() {
+                sparkline.add_sample(at, latency);
                 log::debug!(
-                    "[tui::connectivity] ipv4_sparkline_updated: latency={}ms points={} min={:?} max={:?} avg={:?}",
-                    latency.as_millis(),
-                    sparkline.len(),
-                    sparkline.min_value(),
-                    sparkline.max_value(),
-                    sparkline.average_value()
-                );
-            } else {
-                log::warn!("[tui::connectivity] failed_to_lock_ipv4_sparkline");
-            }
-        } else {
-            log::debug!(
-                "[tui::connectivity] no_ipv4_latency: status={:?}",
-                ping_result.ipv4_status
-            );
-        }
-
-        // Update IPv6 sparkline
-        log::debug!(
-            "[tui::connectivity] ipv6_ping_status_check: status={:?} was_attempted={} is_success={}",
-            ping_result.ipv6_status,
-            ipv6_attempted,
-            ipv6_success
-        );
-
-        if let Some(latency) = ping_result.ipv6_status.latency() {
-            if let Ok(mut sparkline) = self.ipv6_sparkline.lock() {
-                sparkline.add_latency(latency);
-                log::debug!(
-                    "[tui::connectivity] ipv6_sparkline_updated: latency={}ms points={}",
-                    latency.as_millis(),
+                    "[tui::connectivity] sparkline_updated: family={:?} latency={:?} points={}",
+                    family,
+                    latency,
                     sparkline.len()
                 );
             } else {
-                log::warn!("[tui::connectivity] failed_to_lock_ipv6_sparkline");
-            }
-        } else {
-            log::debug!(
-                "[tui::connectivity] no_ipv6_latency: status={:?} attempted={}",
-                ping_result.ipv6_status,
-                ipv6_attempted
-            );
-
-            // Log detailed IPv6 status for debugging
-            match &ping_result.ipv6_status {
-                crate::scan::ping::PingStatus::Failed(failure) => {
-                    log::debug!("[tui::connectivity] ipv6_ping_failed: failure={:?}", failure);
-                }
-                crate::scan::ping::PingStatus::NoAddress => {
-                    log::debug!("[tui::connectivity] ipv6_ping_no_address");
-                }
-                crate::scan::ping::PingStatus::NotQueried => {
-                    log::debug!("[tui::connectivity] ipv6_ping_not_queried");
-                }
-                crate::scan::ping::PingStatus::ToolMissing(tool) => {
-                    log::debug!("[tui::connectivity] ipv6_ping_tool_missing: tool={}", tool);
-                }
-                _ => {
-                    log::debug!("[tui::connectivity] ipv6_ping_other_status");
-                }
+                log::warn!("[tui::connectivity] failed_to_lock_sparkline: family={:?}", family);
             }
         }
     }
@@ -395,77 +478,10 @@ impl Pane for ConnectivityPane {
         }
         lines.push(Line::from(status_spans));
 
-        lines.push(Line::from(""));
-
-        // Calculate sparkline width - use almost the full width of the pane
-        let sparkline_width = (inner_area.width.saturating_sub(2)) as usize; // Leave 2 chars margin
-
-        // Get sparkline data for native Ratatui Sparkline widgets
-        let (ipv4_current, ipv4_avg, ipv4_data) = if let Ok(sparkline) = self.ipv4_sparkline.lock() {
-            let current = sparkline
-                .current_value()
-                .map(|v| format!("{}ms", v as u32))
-                .unwrap_or_else(|| "---".to_string());
-            let avg = sparkline
-                .average_value()
-                .map(|v| format!("{}ms", v as u32))
-                .unwrap_or_else(|| "---".to_string());
-            let data = sparkline.get_data_for_width(sparkline_width);
-            log::trace!(
-                "[tui::connectivity] ipv4_sparkline_render: points={} width={} data_len={} current={} avg={}",
-                sparkline.len(),
-                sparkline_width,
-                data.len(),
-                current,
-                avg
-            );
-            (current, avg, data)
-        } else {
-            log::trace!("[tui::connectivity] ipv4_sparkline_lock_failed");
-            ("---".to_string(), "---".to_string(), vec![])
-        };
-
-        let (ipv6_current, ipv6_avg, ipv6_data) = if let Ok(sparkline) = self.ipv6_sparkline.lock() {
-            let current = sparkline
-                .current_value()
-                .map(|v| format!("{}ms", v as u32))
-                .unwrap_or_else(|| "---".to_string());
-            let avg = sparkline
-                .average_value()
-                .map(|v| format!("{}ms", v as u32))
-                .unwrap_or_else(|| "---".to_string());
-            let data = sparkline.get_data_for_width(sparkline_width);
-            log::trace!(
-                "[tui::connectivity] ipv6_sparkline_render: points={} width={} data_len={} current={} avg={}",
-                sparkline.len(),
-                sparkline_width,
-                data.len(),
-                current,
-                avg
-            );
-            (current, avg, data)
-        } else {
-            log::trace!("[tui::connectivity] ipv6_sparkline_lock_failed");
-            ("---".to_string(), "---".to_string(), vec![])
-        };
-
-        // Create layout for status and sparklines
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Status line
-                Constraint::Length(1), // Spacing
-                Constraint::Length(1), // IPv4 title
-                Constraint::Length(4), // IPv4 sparkline (taller for btop-style)
-                Constraint::Length(1), // Spacing
-                Constraint::Length(1), // IPv6 title
-                Constraint::Length(4), // IPv6 sparkline (taller for btop-style)
-            ])
-            .split(inner_area);
-
-        // Render status paragraph
-        let status_paragraph = Paragraph::new(lines).alignment(Alignment::Left);
-        status_paragraph.render(chunks[0], frame.buffer_mut());
+        let rows = connectivity_rows(inner_area);
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .render(rows.status(), frame.buffer_mut());
 
         // A failed ping scan with no samples has nothing pending: the families have no data.
         let checking_text = if state
@@ -478,93 +494,96 @@ impl Pane for ConnectivityPane {
             "checking"
         };
 
-        // IPv4 section - use connectivity state for consistent display
-        let ipv4_status_text = if let Ok(history) = self.connectivity_history.lock() {
-            match history.ipv4_state {
-                ConnectivityState::Connected => format!("{} avg:{}", ipv4_current, ipv4_avg),
-                ConnectivityState::Disconnected => family_failure_label(state, Family::Ipv4),
-                ConnectivityState::Intermittent => format!("intermittent {} avg:{}", ipv4_current, ipv4_avg),
-                ConnectivityState::Checking => checking_text.to_string(),
-            }
-        } else {
-            format!("{} avg:{}", ipv4_current, ipv4_avg)
+        let (ipv4_state, ipv6_state) = match self.connectivity_history.lock() {
+            Ok(history) => (history.ipv4_state.clone(), history.ipv6_state.clone()),
+            Err(_) => (ConnectivityState::Checking, ConnectivityState::Checking),
         };
+        let snapshot = |sparkline: &Mutex<SparklineData>| match sparkline.lock() {
+            Ok(data) => data.clone(),
+            Err(_) => {
+                log::warn!("[tui::connectivity] sparkline_lock_failed");
+                SparklineData::new(0)
+            }
+        };
+        let families = [
+            FamilyView {
+                family: Family::Ipv4,
+                short: "v4",
+                state: ipv4_state,
+                connected: has_ipv4,
+                data: snapshot(&self.ipv4_sparkline),
+            },
+            FamilyView {
+                family: Family::Ipv6,
+                short: "v6",
+                state: ipv6_state,
+                connected: has_ipv6,
+                data: snapshot(&self.ipv6_sparkline),
+            },
+        ];
 
-        let ipv4_title = Paragraph::new(Line::from(vec![
-            Span::styled("📡 IPv4: ", Style::default().fg(Color::White)),
-            Span::styled(
-                ipv4_status_text,
-                Style::default().fg(if has_ipv4 { Color::Green } else { Color::Red }),
-            ),
-        ]));
-        ipv4_title.render(chunks[2], frame.buffer_mut());
-
-        // IPv4 Sparkline
-        let ipv4_color = if has_ipv4 {
-            if ipv4_data.iter().any(|&v| v > 0) {
-                let avg = ipv4_data.iter().sum::<u64>() as f64 / ipv4_data.len() as f64;
-                if avg <= 50.0 {
-                    Color::Green
-                } else if avg <= 150.0 {
-                    Color::Yellow
-                } else {
-                    Color::Red
+        match rows {
+            ConnectivityRows::Full {
+                families: family_rows, ..
+            } => {
+                for (view, (title_area, graph_area)) in families.iter().zip(family_rows) {
+                    let visible = view.data.visible(usize::from(graph_area.width));
+                    let max_us = scale_max_us(&visible);
+                    let state_text = match view.state {
+                        ConnectivityState::Disconnected => family_failure_label(state, view.family),
+                        ConnectivityState::Checking => checking_text.to_string(),
+                        _ => view.latency_text(&visible),
+                    };
+                    let mut spans = vec![
+                        Span::styled(format!("{} ", view.family), Style::default().fg(Color::White)),
+                        Span::styled(state_text, Style::default().fg(view.title_color())),
+                    ];
+                    if !visible.is_empty() {
+                        spans.push(Span::styled(
+                            format!(
+                                " │ scale 0-{}ms │ ← {}s",
+                                max_us / 1000,
+                                span(&visible).as_secs_f64().round() as u64
+                            ),
+                            Style::default().fg(Color::Gray),
+                        ));
+                    }
+                    Paragraph::new(Line::from(spans)).render(title_area, frame.buffer_mut());
+                    render_graph(frame, graph_area, &visible, max_us, view.graph_color(&visible));
                 }
-            } else {
-                Color::Green
             }
-        } else {
-            Color::Red
-        };
-
-        let ipv4_sparkline = Sparkline::default()
-            .data(&ipv4_data)
-            .style(Style::default().fg(ipv4_color));
-        ipv4_sparkline.render(chunks[3], frame.buffer_mut());
-
-        // IPv6 section - use connectivity state for consistent display
-        let ipv6_status_text = if let Ok(history) = self.connectivity_history.lock() {
-            match history.ipv6_state {
-                ConnectivityState::Connected => format!("{} avg:{}", ipv6_current, ipv6_avg),
-                ConnectivityState::Disconnected => family_failure_label(state, Family::Ipv6),
-                ConnectivityState::Intermittent => format!("intermittent {} avg:{}", ipv6_current, ipv6_avg),
-                ConnectivityState::Checking => checking_text.to_string(),
-            }
-        } else {
-            format!("{} avg:{}", ipv6_current, ipv6_avg)
-        };
-
-        let ipv6_title = Paragraph::new(Line::from(vec![
-            Span::styled("📡 IPv6: ", Style::default().fg(Color::White)),
-            Span::styled(
-                ipv6_status_text,
-                Style::default().fg(if has_ipv6 { Color::Green } else { Color::Red }),
-            ),
-        ]));
-        ipv6_title.render(chunks[5], frame.buffer_mut());
-
-        // IPv6 Sparkline
-        let ipv6_color = if has_ipv6 {
-            if ipv6_data.iter().any(|&v| v > 0) {
-                let avg = ipv6_data.iter().sum::<u64>() as f64 / ipv6_data.len() as f64;
-                if avg <= 50.0 {
-                    Color::Green
-                } else if avg <= 150.0 {
-                    Color::Yellow
-                } else {
-                    Color::Red
+            ConnectivityRows::Compact {
+                families: family_rows, ..
+            } => {
+                let labels: Vec<String> = families
+                    .iter()
+                    .map(|view| format!("{} {}", view.short, latest_text(view.data.latest())))
+                    .collect();
+                let label_width = labels
+                    .iter()
+                    .map(|label| Span::raw(label.as_str()).width())
+                    .max()
+                    .unwrap_or(0) as u16
+                    + 1;
+                for ((view, label), row) in families.iter().zip(labels).zip(family_rows) {
+                    let Some(row) = row else { continue };
+                    let label_area = Rect {
+                        width: label_width.min(row.width),
+                        ..row
+                    };
+                    let graph_area = Rect {
+                        x: row.x + label_area.width,
+                        width: row.width - label_area.width,
+                        ..row
+                    };
+                    Paragraph::new(Span::styled(label, Style::default().fg(view.title_color())))
+                        .render(label_area, frame.buffer_mut());
+                    let visible = view.data.visible(usize::from(graph_area.width));
+                    let max_us = scale_max_us(&visible);
+                    render_graph(frame, graph_area, &visible, max_us, view.graph_color(&visible));
                 }
-            } else {
-                Color::Green
             }
-        } else {
-            Color::Red
-        };
-
-        let ipv6_sparkline = Sparkline::default()
-            .data(&ipv6_data)
-            .style(Style::default().fg(ipv6_color));
-        ipv6_sparkline.render(chunks[6], frame.buffer_mut());
+        }
     }
 
     fn title(&self) -> &'static str {
@@ -610,27 +629,156 @@ mod tests {
     }
 
     #[test]
-    fn test_sparkline_data_updates() {
+    fn failed_pings_are_recorded_as_absent_samples() {
         let pane = ConnectivityPane::new();
+        let start = Instant::now();
+        let mut ok = PingResult::new();
+        ok.ipv4_status = PingStatus::Success(Duration::from_micros(500));
+        ok.ipv6_status = PingStatus::NoAddress;
+        ok.queried_at = start;
+        pane.update_sparklines(&ok);
+        let mut failed = failed_ping_with(PingFailure::NoReply);
+        failed.queried_at = start + Duration::from_secs(1);
+        pane.update_sparklines(&failed);
 
-        // Add some test data to IPv4 sparkline
-        {
-            let mut sparkline = pane.ipv4_sparkline.lock().expect("Failed to lock sparkline in test");
-            sparkline.add_latency(Duration::from_millis(25));
-            sparkline.add_latency(Duration::from_millis(30));
-            sparkline.add_latency(Duration::from_millis(20));
-            assert_eq!(sparkline.len(), 3); // 3 real points
-            assert!(sparkline.current_value().is_some());
-            assert!(sparkline.average_value().is_some());
-        }
+        let ipv4 = pane.ipv4_sparkline.lock().expect("ipv4 sparkline");
+        let values: Vec<Option<u64>> = ipv4.visible(10).iter().map(|(_, micros)| *micros).collect();
+        assert_eq!(values, vec![Some(500), None]);
+        let ipv6 = pane.ipv6_sparkline.lock().expect("ipv6 sparkline");
+        assert_eq!(ipv6.len(), 1, "NoAddress is not a ping cycle; the failure is");
+    }
 
-        // Test sparkline data extraction
-        {
-            let sparkline = pane.ipv4_sparkline.lock().expect("Failed to lock sparkline in test");
-            let data = sparkline.get_data_for_width(50);
-            assert!(!data.is_empty());
-            assert_eq!(data.len(), 3); // Should have 3 data points as added above
+    /// Render `pane` once per ping from `pings`, each 1s after the last; returns the final render.
+    fn render_cycles(pane: &ConnectivityPane, pings: &[PingResult], width: u16, height: u16) -> String {
+        let start = Instant::now();
+        let mut out = String::new();
+        for (cycle, ping) in pings.iter().enumerate() {
+            let mut ping = ping.clone();
+            ping.queried_at = start + Duration::from_secs(cycle as u64);
+            out = render_pane(pane, &state_with_ping(ping), width, height, false);
         }
+        out
+    }
+
+    fn ok_ping(ipv4_ms: u64, ipv6_ms: u64) -> PingResult {
+        let mut ping = PingResult::new();
+        ping.ipv4_status = PingStatus::Success(Duration::from_millis(ipv4_ms));
+        ping.ipv6_status = PingStatus::Success(Duration::from_millis(ipv6_ms));
+        ping
+    }
+
+    fn has_bar_glyph(row: &str) -> bool {
+        row.chars().any(|glyph| ('▁'..='█').contains(&glyph))
+    }
+
+    fn row_containing<'a>(out: &'a str, needle: &str) -> &'a str {
+        out.lines()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}:\n{out}"))
+    }
+
+    /// The glyph in the last column inside the right border.
+    fn last_inner_glyph(row: &str) -> char {
+        let glyphs: Vec<char> = row.chars().collect();
+        glyphs[glyphs.len() - 2]
+    }
+
+    #[test]
+    fn compact_mode_at_80x24_draws_both_families() {
+        let pane = ConnectivityPane::new();
+        let pings: Vec<PingResult> = (0..5).map(|_| ok_ping(12, 14)).collect();
+        let out = render_cycles(&pane, &pings, 56, 6);
+        let ipv4_row = row_containing(&out, "v4 12ms");
+        let ipv6_row = row_containing(&out, "v6 14ms");
+        assert!(has_bar_glyph(ipv4_row), "no IPv4 sparkline:\n{out}");
+        assert!(has_bar_glyph(ipv6_row), "no IPv6 sparkline:\n{out}");
+    }
+
+    #[test]
+    fn newest_sample_is_in_the_rightmost_column() {
+        let pane = ConnectivityPane::new();
+        let mut pings: Vec<PingResult> = (0..4).map(|_| ok_ping(12, 14)).collect();
+        let mut failed_v4 = ok_ping(12, 14);
+        failed_v4.ipv4_status = PingStatus::Failed(PingFailure::NoReply);
+        pings.push(failed_v4);
+        let out = render_cycles(&pane, &pings, 56, 6);
+        let ipv4_row = row_containing(&out, "v4 ✗");
+        assert_eq!(
+            last_inner_glyph(ipv4_row),
+            '░',
+            "newest (failed) sample not at the right:\n{out}"
+        );
+        let ipv6_row = row_containing(&out, "v6 14ms");
+        assert!(('▁'..='█').contains(&last_inner_glyph(ipv6_row)), "{out}");
+    }
+
+    #[test]
+    fn failed_sample_renders_the_absent_symbol_under_a_scaled_title() {
+        let out = render_failures(|| failed_ping_with(PingFailure::NoReply));
+        assert!(out.contains('░'), "failed samples not drawn:\n{out}");
+        assert!(out.contains("scale 0-"), "no scale in the title:\n{out}");
+    }
+
+    #[test]
+    fn full_mode_title_names_latency_scale_and_span() {
+        let pane = ConnectivityPane::new();
+        let pings: Vec<PingResult> = [10, 11, 12, 11, 12].iter().map(|ms| ok_ping(*ms, 30)).collect();
+        let out = render_cycles(&pane, &pings, 100, 20);
+        assert!(
+            out.contains("IPv4 12ms avg 11ms │ scale 0-20ms │ ← 4s"),
+            "IPv4 title:\n{out}"
+        );
+        assert!(
+            out.contains("IPv6 30ms avg 30ms │ scale 0-50ms │ ← 4s"),
+            "IPv6 title:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rows_are_compact_below_the_full_mode_height() {
+        let inner = Rect::new(1, 1, 54, 4);
+        let row = |y| Rect::new(1, y, 54, 1);
+        assert_eq!(
+            connectivity_rows(inner),
+            ConnectivityRows::Compact {
+                status: row(1),
+                families: [Some(row(2)), Some(row(3))],
+            }
+        );
+        assert_eq!(
+            connectivity_rows(Rect::new(1, 1, 54, 2)),
+            ConnectivityRows::Compact {
+                status: row(1),
+                families: [Some(row(2)), None],
+            }
+        );
+    }
+
+    #[test]
+    fn rows_give_extra_height_to_the_graphs_in_full_mode() {
+        let rect = |y, height| Rect::new(0, y, 40, height);
+        assert_eq!(
+            connectivity_rows(rect(0, 5)),
+            ConnectivityRows::Full {
+                status: rect(0, 1),
+                families: [(rect(1, 1), rect(2, 1)), (rect(3, 1), rect(4, 1))],
+            }
+        );
+        assert_eq!(
+            connectivity_rows(rect(0, 8)),
+            ConnectivityRows::Full {
+                status: rect(0, 1),
+                families: [(rect(1, 1), rect(2, 3)), (rect(5, 1), rect(6, 2))],
+            }
+        );
+    }
+
+    #[test]
+    fn latency_formats_sub_millisecond_with_a_decimal() {
+        assert_eq!(format_latency(500), "0.5ms");
+        assert_eq!(format_latency(12_400), "12ms");
+        assert_eq!(latest_text(Some(None)), "✗");
+        assert_eq!(latest_text(None), "---");
     }
 
     fn failed_ping(reason: &str) -> PingResult {
