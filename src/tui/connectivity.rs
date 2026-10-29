@@ -109,6 +109,19 @@ impl ConnectivityHistory {
     }
 }
 
+/// First per-protocol ping failure message, if any protocol failed.
+fn failure_reason(ping: &crate::scan::ping::PingResult) -> Option<String> {
+    use crate::scan::ping::PingStatus;
+    [&ping.ipv4_status, &ping.ipv6_status]
+        .into_iter()
+        .find_map(|status| match status {
+            PingStatus::Failed(msg) => Some(msg.clone()),
+            PingStatus::ToolMissing(tool) => Some(format!("{tool} not installed")),
+            PingStatus::NoAddress => Some("no address".to_string()),
+            _ => None,
+        })
+}
+
 /// CONNECTIVITY pane displays real-time ping latency and network connectivity metrics
 pub struct ConnectivityPane {
     title: &'static str,
@@ -313,7 +326,9 @@ impl Pane for ConnectivityPane {
                 (ConnectivityState::Disconnected, ConnectivityState::Intermittent) => {
                     ("ipv6 intermittent", Color::Yellow)
                 }
-                (ConnectivityState::Disconnected, ConnectivityState::Disconnected) => ("no connectivity", Color::Red),
+                (ConnectivityState::Disconnected, ConnectivityState::Disconnected)
+                | (ConnectivityState::Disconnected, ConnectivityState::Checking)
+                | (ConnectivityState::Checking, ConnectivityState::Disconnected) => ("disconnected", Color::Red),
                 (ConnectivityState::Checking, _) | (_, ConnectivityState::Checking) => {
                     ("checking connectivity", Color::Gray)
                 }
@@ -331,6 +346,14 @@ impl Pane for ConnectivityPane {
             log::warn!("[tui::connectivity] failed_to_lock_connectivity_history");
             (false, false, "checking", Color::Gray)
         };
+        let mut status_text = status_text.to_string();
+        if status_text == "disconnected"
+            && let Some(ping_state) = state.scanners.get("ping")
+            && let Some(ScanResult::Ping(ping)) = &ping_state.result
+            && let Some(reason) = failure_reason(ping)
+        {
+            status_text = format!("disconnected: {reason}");
+        }
 
         // Update sparklines if we have ping results
         if let Some(ping_state) = state.scanners.get("ping")
@@ -531,6 +554,9 @@ impl Pane for ConnectivityPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::ping::{PingResult, PingStatus};
+    use crate::tui::testing::render_pane;
+    use crate::types::{ScanState, ScanStatus};
     use std::time::Duration;
 
     #[test]
@@ -568,5 +594,50 @@ mod tests {
             assert!(!data.is_empty());
             assert_eq!(data.len(), 3); // Should have 3 data points as added above
         }
+    }
+
+    fn failed_ping(reason: &str) -> PingResult {
+        let mut ping = PingResult::new();
+        ping.ipv4_status = PingStatus::Failed(reason.to_string());
+        ping.ipv6_status = PingStatus::Failed(reason.to_string());
+        ping
+    }
+
+    fn state_with_ping(ping: PingResult) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "ping".to_string(),
+            ScanState {
+                result: Some(ScanResult::Ping(ping)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: VecDeque::new(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn five_failed_samples_render_disconnected_with_reason() {
+        let pane = ConnectivityPane::new();
+        let mut out = String::new();
+        for _ in 0..5 {
+            let state = state_with_ping(failed_ping("ping binary missing"));
+            out = render_pane(&pane, &state, 100, 20, false);
+        }
+        assert!(out.contains("disconnected"), "{out}");
+        assert!(out.contains("ping binary missing"), "{out}");
+        assert!(!out.contains("checking"), "{out}");
+    }
+
+    #[test]
+    fn fewer_than_three_failures_still_checking() {
+        let pane = ConnectivityPane::new();
+        let mut out = String::new();
+        for _ in 0..2 {
+            out = render_pane(&pane, &state_with_ping(failed_ping("x")), 100, 20, false);
+        }
+        assert!(out.contains("checking"), "{out}");
     }
 }

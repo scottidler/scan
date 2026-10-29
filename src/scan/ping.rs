@@ -106,9 +106,50 @@ pub struct PingScanner {
     interval: Duration,
     timeout: Duration,
     packet_count: u8,
+    program_override: Option<String>,
+}
+
+/// Program and arguments for one ping of `target` on `target_os`.
+///
+/// iputils (Linux) reads `-W` in whole seconds; macOS reads it in milliseconds,
+/// has no `-4`/`-6`, and pings IPv6 through `ping6`.
+pub fn ping_args(
+    target_os: &str,
+    protocol: Protocol,
+    count: u32,
+    timeout: Duration,
+    target: &str,
+) -> (&'static str, Vec<String>) {
+    let macos = target_os == "macos";
+    let (program, family_flag) = match (macos, protocol) {
+        (true, Protocol::Ipv6) => ("ping6", None),
+        (true, _) => ("ping", None),
+        (false, Protocol::Ipv6) => ("ping", Some("-6")),
+        (false, _) => ("ping", Some("-4")),
+    };
+    let wait = if macos {
+        timeout.as_millis().to_string()
+    } else {
+        timeout.as_secs_f64().ceil().max(1.0).to_string()
+    };
+    let mut args: Vec<String> = family_flag.into_iter().map(String::from).collect();
+    args.extend([
+        "-c".to_string(),
+        count.to_string(),
+        "-W".to_string(),
+        wait,
+        target.to_string(),
+    ]);
+    (program, args)
 }
 
 impl PingScanner {
+    /// Use `program` instead of the platform's ping binary.
+    pub fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program_override = Some(program.into());
+        self
+    }
+
     pub fn new(interval: Duration, timeout: Duration, packet_count: u8) -> Self {
         log::debug!(
             "[scan::ping] new: interval={}ms timeout={}ms packet_count={}",
@@ -121,6 +162,7 @@ impl PingScanner {
             interval,
             timeout,
             packet_count,
+            program_override: None,
         }
     }
 }
@@ -230,7 +272,6 @@ impl Scanner for PingScanner {
 
         result.total_duration = scan_start.elapsed();
 
-        // Return success if at least one protocol succeeded, or error if all failed
         if result.has_any_success() {
             log::trace!(
                 "[scan::ping] ping_completed: target={} protocol={} duration={}ms best_latency={:?}",
@@ -239,22 +280,17 @@ impl Scanner for PingScanner {
                 result.total_duration.as_millis(),
                 result.get_best_latency()
             );
-            Ok(ScanResult::Ping(result))
         } else {
-            // All protocols failed
-            let error_msg = format!(
-                "All ping attempts failed for target: {} ({})",
-                target.display_name(),
-                protocol.as_str()
-            );
             log::error!(
-                "[scan::ping] all_pings_failed: target={} protocol={} duration={}ms",
+                "[scan::ping] all_pings_failed: target={} protocol={} duration={}ms ipv4={:?} ipv6={:?}",
                 target.display_name(),
                 protocol.as_str(),
-                result.total_duration.as_millis()
+                result.total_duration.as_millis(),
+                result.ipv4_status,
+                result.ipv6_status
             );
-            Err(eyre::eyre!(error_msg))
         }
+        Ok(ScanResult::Ping(result))
     }
 }
 
@@ -329,31 +365,18 @@ impl PingScanner {
             self.timeout.as_millis()
         );
 
-        // Modern ping command can handle both IPv4 and IPv6
-        // We'll use the unified 'ping' command with protocol-specific flags
-        let ping_command = "ping";
-        let mut args = Vec::new();
-
-        // Add protocol-specific flags
-        match protocol {
-            Protocol::Ipv4 => {
-                args.push("-4"); // Force IPv4
-            }
-            Protocol::Ipv6 => {
-                args.push("-6"); // Force IPv6
-            }
-            Protocol::Both => {
-                log::error!("[scan::ping] invalid_protocol_for_ping: protocol={}", protocol.as_str());
-                eyre::bail!("Protocol::Both is not valid for individual ping operations");
-            }
-        };
-
-        // Create string values with proper lifetimes
-        let packet_count_str = self.packet_count.to_string();
-        let timeout_str = (self.timeout.as_millis() as u32).to_string();
-
-        // Add standard ping arguments
-        args.extend(["-c", &packet_count_str, "-W", &timeout_str, target]);
+        if protocol == Protocol::Both {
+            log::error!("[scan::ping] invalid_protocol_for_ping: protocol={}", protocol.as_str());
+            eyre::bail!("Protocol::Both is not valid for individual ping operations");
+        }
+        let (default_program, args) = ping_args(
+            std::env::consts::OS,
+            protocol,
+            self.packet_count as u32,
+            self.timeout,
+            target,
+        );
+        let ping_command: &str = self.program_override.as_deref().unwrap_or(default_program);
 
         log::debug!(
             "[scan::ping] using_command: {} {:?} for protocol {}",
@@ -801,6 +824,10 @@ mod tests {
         let result = scanner.scan(&target, Protocol::Ipv6).await;
 
         match result {
+            Ok(ScanResult::Ping(ping_result)) if !ping_result.has_any_success() => {
+                // Hosts without IPv6 loopback now report all-failed as Ok with Failed statuses
+                log::warn!("IPv6 ping test failed (may be expected): {:?}", ping_result.ipv6_status);
+            }
             Ok(ScanResult::Ping(ping_result)) => {
                 if let Some(best_latency) = ping_result.get_best_latency() {
                     assert!(best_latency.as_millis() < 100);
@@ -855,7 +882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_target_for_protocol() {
+    async fn test_no_target_for_protocol_returns_failed_status() {
         let scanner = PingScanner::default();
 
         // Create a target that only has IPv4 addresses
@@ -864,9 +891,54 @@ mod tests {
         // Try to ping IPv6 on an IPv4-only target
         let result = scanner.scan(&ipv4_only_target, Protocol::Ipv6).await;
 
-        // Should fail because no IPv6 address is available
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("All ping attempts failed"));
+        // All-failed is Ok with per-protocol statuses, not an Err
+        match result.expect("all-failed scan must be Ok") {
+            ScanResult::Ping(ping) => assert!(matches!(ping.ipv6_status, PingStatus::NoAddress)),
+            _ => panic!("expected Ping result"),
+        }
+    }
+
+    #[test]
+    fn ping_args_linux_uses_seconds_and_family_flag() {
+        let (program, args) = ping_args("linux", Protocol::Ipv4, 1, Duration::from_secs(5), "1.2.3.4");
+        assert_eq!(program, "ping");
+        assert_eq!(args, ["-4", "-c", "1", "-W", "5", "1.2.3.4"]);
+        let (program, args) = ping_args("linux", Protocol::Ipv6, 1, Duration::from_secs(5), "::1");
+        assert_eq!(program, "ping");
+        assert_eq!(args[0], "-6");
+    }
+
+    #[test]
+    fn ping_args_linux_rounds_timeout_up_to_whole_seconds() {
+        let (_, args) = ping_args("linux", Protocol::Ipv4, 1, Duration::from_millis(1500), "h");
+        assert_eq!(args[4], "2");
+        let (_, args) = ping_args("linux", Protocol::Ipv4, 1, Duration::from_millis(100), "h");
+        assert_eq!(args[4], "1");
+    }
+
+    #[test]
+    fn ping_args_macos_uses_millis_and_no_family_flag() {
+        let (program, args) = ping_args("macos", Protocol::Ipv4, 1, Duration::from_secs(5), "1.2.3.4");
+        assert_eq!(program, "ping");
+        assert_eq!(args, ["-c", "1", "-W", "5000", "1.2.3.4"]);
+        let (program, args) = ping_args("macos", Protocol::Ipv6, 1, Duration::from_secs(5), "::1");
+        assert_eq!(program, "ping6");
+        assert!(!args.iter().any(|a| a == "-4" || a == "-6"));
+    }
+
+    #[tokio::test]
+    async fn scan_with_missing_ping_binary_is_ok_with_failed_statuses() {
+        let scanner = PingScanner::default().with_program("/nonexistent/ping-binary");
+        let target = Target::parse("127.0.0.1").unwrap();
+        match scanner.scan(&target, Protocol::Ipv4).await.expect("must be Ok") {
+            ScanResult::Ping(ping) => {
+                assert!(!ping.has_any_success());
+                assert!(!matches!(
+                    ping.ipv4_status,
+                    PingStatus::NotQueried | PingStatus::Success(_)
+                ));
+            }
+            _ => panic!("expected Ping result"),
+        }
     }
 }
