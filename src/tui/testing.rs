@@ -2,9 +2,10 @@
 
 use crate::tui::pane::Pane;
 use crate::types::AppState;
-use ratatui::{Terminal, backend::TestBackend};
+use ratatui::{Terminal, backend::TestBackend, text::Span};
 
 /// Render `pane` at `width` x `height` and return the buffer as newline-joined text rows.
+/// The continuation cell after a double-width glyph is dropped, as a terminal shows it.
 pub fn render_pane(pane: &dyn Pane, state: &AppState, width: u16, height: u16, focused: bool) -> String {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("TestBackend terminal");
     terminal
@@ -15,7 +16,16 @@ pub fn render_pane(pane: &dyn Pane, state: &AppState, width: u16, height: u16, f
         .expect("draw pane");
     let buffer = terminal.backend().buffer();
     (0..height)
-        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            let mut row = String::new();
+            let mut x = 0;
+            while x < width {
+                let symbol = buffer[(x, y)].symbol();
+                row.push_str(symbol);
+                x += Span::raw(symbol).width().max(1) as u16;
+            }
+            row
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

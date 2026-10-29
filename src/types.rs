@@ -1,12 +1,15 @@
 use crate::target::Protocol;
 use dashmap::DashMap;
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::time::Instant;
 
 pub struct AppState {
     pub target: String,
     pub scanners: DashMap<String, ScanState>,
     pub protocol: Protocol,
+    /// Addresses from `Target` resolution: the literal for an IP target, the system resolver's answer for a name.
+    pub resolved_ips: Vec<IpAddr>,
 }
 
 impl AppState {
@@ -15,6 +18,7 @@ impl AppState {
             target,
             scanners: DashMap::new(),
             protocol: Protocol::Both, // Default to scanning both IPv4 and IPv6
+            resolved_ips: Vec::new(),
         }
     }
 

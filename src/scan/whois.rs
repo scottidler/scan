@@ -59,8 +59,8 @@ impl WhoisScanner {
         let domain = match &target.domain {
             Some(d) => d.clone(),
             None => {
-                log::error!("[scan::whois] no_domain_available: target={}", target.display_name());
-                return Err(eyre::eyre!("No domain available for WHOIS lookup"));
+                log::debug!("[scan::whois] not_applicable: target={}", target.display_name());
+                return Ok(WhoisResult::not_applicable(target.display_name().to_string()));
             }
         };
 
@@ -702,6 +702,33 @@ pub struct WhoisResult {
     pub raw_data: Option<String>,
 }
 
+impl WhoisResult {
+    /// Domain WHOIS has nothing to say about an IP target; GEOIP carries its ISP and ASN.
+    pub fn not_applicable(target: String) -> Self {
+        Self {
+            domain: target,
+            registration_date: None,
+            expiry_date: None,
+            last_updated: None,
+            nameservers: Vec::new(),
+            status: Vec::new(),
+            dnssec: None,
+            registrar: None,
+            abuse_contact: None,
+            registrant: None,
+            admin_contact: None,
+            tech_contact: None,
+            privacy_score: PrivacyLevel::Unknown,
+            domain_age_days: None,
+            expires_in_days: None,
+            risk_indicators: Vec::new(),
+            data_source: DataSource::NotApplicable,
+            scan_duration: Duration::ZERO,
+            raw_data: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrarInfo {
     pub name: String,
@@ -741,9 +768,10 @@ pub enum RiskIndicator {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataSource {
-    Rdap,   // Modern RDAP protocol
-    Whois,  // Traditional WHOIS protocol
-    Failed, // Query failed
+    Rdap,          // Modern RDAP protocol
+    Whois,         // Traditional WHOIS protocol
+    Failed,        // Query failed
+    NotApplicable, // IP target: no domain to look up
 }
 
 // Tests
@@ -1138,5 +1166,20 @@ mod tests {
             privacy_level,
             PrivacyLevel::Protected | PrivacyLevel::Corporate
         ));
+    }
+
+    #[tokio::test]
+    async fn ip_target_scan_is_ok_and_not_applicable() {
+        let scanner = WhoisScanner::new();
+        let target = Target::parse("1.1.1.1").unwrap();
+        match scanner.scan(&target, Protocol::Both).await {
+            Ok(ScanResult::Whois(result)) => {
+                assert_eq!(result.data_source, DataSource::NotApplicable);
+                assert_eq!(result.domain, "1.1.1.1");
+                assert!(result.risk_indicators.is_empty());
+            }
+            Ok(other) => panic!("expected Whois result, got {:?}", other),
+            Err(e) => panic!("IP target must not fail WHOIS: {}", e),
+        }
     }
 }

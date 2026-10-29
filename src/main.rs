@@ -87,8 +87,14 @@ async fn main() -> Result<()> {
     }
 
     // Create shared application state (wrapped in Mutex for protocol changes)
-    let state = Arc::new(Mutex::new(scan::types::AppState::new(args.target.clone())));
-    log::debug!("[main] app_state_created: target={}", args.target);
+    let mut app_state = scan::types::AppState::new(args.target.clone());
+    app_state.resolved_ips = target.all_ips().to_vec();
+    log::debug!(
+        "[main] app_state_created: target={} resolved_ips={:?}",
+        args.target,
+        app_state.resolved_ips
+    );
+    let state = Arc::new(Mutex::new(app_state));
 
     // Create and start all scanners using the protocol from app state
     let scanners = scan::scan::create_default_scanners();

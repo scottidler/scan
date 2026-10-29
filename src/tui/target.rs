@@ -1,3 +1,4 @@
+use crate::scan::dns::QueryStatus;
 use crate::tui::pane::{Pane, create_block};
 use crate::types::{AppState, ScanStatus};
 use log;
@@ -9,6 +10,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 use std::any::Any;
+use std::net::IpAddr;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * 60; // 3600
@@ -16,6 +18,28 @@ const MIN_TARGET_PANE_WIDTH: u16 = 25;
 const MIN_TARGET_PANE_HEIGHT: u16 = 12;
 /// Display order of the scanner rows, matching `create_default_scanners`.
 const SCANNER_DISPLAY_ORDER: [&str; 8] = ["ping", "dns", "tls", "http", "whois", "traceroute", "geoip", "port"];
+
+#[derive(Clone, Copy)]
+enum AddressFamily {
+    V4,
+    V6,
+}
+
+impl AddressFamily {
+    fn label(self) -> &'static str {
+        match self {
+            AddressFamily::V4 => "IPv4",
+            AddressFamily::V6 => "IPv6",
+        }
+    }
+
+    fn matches(self, ip: &IpAddr) -> bool {
+        match self {
+            AddressFamily::V4 => ip.is_ipv4(),
+            AddressFamily::V6 => ip.is_ipv6(),
+        }
+    }
+}
 
 /// TARGET pane displays basic target information and scanner status overview
 pub struct TargetPane {
@@ -98,6 +122,73 @@ impl TargetPane {
         summary
     }
 
+    /// One IPv4/IPv6 status row. `Target` resolution (`state.resolved_ips`) answers first, so an IP
+    /// target needs no DNS scan; the DNS scanner's records and status are the fallback.
+    fn address_line(state: &AppState, family: AddressFamily) -> Line<'static> {
+        let label = family.label();
+        let selected = match family {
+            AddressFamily::V4 => state.protocol.includes_ipv4(),
+            AddressFamily::V6 => state.protocol.includes_ipv6(),
+        };
+        if !selected {
+            return Line::from(vec![
+                Span::styled("  ", Style::default().fg(Color::Gray)),
+                Span::styled(format!("⚫ {}: ", label), Style::default().fg(Color::Gray)),
+                Span::styled("disabled", Style::default().fg(Color::Gray)),
+            ]);
+        }
+
+        let (icon, value, color) = match state.resolved_ips.iter().find(|ip| family.matches(ip)) {
+            Some(ip) => {
+                log::trace!("[tui::target] address_from_resolution: family={} ip={}", label, ip);
+                ("✅", ip.to_string(), Color::Green)
+            }
+            None => Self::address_from_dns(state, family),
+        };
+        Line::from(vec![
+            Span::styled("▶ ", Style::default().fg(Color::Green)),
+            Span::styled(format!("{} {}: ", icon, label), Style::default().fg(color)),
+            Span::styled(value, Style::default().fg(color)),
+        ])
+    }
+
+    /// Fallback when `Target` resolution has no address of this family. A family that simply has
+    /// no address is neutral gray; red is kept for a DNS query that errored.
+    fn address_from_dns(state: &AppState, family: AddressFamily) -> (&'static str, String, Color) {
+        if state.target.parse::<IpAddr>().is_ok() {
+            return ("⚫", "n/a".to_string(), Color::Gray);
+        }
+        let Some(dns_state) = state.scanners.get("dns") else {
+            return ("⚫", "initializing...".to_string(), Color::Gray);
+        };
+        match &dns_state.result {
+            Some(crate::types::ScanResult::Dns(dns_result)) => {
+                let (first, status) = match family {
+                    AddressFamily::V4 => (dns_result.A.first().map(|r| r.value.to_string()), &dns_result.A_status),
+                    AddressFamily::V6 => (
+                        dns_result.AAAA.first().map(|r| r.value.to_string()),
+                        &dns_result.AAAA_status,
+                    ),
+                };
+                match (first, status) {
+                    (Some(ip), _) => ("✅", ip, Color::Green),
+                    (None, QueryStatus::Failed(_) | QueryStatus::Timeout) => ("❌", "no data".to_string(), Color::Red),
+                    (None, QueryStatus::NotQueried) => ("⚫", "not queried".to_string(), Color::Gray),
+                    (None, QueryStatus::NoRecords | QueryStatus::Success(_)) => ("⚫", "none".to_string(), Color::Gray),
+                }
+            }
+            Some(_) => {
+                log::warn!("[tui::target] dns_unexpected_result_type:");
+                ("❌", "error".to_string(), Color::Red)
+            }
+            None => match dns_state.status {
+                ScanStatus::Running => ("🔄", "resolving...".to_string(), Color::Yellow),
+                ScanStatus::Failed => ("❌", "resolution failed".to_string(), Color::Red),
+                ScanStatus::Complete => ("⚫", "waiting to resolve...".to_string(), Color::Gray),
+            },
+        }
+    }
+
     /// Calculate scanner statistics
     fn calculate_stats(state: &AppState) -> (usize, usize, usize, usize) {
         let total = state.scanners.len();
@@ -168,273 +259,8 @@ impl Pane for TargetPane {
             ),
         ]));
 
-        // IPv4/IPv6 Protocol Status - Single source of truth
-        match state.scanners.get("dns") {
-            Some(dns_state) => {
-                match &dns_state.result {
-                    Some(crate::types::ScanResult::Dns(dns_result)) => {
-                        // IPv4 status
-                        let ipv4_selected = state.protocol.includes_ipv4();
-                        let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " }; // Chevron or 2 spaces for alignment
-
-                        if ipv4_selected {
-                            if !dns_result.A.is_empty() {
-                                let ip = &dns_result.A[0].value;
-                                log::trace!("[tui::target] ipv4_resolved: ip={}", ip);
-                                lines.push(Line::from(vec![
-                                    Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                                    Span::styled("✅ IPv4: ", Style::default().fg(Color::Green)),
-                                    Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
-                                ]));
-                            } else {
-                                log::trace!("[tui::target] ipv4_no_records:");
-                                lines.push(Line::from(vec![
-                                    Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                                    Span::styled("❌ IPv4: ", Style::default().fg(Color::Red)),
-                                    Span::styled("no data", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                        } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
-                                Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                                Span::styled("disabled", Style::default().fg(Color::Gray)),
-                            ]));
-                        }
-
-                        // IPv6 status
-                        let ipv6_selected = state.protocol.includes_ipv6();
-                        let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " }; // Chevron or 2 spaces for alignment
-
-                        if ipv6_selected {
-                            if !dns_result.AAAA.is_empty() {
-                                let ip = &dns_result.AAAA[0].value;
-                                log::trace!("[tui::target] ipv6_resolved: ip={}", ip);
-                                lines.push(Line::from(vec![
-                                    Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                                    Span::styled("✅ IPv6: ", Style::default().fg(Color::Green)),
-                                    Span::styled(ip.to_string(), Style::default().fg(Color::Green)),
-                                ]));
-                            } else {
-                                log::trace!("[tui::target] ipv6_no_records:");
-                                lines.push(Line::from(vec![
-                                    Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                                    Span::styled("❌ IPv6: ", Style::default().fg(Color::Red)),
-                                    Span::styled("no data", Style::default().fg(Color::Red)),
-                                ]));
-                            }
-                        } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
-                                Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                                Span::styled("disabled", Style::default().fg(Color::Gray)),
-                            ]));
-                        }
-                    }
-                    None => {
-                        match dns_state.status {
-                            ScanStatus::Running => {
-                                log::trace!("[tui::target] dns_resolving:");
-
-                                // IPv4 status during resolution
-                                let ipv4_selected = state.protocol.includes_ipv4();
-                                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-
-                                if ipv4_selected {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                                        Span::styled("🔄 IPv4: ", Style::default().fg(Color::Yellow)),
-                                        Span::styled("resolving...", Style::default().fg(Color::Yellow)),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
-                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
-
-                                // IPv6 status during resolution
-                                let ipv6_selected = state.protocol.includes_ipv6();
-                                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-
-                                if ipv6_selected {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                                        Span::styled("🔄 IPv6: ", Style::default().fg(Color::Yellow)),
-                                        Span::styled("resolving...", Style::default().fg(Color::Yellow)),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
-                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
-                            }
-                            ScanStatus::Failed => {
-                                log::trace!("[tui::target] dns_failed:");
-
-                                // IPv4 status during failure
-                                let ipv4_selected = state.protocol.includes_ipv4();
-                                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-
-                                if ipv4_selected {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                                        Span::styled("❌ IPv4: ", Style::default().fg(Color::Red)),
-                                        Span::styled("resolution failed", Style::default().fg(Color::Red)),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
-                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
-
-                                // IPv6 status during failure
-                                let ipv6_selected = state.protocol.includes_ipv6();
-                                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-
-                                if ipv6_selected {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                                        Span::styled("❌ IPv6: ", Style::default().fg(Color::Red)),
-                                        Span::styled("resolution failed", Style::default().fg(Color::Red)),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
-                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
-                            }
-                            _ => {
-                                log::trace!("[tui::target] dns_waiting:");
-
-                                // IPv4 status while waiting
-                                let ipv4_selected = state.protocol.includes_ipv4();
-                                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-
-                                if ipv4_selected {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
-                                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
-
-                                // IPv6 status while waiting
-                                let ipv6_selected = state.protocol.includes_ipv6();
-                                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-
-                                if ipv6_selected {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("waiting to resolve...", Style::default().fg(Color::Gray)),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
-                                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        // Non-DNS result (shouldn't happen)
-                        log::warn!("[tui::target] dns_unexpected_result_type:");
-
-                        // IPv4 status during error
-                        let ipv4_selected = state.protocol.includes_ipv4();
-                        let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-
-                        if ipv4_selected {
-                            lines.push(Line::from(vec![
-                                Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                                Span::styled("❌ IPv4: ", Style::default().fg(Color::Red)),
-                                Span::styled("error", Style::default().fg(Color::Red)),
-                            ]));
-                        } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
-                                Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                                Span::styled("disabled", Style::default().fg(Color::Gray)),
-                            ]));
-                        }
-
-                        // IPv6 status during error
-                        let ipv6_selected = state.protocol.includes_ipv6();
-                        let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-
-                        if ipv6_selected {
-                            lines.push(Line::from(vec![
-                                Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                                Span::styled("❌ IPv6: ", Style::default().fg(Color::Red)),
-                                Span::styled("error", Style::default().fg(Color::Red)),
-                            ]));
-                        } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
-                                Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                                Span::styled("disabled", Style::default().fg(Color::Gray)),
-                            ]));
-                        }
-                    }
-                }
-            }
-            None => {
-                // No DNS scanner state yet
-                log::trace!("[tui::target] dns_no_state:");
-
-                // IPv4 status when no DNS state
-                let ipv4_selected = state.protocol.includes_ipv4();
-                let ipv4_arrow = if ipv4_selected { "▶ " } else { "  " };
-
-                if ipv4_selected {
-                    lines.push(Line::from(vec![
-                        Span::styled(ipv4_arrow, Style::default().fg(Color::Green)),
-                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                        Span::styled("initializing...", Style::default().fg(Color::Gray)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(ipv4_arrow, Style::default().fg(Color::Gray)),
-                        Span::styled("⚫ IPv4: ", Style::default().fg(Color::Gray)),
-                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                    ]));
-                }
-
-                // IPv6 status when no DNS state
-                let ipv6_selected = state.protocol.includes_ipv6();
-                let ipv6_arrow = if ipv6_selected { "▶ " } else { "  " };
-
-                if ipv6_selected {
-                    lines.push(Line::from(vec![
-                        Span::styled(ipv6_arrow, Style::default().fg(Color::Green)),
-                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                        Span::styled("initializing...", Style::default().fg(Color::Gray)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(ipv6_arrow, Style::default().fg(Color::Gray)),
-                        Span::styled("⚫ IPv6: ", Style::default().fg(Color::Gray)),
-                        Span::styled("disabled", Style::default().fg(Color::Gray)),
-                    ]));
-                }
-            }
-        }
+        lines.push(Self::address_line(state, AddressFamily::V4));
+        lines.push(Self::address_line(state, AddressFamily::V6));
 
         let (total, running, complete, failed) = Self::calculate_stats(state);
         let rows = inner_area.height as usize;
@@ -557,6 +383,7 @@ mod tests {
             target: "example.com".to_string(),
             scanners: DashMap::new(),
             protocol: Protocol::Both,
+            resolved_ips: Vec::new(),
         };
 
         // Add some test scanner states
@@ -674,5 +501,131 @@ mod tests {
     fn test_collapsed_summary_counts() {
         assert_eq!(TargetPane::collapsed_summary(8, 0, 8, 0), "8/8 ✅");
         assert_eq!(TargetPane::collapsed_summary(8, 1, 6, 1), "6/8 ✅ 1 🔄 1 ❌");
+    }
+
+    fn ip_target_state(target: &str) -> AppState {
+        let mut state = AppState::new(target.to_string());
+        state.resolved_ips = vec![target.parse().unwrap()];
+        state
+    }
+
+    #[test]
+    fn bare_ipv4_target_renders_its_address_without_dns() {
+        use crate::tui::testing::render_pane;
+        let state = ip_target_state("1.1.1.1");
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        assert!(out.contains("✅ IPv4: 1.1.1.1"), "{}", out);
+        assert!(!out.contains("IPv4: no data"), "{}", out);
+    }
+
+    #[test]
+    fn bare_ipv6_target_renders_its_address() {
+        use crate::tui::testing::render_pane;
+        let state = ip_target_state("2606:4700:4700::1111");
+        let out = render_pane(&TargetPane::new(), &state, 50, 20, false);
+        assert!(out.contains("✅ IPv6: 2606:4700:4700::1111"), "{}", out);
+    }
+
+    #[test]
+    fn resolved_address_respects_disabled_protocol() {
+        use crate::tui::testing::render_pane;
+        let mut state = ip_target_state("1.1.1.1");
+        state.protocol = Protocol::Ipv6;
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        assert!(out.contains("IPv4: disabled"), "{}", out);
+        assert!(!out.contains("IPv4: 1.1.1.1"), "{}", out);
+    }
+
+    #[test]
+    fn dns_records_fill_in_when_resolution_has_no_address() {
+        use crate::scan::dns::{DnsRecord, DnsResult};
+        use crate::tui::testing::render_pane;
+        use crate::types::ScanResult;
+        let state = AppState::new("example.com".to_string());
+        let mut dns = DnsResult::new();
+        dns.A.push(DnsRecord::new("93.184.216.34".parse().unwrap(), 60));
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: Some(ScanResult::Dns(dns)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        assert!(out.contains("✅ IPv4: 93.184.216.34"), "{}", out);
+        // AAAA left at its default `NotQueried`: never asked, so neutral rather than red.
+        assert!(out.contains("IPv6: not queried"), "{}", out);
+        assert!(!out.contains("❌"), "{}", out);
+    }
+
+    fn state_with_dns(target: &str, dns: crate::scan::dns::DnsResult) -> AppState {
+        let state = AppState::new(target.to_string());
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: Some(crate::types::ScanResult::Dns(dns)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn bare_ip_target_shows_other_family_as_neutral_na() {
+        use crate::tui::testing::render_pane;
+        let out = render_pane(&TargetPane::new(), &ip_target_state("1.1.1.1"), 40, 20, false);
+        assert!(out.contains("✅ IPv4: 1.1.1.1"), "{}", out);
+        assert!(out.contains("IPv6: n/a"), "{}", out);
+        assert!(!out.contains("❌"), "{}", out);
+
+        let out = render_pane(
+            &TargetPane::new(),
+            &ip_target_state("2606:4700:4700::1111"),
+            50,
+            20,
+            false,
+        );
+        assert!(out.contains("IPv4: n/a"), "{}", out);
+        assert!(!out.contains("❌"), "{}", out);
+    }
+
+    #[test]
+    fn domain_with_empty_aaaa_shows_neutral_none() {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+        use crate::tui::testing::render_pane;
+        let mut dns = DnsResult::new();
+        dns.A.push(DnsRecord::new("140.82.112.3".parse().unwrap(), 60));
+        dns.A_status = QueryStatus::Success(1);
+        dns.AAAA_status = QueryStatus::NoRecords;
+        let out = render_pane(&TargetPane::new(), &state_with_dns("github.com", dns), 40, 20, false);
+        assert!(out.contains("✅ IPv4: 140.82.112.3"), "{}", out);
+        assert!(out.contains("IPv6: none"), "{}", out);
+        assert!(!out.contains("❌"), "{}", out);
+    }
+
+    #[test]
+    fn queried_family_that_errored_stays_red() {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+        use crate::tui::testing::render_pane;
+        let mut dns = DnsResult::new();
+        dns.A.push(DnsRecord::new("93.184.216.34".parse().unwrap(), 60));
+        dns.A_status = QueryStatus::Success(1);
+        for status in [QueryStatus::Failed("SERVFAIL".to_string()), QueryStatus::Timeout] {
+            dns.AAAA_status = status;
+            let out = render_pane(
+                &TargetPane::new(),
+                &state_with_dns("example.com", dns.clone()),
+                40,
+                20,
+                false,
+            );
+            assert!(out.contains("❌ IPv6: no data"), "{}", out);
+        }
     }
 }

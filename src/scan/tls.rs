@@ -10,6 +10,7 @@ use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use rustls::pki_types::ServerName;
 use rustls::{CertificateError, ClientConfig, ProtocolVersion};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
@@ -290,6 +291,22 @@ impl TlsResult {
     }
 }
 
+/// Socket address for a TLS connection. Built from parts, so an IPv6 literal needs no brackets.
+pub fn connect_addr(target_ip: &str, port: u16) -> Result<SocketAddr> {
+    let ip: IpAddr = target_ip
+        .parse()
+        .wrap_err_with(|| format!("TLS target is not an IP address: {}", target_ip))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Name the rustls client verifies the certificate against: the domain when there is one, else the IP.
+pub fn server_name(domain: Option<&str>, ip: IpAddr) -> Result<ServerName<'static>> {
+    match domain {
+        Some(domain) => ServerName::try_from(domain.to_string()).wrap_err("Invalid domain name for TLS"),
+        None => Ok(ServerName::IpAddress(ip.into())),
+    }
+}
+
 /// Convert an ASN.1 time to UTC by diffing it against the Unix epoch; no string parsing.
 pub fn asn1_to_utc(t: &Asn1TimeRef) -> Result<DateTime<Utc>> {
     let epoch = Asn1Time::from_unix(0).wrap_err("Failed to build ASN.1 epoch")?;
@@ -513,10 +530,8 @@ impl TlsScanner {
     }
 
     async fn test_basic_connection(&self, target: &Target, target_ip: &str, port: u16) -> Result<HandshakeOutcome> {
-        let domain = target
-            .domain
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("Domain required for TLS scanning"))?;
+        let addr = connect_addr(target_ip, port)?;
+        let server_name = server_name(target.domain.as_deref(), addr.ip())?;
 
         let start_time = Instant::now();
 
@@ -533,14 +548,8 @@ impl TlsScanner {
 
         let connector = TlsConnector::from(Arc::new(config));
 
-        // Parse server name for SNI
-        let server_name = ServerName::try_from(domain.clone()).wrap_err("Invalid domain name for TLS")?;
-
-        // Connect to target
-        let addr = format!("{}:{}", target_ip, port);
-
         match tokio::time::timeout(self.connection_timeout, async {
-            let socket = tokio::net::TcpStream::connect(&addr).await?;
+            let socket = tokio::net::TcpStream::connect(addr).await?;
             // Use handshake_timeout for the TLS handshake specifically
             let tls_stream =
                 match tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await? {
@@ -607,29 +616,27 @@ impl TlsScanner {
 
     /// Blocking OpenSSL work runs on the blocking pool so dropping the scan future never stalls a runtime worker.
     async fn analyze_certificate(&self, target: &Target, target_ip: &str, port: u16) -> Result<Vec<CertificateInfo>> {
-        let domain = target
-            .domain
-            .clone()
-            .ok_or_else(|| eyre::eyre!("Domain required for certificate analysis"))?;
-        let addr = format!("{}:{}", target_ip, port);
+        let sni = target.domain.clone();
+        let addr = connect_addr(target_ip, port)?;
         let connection_timeout = self.connection_timeout;
         let io_timeout = self.total_scan_timeout;
         tokio::task::spawn_blocking(move || {
-            Self::analyze_certificate_with_openssl(&domain, &addr, connection_timeout, io_timeout)
+            Self::analyze_certificate_with_openssl(sni.as_deref(), addr, connection_timeout, io_timeout)
         })
         .await
         .wrap_err("Certificate analysis task failed")?
     }
 
+    /// `sni` is the target's domain; an IP target sends no SNI, since RFC 6066 forbids an IP literal there.
     fn analyze_certificate_with_openssl(
-        domain: &str,
-        addr: &str,
+        sni: Option<&str>,
+        addr: SocketAddr,
         connection_timeout: Duration,
         io_timeout: Duration,
     ) -> Result<Vec<CertificateInfo>> {
         log::debug!(
-            "[scan::tls] analyze_certificate_with_openssl: domain={} addr={} connection_timeout={}s io_timeout={}s",
-            domain,
+            "[scan::tls] analyze_certificate_with_openssl: sni={:?} addr={} connection_timeout={}s io_timeout={}s",
+            sni,
             addr,
             connection_timeout.as_secs(),
             io_timeout.as_secs()
@@ -644,8 +651,7 @@ impl TlsScanner {
 
         // Connect and get certificate chain
         let stream =
-            std::net::TcpStream::connect_timeout(&addr.parse().wrap_err("Invalid address")?, connection_timeout)
-                .wrap_err("TCP connection failed")?;
+            std::net::TcpStream::connect_timeout(&addr, connection_timeout).wrap_err("TCP connection failed")?;
         stream
             .set_read_timeout(Some(io_timeout))
             .wrap_err("Failed to set socket read timeout")?;
@@ -653,7 +659,12 @@ impl TlsScanner {
             .set_write_timeout(Some(io_timeout))
             .wrap_err("Failed to set socket write timeout")?;
 
-        let ssl_stream = connector.connect(domain, stream).wrap_err("SSL connection failed")?;
+        let mut config = connector.configure().wrap_err("Failed to configure SSL connection")?;
+        config.set_use_server_name_indication(sni.is_some());
+        config.set_verify_hostname(false);
+        let ssl_stream = config
+            .connect(sni.unwrap_or_default(), stream)
+            .wrap_err("SSL connection failed")?;
 
         let mut cert_chain = Vec::new();
 
@@ -1203,6 +1214,44 @@ pub(crate) mod fixtures {
         builder.build()
     }
 
+    /// Self-signed `fixture.test` identity that serves TLS on a loopback port, answering every
+    /// connection until the test process exits. Returns the bound port.
+    pub(crate) fn spawn_loopback_tls_server() -> u16 {
+        use openssl::ssl::{SslAcceptor, SslMethod};
+        let server_key = key();
+        let now = Utc::now();
+        let mut builder = X509Builder::new().expect("x509 builder");
+        builder.set_version(2).expect("version");
+        builder.set_subject_name(&name("fixture.test")).expect("subject");
+        builder.set_issuer_name(&name("fixture.test")).expect("issuer");
+        builder.set_pubkey(&server_key).expect("pubkey");
+        builder
+            .set_not_before(&Asn1Time::from_unix((now - chrono::Duration::days(1)).timestamp()).expect("nb"))
+            .expect("set not_before");
+        builder
+            .set_not_after(&Asn1Time::from_unix((now + chrono::Duration::days(30)).timestamp()).expect("na"))
+            .expect("set not_after");
+        builder.sign(&server_key, MessageDigest::sha256()).expect("sign");
+        let cert = builder.build();
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("acceptor");
+        acceptor.set_private_key(&server_key).expect("server key");
+        acceptor.set_certificate(&cert).expect("server cert");
+        let acceptor = acceptor.build();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                // A client that rejects the certificate aborts the handshake; that is expected.
+                if let Ok(mut tls) = acceptor.accept(stream) {
+                    let _ = tls.shutdown();
+                }
+            }
+        });
+        port
+    }
+
     /// What `perform_tls_scan_for_ip` records when rustls rejects an expired certificate and the
     /// OpenSSL pass still reads it: the same functions, in the same order.
     pub(crate) fn expired_handshake_result() -> TlsData {
@@ -1710,7 +1759,7 @@ mod tests {
     #[test]
     fn openssl_analysis_gives_up_on_a_silent_server_after_io_timeout() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().unwrap().to_string();
+        let addr = listener.local_addr().unwrap();
         // Accept and hold the socket open without ever answering the ClientHello.
         let _server = std::thread::spawn(move || {
             let held = listener.accept();
@@ -1720,8 +1769,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = TlsScanner::analyze_certificate_with_openssl(
-                "fixture.test",
-                &addr,
+                Some("fixture.test"),
+                addr,
                 Duration::from_secs(1),
                 Duration::from_millis(200),
             );
@@ -1731,5 +1780,53 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("OpenSSL handshake hung past its socket timeout");
         assert!(errored);
+    }
+
+    #[test]
+    fn connect_addr_builds_ipv6_socket_addr_without_brackets() {
+        let addr = connect_addr("2606:4700:4700::1111", 443).expect("IPv6 literal");
+        assert_eq!(addr, "[2606:4700:4700::1111]:443".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            connect_addr("1.1.1.1", 443).unwrap(),
+            "1.1.1.1:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn connect_addr_rejects_a_hostname() {
+        let err = connect_addr("example.com", 443).unwrap_err();
+        assert!(err.to_string().contains("not an IP address"), "{}", err);
+    }
+
+    #[test]
+    fn server_name_uses_ip_when_there_is_no_domain() {
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(matches!(server_name(None, ip).unwrap(), ServerName::IpAddress(_)));
+        assert!(matches!(
+            server_name(Some("example.com"), ip).unwrap(),
+            ServerName::DnsName(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ip_target_tls_scan_reaches_the_certificate() {
+        let port = fixtures::spawn_loopback_tls_server();
+        let mut target = Target::parse("127.0.0.1").expect("IP target");
+        target.port = Some(port);
+        let result = TlsScanner::new()
+            .perform_tls_scan_for_ip(&target, "127.0.0.1")
+            .await
+            .expect("scan returns data");
+        assert!(
+            !result.certificate_errors.iter().any(|e| e.contains("Domain required")),
+            "{:?}",
+            result.certificate_errors
+        );
+        assert_eq!(
+            result.certificate_chain.first().map(|c| c.subject.as_str()),
+            Some("CN=fixture.test"),
+            "errors: {:?}",
+            result.certificate_errors
+        );
     }
 }
