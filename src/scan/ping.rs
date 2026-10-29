@@ -25,10 +25,44 @@ pub struct PingData {
 pub enum PingStatus {
     NotQueried,          // Protocol not attempted (due to protocol restrictions)
     Success(Duration),   // Ping succeeded with latency
-    Failed(String),      // Ping failed with error message
+    Failed(PingFailure), // Ping failed, with the classified cause
     NoAddress,           // No address available for this protocol
     ToolMissing(String), // Required tool (ping/ping6) not available
 }
+
+/// Why a ping failed, classified where the ping output is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingFailure {
+    /// ping ran and nothing answered.
+    NoReply,
+    /// This host has no route for the family.
+    NoRoute,
+    /// Anything else, with the tool's own words.
+    Other(String),
+}
+
+impl PingFailure {
+    /// The label shown to the user for a failure on `family`.
+    pub fn label(&self, family: Family) -> String {
+        match self {
+            PingFailure::NoReply => "no echo reply".to_string(),
+            PingFailure::NoRoute => RouteError::NoRoute(family).to_string(),
+            PingFailure::Other(reason) => reason.clone(),
+        }
+    }
+}
+
+/// A ping that ran, exited unsuccessfully and said nothing: no echo came back.
+#[derive(Debug)]
+struct NoEchoReply(String);
+
+impl std::fmt::Display for NoEchoReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoEchoReply {}
 
 impl PingStatus {
     pub fn was_attempted(&self) -> bool {
@@ -105,18 +139,18 @@ impl PingResult {
     /// address, so an IPv6 literal with no local route reports the route, not IPv4's
     /// missing address.
     pub fn failure_reason(&self) -> Option<String> {
-        let statuses = [&self.ipv4_status, &self.ipv6_status];
+        let statuses = [(&self.ipv4_status, Family::Ipv4), (&self.ipv6_status, Family::Ipv6)];
         statuses
             .into_iter()
-            .find_map(|status| match status {
-                PingStatus::Failed(msg) => Some(msg.clone()),
+            .find_map(|(status, family)| match status {
+                PingStatus::Failed(failure) => Some(failure.label(family)),
                 PingStatus::ToolMissing(tool) => Some(format!("{tool} not installed")),
                 _ => None,
             })
             .or_else(|| {
                 statuses
                     .into_iter()
-                    .any(|status| matches!(status, PingStatus::NoAddress))
+                    .any(|(status, _)| matches!(status, PingStatus::NoAddress))
                     .then(|| "no address".to_string())
             })
     }
@@ -395,8 +429,15 @@ impl PingScanner {
             PingStatus::ToolMissing("ping".to_string())
         } else if error_msg.contains("No") && error_msg.contains("address available") {
             PingStatus::NoAddress
+        } else if matches!(error.downcast_ref::<RouteError>(), Some(RouteError::NoRoute(_))) {
+            PingStatus::Failed(PingFailure::NoRoute)
+        } else if error.chain().any(|cause| cause.is::<NoEchoReply>()) {
+            PingStatus::Failed(PingFailure::NoReply)
         } else {
-            PingStatus::Failed(classify_route_error(&error_msg, family).to_string())
+            match classify_route_error(&error_msg, family) {
+                RouteError::NoRoute(_) => PingStatus::Failed(PingFailure::NoRoute),
+                RouteError::Other(reason) => PingStatus::Failed(PingFailure::Other(reason)),
+            }
         }
     }
 
@@ -503,7 +544,11 @@ impl PingScanner {
                     stderr.trim()
                 );
             } else {
-                eyre::bail!(unsuccessful_ping_message(target, ping_command, &output.status, &stderr));
+                let message = unsuccessful_ping_message(target, ping_command, &output.status, &stderr);
+                if stderr.trim().is_empty() {
+                    return Err(eyre::Report::new(NoEchoReply(message)));
+                }
+                eyre::bail!(message);
             }
         }
 
@@ -640,7 +685,7 @@ mod tests {
     fn failure_reason_prefers_an_attempted_family_over_no_address() {
         let mut result = PingResult::new();
         result.ipv4_status = PingStatus::NoAddress;
-        result.ipv6_status = PingStatus::Failed("no IPv6 route on this host".to_string());
+        result.ipv6_status = PingStatus::Failed(PingFailure::NoRoute);
         assert_eq!(result.failure_reason().as_deref(), Some("no IPv6 route on this host"));
 
         result.ipv6_status = PingStatus::NotQueried;
@@ -651,14 +696,38 @@ mod tests {
     fn classify_ping_error_names_the_missing_ipv6_route() {
         let error = eyre::eyre!(RouteError::NoRoute(Family::Ipv6));
         match PingScanner::classify_ping_error(&error, Family::Ipv6) {
-            PingStatus::Failed(reason) => assert_eq!(reason, "no IPv6 route on this host"),
+            PingStatus::Failed(PingFailure::NoRoute) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
         let error = eyre::eyre!("Ping failed for target: x (using ping) - stderr: connect: No route to host");
         match PingScanner::classify_ping_error(&error, Family::Ipv4) {
-            PingStatus::Failed(reason) => assert_eq!(reason, "host unreachable"),
+            PingStatus::Failed(failure) => assert_eq!(failure, PingFailure::Other("host unreachable".to_string())),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_ping_error_names_a_silent_ping_no_reply() {
+        let error = eyre::Report::new(NoEchoReply("no reply from x".to_string())).wrap_err("outer");
+        for family in [Family::Ipv4, Family::Ipv6] {
+            match PingScanner::classify_ping_error(&error, family) {
+                PingStatus::Failed(failure) => assert_eq!(failure, PingFailure::NoReply),
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+        // A ping that spoke on stderr is not a silent no-reply.
+        let noisy = eyre::eyre!("Ping failed for target: x (using ping) - stderr: ping: bad address");
+        assert!(matches!(
+            PingScanner::classify_ping_error(&noisy, Family::Ipv4),
+            PingStatus::Failed(PingFailure::Other(_))
+        ));
+    }
+
+    #[test]
+    fn ping_failure_labels_are_honest() {
+        assert_eq!(PingFailure::NoReply.label(Family::Ipv4), "no echo reply");
+        assert_eq!(PingFailure::NoRoute.label(Family::Ipv6), "no IPv6 route on this host");
+        assert_eq!(PingFailure::Other("boom".into()).label(Family::Ipv4), "boom");
     }
 
     #[cfg(unix)]

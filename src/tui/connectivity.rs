@@ -1,3 +1,5 @@
+use crate::scan::Family;
+use crate::scan::ping::PingStatus;
 use crate::tui::pane::{Pane, create_block};
 use crate::tui::sparkline::SparklineData;
 use crate::types::{AppState, ScanResult};
@@ -15,7 +17,26 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 const MIN_CONNECTIVITY_PANE_WIDTH: u16 = 25;
+const NO_REPLY_LABEL: &str = "no echo reply";
 const MIN_CONNECTIVITY_PANE_HEIGHT: u16 = 12; // Double-height sparklines like btop
+
+/// The label for a family's latest ping failure, or `no ping reply` when none is on record.
+fn family_failure_label(state: &AppState, family: Family) -> String {
+    let status = state
+        .scanners
+        .get("ping")
+        .and_then(|ping_state| match &ping_state.result {
+            Some(ScanResult::Ping(ping)) => Some(match family {
+                Family::Ipv4 => ping.ipv4_status.clone(),
+                Family::Ipv6 => ping.ipv6_status.clone(),
+            }),
+            _ => None,
+        });
+    match status {
+        Some(PingStatus::Failed(failure)) => failure.label(family),
+        _ => "no ping reply".to_string(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum ConnectivityState {
@@ -243,8 +264,8 @@ impl ConnectivityPane {
 
             // Log detailed IPv6 status for debugging
             match &ping_result.ipv6_status {
-                crate::scan::ping::PingStatus::Failed(msg) => {
-                    log::debug!("[tui::connectivity] ipv6_ping_failed: error_msg={}", msg);
+                crate::scan::ping::PingStatus::Failed(failure) => {
+                    log::debug!("[tui::connectivity] ipv6_ping_failed: failure={:?}", failure);
                 }
                 crate::scan::ping::PingStatus::NoAddress => {
                     log::debug!("[tui::connectivity] ipv6_ping_no_address");
@@ -315,7 +336,7 @@ impl Pane for ConnectivityPane {
                 }
                 (ConnectivityState::Disconnected, ConnectivityState::Disconnected)
                 | (ConnectivityState::Disconnected, ConnectivityState::Checking)
-                | (ConnectivityState::Checking, ConnectivityState::Disconnected) => ("disconnected", Color::Red),
+                | (ConnectivityState::Checking, ConnectivityState::Disconnected) => ("no ping reply", Color::Red),
                 (ConnectivityState::Checking, _) | (_, ConnectivityState::Checking) => {
                     ("checking connectivity", Color::Gray)
                 }
@@ -347,12 +368,13 @@ impl Pane for ConnectivityPane {
         {
             status_text = failure;
             status_color = Color::Red;
-        } else if status_text == "disconnected"
+        } else if status_text == "no ping reply"
             && let Some(ping_state) = state.scanners.get("ping")
             && let Some(ScanResult::Ping(ping)) = &ping_state.result
             && let Some(reason) = ping.failure_reason()
+            && reason != NO_REPLY_LABEL
         {
-            status_text = format!("disconnected: {reason}");
+            status_text = format!("no ping reply: {reason}");
         }
 
         // Update sparklines if we have ping results
@@ -460,7 +482,7 @@ impl Pane for ConnectivityPane {
         let ipv4_status_text = if let Ok(history) = self.connectivity_history.lock() {
             match history.ipv4_state {
                 ConnectivityState::Connected => format!("{} avg:{}", ipv4_current, ipv4_avg),
-                ConnectivityState::Disconnected => "disconnected".to_string(),
+                ConnectivityState::Disconnected => family_failure_label(state, Family::Ipv4),
                 ConnectivityState::Intermittent => format!("intermittent {} avg:{}", ipv4_current, ipv4_avg),
                 ConnectivityState::Checking => checking_text.to_string(),
             }
@@ -504,7 +526,7 @@ impl Pane for ConnectivityPane {
         let ipv6_status_text = if let Ok(history) = self.connectivity_history.lock() {
             match history.ipv6_state {
                 ConnectivityState::Connected => format!("{} avg:{}", ipv6_current, ipv6_avg),
-                ConnectivityState::Disconnected => "network unreachable".to_string(),
+                ConnectivityState::Disconnected => family_failure_label(state, Family::Ipv6),
                 ConnectivityState::Intermittent => format!("intermittent {} avg:{}", ipv6_current, ipv6_avg),
                 ConnectivityState::Checking => checking_text.to_string(),
             }
@@ -569,7 +591,7 @@ impl Pane for ConnectivityPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::ping::{PingResult, PingStatus};
+    use crate::scan::ping::{PingFailure, PingResult};
     use crate::tui::testing::render_pane;
     use crate::types::{ScanState, ScanStatus};
     use std::time::Duration;
@@ -613,9 +635,52 @@ mod tests {
 
     fn failed_ping(reason: &str) -> PingResult {
         let mut ping = PingResult::new();
-        ping.ipv4_status = PingStatus::Failed(reason.to_string());
-        ping.ipv6_status = PingStatus::Failed(reason.to_string());
+        ping.ipv4_status = PingStatus::Failed(PingFailure::Other(reason.to_string()));
+        ping.ipv6_status = PingStatus::Failed(PingFailure::Other(reason.to_string()));
         ping
+    }
+
+    fn failed_ping_with(failure: PingFailure) -> PingResult {
+        let mut ping = PingResult::new();
+        ping.ipv4_status = PingStatus::Failed(failure.clone());
+        ping.ipv6_status = PingStatus::Failed(failure);
+        ping
+    }
+
+    fn render_failures(ping: impl Fn() -> PingResult) -> String {
+        let pane = ConnectivityPane::new();
+        let mut out = String::new();
+        for _ in 0..5 {
+            out = render_pane(&pane, &state_with_ping(ping()), 100, 20, false);
+        }
+        out
+    }
+
+    #[test]
+    fn no_reply_renders_no_echo_reply_never_disconnected_or_unreachable() {
+        let out = render_failures(|| failed_ping_with(PingFailure::NoReply));
+        assert!(out.contains("no echo reply"), "{out}");
+        assert!(out.contains("no ping reply"), "{out}");
+        assert!(!out.contains("disconnected"), "{out}");
+        assert!(!out.contains("network unreachable"), "{out}");
+    }
+
+    #[test]
+    fn no_route_renders_the_missing_route_on_this_host() {
+        let out = render_failures(|| {
+            let mut ping = failed_ping_with(PingFailure::NoReply);
+            ping.ipv6_status = PingStatus::Failed(PingFailure::NoRoute);
+            ping
+        });
+        assert!(out.contains("no IPv6 route on this host"), "{out}");
+        assert!(out.contains("no echo reply"), "{out}");
+        assert!(!out.contains("network unreachable"), "{out}");
+    }
+
+    #[test]
+    fn other_failure_keeps_its_reason_under_the_overall_label() {
+        let out = render_failures(|| failed_ping("ping binary missing"));
+        assert!(out.contains("no ping reply: ping binary missing"), "{out}");
     }
 
     fn state_with_ping(ping: PingResult) -> AppState {
@@ -634,14 +699,14 @@ mod tests {
     }
 
     #[test]
-    fn five_failed_samples_render_disconnected_with_reason() {
+    fn five_failed_samples_render_no_ping_reply_with_reason() {
         let pane = ConnectivityPane::new();
         let mut out = String::new();
         for _ in 0..5 {
             let state = state_with_ping(failed_ping("ping binary missing"));
             out = render_pane(&pane, &state, 100, 20, false);
         }
-        assert!(out.contains("disconnected"), "{out}");
+        assert!(out.contains("no ping reply"), "{out}");
         assert!(out.contains("ping binary missing"), "{out}");
         assert!(!out.contains("checking"), "{out}");
     }

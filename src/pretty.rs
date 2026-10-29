@@ -500,7 +500,7 @@ mod tests {
     use crate::scan::http::{
         CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade as HttpSecurityGrade, SecurityHeaders,
     };
-    use crate::scan::ping::{PingResult, PingStatus};
+    use crate::scan::ping::{PingFailure, PingResult, PingStatus};
     use crate::scan::whois::WhoisResult;
     use std::collections::VecDeque;
     use std::time::Instant;
@@ -517,7 +517,7 @@ mod tests {
 
     fn all_failed_ping() -> ScanResult {
         let mut ping = PingResult::new();
-        ping.ipv4_status = PingStatus::Failed("100% packet loss".to_string());
+        ping.ipv4_status = PingStatus::Failed(PingFailure::NoReply);
         ping.ipv6_status = PingStatus::NoAddress;
         ScanResult::Ping(ping)
     }
@@ -558,7 +558,7 @@ mod tests {
     fn all_failed_ping_prints_failure_icon_and_reason() {
         let out = format_scan_state("ping", &state(ScanStatus::Complete, Some(all_failed_ping()), None));
         assert!(out.starts_with("❌ PING: "), "{out}");
-        assert!(out.contains("100% packet loss"), "reason missing: {out}");
+        assert!(out.contains("Ping failed: no echo reply"), "reason missing: {out}");
         assert!(!out.contains('✅'), "success icon on a failed ping: {out}");
     }
 
