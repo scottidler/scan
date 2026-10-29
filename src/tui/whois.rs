@@ -230,13 +230,7 @@ impl Pane for WhoisPane {
 
                 lines.push(Line::from(vec![
                     Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        match &whois_result.data_source {
-                            crate::scan::whois::DataSource::Failed(reason) => format!("Failed: {}", reason),
-                            source => format!("{:?}", source),
-                        },
-                        Style::default().fg(source_color),
-                    ),
+                    Span::styled(whois_result.data_source.to_string(), Style::default().fg(source_color)),
                 ]));
             } else {
                 // No WHOIS data available yet - check scanner status

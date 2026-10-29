@@ -3,17 +3,30 @@ use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use hickory_resolver::Resolver;
 use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use whois_rust::{WhoIs, WhoIsLookupOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// RDAP request timeout.
 const RDAP_TIMEOUT_SECS: u64 = 30;
-/// Socket timeout for the traditional WHOIS fallback (whois-rust defaults to 60s).
+/// Hard limit on the whole traditional WHOIS fallback: IANA referral, registry, registrar.
 const WHOIS_LOOKUP_TIMEOUT_SECS: u64 = 15;
+/// IANA's WHOIS server, which names the WHOIS server for each TLD.
+const IANA_WHOIS_SERVER: &str = "whois.iana.org";
+const WHOIS_PORT: u16 = 43;
+/// Upper bound on one WHOIS response; registry answers are a few KiB.
+const WHOIS_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+/// `parse_whois_text` keys that carry registration data; an answer with none of them is a
+/// refusal or an error page, not a WHOIS record.
+const WHOIS_REGISTRAR_KEYS: &[&str] = &["registrar"];
+const WHOIS_CREATION_KEYS: &[&str] = &["creation date", "created", "registered", "registration time"];
+const WHOIS_EXPIRY_KEYS: &[&str] = &["expiry date", "expires", "expiration date", "registry expiry date"];
+const WHOIS_NAMESERVER_KEYS: &[&str] = &["name server", "nameserver", "nserver"];
 /// Headroom on the scan deadline past RDAP plus the fallback, for parsing and scheduling.
 const DEADLINE_SLACK_SECS: u64 = 5;
 const WHOIS_SCAN_INTERVAL_SECS: u64 = 60 * 60; // 1 hour
@@ -23,8 +36,8 @@ const NEAR_EXPIRY_THRESHOLD_DAYS: i64 = 30;
 #[derive(Debug, Clone)]
 pub struct WhoisScanner {
     client: Client,
-    /// Shared so the blocking lookup can own a handle on the `spawn_blocking` thread.
-    whois_client: Arc<WhoIs>,
+    /// `host:port` of the server that refers each TLD to its registry WHOIS server.
+    iana_server: String,
     rdap_timeout: Duration,
     whois_timeout: Duration,
 }
@@ -49,18 +62,9 @@ impl WhoisScanner {
             .build()
             .expect("Failed to create HTTP client");
 
-        let whois_client = WhoIs::from_path("/usr/bin/whois").unwrap_or_else(|_| {
-            WhoIs::from_path("/bin/whois").unwrap_or_else(|_| {
-                WhoIs::from_string("whois").unwrap_or_else(|_| {
-                    // Fallback to a basic whois client if system whois is not available
-                    WhoIs::from_host("whois.iana.org").unwrap()
-                })
-            })
-        });
-
         Self {
             client,
-            whois_client: Arc::new(whois_client),
+            iana_server: format!("{}:{}", IANA_WHOIS_SERVER, WHOIS_PORT),
             rdap_timeout: Duration::from_secs(RDAP_TIMEOUT_SECS),
             whois_timeout: Duration::from_secs(WHOIS_LOOKUP_TIMEOUT_SECS),
         }
@@ -175,21 +179,80 @@ impl WhoisScanner {
 
     async fn query_traditional_whois(&self, domain: &str) -> eyre::Result<WhoisResult> {
         let start_time = Instant::now();
-
-        let lookup_options = Self::lookup_options(domain, self.whois_timeout)?;
-        let whois_client = Arc::clone(&self.whois_client);
-        // whois-rust's lookup is blocking std socket I/O: on a runtime worker it would stall the
-        // worker and the scan deadline could not preempt it.
-        let whois_text = tokio::task::spawn_blocking(move || whois_client.lookup(lookup_options)).await??;
-
+        let whois_text = self.lookup_whois_text(domain).await?;
         self.parse_whois_text(domain, &whois_text, start_time.elapsed()).await
     }
 
-    /// Lookup options for `domain` with the socket timeout set explicitly.
-    fn lookup_options(domain: &str, timeout: Duration) -> eyre::Result<WhoIsLookupOptions> {
-        let mut options = WhoIsLookupOptions::from_string(domain)?;
-        options.timeout = Some(timeout);
-        Ok(options)
+    /// IANA names the registry WHOIS server for the TLD; the registry may refer on to the
+    /// registrar's server (thin registries like .com). All hops share one deadline. IANA and the
+    /// registry are required; the registrar hop is optional data, so its timeout, failure or
+    /// refusal keeps the registry answer.
+    async fn lookup_whois_text(&self, domain: &str) -> eyre::Result<String> {
+        let deadline = tokio::time::Instant::now() + self.whois_timeout;
+        let tld = domain.rsplit('.').next().unwrap_or(domain);
+        log::debug!(
+            "[scan::whois] lookup_whois_text: domain={} tld={} timeout={:?}",
+            domain,
+            tld,
+            self.whois_timeout
+        );
+
+        let iana_text = self.required_hop(deadline, &self.iana_server, tld).await?;
+        let registry =
+            whois_referral(&iana_text).ok_or_else(|| eyre::eyre!("IANA lists no WHOIS server for .{}", tld))?;
+        let registry_server = with_whois_port(&registry);
+        let registry_text = self.required_hop(deadline, &registry_server, domain).await?;
+
+        let (server, text) = match whois_referral(&registry_text).filter(|r| !r.eq_ignore_ascii_case(&registry)) {
+            None => (registry_server, registry_text),
+            Some(registrar) => {
+                let registrar_server = with_whois_port(&registrar);
+                match tokio::time::timeout_at(deadline, whois_query(&registrar_server, domain)).await {
+                    Ok(Ok(registrar_text)) if has_registration_data(&registrar_text) => {
+                        (registrar_server, registrar_text)
+                    }
+                    Ok(Ok(registrar_text)) => {
+                        log::debug!(
+                            "[scan::whois] registrar_answer_without_data: registrar={} first_line={:?}; using registry answer",
+                            registrar_server,
+                            first_non_empty_line(&registrar_text)
+                        );
+                        (registry_server, registry_text)
+                    }
+                    Ok(Err(e)) => {
+                        log::debug!(
+                            "[scan::whois] registrar_referral_failed: registrar={} error={:#}; using registry answer",
+                            registrar_server,
+                            e
+                        );
+                        (registry_server, registry_text)
+                    }
+                    Err(_) => {
+                        log::debug!(
+                            "[scan::whois] registrar_referral_timed_out: registrar={}; using registry answer",
+                            registrar_server
+                        );
+                        (registry_server, registry_text)
+                    }
+                }
+            }
+        };
+
+        if !has_registration_data(&text) {
+            return Err(eyre::eyre!(
+                "WHOIS answer from {} has no registration data: {}",
+                server,
+                first_non_empty_line(&text)
+            ));
+        }
+        Ok(text)
+    }
+
+    /// One hop the lookup cannot do without; running out of the shared deadline fails the lookup.
+    async fn required_hop(&self, deadline: tokio::time::Instant, server: &str, query: &str) -> eyre::Result<String> {
+        tokio::time::timeout_at(deadline, whois_query(server, query))
+            .await
+            .map_err(|_| eyre::eyre!("WHOIS lookup timed out after {:?}", self.whois_timeout))?
     }
 
     fn get_rdap_endpoint(&self, tld: &str, domain: &str) -> String {
@@ -346,16 +409,16 @@ impl WhoisScanner {
                 let value = value.trim();
 
                 match key.as_str() {
-                    "creation date" | "created" | "registered" | "registration time" => {
+                    k if WHOIS_CREATION_KEYS.contains(&k) => {
                         result.registration_date = self.parse_whois_date(value);
                     }
-                    "expiry date" | "expires" | "expiration date" | "registry expiry date" => {
+                    k if WHOIS_EXPIRY_KEYS.contains(&k) => {
                         result.expiry_date = self.parse_whois_date(value);
                     }
                     "updated date" | "last updated" | "changed" | "last modified" => {
                         result.last_updated = self.parse_whois_date(value);
                     }
-                    "name server" | "nameserver" | "nserver" => {
+                    k if WHOIS_NAMESERVER_KEYS.contains(&k) => {
                         if !value.is_empty() {
                             result.nameservers.push(value.to_lowercase());
                         }
@@ -365,7 +428,7 @@ impl WhoisScanner {
                             result.status.push(value.to_string());
                         }
                     }
-                    "registrar" => {
+                    k if WHOIS_REGISTRAR_KEYS.contains(&k) => {
                         if result.registrar.is_none() {
                             result.registrar = Some(RegistrarInfo {
                                 name: value.to_string(),
@@ -521,6 +584,11 @@ impl WhoisScanner {
     }
 
     fn parse_whois_date(&self, date_str: &str) -> Option<DateTime<Utc>> {
+        // RFC 3339 covers fractional seconds and numeric offsets (MarkMonitor: `1997-09-15T07:00:00.000+00:00`)
+        if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
+            return Some(dt.with_timezone(&Utc));
+        }
+
         // Try various date formats commonly used in WHOIS
         let formats = [
             "%Y-%m-%dT%H:%M:%SZ", // ISO 8601
@@ -808,6 +876,123 @@ pub enum DataSource {
     NotApplicable,  // IP target: no domain to look up
 }
 
+impl std::fmt::Display for DataSource {
+    /// The label the WHOIS pane prints after `Source:`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataSource::Rdap => write!(f, "RDAP"),
+            DataSource::Whois => write!(f, "WHOIS"),
+            DataSource::Failed(reason) => write!(f, "Failed: {}", reason),
+            DataSource::NotApplicable => write!(f, "n/a"),
+        }
+    }
+}
+
+/// Sends one WHOIS query (RFC 3912) to `server` (`host:port`) and returns the whole response.
+async fn whois_query(server: &str, query: &str) -> eyre::Result<String> {
+    log::trace!("[scan::whois] whois_query: server={} query={}", server, query);
+    let mut stream = connect_whois_server(server).await?;
+    stream.write_all(format!("{}\r\n", query).as_bytes()).await?;
+    let mut response = Vec::new();
+    stream
+        .take(WHOIS_MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .await?;
+    if response.len() as u64 > WHOIS_MAX_RESPONSE_BYTES {
+        return Err(eyre::eyre!("WHOIS answer from {} exceeded 1 MiB", server));
+    }
+    if response.is_empty() {
+        return Err(eyre::eyre!("WHOIS server {} returned an empty response", server));
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Resolves `server` (`host:port`) with the async Hickory resolver, never the blocking system
+/// resolver, and connects to the first address that accepts. An IP literal skips resolution.
+async fn connect_whois_server(server: &str) -> eyre::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = match server.parse::<SocketAddr>() {
+        Ok(addr) => vec![addr],
+        Err(_) => {
+            let (host, port) = server
+                .rsplit_once(':')
+                .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+                .ok_or_else(|| eyre::eyre!("WHOIS server {} is not host:port", server))?;
+            let resolver = Resolver::builder_tokio()
+                .map_err(|e| eyre::eyre!("WHOIS resolver setup failed: {}", e))?
+                .build();
+            let lookup = resolver
+                .lookup_ip(host)
+                .await
+                .map_err(|e| eyre::eyre!("WHOIS server {} did not resolve: {}", host, e))?;
+            lookup.iter().map(|ip| SocketAddr::new(ip, port)).collect()
+        }
+    };
+    log::trace!(
+        "[scan::whois] connect_whois_server: server={} addrs={:?}",
+        server,
+        addrs
+    );
+
+    let mut last_error = None;
+    for addr in &addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(match last_error {
+        Some(e) => eyre::eyre!("WHOIS connect to {} failed: {}", server, e),
+        None => eyre::eyre!("WHOIS server {} resolved to no addresses", server),
+    })
+}
+
+/// True when some line's key is one `parse_whois_text` reads registration data from.
+fn has_registration_data(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Some((key, value)) = line.trim().split_once(':') else {
+            return false;
+        };
+        let key = key.trim().to_lowercase();
+        !value.trim().is_empty()
+            && [
+                WHOIS_REGISTRAR_KEYS,
+                WHOIS_CREATION_KEYS,
+                WHOIS_EXPIRY_KEYS,
+                WHOIS_NAMESERVER_KEYS,
+            ]
+            .iter()
+            .any(|keys| keys.contains(&key.as_str()))
+    })
+}
+
+fn first_non_empty_line(text: &str) -> &str {
+    text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("")
+}
+
+/// The next WHOIS server named in a response. `whois:`, `refer:` and `Registrar WHOIS Server:`
+/// are accepted in any answer; the lookup only follows IANA's and the registry's. `None` when
+/// the response names none.
+fn whois_referral(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        let key = key.trim().to_lowercase();
+        if !matches!(key.as_str(), "whois" | "refer" | "registrar whois server") {
+            return None;
+        }
+        let server = value.trim().trim_start_matches("whois://").trim_end_matches('/');
+        (!server.is_empty()).then(|| server.to_string())
+    })
+}
+
+/// `host` -> `host:43`; a server given with an explicit port is kept as is.
+fn with_whois_port(server: &str) -> String {
+    if server.contains(':') {
+        server.to_string()
+    } else {
+        format!("{}:{}", server, WHOIS_PORT)
+    }
+}
+
 // Tests
 #[cfg(test)]
 mod tests {
@@ -827,47 +1012,348 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lookup_options_set_the_socket_timeout() {
-        let options = WhoisScanner::lookup_options("example.com", Duration::from_secs(7)).unwrap();
-        assert_eq!(options.timeout, Some(Duration::from_secs(7)));
-        assert!(WhoisScanner::lookup_options("not a domain!", Duration::from_secs(7)).is_err());
+    /// Bound on every fake-server accept and read, so a missed connection ends the server
+    /// instead of hanging the test.
+    const FAKE_SERVER_WAIT: Duration = Duration::from_secs(2);
+
+    /// Serves one canned answer per connection, in order, on 127.0.0.1; returns the address
+    /// and a handle yielding the queries received.
+    async fn fake_whois(answers: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let mut queries = Vec::new();
+            for answer in answers {
+                // A connection that never comes ends the server, so a missed referral fails the
+                // test's query assertions instead of hanging it.
+                let Ok(accepted) = tokio::time::timeout(FAKE_SERVER_WAIT, listener.accept()).await else {
+                    break;
+                };
+                let (mut socket, _) = accepted.unwrap();
+                let mut buf = vec![0u8; 512];
+                let Ok(read) = tokio::time::timeout(FAKE_SERVER_WAIT, socket.read(&mut buf)).await else {
+                    break;
+                };
+                let n = read.unwrap();
+                queries.push(String::from_utf8_lossy(&buf[..n]).trim_end().to_string());
+                socket.write_all(answer.as_bytes()).await.unwrap();
+            }
+            queries
+        });
+        (addr, handle)
     }
 
-    /// A WHOIS server that accepts and never answers must not stall the async runtime: on a
-    /// single-threaded runtime a 300ms timer still fires while the lookup waits out its 3s socket timeout.
-    #[tokio::test]
-    async fn traditional_whois_does_not_block_the_runtime() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _silent = std::thread::spawn(move || {
-            let held: Vec<_> = listener.incoming().take(1).collect();
-            std::thread::sleep(Duration::from_secs(5));
-            drop(held);
+    /// Accepts one connection and never answers it; the socket is held past any test's limit.
+    async fn silent_whois() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok(Ok((socket, _))) = tokio::time::timeout(FAKE_SERVER_WAIT, listener.accept()).await {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                drop(socket);
+            }
         });
-        let servers = format!(r#"{{"_": {{"ip": "{addr}"}}, "test": "{addr}"}}"#);
-        let scanner = WhoisScanner {
-            client: Client::new(),
-            whois_client: Arc::new(WhoIs::from_string(servers).unwrap()),
-            rdap_timeout: Duration::from_secs(1),
-            whois_timeout: Duration::from_secs(3),
-        };
-        let started = Instant::now();
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(300),
-            scanner.query_traditional_whois("example.test"),
+        addr
+    }
+
+    /// An HTTP proxy that answers every CONNECT with 502, so any HTTPS request through it fails.
+    async fn refusing_proxy() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok(Ok((mut socket, _))) = tokio::time::timeout(FAKE_SERVER_WAIT, listener.accept()).await {
+                let mut buf = vec![0u8; 1024];
+                if tokio::time::timeout(FAKE_SERVER_WAIT, socket.read(&mut buf))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        addr
+    }
+
+    /// A registry answer carrying its own registration data and a referral to `registrar`.
+    fn registry_answer_referring_to(registrar: &str) -> String {
+        format!(
+            "Domain Name: EXAMPLE.TEST\nRegistrar: Registry Registrar\nCreation Date: 2001-02-03T00:00:00Z\n\
+             Registry Expiry Date: 2031-02-03T00:00:00Z\nRegistrar WHOIS Server: {registrar}\n"
         )
-        .await;
-        assert!(
-            outcome.is_err(),
-            "lookup returned before the timer: {:?}",
-            outcome.map(|r| r.is_ok())
+    }
+
+    fn scanner_with_iana(iana_server: String, whois_timeout: Duration) -> WhoisScanner {
+        WhoisScanner {
+            client: Client::new(),
+            iana_server,
+            rdap_timeout: Duration::from_secs(1),
+            whois_timeout,
+        }
+    }
+
+    #[test]
+    fn whois_referral_reads_iana_and_registrar_lines() {
+        assert_eq!(
+            whois_referral("domain: COM\nwhois:        whois.verisign-grs.com\n"),
+            Some("whois.verisign-grs.com".to_string())
         );
+        assert_eq!(
+            whois_referral("refer: whois.nic.io\n"),
+            Some("whois.nic.io".to_string())
+        );
+        assert_eq!(
+            whois_referral("   Registrar WHOIS Server: whois://whois.markmonitor.com/\n"),
+            Some("whois.markmonitor.com".to_string())
+        );
+        assert_eq!(whois_referral("domain: DEV\nwhois:\n"), None);
+        assert_eq!(whois_referral("Registrar: MarkMonitor Inc.\n"), None);
+    }
+
+    #[test]
+    fn whois_date_parses_fractional_seconds_and_offset() {
+        let scanner = WhoisScanner::new();
+        let parsed = scanner.parse_whois_date("1997-09-15T07:00:00.000+00:00").unwrap();
+        assert_eq!(parsed.to_rfc3339(), "1997-09-15T07:00:00+00:00");
+        let offset = scanner.parse_whois_date("2028-09-14T07:00:00-05:00").unwrap();
+        assert_eq!(offset.to_rfc3339(), "2028-09-14T12:00:00+00:00");
+    }
+
+    #[test]
+    fn with_whois_port_adds_43_only_when_missing() {
+        assert_eq!(with_whois_port("whois.nic.io"), "whois.nic.io:43");
+        assert_eq!(with_whois_port("127.0.0.1:4343"), "127.0.0.1:4343");
+    }
+
+    /// IANA -> registry -> registrar, each a separate local server: the fallback follows both
+    /// referrals and parses the registrar's answer.
+    #[tokio::test]
+    async fn traditional_whois_follows_iana_and_registrar_referrals() {
+        let (registrar, registrar_queries) = fake_whois(vec![
+            "Domain Name: example.test\nRegistrar: Fixture Registrar\nCreation Date: 2001-02-03T00:00:00Z\n"
+                .to_string(),
+        ])
+        .await;
+        let (registry, registry_queries) = fake_whois(vec![format!(
+            "Domain Name: EXAMPLE.TEST\nRegistrar WHOIS Server: {registrar}\n"
+        )])
+        .await;
+        let (iana, iana_queries) = fake_whois(vec![format!("domain: TEST\nwhois: {registry}\n")]).await;
+
+        let result = scanner_with_iana(iana, Duration::from_secs(5))
+            .query_traditional_whois("example.test")
+            .await
+            .unwrap();
+
+        assert_eq!(iana_queries.await.unwrap(), vec!["test"]);
+        assert_eq!(registry_queries.await.unwrap(), vec!["example.test"]);
+        assert_eq!(registrar_queries.await.unwrap(), vec!["example.test"]);
+        assert_eq!(result.registrar.unwrap().name, "Fixture Registrar");
+        assert!(result.registration_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn traditional_whois_names_a_tld_without_a_whois_server() {
+        let (iana, _) = fake_whois(vec!["domain: DEV\nwhois:\n".to_string()]).await;
+        let err = scanner_with_iana(iana, Duration::from_secs(5))
+            .query_traditional_whois("example.dev")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no WHOIS server for .dev"), "{err:#}");
+    }
+
+    /// A server that accepts and never answers is cut off at the fallback's own time limit,
+    /// without blocking the runtime, and the error names the sub-second limit truthfully.
+    #[tokio::test]
+    async fn traditional_whois_is_bounded_by_its_timeout() {
+        let iana = silent_whois().await;
+        let started = Instant::now();
+        let err = scanner_with_iana(iana, Duration::from_millis(300))
+            .query_traditional_whois("example.test")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out after 300ms"), "{err:#}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "runtime was blocked for {:?}",
+            "took {:?}",
             started.elapsed()
         );
+    }
+
+    /// The registrar hop is optional data: a registrar that accepts and stalls costs the rest of
+    /// the budget, not the registry answer already in hand.
+    #[tokio::test]
+    async fn traditional_whois_keeps_registry_answer_when_registrar_is_silent() {
+        let registrar = silent_whois().await;
+        let (registry, _) = fake_whois(vec![registry_answer_referring_to(&registrar)]).await;
+        let (iana, _) = fake_whois(vec![format!("domain: TEST\nwhois: {registry}\n")]).await;
+
+        let started = Instant::now();
+        let result = scanner_with_iana(iana, Duration::from_millis(500))
+            .query_traditional_whois("example.test")
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.registrar.unwrap().name, "Registry Registrar");
+        assert!(result.registration_date.is_some());
+        assert!(result.expiry_date.is_some());
+    }
+
+    /// A registrar refusal is not a WHOIS record; the registry's data stands.
+    #[tokio::test]
+    async fn traditional_whois_keeps_registry_answer_when_registrar_refuses() {
+        let (registrar, registrar_queries) = fake_whois(vec!["Query limit exceeded\r\n".to_string()]).await;
+        let (registry, _) = fake_whois(vec![registry_answer_referring_to(&registrar)]).await;
+        let (iana, _) = fake_whois(vec![format!("domain: TEST\nwhois: {registry}\n")]).await;
+
+        let result = scanner_with_iana(iana, Duration::from_secs(5))
+            .query_traditional_whois("example.test")
+            .await
+            .unwrap();
+
+        assert_eq!(registrar_queries.await.unwrap(), vec!["example.test"]);
+        assert_eq!(result.registrar.unwrap().name, "Registry Registrar");
+        assert!(result.registration_date.is_some());
+        assert!(result.expiry_date.is_some());
+    }
+
+    /// No registration data anywhere is a loud failure, never an empty success.
+    #[tokio::test]
+    async fn traditional_whois_errors_when_registry_answer_has_no_registration_data() {
+        let (registry, _) = fake_whois(vec!["Query limit exceeded\r\n".to_string()]).await;
+        let (iana, _) = fake_whois(vec![format!("domain: TEST\nwhois: {registry}\n")]).await;
+
+        let err = scanner_with_iana(iana, Duration::from_secs(5))
+            .query_traditional_whois("example.test")
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("has no registration data"), "{message}");
+        assert!(message.contains(&registry), "{message}");
+        assert!(message.ends_with("Query limit exceeded"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn whois_query_errors_on_an_answer_over_1_mib() {
+        let mut answer = String::from("Registrar: Prefix Registrar\r\n");
+        answer.push_str(&"x".repeat(WHOIS_MAX_RESPONSE_BYTES as usize + 1 - answer.len()));
+        let (server, _) = fake_whois(vec![answer]).await;
+
+        let err = whois_query(&server, "test").await.unwrap_err();
+        assert!(err.to_string().contains("exceeded 1 MiB"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn whois_query_accepts_an_answer_of_exactly_1_mib() {
+        let mut answer = String::from("Registrar: Prefix Registrar\r\n");
+        answer.push_str(&"x".repeat(WHOIS_MAX_RESPONSE_BYTES as usize - answer.len()));
+        let (server, _) = fake_whois(vec![answer]).await;
+
+        let text = whois_query(&server, "test").await.unwrap();
+        assert_eq!(text.len() as u64, WHOIS_MAX_RESPONSE_BYTES);
+    }
+
+    /// A hostname goes through the Hickory resolver (here its hosts-file lookup), then the
+    /// connection tries each address it returned.
+    #[tokio::test]
+    async fn whois_query_resolves_a_hostname_server() {
+        let (server, queries) = fake_whois(vec!["Registrar: Local Registrar\r\n".to_string()]).await;
+        let port = server.rsplit_once(':').unwrap().1;
+
+        let text = whois_query(&format!("localhost:{port}"), "example.test").await.unwrap();
+
+        assert!(text.contains("Local Registrar"), "{text}");
+        assert_eq!(queries.await.unwrap(), vec!["example.test"]);
+    }
+
+    #[tokio::test]
+    async fn whois_query_rejects_a_server_without_a_port() {
+        let err = whois_query("whois.example", "example.test").await.unwrap_err();
+        assert!(err.to_string().contains("is not host:port"), "{err:#}");
+    }
+
+    #[test]
+    fn has_registration_data_reads_the_parsed_keys_only() {
+        assert!(has_registration_data("Registrar: MarkMonitor Inc.\n"));
+        assert!(has_registration_data("   Creation Date: 1997-09-15T04:00:00Z\n"));
+        assert!(has_registration_data("Registry Expiry Date: 2028-09-14T04:00:00Z\n"));
+        assert!(has_registration_data("nserver: ns1.example.test\n"));
+        assert!(!has_registration_data("Query limit exceeded\r\n"));
+        assert!(!has_registration_data(
+            "Registrar WHOIS Server: whois.example\nDomain Name: X\n"
+        ));
+        assert!(!has_registration_data("Registrar:\nCreation Date:   \n"));
+    }
+
+    #[test]
+    fn data_source_display_is_the_pane_label() {
+        assert_eq!(DataSource::Rdap.to_string(), "RDAP");
+        assert_eq!(DataSource::Whois.to_string(), "WHOIS");
+        assert_eq!(DataSource::NotApplicable.to_string(), "n/a");
+        assert_eq!(
+            DataSource::Failed("both down".to_string()).to_string(),
+            "Failed: both down"
+        );
+    }
+
+    /// AC5: RDAP fails (its only route is a proxy that refuses CONNECT), the scanner falls back to
+    /// WHOIS through local servers, and the WHOIS pane shows the WHOIS source and its data.
+    #[tokio::test]
+    async fn scan_falls_back_to_whois_when_rdap_fails_and_the_pane_shows_it() {
+        use crate::tui::WhoisPane;
+        use crate::tui::testing::render_pane;
+        use crate::types::{AppState, ScanState, ScanStatus};
+
+        let proxy = refusing_proxy().await;
+        let (registrar, _) = fake_whois(vec![
+            "Domain Name: example.test\nRegistrar: Fixture Registrar\nCreation Date: 2001-02-03T00:00:00Z\n\
+             Registry Expiry Date: 2031-02-03T00:00:00Z\n"
+                .to_string(),
+        ])
+        .await;
+        let (registry, _) = fake_whois(vec![registry_answer_referring_to(&registrar)]).await;
+        let (iana, _) = fake_whois(vec![format!("domain: TEST\nwhois: {registry}\n")]).await;
+
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy}")).unwrap())
+            .build()
+            .unwrap();
+        let scanner = WhoisScanner {
+            client,
+            iana_server: iana,
+            rdap_timeout: Duration::from_secs(5),
+            whois_timeout: Duration::from_secs(5),
+        };
+        let target = Target::parse("example.test").unwrap();
+
+        let result = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap();
+        let ScanResult::Whois(whois) = &result else {
+            panic!("expected a WHOIS result, got {result:?}");
+        };
+        assert_eq!(whois.data_source, DataSource::Whois, "{:?}", whois.data_source);
+
+        let state = AppState::new("example.test".to_string());
+        state.scanners.insert(
+            "whois".to_string(),
+            ScanState {
+                result: Some(result),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let out = render_pane(&WhoisPane::new(), &state, 100, 40, false);
+        assert!(out.contains("Source: WHOIS"), "{out}");
+        assert!(out.contains("Fixture Registrar"), "{out}");
     }
 
     #[test]
