@@ -121,10 +121,13 @@ async fn read_request_path(socket: &mut tokio::net::TcpStream) -> Option<String>
 }
 
 /// A URL on a local port nothing listens on, so a request to it is refused at once.
+/// The port stays bound, never listening, for the life of the test process: freeing it let a
+/// parallel test's server bind it, and the request was then accepted and reset, not refused.
 pub async fn dead_http_url() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    std::mem::forget(socket);
     format!("http://{addr}/gone")
 }
 
