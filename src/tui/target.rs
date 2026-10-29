@@ -308,7 +308,11 @@ impl Pane for TargetPane {
             state.scanners.len()
         );
 
-        // Create and render the paragraph
+        // No line here carries a failure reason, so every one is fit to a single row.
+        let lines: Vec<Line<'_>> = lines
+            .into_iter()
+            .map(|line| crate::tui::text::fit_line(line, inner_area.width))
+            .collect();
         let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
 
         paragraph.render(inner_area, frame.buffer_mut());
@@ -627,5 +631,42 @@ mod tests {
             );
             assert!(out.contains("❌ IPv6: no data"), "{}", out);
         }
+    }
+
+    const LONG_TARGET: &str = "a-very-long-subdomain-label.of-a-long-registrable-domain.example.com";
+
+    #[test]
+    fn long_target_is_fit_with_ellipsis_in_narrow_terminals() {
+        let state = AppState::new(LONG_TARGET.to_string());
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &TargetPane::new(),
+            &state,
+            0,
+            0,
+            &format!("🎯 {LONG_TARGET}"),
+        );
+    }
+
+    fn protocol_source(state: &AppState) -> String {
+        format!("🔗 Protocol: {} (Press 'p' to cycle)", state.protocol_display())
+    }
+
+    #[test]
+    fn protocol_line_is_fit_with_ellipsis_at_108_columns() {
+        // Scott's ~108-column screenshot cut this to `Protocol: IPv4+IPv6 (Pre`.
+        let state = AppState::new("www.tatari.tv".to_string());
+        let (width, height) = crate::tui::testing::dashboard_pane_size(0, 0, 108, 40);
+        let expected = crate::tui::testing::expected_clip(&protocol_source(&state), width - 2);
+        let out = crate::tui::testing::render_pane(&TargetPane::new(), &state, width, height, false);
+        assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
+    }
+
+    #[test]
+    fn protocol_line_that_fits_is_unchanged() {
+        let state = AppState::new("www.tatari.tv".to_string());
+        let (width, height) = crate::tui::testing::dashboard_pane_size(0, 0, 200, 55);
+        let out = crate::tui::testing::render_pane(&TargetPane::new(), &state, width, height, false);
+        assert!(out.contains(&protocol_source(&state)), "protocol line changed:\n{out}");
+        assert!(!out.contains('…'), "nothing here is too long:\n{out}");
     }
 }

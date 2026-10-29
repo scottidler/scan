@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use std::any::Any;
 
@@ -54,6 +54,8 @@ impl Pane for GeoIpPane {
 
         // Prepare content lines
         let mut lines = Vec::new();
+        // Rows that wrap instead of being fit: the status header (it carries a failure reason).
+        let wrapped = [0];
 
         // GeoIP status header
         lines.push(Line::from(vec![
@@ -184,8 +186,12 @@ impl Pane for GeoIpPane {
             ]));
         }
 
-        // Create and render the paragraph
-        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
+        // Identifiers are fit to the width; the status header and reason rows wrap so their cause
+        // stays readable.
+        let lines = crate::tui::text::fit_lines_except(lines, inner_area.width, &wrapped);
+        let paragraph = Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
         paragraph.render(inner_area, frame.buffer_mut());
     }
 
@@ -222,5 +228,50 @@ mod tests {
         assert_eq!(pane.min_size(), (MIN_GEOIP_PANE_WIDTH, MIN_GEOIP_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
+    }
+
+    fn complete_state(scanner: &str, result: crate::types::ScanResult) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            scanner.to_string(),
+            crate::types::ScanState {
+                result: Some(result),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn long_location_is_fit_with_ellipsis_in_narrow_terminals() {
+        use crate::scan::geoip::{GeoIpData, GeoIpResult, GeoIpStatus, GeoLocation};
+        let mut result = GeoIpResult::new();
+        result.ipv4_status = GeoIpStatus::Success;
+        result.ipv4_result = Some(GeoIpData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            location: Some(GeoLocation {
+                country: "United Kingdom of Great Britain and Northern Ireland".to_string(),
+                country_code: "GB".to_string(),
+                region: "Llanfairpwllgwyngyll".to_string(),
+                region_code: "AGY".to_string(),
+                city: "Newcastle upon Tyne".to_string(),
+                latitude: 54.9783,
+                longitude: -1.6178,
+                timezone: "Europe/London".to_string(),
+            }),
+            network_info: None,
+            scan_duration: std::time::Duration::from_millis(20),
+            data_source: "ip-api.com".to_string(),
+        });
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &GeoIpPane::new(),
+            &complete_state("geoip", ScanResult::GeoIp(result)),
+            1,
+            3,
+            "📍 Location: Newcastle upon Tyne, Llanfairpwllgwyngyll, United Kingdom of Great Britain and Northern Ireland",
+        );
     }
 }

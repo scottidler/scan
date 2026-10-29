@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use std::any::Any;
 
@@ -57,6 +57,8 @@ impl Pane for WhoisPane {
 
         // Prepare content lines
         let mut lines = Vec::new();
+        // Rows that wrap instead of being fit: the status header (it carries a failure reason).
+        let mut wrapped = vec![0];
 
         // WHOIS status header
         lines.push(Line::from(vec![
@@ -88,15 +90,31 @@ impl Pane for WhoisPane {
                     Span::styled("🎯 Target: ", Style::default().fg(Color::White)),
                     Span::styled(whois_result.domain.clone(), Style::default().fg(Color::Cyan)),
                 ]));
+                wrapped.push(lines.len());
                 lines.push(Line::from(vec![
                     Span::styled("📡 Source: ", Style::default().fg(Color::White)),
                     Span::styled(reason.to_string(), Style::default().fg(Color::Gray)),
                 ]));
             } else if let Some(ScanResult::Whois(whois_result)) = &whois_state.result {
-                // Domain name
+                // Domain name. A suffix-list failure rides on it, and then it wraps to keep the cause.
+                if whois_result.suffix_list_error.is_some() {
+                    wrapped.push(lines.len());
+                }
                 lines.push(Line::from(vec![
                     Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
                     Span::styled(whois_result.domain_label(), Style::default().fg(Color::Cyan)),
+                ]));
+
+                // Data source, directly under the domain: a long NS or status list below cannot push
+                // it out of the pane.
+                let source_color = match &whois_result.data_source {
+                    crate::scan::whois::DataSource::Rdap => Color::Green,
+                    crate::scan::whois::DataSource::Whois => Color::Yellow,
+                    crate::scan::whois::DataSource::NotApplicable(_) => Color::Gray,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("📡 Source: ", Style::default().fg(Color::White)),
+                    Span::styled(whois_result.data_source.to_string(), Style::default().fg(source_color)),
                 ]));
 
                 // Registrar
@@ -217,18 +235,6 @@ impl Pane for WhoisPane {
                         ]));
                     }
                 }
-
-                // Data source
-                let source_color = match &whois_result.data_source {
-                    crate::scan::whois::DataSource::Rdap => Color::Green,
-                    crate::scan::whois::DataSource::Whois => Color::Yellow,
-                    crate::scan::whois::DataSource::NotApplicable(_) => Color::Gray,
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                    Span::styled(whois_result.data_source.to_string(), Style::default().fg(source_color)),
-                ]));
             } else {
                 // No WHOIS data available yet - check scanner status
                 match whois_state.status {
@@ -270,8 +276,12 @@ impl Pane for WhoisPane {
             ]));
         }
 
-        // Create and render the paragraph
-        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
+        // Identifiers are fit to the width; the status header and reason rows wrap so their cause
+        // stays readable.
+        let lines = crate::tui::text::fit_lines_except(lines, inner_area.width, &wrapped);
+        let paragraph = Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
         paragraph.render(inner_area, frame.buffer_mut());
     }
 
@@ -339,5 +349,91 @@ mod tests {
         for wrong in ["failed", "Query Failed", "retrieved", "Privacy"] {
             assert!(!out.contains(wrong), "found {:?}:\n{}", wrong, out);
         }
+    }
+
+    const LONG_DOMAIN: &str = "a-very-long-registrable-domain-name-for-clipping.example";
+
+    #[test]
+    fn long_domain_is_fit_with_ellipsis_in_narrow_terminals() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, WhoisResult};
+        let mut result = WhoisResult::not_applicable(LONG_DOMAIN.to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &WhoisPane::new(),
+            &state_with_whois(result),
+            1,
+            0,
+            &format!("🌐 Domain: {LONG_DOMAIN}"),
+        );
+    }
+
+    #[test]
+    fn suffix_list_failure_on_the_domain_row_wraps_instead_of_clipping() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, WhoisResult};
+        let mut result = WhoisResult::not_applicable("www.tatari.tv".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.suffix_list_error = Some("connection refused".to_string());
+        let (width, height) = crate::tui::testing::dashboard_pane_size(1, 0, 108, 40);
+        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), width, height, false);
+        let flat: String = out
+            .lines()
+            .map(|l| l.trim_matches(['│', ' ']))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains("refused)"), "reason cut off:\n{out}");
+        assert!(!out.contains('…'), "reason row was fit, not wrapped:\n{out}");
+    }
+
+    #[test]
+    fn domain_from_host_is_intact_at_200x55() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, WhoisResult};
+        let mut result = WhoisResult::not_applicable("www.tatari.tv".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.queried_domain = "tatari.tv".to_string();
+        let (width, height) = crate::tui::testing::dashboard_pane_size(1, 0, 200, 55);
+        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), width, height, false);
+        assert!(out.contains("Domain: tatari.tv (from www.tatari.tv)"), "{out}");
+        assert!(out.contains("Source: RDAP"), "{out}");
+    }
+
+    #[test]
+    fn source_stays_visible_under_long_ns_and_status_lists_at_200x55() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, RegistrarInfo, RiskIndicator, WhoisResult};
+        // Shaped like web.dev: 4 name servers, 6 status items, 1 risk, which overran 17 rows.
+        let mut result = WhoisResult::not_applicable("web.dev".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.registrar = Some(RegistrarInfo {
+            name: "MarkMonitor Inc.".to_string(),
+            iana_id: None,
+            abuse_contact: None,
+            url: None,
+        });
+        result.registration_date = Some(chrono::Utc::now() - chrono::Duration::days(2000));
+        result.expiry_date = Some(chrono::Utc::now() + chrono::Duration::days(365));
+        result.nameservers = (1..=4).map(|n| format!("ns{n}.zdns.google")).collect();
+        result.status = [
+            "client delete prohibited",
+            "client transfer prohibited",
+            "client update prohibited",
+            "server delete prohibited",
+            "server transfer prohibited",
+            "server update prohibited",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        result.risk_indicators = vec![RiskIndicator::WeakDnssec];
+        let (width, height) = crate::tui::testing::dashboard_pane_size(1, 0, 200, 55);
+        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), width, height, false);
+        assert!(out.contains("Source: RDAP"), "Source pushed below the pane:\n{out}");
+        let rows: Vec<&str> = out.lines().collect();
+        let domain_row = rows
+            .iter()
+            .position(|r| r.contains("Domain: web.dev"))
+            .expect("domain row");
+        assert!(
+            rows[domain_row + 1].contains("📡 Source: RDAP"),
+            "Source not under Domain:\n{out}"
+        );
     }
 }

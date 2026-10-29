@@ -15,22 +15,10 @@ const MAX_CSP_ISSUES_DISPLAYED: usize = 3;
 const MAX_CORS_ISSUES_DISPLAYED: usize = 3;
 const MAX_HTTP_VULNERABILITIES_DISPLAYED: usize = 5;
 const MAX_TLS_VULNERABILITIES_DISPLAYED: usize = 5;
-const CIPHER_DISPLAY_MAX_LENGTH: usize = 25;
-const CIPHER_TRUNCATE_LENGTH: usize = 22;
 const CN_EXTRACT_PREFIX_LENGTH: usize = 3;
 const CN_DISPLAY_MAX_LENGTH: usize = 25;
 const CERT_EXPIRY_WARNING_DAYS: i64 = 30;
 const CERT_EXPIRY_CRITICAL_DAYS: i64 = 7;
-const CSP_HEADER_DISPLAY_MAX_LENGTH: usize = 40;
-const CSP_HEADER_TRUNCATE_LENGTH: usize = 37;
-const ISSUE_DISPLAY_MAX_LENGTH: usize = 20;
-const ISSUE_TRUNCATE_LENGTH: usize = 17;
-const CORS_ORIGIN_DISPLAY_MAX_LENGTH: usize = 25;
-const CORS_ORIGIN_TRUNCATE_LENGTH: usize = 22;
-const SPF_DISPLAY_MAX_LENGTH: usize = 50;
-const SPF_TRUNCATE_LENGTH: usize = 47;
-const DMARC_DISPLAY_MAX_LENGTH: usize = 50;
-const DMARC_TRUNCATE_LENGTH: usize = 47;
 const MIN_SECURITY_PANE_WIDTH: u16 = 50;
 const MIN_SECURITY_PANE_HEIGHT: u16 = 35;
 
@@ -340,10 +328,7 @@ impl SecurityPane {
             if let Some(cipher) = negotiated_cipher {
                 lines.push(Line::from(vec![
                     Span::styled("🔑 Cipher: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        crate::tui::text::ellipsize(&cipher, CIPHER_DISPLAY_MAX_LENGTH, CIPHER_TRUNCATE_LENGTH),
-                        Style::default().fg(Color::Yellow),
-                    ),
+                    Span::styled(cipher, Style::default().fg(Color::Yellow)),
                 ]));
             }
 
@@ -583,27 +568,17 @@ impl SecurityPane {
                     ),
                 ]));
 
-                // CSP Header Value (truncated for display)
+                // CSP Header Value
                 lines.push(Line::from(vec![
                     Span::styled("    Policy: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        crate::tui::text::ellipsize(
-                            &header_value,
-                            CSP_HEADER_DISPLAY_MAX_LENGTH,
-                            CSP_HEADER_TRUNCATE_LENGTH,
-                        ),
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled(header_value, Style::default().fg(Color::Gray)),
                 ]));
 
                 // CSP Issues
                 for issue in issues {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
-                        Span::styled(
-                            crate::tui::text::ellipsize(&issue, ISSUE_DISPLAY_MAX_LENGTH, ISSUE_TRUNCATE_LENGTH),
-                            Style::default().fg(Color::Red),
-                        ),
+                        Span::styled(issue, Style::default().fg(Color::Red)),
                     ]));
                 }
             } else {
@@ -639,14 +614,7 @@ impl SecurityPane {
                 if let Some(origin) = &access_control_allow_origin {
                     lines.push(Line::from(vec![
                         Span::styled("    Origin: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            crate::tui::text::ellipsize(
-                                origin,
-                                CORS_ORIGIN_DISPLAY_MAX_LENGTH,
-                                CORS_ORIGIN_TRUNCATE_LENGTH,
-                            ),
-                            Style::default().fg(Color::Gray),
-                        ),
+                        Span::styled(origin.clone(), Style::default().fg(Color::Gray)),
                     ]));
                 }
 
@@ -674,10 +642,7 @@ impl SecurityPane {
                 for issue in issues {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
-                        Span::styled(
-                            crate::tui::text::ellipsize(&issue, ISSUE_DISPLAY_MAX_LENGTH, ISSUE_TRUNCATE_LENGTH),
-                            Style::default().fg(Color::Red),
-                        ),
+                        Span::styled(issue, Style::default().fg(Color::Red)),
                     ]));
                 }
             }
@@ -762,24 +727,18 @@ impl SecurityPane {
                 ),
             ]));
 
-            // Show actual record contents (truncated)
+            // Show actual record contents
             if let Some(spf) = &spf_record {
                 lines.push(Line::from(vec![
                     Span::styled("    SPF: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        crate::tui::text::ellipsize(spf, SPF_DISPLAY_MAX_LENGTH, SPF_TRUNCATE_LENGTH),
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled(spf.clone(), Style::default().fg(Color::Gray)),
                 ]));
             }
 
             if let Some(dmarc) = &dmarc_record {
                 lines.push(Line::from(vec![
                     Span::styled("    DMARC: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        crate::tui::text::ellipsize(dmarc, DMARC_DISPLAY_MAX_LENGTH, DMARC_TRUNCATE_LENGTH),
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled(dmarc.clone(), Style::default().fg(Color::Gray)),
                 ]));
             }
 
@@ -847,11 +806,15 @@ impl Pane for SecurityPane {
         );
 
         // Apply scroll offset - skip lines from the beginning
-        let visible_lines = if safe_scroll_offset < total_lines {
+        // Scrolling is by logical line, so every line is fit to one row rather than wrapped.
+        let visible_lines: Vec<Line<'_>> = if safe_scroll_offset < total_lines {
             lines.into_iter().skip(safe_scroll_offset as usize).collect()
         } else {
             lines
-        };
+        }
+        .into_iter()
+        .map(|line| crate::tui::text::fit_line(line, inner_area.width))
+        .collect();
 
         log::trace!("[tui::security] render_content: visible_lines={}", visible_lines.len());
 
@@ -1788,5 +1751,32 @@ mod tests {
             CN_DISPLAY_MAX_LENGTH
         );
         assert_eq!(common_name_display("CN="), "");
+    }
+
+    #[test]
+    fn long_cipher_is_fit_with_ellipsis_in_narrow_terminals() {
+        let cipher = "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256_AND_A_LONG_VENDOR_SUFFIX";
+        let state = state_with_tls(ScanStatus::Complete);
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.negotiated_cipher = Some(crate::scan::tls::CipherSuite {
+                name: cipher.to_string(),
+                protocol_version: "TLSv1.3".to_string(),
+                key_exchange: "ECDHE".to_string(),
+                authentication: "RSA".to_string(),
+                encryption: "CHACHA20".to_string(),
+                mac: "POLY1305".to_string(),
+                is_secure: true,
+            });
+        }
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &SecurityPane::new(),
+            &state,
+            2,
+            2,
+            &format!("🔑 Cipher: {cipher}"),
+        );
     }
 }

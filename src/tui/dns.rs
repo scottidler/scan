@@ -10,18 +10,14 @@ use ratatui::{
 };
 use std::any::Any;
 
-const TXT_TRUNCATE_SUFFIX_LENGTH: usize = 3;
 const MAX_A_RECORDS_DISPLAYED: usize = 1000;
 const TTL_GOOD_THRESHOLD: u32 = 300;
 const TTL_WARNING_THRESHOLD: u32 = 60;
 const MAX_AAAA_RECORDS_DISPLAYED: usize = 1000;
-const IPV6_DISPLAY_MAX_LENGTH: usize = 25;
-const IPV6_TRUNCATE_LENGTH: usize = 22;
 const MAX_MX_RECORDS_DISPLAYED: usize = 1000;
 const MX_PRIORITY_GOOD_THRESHOLD: u16 = 10;
 const MX_PRIORITY_WARNING_THRESHOLD: u16 = 20;
 const MAX_TXT_RECORDS_DISPLAYED: usize = 1000;
-const TXT_DISPLAY_MAX_LENGTH: usize = 45;
 const MS_RECORD_PREVIEW_LENGTH: usize = 10;
 const MS_RECORD_PREFIX_LENGTH: usize = 3;
 const MAX_NS_RECORDS_DISPLAYED: usize = 1000;
@@ -86,10 +82,6 @@ impl DnsPane {
         let old_offset = self.scroll_offset;
         self.scroll_offset = 0;
         log::debug!("[tui::dns] reset_scroll: old_offset={}", old_offset);
-    }
-
-    fn truncate_txt(text: &str, max_len: usize) -> String {
-        crate::tui::text::ellipsize(text, max_len, max_len.saturating_sub(TXT_TRUNCATE_SUFFIX_LENGTH))
     }
 
     /// Build the actual content lines - SINGLE SOURCE OF TRUTH
@@ -203,11 +195,10 @@ impl DnsPane {
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
                 let ipv6_str = record.value.to_string();
-                let display_str = crate::tui::text::ellipsize(&ipv6_str, IPV6_DISPLAY_MAX_LENGTH, IPV6_TRUNCATE_LENGTH);
 
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(display_str, Style::default().fg(Color::Cyan)),
+                    Span::styled(ipv6_str, Style::default().fg(Color::Cyan)),
                 ]));
             }
         }
@@ -298,7 +289,7 @@ impl DnsPane {
                             .collect::<String>()
                     )
                 } else {
-                    Self::truncate_txt(&value, TXT_DISPLAY_MAX_LENGTH)
+                    value
                 };
 
                 lines.push(Line::from(vec![
@@ -522,11 +513,15 @@ impl Pane for DnsPane {
         );
 
         // Apply scroll offset - skip lines from the beginning
-        let visible_lines = if safe_scroll_offset < total_lines {
+        // Scrolling is by logical line, so every line is fit to one row rather than wrapped.
+        let visible_lines: Vec<Line<'_>> = if safe_scroll_offset < total_lines {
             lines.into_iter().skip(safe_scroll_offset as usize).collect()
         } else {
             lines
-        };
+        }
+        .into_iter()
+        .map(|line| crate::tui::text::fit_line(line, inner_area.width))
+        .collect();
 
         log::trace!("[tui::dns] render_content: visible_lines={}", visible_lines.len());
 
@@ -560,19 +555,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_txt_cuts_multibyte_by_chars() {
-        // 1 ASCII byte then 2-byte chars: the old byte cut at 42 lands inside a char.
-        let txt = format!("v{}", "é".repeat(60));
-        let out = DnsPane::truncate_txt(&txt, TXT_DISPLAY_MAX_LENGTH);
-        assert!(out.ends_with("..."), "{out}");
-        assert_eq!(out.chars().count(), TXT_DISPLAY_MAX_LENGTH, "{out}");
-        assert_eq!(
-            DnsPane::truncate_txt("v=spf1 -all", TXT_DISPLAY_MAX_LENGTH),
-            "v=spf1 -all"
-        );
-    }
-
-    #[test]
     fn test_dns_pane_creation() {
         let pane = DnsPane::new();
         assert_eq!(pane.title(), "dns");
@@ -580,5 +562,60 @@ mod tests {
         assert_eq!(pane.min_size(), (MIN_DNS_PANE_WIDTH, MIN_DNS_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
+    }
+
+    fn complete_state(scanner: &str, result: crate::types::ScanResult) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            scanner.to_string(),
+            crate::types::ScanState {
+                result: Some(result),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn long_txt_record_is_fit_with_ellipsis_in_narrow_terminals() {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+        let txt = "v=spf1 include:_spf.a-very-long-mail-provider.example.com include:_spf.another.example.net -all";
+        let mut result = DnsResult::new();
+        result.TXT = vec![DnsRecord {
+            value: txt.to_string(),
+            ttl_original: 3600,
+            queried_at: std::time::Instant::now(),
+        }];
+        result.TXT_status = QueryStatus::Success(1);
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &DnsPane::new(),
+            &complete_state("dns", crate::types::ScanResult::Dns(result)),
+            2,
+            0,
+            &format!("  {txt}"),
+        );
+    }
+
+    #[test]
+    fn long_multibyte_txt_record_is_fit_by_display_width() {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+        let txt = format!("v{}", "é".repeat(60));
+        let mut result = DnsResult::new();
+        result.TXT = vec![DnsRecord {
+            value: txt.clone(),
+            ttl_original: 3600,
+            queried_at: std::time::Instant::now(),
+        }];
+        result.TXT_status = QueryStatus::Success(1);
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &DnsPane::new(),
+            &complete_state("dns", crate::types::ScanResult::Dns(result)),
+            2,
+            0,
+            &format!("  {txt}"),
+        );
     }
 }

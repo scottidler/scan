@@ -10,8 +10,6 @@ use ratatui::{
 };
 use std::any::Any;
 
-const URL_DISPLAY_MAX_LENGTH: usize = 35;
-const URL_TRUNCATE_LENGTH: usize = 32;
 const HTTP_SUCCESS_STATUS_MIN: u16 = 200;
 const HTTP_SUCCESS_STATUS_MAX: u16 = 299;
 const HTTP_REDIRECT_STATUS_MIN: u16 = 300;
@@ -37,20 +35,6 @@ impl HttpPane {
         Self {
             title: "http",
             id: "http",
-        }
-    }
-
-    /// Truncate URL to fit in the display
-    fn truncate_url(url: &str) -> String {
-        if url.chars().count() <= URL_DISPLAY_MAX_LENGTH {
-            url.to_string()
-        } else {
-            // Remove protocol and show domain + path
-            let url_without_protocol = url
-                .strip_prefix("https://")
-                .or_else(|| url.strip_prefix("http://"))
-                .unwrap_or(url);
-            crate::tui::text::ellipsize(url_without_protocol, URL_DISPLAY_MAX_LENGTH, URL_TRUNCATE_LENGTH)
         }
     }
 }
@@ -80,6 +64,8 @@ impl Pane for HttpPane {
 
         // Prepare content lines
         let mut lines = Vec::new();
+        // Rows that wrap instead of being fit: the status header (it carries a failure reason).
+        let mut wrapped = vec![0];
 
         // HTTP status header
         lines.push(Line::from(vec![
@@ -102,6 +88,7 @@ impl Pane for HttpPane {
             if let Some(ScanResult::Http(http_result)) = &http_state.result {
                 if let Some(primary_data) = http_result.get_primary_result() {
                     if let Some(reason) = &primary_data.https_failure {
+                        wrapped.push(lines.len());
                         lines.push(Line::from(vec![
                             Span::styled("⚠️  ", Style::default().fg(Color::Red)),
                             Span::styled(
@@ -183,20 +170,18 @@ impl Pane for HttpPane {
                             ),
                         ]));
 
-                        // Show each redirect in the chain
+                        // One row per URL, so a long source URL cannot push its target off the row.
                         for redirect in &primary_data.redirect_chain {
-                            let from_url = Self::truncate_url(&redirect.from);
-                            let to_url = Self::truncate_url(&redirect.to);
-
                             lines.push(Line::from(vec![
-                                Span::styled("  ", Style::default()),
-                                Span::styled(from_url, Style::default().fg(Color::Gray)),
-                                Span::styled(" → ", Style::default().fg(Color::Magenta)),
-                                Span::styled(to_url, Style::default().fg(Color::Cyan)),
                                 Span::styled(
-                                    format!(" ({})", redirect.status_code),
+                                    format!("  {} ", redirect.status_code),
                                     Style::default().fg(Color::Yellow),
                                 ),
+                                Span::styled(redirect.from.clone(), Style::default().fg(Color::Gray)),
+                            ]));
+                            lines.push(Line::from(vec![
+                                Span::styled("    → ", Style::default().fg(Color::Magenta)),
+                                Span::styled(redirect.to.clone(), Style::default().fg(Color::Cyan)),
                             ]));
                         }
                     }
@@ -268,8 +253,9 @@ impl Pane for HttpPane {
             ]));
         }
 
-        // Create and render the paragraph
-        // Wrap so a long HTTPS failure reason stays readable instead of clipping at the border.
+        // Identifiers are fit to the width; the status header and the HTTPS failure reason wrap so
+        // their cause stays readable.
+        let lines = crate::tui::text::fit_lines_except(lines, inner_area.width, &wrapped);
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: false });
@@ -301,16 +287,6 @@ impl Pane for HttpPane {
 mod tests {
     use super::*;
 
-    #[test]
-    fn truncate_url_cuts_multibyte_by_chars() {
-        // `/` then 2-byte chars: the old byte cut at 32 lands inside a char.
-        let url = format!("https://ex.com/{}", "ü".repeat(40));
-        let out = HttpPane::truncate_url(&url);
-        assert!(out.starts_with("ex.com/ü"), "{out}");
-        assert!(out.ends_with("..."), "{out}");
-        assert_eq!(out.chars().count(), URL_TRUNCATE_LENGTH + 3, "{out}");
-        assert_eq!(HttpPane::truncate_url("https://example.com/"), "https://example.com/");
-    }
     use crate::scan::http::{CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade, SecurityHeaders};
     use crate::tui::testing::render_pane;
     use crate::types::{ScanState, ScanStatus};
@@ -433,5 +409,60 @@ mod tests {
         assert_eq!(pane.min_size(), (MIN_HTTP_PANE_WIDTH, MIN_HTTP_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
+    }
+
+    const LONG_CONTENT_TYPE: &str = "application/vnd.example.a-very-long-vendor-media-type+json; charset=utf-8";
+    const LONG_REDIRECT_TO: &str = "https://www.a-very-long-host-name.example.com/a/long/path/to/the/landing/page";
+
+    #[test]
+    fn long_content_type_is_fit_with_ellipsis_in_narrow_terminals() {
+        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        data.content_type = Some(LONG_CONTENT_TYPE.to_string());
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &HttpPane::new(),
+            &state_with_http(data),
+            1,
+            1,
+            &format!("📄 Type: {LONG_CONTENT_TYPE}"),
+        );
+    }
+
+    #[test]
+    fn long_redirect_target_url_is_fit_on_its_own_row() {
+        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        data.redirect_chain = vec![crate::scan::http::RedirectInfo {
+            from: "http://example.com/".to_string(),
+            to: LONG_REDIRECT_TO.to_string(),
+            status_code: 301,
+        }];
+        // The middle row is too short at 80x24 to reach the redirect rows; 108x40 shows them.
+        let (width, height) = crate::tui::testing::dashboard_pane_size(1, 1, 108, 40);
+        let expected = crate::tui::testing::expected_clip(&format!("    → {LONG_REDIRECT_TO}"), width - 2);
+        let out = render_pane(&HttpPane::new(), &state_with_http(data), width, height, false);
+        assert!(
+            out.contains("301 http://example.com/"),
+            "redirect source row missing:\n{out}"
+        );
+        assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
+    }
+
+    #[test]
+    fn long_multibyte_redirect_url_is_fit_by_display_width() {
+        let to = format!("https://ex.com/{}", "ü".repeat(40));
+        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        data.redirect_chain = vec![crate::scan::http::RedirectInfo {
+            from: "http://ex.com/".to_string(),
+            to: to.clone(),
+            status_code: 308,
+        }];
+        let out = render_pane(
+            &HttpPane::new(),
+            &state_with_http(data),
+            LIVE_PANE_WIDTH,
+            LIVE_PANE_HEIGHT,
+            false,
+        );
+        let expected = crate::tui::testing::expected_clip(&format!("    → {to}"), LIVE_PANE_WIDTH - 2);
+        assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
     }
 }

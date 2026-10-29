@@ -177,7 +177,12 @@ impl Pane for TraceroutePane {
 
         // Apply scrolling to lines
         let visible_height = inner_area.height;
-        let visible_lines = self.apply_scroll_to_lines(lines, visible_height);
+        // Scrolling is by logical line, so every line is fit to one row rather than wrapped.
+        let visible_lines: Vec<Line<'_>> = self
+            .apply_scroll_to_lines(lines, visible_height)
+            .into_iter()
+            .map(|line| crate::tui::text::fit_line(line, inner_area.width))
+            .collect();
 
         // Create and render the paragraph
         let paragraph = Paragraph::new(visible_lines).alignment(Alignment::Left);
@@ -266,5 +271,75 @@ mod tests {
         assert_eq!(pane.min_size(), (MIN_TRACEROUTE_PANE_WIDTH, MIN_TRACEROUTE_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
+    }
+
+    fn traced_state(data: crate::scan::traceroute::TracerouteData) -> AppState {
+        let mut result = crate::scan::traceroute::TracerouteResult::new();
+        result.ipv6_status = crate::scan::traceroute::TracerouteStatus::Success(data.total_hops);
+        result.ipv6_result = Some(data);
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "traceroute".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Traceroute(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
+    fn ipv6_route(hop_ip: &str, reached: bool) -> crate::scan::traceroute::TracerouteData {
+        use crate::scan::traceroute::{HopResponse, TracerouteData, TracerouteHop};
+        use std::time::Duration;
+        let ip: std::net::IpAddr = hop_ip.parse().expect("ip");
+        TracerouteData {
+            hops: vec![TracerouteHop {
+                hop_number: 1,
+                responses: vec![HopResponse {
+                    ip_address: Some(ip),
+                    rtt: Some(Duration::from_millis(5)),
+                    timeout: false,
+                }],
+                best_rtt: Some(Duration::from_millis(5)),
+                avg_rtt: Some(Duration::from_millis(5)),
+                worst_rtt: Some(Duration::from_millis(5)),
+                packet_loss: 0.0,
+            }],
+            destination_reached: reached,
+            total_hops: 1,
+            max_hops: 30,
+            target_ip: ip,
+            scan_duration: Duration::from_millis(100),
+            ipv6: true,
+        }
+    }
+
+    #[test]
+    fn long_ipv6_hop_is_fit_with_ellipsis_in_narrow_terminals() {
+        let hop = "2001:db8:aaaa:bbbb:cccc:dddd:eeee:ffff";
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &TraceroutePane::new(),
+            &traced_state(ipv6_route(hop, true)),
+            2,
+            1,
+            &format!("   1: {hop} (5ms)"),
+        );
+    }
+
+    #[test]
+    fn reached_and_silent_labels_are_intact_at_200x55() {
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 200, 55);
+        let render = |reached| {
+            let state = traced_state(ipv6_route("2001:db8::1", reached));
+            crate::tui::testing::render_pane(&TraceroutePane::new(), &state, width, height, false)
+        };
+        let reached = render(true);
+        assert!(reached.contains("✓ reached"), "{reached}");
+        let silent = render(false);
+        assert!(silent.contains("✗ target silent (last reply: hop 1)"), "{silent}");
+        assert!(!silent.contains('…'), "{silent}");
     }
 }

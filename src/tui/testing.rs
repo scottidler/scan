@@ -1,8 +1,9 @@
 //! Test-only helper that renders a pane into a `TestBackend` buffer.
 
+use crate::tui::layout::PaneLayout;
 use crate::tui::pane::Pane;
 use crate::types::AppState;
-use ratatui::{Terminal, backend::TestBackend, text::Span};
+use ratatui::{Terminal, backend::TestBackend, layout::Rect, text::Span};
 
 /// Render `pane` at `width` x `height` and return the buffer as newline-joined text rows.
 /// The continuation cell after a double-width glyph is dropped, as a terminal shows it.
@@ -30,10 +31,79 @@ pub fn render_pane(pane: &dyn Pane, state: &AppState, width: u16, height: u16, f
         .join("\n")
 }
 
+/// The narrow terminals the clipping fixtures render at: Scott's 80x24 and his ~108-column
+/// screenshot.
+pub const NARROW_TERMINALS: [(u16, u16); 2] = [(80, 24), (108, 40)];
+
+/// Width and height of the dashboard cell at `row`, `col` in a `cols` x `rows` terminal, as
+/// `PaneLayout` splits it.
+pub fn dashboard_pane_size(row: usize, col: usize, cols: u16, rows: u16) -> (u16, u16) {
+    let grid = PaneLayout::default_dashboard().create_grid_layout_public(Rect::new(0, 0, cols, rows));
+    let cell = grid[row][col];
+    (cell.width, cell.height)
+}
+
+/// What a line of `source` text must show in `width` cells: the longest char prefix that leaves
+/// one cell for `…`, then `…`. Built from the source text, independently of `fit_line`.
+pub fn expected_clip(source: &str, width: u16) -> String {
+    let budget = usize::from(width) - 1;
+    let mut used = 0;
+    let mut prefix = String::new();
+    for c in source.chars() {
+        let c_width = Span::raw(c.to_string()).width();
+        if used + c_width > budget {
+            break;
+        }
+        prefix.push(c);
+        used += c_width;
+    }
+    format!("{prefix}…")
+}
+
+/// Render `pane` in its dashboard cell (`row`, `col`) of each narrow terminal and assert one row
+/// shows exactly `expected_clip(source)` between the borders.
+pub fn assert_clipped_in_narrow_terminals(pane: &dyn Pane, state: &AppState, row: usize, col: usize, source: &str) {
+    for (cols, rows) in NARROW_TERMINALS {
+        let (width, height) = dashboard_pane_size(row, col, cols, rows);
+        let inner_width = width - 2;
+        assert!(
+            Span::raw(source).width() > usize::from(inner_width),
+            "{cols}x{rows}: fixture `{source}` fits {inner_width} cells, so it cannot test clipping"
+        );
+        let expected = expected_clip(source, inner_width);
+        let out = render_pane(pane, state, width, height, false);
+        let found = out.lines().any(|line| {
+            line.strip_prefix('│')
+                .and_then(|inner| inner.strip_prefix(expected.as_str()))
+                .is_some_and(|rest| rest.trim_end_matches('│').trim().is_empty())
+        });
+        assert!(
+            found,
+            "{} at {cols}x{rows} ({width}x{height}): no row reads `{expected}`:\n{out}",
+            pane.title()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::*;
+
+    #[test]
+    fn dashboard_pane_sizes_follow_the_layout_percentages() {
+        // 80 cols: target 30% = 24, connectivity 70% = 56; the four middle panes 20 each.
+        assert_eq!(dashboard_pane_size(0, 0, 80, 24).0, 24);
+        assert_eq!(dashboard_pane_size(0, 1, 80, 24), (56, 6));
+        assert_eq!(dashboard_pane_size(1, 0, 80, 24).0, 20);
+    }
+
+    #[test]
+    fn expected_clip_keeps_a_prefix_one_cell_short_of_the_width() {
+        assert_eq!(expected_clip("abcdef", 4), "abc…");
+        assert_eq!(expected_clip("🎯 abc", 4), "🎯 …");
+        assert_eq!(expected_clip("a🦀b", 3), "a…");
+    }
 
     fn assert_renders_title(pane: &dyn Pane) {
         let state = AppState::new("example.com".to_string());

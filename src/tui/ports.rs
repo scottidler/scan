@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use std::any::Any;
 
@@ -61,6 +61,8 @@ impl Pane for PortsPane {
 
         // Prepare content lines
         let mut lines = Vec::new();
+        // Rows that wrap instead of being fit: the status header (it carries a failure reason).
+        let wrapped = [0];
 
         // Ports status header
         lines.push(Line::from(vec![
@@ -292,8 +294,12 @@ impl Pane for PortsPane {
         // Add port lines to main lines
         lines.extend(port_lines);
 
-        // Create and render the paragraph
-        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
+        // Identifiers are fit to the width; the status header and reason rows wrap so their cause
+        // stays readable.
+        let lines = crate::tui::text::fit_lines_except(lines, inner_area.width, &wrapped);
+        let paragraph = Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
         paragraph.render(inner_area, frame.buffer_mut());
     }
 
@@ -330,5 +336,52 @@ mod tests {
         assert_eq!(pane.min_size(), (MIN_PORTS_PANE_WIDTH, MIN_PORTS_PANE_HEIGHT));
         assert!(pane.is_visible());
         assert!(pane.is_focusable());
+    }
+
+    #[test]
+    fn long_service_name_is_fit_with_ellipsis_in_narrow_terminals() {
+        use crate::scan::port::{
+            OpenPort, PortData, PortResult, PortState, PortStatus, ScanMode, ServiceInfo, Transport,
+        };
+        let service = "a-very-long-service-name-from-a-banner-grab-for-clipping";
+        let mut result = PortResult::new();
+        result.ipv4_status = PortStatus::Success(1);
+        result.ipv4_result = Some(PortData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            open_ports: vec![OpenPort {
+                port: 8080,
+                transport: Transport::Tcp,
+                state: PortState::Open,
+                service: Some(ServiceInfo {
+                    name: service.to_string(),
+                    version: None,
+                    banner: None,
+                    confidence: 1.0,
+                }),
+                response_time: std::time::Duration::from_millis(5),
+            }],
+            closed_ports: 0,
+            filtered_ports: 0,
+            scan_duration: std::time::Duration::from_millis(50),
+            scan_mode: ScanMode::Quick,
+        });
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "port".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Port(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &PortsPane::new(),
+            &state,
+            1,
+            2,
+            &format!("   8080/tcp ({service})"),
+        );
     }
 }

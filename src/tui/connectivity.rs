@@ -479,6 +479,12 @@ impl Pane for ConnectivityPane {
         lines.push(Line::from(status_spans));
 
         let rows = connectivity_rows(inner_area);
+        // The status gets one row, so a long failure reason is fit to it rather than wrapped.
+        let status_width = rows.status().width;
+        let lines: Vec<Line<'_>> = lines
+            .into_iter()
+            .map(|line| crate::tui::text::fit_line(line, status_width))
+            .collect();
         Paragraph::new(lines)
             .alignment(Alignment::Left)
             .render(rows.status(), frame.buffer_mut());
@@ -548,7 +554,8 @@ impl Pane for ConnectivityPane {
                             Style::default().fg(Color::Gray),
                         ));
                     }
-                    Paragraph::new(Line::from(spans)).render(title_area, frame.buffer_mut());
+                    Paragraph::new(crate::tui::text::fit_line(Line::from(spans), title_area.width))
+                        .render(title_area, frame.buffer_mut());
                     render_graph(frame, graph_area, &visible, max_us, view.graph_color(&visible));
                 }
             }
@@ -576,7 +583,8 @@ impl Pane for ConnectivityPane {
                         width: row.width - label_area.width,
                         ..row
                     };
-                    Paragraph::new(Span::styled(label, Style::default().fg(view.title_color())))
+                    let label = Line::from(Span::styled(label, Style::default().fg(view.title_color())));
+                    Paragraph::new(crate::tui::text::fit_line(label, label_area.width))
                         .render(label_area, frame.buffer_mut());
                     let visible = view.data.visible(usize::from(graph_area.width));
                     let max_us = scale_max_us(&visible);
@@ -895,5 +903,38 @@ mod tests {
             out.contains("failed: timed out after 30s"),
             "failed refresh hidden:\n{out}"
         );
+    }
+
+    #[test]
+    fn long_failure_reason_is_fit_to_the_status_row_in_narrow_terminals() {
+        let reason = "timed out after 30s waiting for an echo reply from a-very-long-host-name.example.com over IPv4";
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "ping".to_string(),
+            ScanState {
+                result: None,
+                error: Some(eyre::eyre!(reason)),
+                status: ScanStatus::Failed,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::tui::testing::assert_clipped_in_narrow_terminals(
+            &ConnectivityPane::new(),
+            &state,
+            0,
+            1,
+            &format!("🌐 Status: failed: {reason}"),
+        );
+    }
+
+    #[test]
+    fn full_mode_title_is_intact_at_200x55() {
+        let pane = ConnectivityPane::new();
+        let pings: Vec<PingResult> = (0..5).map(|_| ok_ping(12, 15)).collect();
+        let (width, height) = crate::tui::testing::dashboard_pane_size(0, 1, 200, 55);
+        let out = render_cycles(&pane, &pings, width, height);
+        assert!(out.contains("scale 0-"), "title lost its scale:\n{out}");
+        assert!(!out.contains('…'), "title clipped at 200 columns:\n{out}");
     }
 }
