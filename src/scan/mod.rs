@@ -3,7 +3,7 @@ pub mod geoip;
 pub mod http;
 pub mod ping;
 pub mod port;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub mod testing;
 pub mod tls;
 pub mod traceroute;

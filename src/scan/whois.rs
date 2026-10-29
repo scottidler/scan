@@ -1,13 +1,19 @@
+mod cache;
+
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
+use cache::{CachedSource, FETCH_TIMEOUT};
 use chrono::{DateTime, Utc};
 use hickory_resolver::Resolver;
 use log;
+use psl::Psl;
+use publicsuffix::{self as psl, IcannList};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -27,6 +33,14 @@ const WHOIS_REGISTRAR_KEYS: &[&str] = &["registrar"];
 const WHOIS_CREATION_KEYS: &[&str] = &["creation date", "created", "registered", "registration time"];
 const WHOIS_EXPIRY_KEYS: &[&str] = &["expiry date", "expires", "expiration date", "registry expiry date"];
 const WHOIS_NAMESERVER_KEYS: &[&str] = &["name server", "nameserver", "nserver"];
+/// IANA's RDAP bootstrap for DNS: which RDAP base URL serves each TLD.
+const RDAP_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
+const RDAP_BOOTSTRAP_CACHE_FILE: &str = "rdap-dns.json";
+/// The public suffix list; its ICANN section names the registrable domain of a host.
+const PSL_URL: &str = "https://publicsuffix.org/list/public_suffix_list.dat";
+const PSL_CACHE_FILE: &str = "public_suffix_list.dat";
+/// Directory under the user cache dir (`~/.cache`) holding both files.
+const CACHE_DIR_NAME: &str = "scan";
 /// Headroom on the scan deadline past RDAP plus the fallback, for parsing and scheduling.
 const DEADLINE_SLACK_SECS: u64 = 5;
 const WHOIS_SCAN_INTERVAL_SECS: u64 = 60 * 60; // 1 hour
@@ -38,6 +52,14 @@ pub struct WhoisScanner {
     client: Client,
     /// `host:port` of the server that refers each TLD to its registry WHOIS server.
     iana_server: String,
+    /// IANA RDAP bootstrap (`dns.json`), fetched and cached for `CACHE_MAX_AGE`.
+    rdap_bootstrap_url: String,
+    /// Public suffix list, fetched and cached for `CACHE_MAX_AGE`.
+    psl_url: String,
+    /// Where both fetched files are cached; `None` when the platform has no cache dir.
+    cache_dir: Option<PathBuf>,
+    /// Bound on one fetch of either file, taken from inside the RDAP budget.
+    source_fetch_timeout: Duration,
     rdap_timeout: Duration,
     whois_timeout: Duration,
 }
@@ -58,6 +80,7 @@ impl WhoisScanner {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(RDAP_TIMEOUT_SECS))
+            .connect_timeout(FETCH_TIMEOUT)
             .user_agent("scan/1.0")
             .build()
             .expect("Failed to create HTTP client");
@@ -65,6 +88,10 @@ impl WhoisScanner {
         Self {
             client,
             iana_server: format!("{}:{}", IANA_WHOIS_SERVER, WHOIS_PORT),
+            rdap_bootstrap_url: RDAP_BOOTSTRAP_URL.to_string(),
+            psl_url: PSL_URL.to_string(),
+            cache_dir: dirs::cache_dir().map(|dir| dir.join(CACHE_DIR_NAME)),
+            source_fetch_timeout: FETCH_TIMEOUT,
             rdap_timeout: Duration::from_secs(RDAP_TIMEOUT_SECS),
             whois_timeout: Duration::from_secs(WHOIS_LOOKUP_TIMEOUT_SECS),
         }
@@ -73,36 +100,75 @@ impl WhoisScanner {
     async fn scan_whois(&self, target: &Target) -> eyre::Result<WhoisResult> {
         log::debug!("[scan::whois] scan_whois: target={}", target.display_name());
 
-        let domain = match &target.domain {
+        let host = match &target.domain {
             Some(d) => d.clone(),
             None => {
                 log::debug!("[scan::whois] not_applicable: target={}", target.display_name());
-                return Ok(WhoisResult::not_applicable(target.display_name().to_string()));
+                return Ok(WhoisResult::not_applicable(
+                    target.display_name().to_string(),
+                    NotApplicableReason::IpTarget,
+                ));
             }
         };
 
-        log::debug!("[scan::whois] querying_domain: domain={}", domain);
+        // Cold-cache fetches of the suffix list and the RDAP bootstrap spend the RDAP budget, so
+        // the scan deadline still covers RDAP plus the WHOIS fallback.
+        let rdap_deadline = tokio::time::Instant::now() + self.rdap_timeout;
+        let (domain, suffix_list_error) = match self.registrable_domain(&host, rdap_deadline).await {
+            Ok(Some(domain)) => (domain, None),
+            Ok(None) => {
+                log::debug!("[scan::whois] no_registrable_domain: host={}", host);
+                return Ok(WhoisResult::not_applicable(
+                    host,
+                    NotApplicableReason::NoRegistrableDomain,
+                ));
+            }
+            Err(e) => {
+                let raw = normalized_host(&host);
+                log::warn!(
+                    "[scan::whois] suffix_list_unavailable_using_raw_host: host={} error={:#}",
+                    raw,
+                    e
+                );
+                (raw, Some(format!("{:#}", e)))
+            }
+        };
+
+        log::debug!(
+            "[scan::whois] querying_domain: host={} domain={} suffix_list_error={:?}",
+            host,
+            domain,
+            suffix_list_error
+        );
+        let for_target = |mut result: WhoisResult, source: DataSource| {
+            result.data_source = source;
+            result.domain = host.clone();
+            result.queried_domain = domain.clone();
+            result.suffix_list_error = suffix_list_error.clone();
+            result
+        };
 
         // Try RDAP first (modern protocol)
         log::trace!("[scan::whois] trying_rdap: domain={}", domain);
         let rdap_start = Instant::now();
-        let rdap_error = match self.query_rdap(&domain).await {
-            Ok(mut result) => {
-                let rdap_duration = rdap_start.elapsed();
-                result.data_source = DataSource::Rdap;
+        let rdap_outcome = match tokio::time::timeout_at(rdap_deadline, self.query_rdap(&domain, rdap_deadline)).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(eyre::eyre!("RDAP timed out after {:?}", self.rdap_timeout)),
+        };
+        let rdap_error = match rdap_outcome {
+            Ok(result) => {
                 log::trace!(
                     "[scan::whois] rdap_successful: domain={} duration={}ms",
                     domain,
-                    rdap_duration.as_millis()
+                    rdap_start.elapsed().as_millis()
                 );
-                return Ok(result);
+                return Ok(for_target(result, DataSource::Rdap));
             }
             Err(e) => {
-                let rdap_duration = rdap_start.elapsed();
                 log::debug!(
-                    "[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={}",
+                    "[scan::whois] rdap_failed_trying_whois: domain={} duration={}ms error={:#}",
                     domain,
-                    rdap_duration.as_millis(),
+                    rdap_start.elapsed().as_millis(),
                     e
                 );
                 e
@@ -113,22 +179,19 @@ impl WhoisScanner {
         log::trace!("[scan::whois] trying_traditional_whois: domain={}", domain);
         let whois_start = Instant::now();
         match self.query_traditional_whois(&domain).await {
-            Ok(mut result) => {
-                let whois_duration = whois_start.elapsed();
-                result.data_source = DataSource::Whois;
+            Ok(result) => {
                 log::trace!(
                     "[scan::whois] whois_successful: domain={} duration={}ms",
                     domain,
-                    whois_duration.as_millis()
+                    whois_start.elapsed().as_millis()
                 );
-                Ok(result)
+                Ok(for_target(result, DataSource::Whois))
             }
             Err(e) => {
-                let whois_duration = whois_start.elapsed();
                 log::error!(
                     "[scan::whois] both_methods_failed: domain={} whois_duration={}ms error={}",
                     domain,
-                    whois_duration.as_millis(),
+                    whois_start.elapsed().as_millis(),
                     e
                 );
 
@@ -137,13 +200,70 @@ impl WhoisScanner {
         }
     }
 
-    async fn query_rdap(&self, domain: &str) -> eyre::Result<WhoisResult> {
+    /// The registrable domain of `host` under the ICANN section of the public suffix list:
+    /// `www.tatari.tv` -> `tatari.tv`. `Ok(None)` when the host has none (`localhost`, a bare
+    /// public suffix, a name `idna` rejects). `Err` when the suffix list is unavailable.
+    async fn registrable_domain(&self, host: &str, deadline: tokio::time::Instant) -> eyre::Result<Option<String>> {
+        log::debug!("[scan::whois] registrable_domain: host={}", host);
+        let ascii = match idna::domain_to_ascii(host.trim_end_matches('.')) {
+            Ok(ascii) => ascii,
+            Err(e) => {
+                log::debug!("[scan::whois] host_not_a_domain_name: host={} error={}", host, e);
+                return Ok(None);
+            }
+        };
+        let list = self
+            .cached_source(&self.psl_url, PSL_CACHE_FILE)
+            .load(deadline, parse_suffix_list)
+            .await?;
+        let domain = list
+            .domain(ascii.as_bytes())
+            .map(|d| String::from_utf8_lossy(d.as_bytes()).into_owned());
+        log::debug!(
+            "[scan::whois] registrable_domain_found: host={} ascii={} domain={:?}",
+            host,
+            ascii,
+            domain
+        );
+        Ok(domain)
+    }
+
+    /// The RDAP base URL IANA's bootstrap lists for `tld`, ending in `/`. `Ok(None)` when the TLD
+    /// has no RDAP service; `Err` when the bootstrap is unavailable.
+    async fn rdap_base_url(&self, tld: &str, deadline: tokio::time::Instant) -> eyre::Result<Option<String>> {
+        log::debug!("[scan::whois] rdap_base_url: tld={}", tld);
+        let bootstrap = self
+            .cached_source(&self.rdap_bootstrap_url, RDAP_BOOTSTRAP_CACHE_FILE)
+            .load(deadline, parse_rdap_bootstrap)
+            .await?;
+        let base = bootstrap.base_url(tld);
+        log::debug!("[scan::whois] rdap_base_url_found: tld={} base={:?}", tld, base);
+        Ok(base)
+    }
+
+    fn cached_source<'a>(&'a self, url: &'a str, file_name: &'a str) -> CachedSource<'a> {
+        CachedSource {
+            client: &self.client,
+            url,
+            cache_dir: self.cache_dir.as_deref(),
+            file_name,
+            fetch_timeout: self.source_fetch_timeout,
+        }
+    }
+
+    async fn query_rdap(&self, domain: &str, deadline: tokio::time::Instant) -> eyre::Result<WhoisResult> {
         let start_time = Instant::now();
-        let tld = domain.split('.').next_back().unwrap_or("");
+        let tld = domain.rsplit('.').next().unwrap_or(domain);
 
-        let rdap_url = self.get_rdap_endpoint(tld, domain);
+        let base = self
+            .rdap_base_url(tld, deadline)
+            .await
+            .map_err(|e| eyre::eyre!("RDAP bootstrap unavailable: {:#}", e))?
+            .ok_or_else(|| eyre::eyre!("no RDAP service for .{}", tld))?;
+        let rdap_url = format!("{}domain/{}", base, domain);
+        log::debug!("[scan::whois] query_rdap: domain={} url={}", domain, rdap_url);
 
-        let response = self.client.get(&rdap_url).timeout(self.rdap_timeout).send().await?;
+        let response = self.client.get(&rdap_url).send().await?;
 
         if !response.status().is_success() {
             return Err(eyre::eyre!("RDAP query failed with status: {}", response.status()));
@@ -231,19 +351,6 @@ impl WhoisScanner {
             .map_err(|_| eyre::eyre!("WHOIS lookup timed out after {:?}", self.whois_timeout))?
     }
 
-    fn get_rdap_endpoint(&self, tld: &str, domain: &str) -> String {
-        match tld.to_lowercase().as_str() {
-            "com" | "net" => format!("https://rdap.verisign.com/com/v1/domain/{}", domain),
-            "org" => format!("https://rdap.publicinterestregistry.org/rdap/domain/{}", domain),
-            "tv" => format!("https://rdap.nic.tv/domain/{}", domain),
-            "io" => format!("https://rdap.nic.io/domain/{}", domain),
-            "uk" => format!("https://rdap.nominet.uk/uk/domain/{}", domain),
-            "info" => format!("https://rdap.afilias.net/rdap/domain/{}", domain),
-            "biz" => format!("https://rdap.afilias.net/rdap/domain/{}", domain),
-            _ => format!("https://rdap.iana.org/domain/{}", domain), // IANA bootstrap
-        }
-    }
-
     async fn parse_rdap_response(
         &self,
         domain: &str,
@@ -252,6 +359,8 @@ impl WhoisScanner {
     ) -> eyre::Result<WhoisResult> {
         let mut result = WhoisResult {
             domain: domain.to_string(),
+            queried_domain: domain.to_string(),
+            suffix_list_error: None,
             registration_date: None,
             expiry_date: None,
             last_updated: None,
@@ -353,6 +462,8 @@ impl WhoisScanner {
     async fn parse_whois_text(&self, domain: &str, whois_text: &str, duration: Duration) -> eyre::Result<WhoisResult> {
         let mut result = WhoisResult {
             domain: domain.to_string(),
+            queried_domain: domain.to_string(),
+            suffix_list_error: None,
             registration_date: None,
             expiry_date: None,
             last_updated: None,
@@ -759,7 +870,13 @@ impl Scanner for WhoisScanner {
 // Data structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoisResult {
+    /// The target host, as given.
     pub domain: String,
+    /// The domain RDAP and WHOIS were asked about: the registrable domain of `domain`, or the
+    /// normalized raw host when the suffix list was unavailable.
+    pub queried_domain: String,
+    /// Why `queried_domain` is the raw host rather than the registrable domain.
+    pub suffix_list_error: Option<String>,
     pub registration_date: Option<DateTime<Utc>>,
     pub expiry_date: Option<DateTime<Utc>>,
     pub last_updated: Option<DateTime<Utc>>,
@@ -781,10 +898,24 @@ pub struct WhoisResult {
 }
 
 impl WhoisResult {
-    /// Domain WHOIS has nothing to say about an IP target; GEOIP carries its ISP and ASN.
-    pub fn not_applicable(target: String) -> Self {
+    /// The text after `Domain:` in the pane and in `--no-tui` output.
+    pub fn domain_label(&self) -> String {
+        match &self.suffix_list_error {
+            Some(error) => format!("{} (suffix list unavailable: {})", self.queried_domain, error),
+            None if self.queried_domain != self.domain => {
+                format!("{} (from {})", self.queried_domain, self.domain)
+            }
+            None => self.queried_domain.clone(),
+        }
+    }
+
+    /// Nothing to look up: an IP target (GEOIP carries its ISP and ASN), or a host with no
+    /// registrable domain.
+    pub fn not_applicable(target: String, reason: NotApplicableReason) -> Self {
         Self {
+            queried_domain: target.clone(),
             domain: target,
+            suffix_list_error: None,
             registration_date: None,
             expiry_date: None,
             last_updated: None,
@@ -800,7 +931,7 @@ impl WhoisResult {
             domain_age_days: None,
             expires_in_days: None,
             risk_indicators: Vec::new(),
-            data_source: DataSource::NotApplicable,
+            data_source: DataSource::NotApplicable(reason),
             scan_duration: Duration::ZERO,
             raw_data: None,
         }
@@ -845,9 +976,26 @@ pub enum RiskIndicator {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataSource {
-    Rdap,          // Modern RDAP protocol
-    Whois,         // Traditional WHOIS protocol
-    NotApplicable, // IP target: no domain to look up
+    Rdap,                               // Modern RDAP protocol
+    Whois,                              // Traditional WHOIS protocol
+    NotApplicable(NotApplicableReason), // No domain to look up
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum NotApplicableReason {
+    IpTarget,
+    /// `localhost`, a bare public suffix, or a name that is not a domain name.
+    NoRegistrableDomain,
+}
+
+impl std::fmt::Display for NotApplicableReason {
+    /// The reason the WHOIS pane and `--no-tui` print in gray.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotApplicableReason::IpTarget => write!(f, "n/a for IP targets (see GEOIP)"),
+            NotApplicableReason::NoRegistrableDomain => write!(f, "no registrable domain"),
+        }
+    }
 }
 
 impl std::fmt::Display for DataSource {
@@ -856,7 +1004,7 @@ impl std::fmt::Display for DataSource {
         match self {
             DataSource::Rdap => write!(f, "RDAP"),
             DataSource::Whois => write!(f, "WHOIS"),
-            DataSource::NotApplicable => write!(f, "n/a"),
+            DataSource::NotApplicable(_) => write!(f, "n/a"),
         }
     }
 }
@@ -919,6 +1067,49 @@ async fn connect_whois_server(server: &str) -> eyre::Result<TcpStream> {
     })
 }
 
+/// `host` as RDAP and WHOIS expect it: lowercase, no trailing dot, punycode when `idna` accepts it.
+fn normalized_host(host: &str) -> String {
+    let host = host.trim_end_matches('.');
+    idna::domain_to_ascii(host).unwrap_or_else(|_| host.to_lowercase())
+}
+
+/// The ICANN section only: the PRIVATE section would make `github.io` a public suffix, so
+/// `foo.github.io` would be its own registrable domain.
+fn parse_suffix_list(text: &str) -> eyre::Result<IcannList> {
+    text.parse::<IcannList>()
+        .map_err(|e| eyre::eyre!("public suffix list does not parse: {}", e))
+}
+
+/// IANA's RDAP bootstrap file (RFC 9224): each service is a list of TLDs and their base URLs.
+#[derive(Debug, Deserialize)]
+struct RdapBootstrap {
+    services: Vec<(Vec<String>, Vec<String>)>,
+}
+
+impl RdapBootstrap {
+    /// The base URL for `tld`, preferring HTTPS, normalized to end in `/`.
+    fn base_url(&self, tld: &str) -> Option<String> {
+        let (_, urls) = self
+            .services
+            .iter()
+            .find(|(tlds, _)| tlds.iter().any(|t| t.eq_ignore_ascii_case(tld)))?;
+        let url = urls
+            .iter()
+            .find(|u| u.starts_with("https://"))
+            .or_else(|| urls.first())?;
+        Some(if url.ends_with('/') { url.clone() } else { format!("{}/", url) })
+    }
+}
+
+fn parse_rdap_bootstrap(text: &str) -> eyre::Result<RdapBootstrap> {
+    let bootstrap: RdapBootstrap =
+        serde_json::from_str(text).map_err(|e| eyre::eyre!("RDAP bootstrap does not parse: {}", e))?;
+    if bootstrap.services.is_empty() {
+        return Err(eyre::eyre!("RDAP bootstrap lists no services"));
+    }
+    Ok(bootstrap)
+}
+
 /// True when some line's key is one `parse_whois_text` reads registration data from.
 fn has_registration_data(text: &str) -> bool {
     text.lines().any(|line| {
@@ -970,6 +1161,7 @@ fn with_whois_port(server: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::testing::{FakeHttp, dead_http_url, temp_dir};
 
     #[test]
     fn deadline_covers_rdap_and_whois_fallback() {
@@ -1029,6 +1221,12 @@ mod tests {
         addr
     }
 
+    /// A WHOIS address nothing listens on, for tests that must never reach the fallback.
+    async fn dead_whois() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
     /// An HTTP proxy that answers every CONNECT with 502, so any HTTPS request through it fails.
     async fn refusing_proxy() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1062,8 +1260,10 @@ mod tests {
         WhoisScanner {
             client: Client::new(),
             iana_server,
+            cache_dir: Some(temp_dir("whois-iana")),
             rdap_timeout: Duration::from_secs(1),
             whois_timeout,
+            ..WhoisScanner::new()
         }
     }
 
@@ -1270,7 +1470,10 @@ mod tests {
     fn data_source_display_is_the_pane_label() {
         assert_eq!(DataSource::Rdap.to_string(), "RDAP");
         assert_eq!(DataSource::Whois.to_string(), "WHOIS");
-        assert_eq!(DataSource::NotApplicable.to_string(), "n/a");
+        assert_eq!(
+            DataSource::NotApplicable(NotApplicableReason::IpTarget).to_string(),
+            "n/a"
+        );
     }
 
     /// AC5: RDAP fails (its only route is a proxy that refuses CONNECT), the scanner falls back to
@@ -1298,8 +1501,10 @@ mod tests {
         let scanner = WhoisScanner {
             client,
             iana_server: iana,
+            cache_dir: Some(temp_dir("whois-proxy")),
             rdap_timeout: Duration::from_secs(5),
             whois_timeout: Duration::from_secs(5),
+            ..WhoisScanner::new()
         };
         let target = Target::parse("example.test").unwrap();
 
@@ -1342,8 +1547,10 @@ mod tests {
         let scanner = WhoisScanner {
             client,
             iana_server: iana,
+            cache_dir: Some(temp_dir("whois-proxy")),
             rdap_timeout: Duration::from_secs(5),
             whois_timeout: Duration::from_secs(5),
+            ..WhoisScanner::new()
         };
         let target = Target::parse("example.test").unwrap();
 
@@ -1377,6 +1584,312 @@ mod tests {
         assert!(printed.contains("❌ WHOIS:"), "{printed}");
     }
 
+    /// ICANN section plus a PRIVATE entry, so a test can tell which section was read.
+    const PSL_FIXTURE: &str = "// ===BEGIN ICANN DOMAINS===\ntv\nuk\nco.uk\nio\ndev\nde\n\
+                               // ===END ICANN DOMAINS===\n// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n\
+                               // ===END PRIVATE DOMAINS===\n";
+
+    const RDAP_FIXTURE: &str = r#"{"events":[{"eventAction":"registration","eventDate":"2001-02-03T00:00:00Z"}],
+        "entities":[{"roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","Fixture Registrar"]]]}]}"#;
+
+    /// A bootstrap naming the fake's `/rdap/` for `.dev` and `.tv`, and no service for `.io`.
+    fn bootstrap_fixture(rdap_base: &str) -> String {
+        format!(r#"{{"services":[[["dev","tv"],["{rdap_base}"]],[["com"],["https://rdap.example/"]]]}}"#)
+    }
+
+    /// A fake serving the suffix list at `/psl`, the bootstrap at `/dns.json`, and RDAP answers
+    /// for `rdap_domains` under `/rdap/`.
+    async fn fake_sources(rdap_domains: &[&str]) -> FakeHttp {
+        let fake = FakeHttp::start(vec![("/psl", 200, PSL_FIXTURE.to_string())]).await;
+        fake.add_route("/dns.json", 200, bootstrap_fixture(&fake.url("/rdap/")));
+        for domain in rdap_domains {
+            fake.add_route(&format!("/rdap/domain/{domain}"), 200, RDAP_FIXTURE.to_string());
+        }
+        fake
+    }
+
+    fn scanner_with_fakes(fake: &FakeHttp, iana_server: String) -> WhoisScanner {
+        WhoisScanner {
+            client: Client::builder().no_proxy().build().unwrap(),
+            iana_server,
+            rdap_bootstrap_url: fake.url("/dns.json"),
+            psl_url: fake.url("/psl"),
+            cache_dir: Some(temp_dir("whois-fakes")),
+            source_fetch_timeout: FETCH_TIMEOUT,
+            rdap_timeout: Duration::from_secs(5),
+            whois_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn render_whois(result: ScanResult) -> String {
+        use crate::tui::WhoisPane;
+        use crate::tui::testing::render_pane;
+        use crate::types::{AppState, ScanState, ScanStatus};
+        let state = AppState::new("target".to_string());
+        state.scanners.insert(
+            "whois".to_string(),
+            ScanState {
+                result: Some(result),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        render_pane(&WhoisPane::new(), &state, 100, 40, false)
+    }
+
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(5)
+    }
+
+    /// Defect #4: the registrable domain under the ICANN section only, from a lowercased,
+    /// punycoded host.
+    #[tokio::test]
+    async fn registrable_domain_is_the_icann_registrable_domain() {
+        let fake = fake_sources(&[]).await;
+        let scanner = scanner_with_fakes(&fake, dead_whois().await);
+        for (host, expected) in [
+            ("www.tatari.tv", "tatari.tv"),
+            ("a.b.co.uk", "b.co.uk"),
+            ("foo.github.io", "github.io"),
+            ("WWW.Tatari.TV.", "tatari.tv"),
+            ("www.bücher.de", "xn--bcher-kva.de"),
+        ] {
+            let domain = scanner.registrable_domain(host, far_deadline()).await.unwrap();
+            assert_eq!(domain.as_deref(), Some(expected), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_without_a_registrable_domain_has_none() {
+        let fake = fake_sources(&[]).await;
+        let scanner = scanner_with_fakes(&fake, dead_whois().await);
+        for host in ["localhost", "co.uk", "tv"] {
+            assert_eq!(
+                scanner.registrable_domain(host, far_deadline()).await.unwrap(),
+                None,
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_registrable_domain_scan_is_not_applicable_and_the_pane_says_why() {
+        let fake = fake_sources(&[]).await;
+        let scanner = scanner_with_fakes(&fake, dead_whois().await);
+        let target = Target::parse("localhost").unwrap();
+
+        let result = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap();
+        let ScanResult::Whois(whois) = &result else {
+            panic!("expected a WHOIS result, got {result:?}");
+        };
+        assert_eq!(
+            whois.data_source,
+            DataSource::NotApplicable(NotApplicableReason::NoRegistrableDomain)
+        );
+        let pane = render_whois(result);
+        assert!(pane.contains("no registrable domain"), "{pane}");
+        assert!(!pane.contains("IP targets"), "{pane}");
+    }
+
+    /// Defect #5: the RDAP base comes from the bootstrap, not a table.
+    #[tokio::test]
+    async fn rdap_base_url_reads_the_bootstrap() {
+        let fake = fake_sources(&[]).await;
+        let scanner = scanner_with_fakes(&fake, dead_whois().await);
+        assert_eq!(
+            scanner.rdap_base_url("dev", far_deadline()).await.unwrap(),
+            Some(fake.url("/rdap/"))
+        );
+        assert_eq!(
+            scanner.rdap_base_url("DEV", far_deadline()).await.unwrap(),
+            Some(fake.url("/rdap/"))
+        );
+        assert_eq!(scanner.rdap_base_url("io", far_deadline()).await.unwrap(), None);
+    }
+
+    #[test]
+    fn rdap_bootstrap_prefers_https_and_ends_the_base_in_a_slash() {
+        let bootstrap = parse_rdap_bootstrap(
+            r#"{"services":[[["xyz"],["http://rdap.example/x","https://rdap.example/x"]],[["abc"],["http://plain.example"]]]}"#,
+        )
+        .unwrap();
+        assert_eq!(bootstrap.base_url("xyz").as_deref(), Some("https://rdap.example/x/"));
+        assert_eq!(bootstrap.base_url("abc").as_deref(), Some("http://plain.example/"));
+        assert_eq!(bootstrap.base_url("nope"), None);
+    }
+
+    #[test]
+    fn rdap_bootstrap_without_services_is_corrupt() {
+        assert!(parse_rdap_bootstrap(r#"{"services":[]}"#).is_err());
+        assert!(parse_rdap_bootstrap("<html>").is_err());
+    }
+
+    #[test]
+    fn suffix_list_without_an_icann_section_is_corrupt() {
+        assert!(parse_suffix_list("<html>captive portal</html>").is_err());
+        assert!(parse_suffix_list(PSL_FIXTURE).is_ok());
+    }
+
+    /// AC1 at the scanner seam: `www.tatari.tv` is looked up as `tatari.tv` over RDAP, and the
+    /// pane names both.
+    #[tokio::test]
+    async fn scan_queries_rdap_for_the_registrable_domain_and_the_pane_shows_both() {
+        let fake = fake_sources(&["tatari.tv"]).await;
+        let scanner = scanner_with_fakes(&fake, dead_whois().await);
+        let target = Target::parse("www.tatari.tv").unwrap();
+
+        let result = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap();
+        let ScanResult::Whois(whois) = &result else {
+            panic!("expected a WHOIS result, got {result:?}");
+        };
+        assert_eq!(whois.domain, "www.tatari.tv");
+        assert_eq!(whois.queried_domain, "tatari.tv");
+        assert_eq!(whois.data_source, DataSource::Rdap);
+        assert_eq!(fake.hits("/rdap/domain/tatari.tv"), 1);
+
+        let pane = render_whois(result);
+        assert!(pane.contains("Domain: tatari.tv (from www.tatari.tv)"), "{pane}");
+        assert!(pane.contains("Source: RDAP"), "{pane}");
+        assert!(pane.contains("Fixture Registrar"), "{pane}");
+    }
+
+    /// A TLD the bootstrap does not list skips RDAP with its reason and still runs WHOIS.
+    #[tokio::test]
+    async fn tld_without_rdap_service_skips_rdap_and_still_runs_whois() {
+        let fake = fake_sources(&[]).await;
+        let (iana, iana_queries) = fake_whois(vec!["domain: IO\n".to_string()]).await;
+        let scanner = scanner_with_fakes(&fake, iana);
+        let target = Target::parse("example.io").unwrap();
+
+        let err = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap_err();
+
+        assert!(
+            err.to_string().starts_with("RDAP: no RDAP service for .io; WHOIS: "),
+            "{err:#}"
+        );
+        assert_eq!(iana_queries.await.unwrap(), vec!["io"]);
+    }
+
+    /// With no suffix list and no cache, the lookup runs on the raw host and says why.
+    #[tokio::test]
+    async fn suffix_list_unavailable_runs_on_the_raw_host_and_says_so() {
+        let fake = fake_sources(&["www.tatari.tv"]).await;
+        let dead_psl = dead_http_url().await;
+        let scanner = WhoisScanner {
+            psl_url: dead_psl.clone(),
+            ..scanner_with_fakes(&fake, dead_whois().await)
+        };
+        let target = Target::parse("www.tatari.tv").unwrap();
+
+        let result = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap();
+        let ScanResult::Whois(whois) = &result else {
+            panic!("expected a WHOIS result, got {result:?}");
+        };
+        assert_eq!(whois.queried_domain, "www.tatari.tv");
+        assert_eq!(whois.data_source, DataSource::Rdap);
+        let error = whois.suffix_list_error.as_deref().unwrap_or_default();
+        assert!(error.contains(&dead_psl), "{error}");
+
+        let pane = render_whois(result);
+        assert!(
+            pane.contains("Domain: www.tatari.tv (suffix list unavailable: "),
+            "{pane}"
+        );
+    }
+
+    /// Both files are cached: a second scan within 24h fetches neither.
+    #[tokio::test]
+    async fn second_lookup_within_24h_makes_no_fetch() {
+        let fake = fake_sources(&["tatari.tv"]).await;
+        let scanner = scanner_with_fakes(&fake, dead_whois().await);
+        let target = Target::parse("www.tatari.tv").unwrap();
+
+        for _ in 0..2 {
+            Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap();
+        }
+
+        assert_eq!(fake.hits("/psl"), 1);
+        assert_eq!(fake.hits("/dns.json"), 1);
+        assert_eq!(fake.hits("/rdap/domain/tatari.tv"), 2);
+        let cache_dir = scanner.cache_dir.as_ref().unwrap();
+        assert!(cache_dir.join(PSL_CACHE_FILE).exists());
+        assert!(cache_dir.join(RDAP_BOOTSTRAP_CACHE_FILE).exists());
+    }
+
+    /// A cold-cache fetch that hangs spends the RDAP budget, not time on top of it, so the scan
+    /// still ends inside `deadline()`.
+    #[tokio::test]
+    async fn cold_cache_fetch_counts_against_the_rdap_budget() {
+        let silent = crate::scan::testing::silent_http_url().await;
+        let (iana, _) = fake_whois(vec!["domain: TV\n".to_string()]).await;
+        let scanner = WhoisScanner {
+            client: Client::builder().no_proxy().build().unwrap(),
+            iana_server: iana,
+            rdap_bootstrap_url: silent.clone(),
+            psl_url: silent,
+            cache_dir: Some(temp_dir("whois-budget")),
+            source_fetch_timeout: FETCH_TIMEOUT,
+            rdap_timeout: Duration::from_millis(400),
+            whois_timeout: Duration::from_secs(2),
+        };
+        let target = Target::parse("www.tatari.tv").unwrap();
+        let started = Instant::now();
+
+        let err = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().starts_with("RDAP: "), "{err:#}");
+    }
+
+    /// A hung bootstrap fetch on a cold cache gives up at the per-fetch limit, well inside the RDAP
+    /// budget, and the WHOIS fallback still runs. Scaled down: 300ms limit inside a 3s budget.
+    #[tokio::test]
+    async fn hung_bootstrap_fetch_gives_up_at_the_fetch_limit_and_whois_still_runs() {
+        let fake = fake_sources(&["tatari.tv"]).await;
+        let silent = crate::scan::testing::silent_http_url().await;
+        let (iana, iana_queries) = fake_whois(vec!["domain: TV\n".to_string()]).await;
+        let scanner = WhoisScanner {
+            rdap_bootstrap_url: silent,
+            source_fetch_timeout: Duration::from_millis(300),
+            rdap_timeout: Duration::from_secs(3),
+            ..scanner_with_fakes(&fake, iana)
+        };
+        let target = Target::parse("www.tatari.tv").unwrap();
+        let started = Instant::now();
+
+        let err = Scanner::scan(&scanner, &target, Protocol::Both).await.unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "took {:?}",
+            started.elapsed()
+        );
+        let message = err.to_string();
+        assert!(message.starts_with("RDAP: RDAP bootstrap unavailable: "), "{message}");
+        assert!(message.contains("timed out after 300ms"), "{message}");
+        assert_eq!(iana_queries.await.unwrap(), vec!["tv"]);
+    }
+
+    #[test]
+    fn domain_label_names_the_source_of_the_queried_domain() {
+        let mut result = WhoisResult::not_applicable("www.tatari.tv".to_string(), NotApplicableReason::IpTarget);
+        result.queried_domain = "tatari.tv".to_string();
+        assert_eq!(result.domain_label(), "tatari.tv (from www.tatari.tv)");
+        result.queried_domain = "www.tatari.tv".to_string();
+        assert_eq!(result.domain_label(), "www.tatari.tv");
+        result.suffix_list_error = Some("refused".to_string());
+        assert_eq!(
+            result.domain_label(),
+            "www.tatari.tv (suffix list unavailable: refused)"
+        );
+    }
+
     #[test]
     fn whois_ignores_protocol_changes() {
         assert!(!WhoisScanner::new().uses_protocol());
@@ -1396,6 +1909,8 @@ mod tests {
         // Test open privacy (has contact info)
         let mut result = WhoisResult {
             domain: "test.com".to_string(),
+            queried_domain: "test.com".to_string(),
+            suffix_list_error: None,
             registration_date: None,
             expiry_date: None,
             last_updated: None,
@@ -1456,6 +1971,8 @@ mod tests {
 
         let result = WhoisResult {
             domain: "test.com".to_string(),
+            queried_domain: "test.com".to_string(),
+            suffix_list_error: None,
             registration_date: Some(Utc::now() - chrono::Duration::days(15)), // Recent registration
             expiry_date: Some(Utc::now() + chrono::Duration::days(15)),       // Near expiry
             last_updated: None,
@@ -1485,20 +2002,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rdap_endpoint_selection() {
-        let scanner = WhoisScanner::new();
-
-        assert!(scanner.get_rdap_endpoint("com", "example.com").contains("verisign"));
-        assert!(
-            scanner
-                .get_rdap_endpoint("org", "example.org")
-                .contains("publicinterestregistry")
-        );
-        assert!(scanner.get_rdap_endpoint("tv", "example.tv").contains("nic.tv"));
-        assert!(scanner.get_rdap_endpoint("xyz", "example.xyz").contains("iana.org"));
-    }
-
-    #[test]
     fn test_whois_date_parsing() {
         let scanner = WhoisScanner::new();
 
@@ -1508,20 +2011,6 @@ mod tests {
         assert!(scanner.parse_whois_date("2023-01-15").is_some());
         assert!(scanner.parse_whois_date("15-Jan-2023").is_some());
         assert!(scanner.parse_whois_date("invalid-date").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_rdap_endpoint() {
-        let scanner = WhoisScanner::new();
-
-        let com_endpoint = scanner.get_rdap_endpoint("com", "google.com");
-        assert!(com_endpoint.contains("verisign.com"));
-
-        let tv_endpoint = scanner.get_rdap_endpoint("tv", "example.tv");
-        assert!(tv_endpoint.contains("nic.tv"));
-
-        let unknown_endpoint = scanner.get_rdap_endpoint("unknown", "example.unknown");
-        assert!(unknown_endpoint.contains("iana.org"));
     }
 
     #[test]
@@ -1580,6 +2069,8 @@ mod tests {
         let scanner = WhoisScanner::new();
         let mut result = WhoisResult {
             domain: "example.com".to_string(),
+            queried_domain: "example.com".to_string(),
+            suffix_list_error: None,
             registration_date: Some(chrono::Utc::now() - chrono::Duration::days(365)),
             expiry_date: Some(chrono::Utc::now() + chrono::Duration::days(365)),
             last_updated: Some(chrono::Utc::now() - chrono::Duration::days(30)),
@@ -1611,12 +2102,16 @@ mod tests {
 
     #[test]
     fn test_data_source_types() {
-        let sources = [DataSource::Rdap, DataSource::Whois, DataSource::NotApplicable];
+        let sources = [
+            DataSource::Rdap,
+            DataSource::Whois,
+            DataSource::NotApplicable(NotApplicableReason::IpTarget),
+        ];
 
         assert_eq!(sources.len(), 3);
         assert!(matches!(sources[0], DataSource::Rdap));
         assert!(matches!(sources[1], DataSource::Whois));
-        assert!(matches!(sources[2], DataSource::NotApplicable));
+        assert!(matches!(sources[2], DataSource::NotApplicable(_)));
     }
 
     #[test]
@@ -1626,6 +2121,8 @@ mod tests {
         // Create a result with multiple risk factors
         let result = WhoisResult {
             domain: "suspicious.com".to_string(),
+            queried_domain: "suspicious.com".to_string(),
+            suffix_list_error: None,
             registration_date: Some(chrono::Utc::now() - chrono::Duration::days(5)), // Very recent
             expiry_date: Some(chrono::Utc::now() + chrono::Duration::days(10)),      // Soon expiring
             last_updated: Some(chrono::Utc::now() - chrono::Duration::days(1)),
@@ -1704,7 +2201,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_whois_scanner_timeout() {
-        let scanner = WhoisScanner::new();
+        let scanner = WhoisScanner {
+            cache_dir: Some(temp_dir("whois-timeout")),
+            ..WhoisScanner::new()
+        };
         let target = Target::parse("nonexistent-domain-12345.test").unwrap();
 
         let result = scanner.scan(&target, Protocol::Both).await;
@@ -1712,7 +2212,7 @@ mod tests {
         // Should handle timeout gracefully
         match result {
             Ok(ScanResult::Whois(whois_result)) => {
-                assert_ne!(whois_result.data_source, DataSource::NotApplicable);
+                assert!(!matches!(whois_result.data_source, DataSource::NotApplicable(_)));
             }
             Ok(_) => panic!("Expected Whois result"),
             Err(_) => {
@@ -1728,6 +2228,8 @@ mod tests {
         // Test with mixed information
         let mixed_result = WhoisResult {
             domain: "mixed.com".to_string(),
+            queried_domain: "mixed.com".to_string(),
+            suffix_list_error: None,
             registration_date: None,
             expiry_date: None,
             last_updated: None,
@@ -1777,7 +2279,10 @@ mod tests {
         let target = Target::parse("1.1.1.1").unwrap();
         match scanner.scan(&target, Protocol::Both).await {
             Ok(ScanResult::Whois(result)) => {
-                assert_eq!(result.data_source, DataSource::NotApplicable);
+                assert_eq!(
+                    result.data_source,
+                    DataSource::NotApplicable(NotApplicableReason::IpTarget)
+                );
                 assert_eq!(result.domain, "1.1.1.1");
                 assert!(result.risk_indicators.is_empty());
             }

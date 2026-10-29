@@ -11,7 +11,6 @@ const MAX_PORTS_DISPLAY: usize = 4;
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 3600;
 const SEPARATOR_WIDTH: usize = 80;
-const WHOIS_NOT_APPLICABLE_TEXT: &str = "n/a for IP targets (see GEOIP)";
 
 /// What a finished result says about its target, which picks the line's icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +209,7 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
 
         ScanResult::Whois(whois) => {
             match &whois.data_source {
-                DataSource::NotApplicable => return (Outcome::NotApplicable, WHOIS_NOT_APPLICABLE_TEXT.to_string()),
+                DataSource::NotApplicable(reason) => return (Outcome::NotApplicable, reason.to_string()),
                 DataSource::Rdap | DataSource::Whois => {}
             }
             let age_str = whois
@@ -254,7 +253,9 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
             (
                 Outcome::Ok,
                 format!(
-                    "{}, {}, {:?} privacy, {} ({}ms{})",
+                    "{} via {}: {}, {}, {:?} privacy, {} ({}ms{})",
+                    whois.domain_label(),
+                    whois.data_source,
                     age_str,
                     expiry_str,
                     whois.privacy_score,
@@ -501,7 +502,7 @@ mod tests {
         CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade as HttpSecurityGrade, SecurityHeaders,
     };
     use crate::scan::ping::{PingFailure, PingResult, PingStatus};
-    use crate::scan::whois::WhoisResult;
+    use crate::scan::whois::{NotApplicableReason, WhoisResult};
     use std::collections::VecDeque;
     use std::time::Instant;
 
@@ -585,8 +586,38 @@ mod tests {
     }
 
     #[test]
+    fn whois_prints_the_queried_domain_and_its_source() {
+        use crate::scan::whois::DataSource;
+        let mut whois = WhoisResult::not_applicable("www.tatari.tv".to_string(), NotApplicableReason::IpTarget);
+        whois.queried_domain = "tatari.tv".to_string();
+        whois.data_source = DataSource::Rdap;
+        let out = format_scan_state(
+            "whois",
+            &state(ScanStatus::Complete, Some(ScanResult::Whois(whois)), None),
+        );
+        assert!(
+            out.starts_with("✅ WHOIS: tatari.tv (from www.tatari.tv) via RDAP: "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn whois_no_registrable_domain_prints_the_reason() {
+        let result = ScanResult::Whois(WhoisResult::not_applicable(
+            "localhost".to_string(),
+            NotApplicableReason::NoRegistrableDomain,
+        ));
+        let out = format_scan_state("whois", &state(ScanStatus::Complete, Some(result), None));
+        assert!(out.contains("no registrable domain"), "{out}");
+        assert!(!out.contains('✅'), "{out}");
+    }
+
+    #[test]
     fn whois_not_applicable_prints_neutral() {
-        let result = ScanResult::Whois(WhoisResult::not_applicable("192.0.2.1".to_string()));
+        let result = ScanResult::Whois(WhoisResult::not_applicable(
+            "192.0.2.1".to_string(),
+            NotApplicableReason::IpTarget,
+        ));
         let out = format_scan_state("whois", &state(ScanStatus::Complete, Some(result), None));
         assert!(out.contains("n/a"), "{out}");
         assert!(!out.contains('✅'), "n/a printed as a successful lookup: {out}");

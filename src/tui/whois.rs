@@ -15,7 +15,6 @@ const EXPIRY_WARNING_DAYS: i64 = 30;
 const EXPIRY_CAUTION_DAYS: i64 = 90;
 const MIN_WHOIS_PANE_WIDTH: u16 = 35;
 const MIN_WHOIS_PANE_HEIGHT: u16 = 16;
-const NOT_APPLICABLE_TEXT: &str = "n/a for IP targets (see GEOIP)";
 
 /// WHOIS pane displays domain registration and ownership information
 pub struct WhoisPane {
@@ -78,7 +77,7 @@ impl Pane for WhoisPane {
             ]);
 
             if let Some(ScanResult::Whois(whois_result)) = &whois_state.result
-                && whois_result.data_source == DataSource::NotApplicable
+                && let DataSource::NotApplicable(reason) = &whois_result.data_source
             {
                 // Nothing was retrieved, so the header must not claim it was.
                 lines[0] = Line::from(vec![
@@ -91,13 +90,13 @@ impl Pane for WhoisPane {
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                    Span::styled(NOT_APPLICABLE_TEXT, Style::default().fg(Color::Gray)),
+                    Span::styled(reason.to_string(), Style::default().fg(Color::Gray)),
                 ]));
             } else if let Some(ScanResult::Whois(whois_result)) = &whois_state.result {
                 // Domain name
                 lines.push(Line::from(vec![
                     Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                    Span::styled(whois_result.domain.clone(), Style::default().fg(Color::Cyan)),
+                    Span::styled(whois_result.domain_label(), Style::default().fg(Color::Cyan)),
                 ]));
 
                 // Registrar
@@ -223,7 +222,7 @@ impl Pane for WhoisPane {
                 let source_color = match &whois_result.data_source {
                     crate::scan::whois::DataSource::Rdap => Color::Green,
                     crate::scan::whois::DataSource::Whois => Color::Yellow,
-                    crate::scan::whois::DataSource::NotApplicable => Color::Gray,
+                    crate::scan::whois::DataSource::NotApplicable(_) => Color::Gray,
                 };
 
                 lines.push(Line::from(vec![
@@ -328,9 +327,12 @@ mod tests {
 
     #[test]
     fn ip_target_renders_not_applicable_not_failure() {
-        use crate::scan::whois::WhoisResult;
+        use crate::scan::whois::{NotApplicableReason, WhoisResult};
         use crate::tui::testing::render_pane;
-        let state = state_with_whois(WhoisResult::not_applicable("1.1.1.1".to_string()));
+        let state = state_with_whois(WhoisResult::not_applicable(
+            "1.1.1.1".to_string(),
+            NotApplicableReason::IpTarget,
+        ));
         let out = render_pane(&WhoisPane::new(), &state, 60, 16, false);
         assert!(out.contains("n/a for IP targets (see GEOIP)"), "{}", out);
         assert!(out.contains("1.1.1.1"), "{}", out);
