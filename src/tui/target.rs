@@ -14,6 +14,8 @@ const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * 60; // 3600
 const MIN_TARGET_PANE_WIDTH: u16 = 25;
 const MIN_TARGET_PANE_HEIGHT: u16 = 12;
+/// Display order of the scanner rows, matching `create_default_scanners`.
+const SCANNER_DISPLAY_ORDER: [&str; 8] = ["ping", "dns", "tls", "http", "whois", "traceroute", "geoip", "port"];
 
 /// TARGET pane displays basic target information and scanner status overview
 pub struct TargetPane {
@@ -53,6 +55,47 @@ impl TargetPane {
             ScanStatus::Complete => ("✅", Color::Green),
             ScanStatus::Failed => ("❌", Color::Red),
         }
+    }
+
+    /// Scanner keys in the fixed display order; unknown keys follow, sorted.
+    /// DashMap iteration order is arbitrary, so rows would reshuffle every redraw without this.
+    fn ordered_scanner_keys(state: &AppState) -> Vec<String> {
+        let mut keys: Vec<String> = SCANNER_DISPLAY_ORDER
+            .iter()
+            .filter(|name| state.scanners.contains_key(**name))
+            .map(|name| name.to_string())
+            .collect();
+        let mut extra: Vec<String> = state
+            .scanners
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|key| !SCANNER_DISPLAY_ORDER.contains(&key.as_str()))
+            .collect();
+        extra.sort();
+        keys.extend(extra);
+        keys
+    }
+
+    fn summary_color(running: usize, failed: usize) -> Style {
+        if failed > 0 {
+            Style::default().fg(Color::Red)
+        } else if running > 0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
+        }
+    }
+
+    /// One-line stand-in for the scanner list, e.g. `6/8 ✅ 1 🔄 1 ❌`.
+    fn collapsed_summary(total: usize, running: usize, complete: usize, failed: usize) -> String {
+        let mut summary = format!("{}/{} ✅", complete, total);
+        if running > 0 {
+            summary.push_str(&format!(" {} 🔄", running));
+        }
+        if failed > 0 {
+            summary.push_str(&format!(" {} ❌", failed));
+        }
+        summary
     }
 
     /// Calculate scanner statistics
@@ -393,39 +436,44 @@ impl Pane for TargetPane {
             }
         }
 
-        // Empty line for spacing
-        lines.push(Line::from(""));
-
-        // Scanner statistics
         let (total, running, complete, failed) = Self::calculate_stats(state);
+        let rows = inner_area.height as usize;
+        let ordered = Self::ordered_scanner_keys(state);
 
-        lines.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::White)),
-            Span::styled(
-                format!("{}/{} scanners", complete, total),
-                if failed > 0 {
-                    Style::default().fg(Color::Red)
-                } else if running > 0 {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Green)
-                },
-            ),
-        ]));
-
-        // Show all scanner statuses
-        for scanner in state.scanners.iter() {
-            let (icon, color) = Self::status_icon_and_color(&scanner.status);
-            let elapsed = scanner.last_updated.elapsed();
-
+        // Spacer + Status line + one row per scanner must all fit, otherwise show the
+        // one-line summary: a clipped list would silently hide scanners.
+        let full_list_rows = lines.len() + 2 + ordered.len();
+        if full_list_rows <= rows {
+            lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled(format!("{} ", icon), Style::default().fg(color)),
+                Span::styled("Status: ", Style::default().fg(Color::White)),
                 Span::styled(
-                    format!("{}: ", scanner.key().to_uppercase()),
-                    Style::default().fg(Color::White),
+                    format!("{}/{} scanners", complete, total),
+                    Self::summary_color(running, failed),
                 ),
-                Span::styled(Self::format_elapsed(elapsed), Style::default().fg(Color::Gray)),
             ]));
+
+            for key in &ordered {
+                if let Some(scanner) = state.scanners.get(key) {
+                    let (icon, color) = Self::status_icon_and_color(&scanner.status);
+                    let elapsed = scanner.last_updated.elapsed();
+
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{} ", icon), Style::default().fg(color)),
+                        Span::styled(format!("{}: ", key.to_uppercase()), Style::default().fg(Color::White)),
+                        Span::styled(Self::format_elapsed(elapsed), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+            }
+        } else {
+            // The summary outranks the protocol hint when rows are scarce.
+            if lines.len() + 1 > rows && lines.len() > 2 {
+                lines.remove(1);
+            }
+            lines.push(Line::from(Span::styled(
+                Self::collapsed_summary(total, running, complete, failed),
+                Self::summary_color(running, failed),
+            )));
         }
 
         log::trace!(
@@ -550,5 +598,81 @@ mod tests {
         assert_eq!(running, 1);
         assert_eq!(complete, 1);
         assert_eq!(failed, 1);
+    }
+
+    fn state_with_scanners(names: &[&str], status: ScanStatus) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        for name in names {
+            state.scanners.insert(
+                name.to_string(),
+                ScanState {
+                    result: None,
+                    error: None,
+                    status: status.clone(),
+                    last_updated: Instant::now(),
+                    history: Default::default(),
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn test_full_list_uses_constant_order() {
+        use crate::tui::testing::render_pane;
+        // Inserted in reverse so map order cannot match the constant by accident.
+        let mut names = SCANNER_DISPLAY_ORDER.to_vec();
+        names.reverse();
+        let state = state_with_scanners(&names, ScanStatus::Complete);
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        let positions: Vec<usize> = SCANNER_DISPLAY_ORDER
+            .iter()
+            .map(|n| {
+                out.find(&format!("{}:", n.to_uppercase()))
+                    .unwrap_or_else(|| panic!("{} missing:\n{}", n, out))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "order wrong:\n{}", out);
+    }
+
+    #[test]
+    fn test_short_pane_collapses_never_clips_subset() {
+        use crate::tui::testing::render_pane;
+        let state = state_with_scanners(&SCANNER_DISPLAY_ORDER, ScanStatus::Complete);
+        // 6 rows is the 25% top row of a 24-row terminal; inner height is 4.
+        for height in [6u16, 8, 10, 12] {
+            let out = render_pane(&TargetPane::new(), &state, 40, height, false);
+            assert!(out.contains("8/8 ✅"), "no summary at height {}:\n{}", height, out);
+            assert!(
+                !SCANNER_DISPLAY_ORDER
+                    .iter()
+                    .any(|n| out.contains(&format!("{}:", n.to_uppercase()))),
+                "partial scanner list at height {}:\n{}",
+                height,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn test_tall_pane_shows_every_scanner_and_no_summary() {
+        use crate::tui::testing::render_pane;
+        let state = state_with_scanners(&SCANNER_DISPLAY_ORDER, ScanStatus::Complete);
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        for n in SCANNER_DISPLAY_ORDER {
+            assert!(
+                out.contains(&format!("{}:", n.to_uppercase())),
+                "{} missing:\n{}",
+                n,
+                out
+            );
+        }
+        assert!(!out.contains("8/8 ✅"));
+    }
+
+    #[test]
+    fn test_collapsed_summary_counts() {
+        assert_eq!(TargetPane::collapsed_summary(8, 0, 8, 0), "8/8 ✅");
+        assert_eq!(TargetPane::collapsed_summary(8, 1, 6, 1), "6/8 ✅ 1 🔄 1 ❌");
     }
 }

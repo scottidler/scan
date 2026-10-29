@@ -169,6 +169,32 @@ impl DnsResult {
         }
     }
 
+    /// Sort every record set so resolver answer order (round-robin, shuffling) never
+    /// changes what the pane shows between scans.
+    pub fn sort_records(&mut self) {
+        self.A.sort_by_key(|r| r.value);
+        self.AAAA.sort_by_key(|r| r.value);
+        self.CNAME.sort_by(|a, b| a.value.cmp(&b.value));
+        self.NS.sort_by(|a, b| a.value.cmp(&b.value));
+        self.TXT.sort_by(|a, b| a.value.cmp(&b.value));
+        self.PTR.sort_by(|a, b| a.value.cmp(&b.value));
+        self.CAA.sort_by(|a, b| {
+            (&a.value.tag, &a.value.value, a.value.flags).cmp(&(&b.value.tag, &b.value.value, b.value.flags))
+        });
+        self.MX
+            .sort_by(|a, b| (a.value.priority, &a.value.exchange).cmp(&(b.value.priority, &b.value.exchange)));
+        self.SOA
+            .sort_by(|a, b| (&a.value.primary_ns, a.value.serial).cmp(&(&b.value.primary_ns, b.value.serial)));
+        self.SRV.sort_by(|a, b| {
+            (a.value.priority, a.value.weight, a.value.port, &a.value.target).cmp(&(
+                b.value.priority,
+                b.value.weight,
+                b.value.port,
+                &b.value.target,
+            ))
+        });
+    }
+
     pub fn update_ttls(&mut self) {
         // TTL updates are handled individually when querying since each record
         // type can have different TTLs and query times
@@ -739,6 +765,7 @@ impl DnsScanner {
             };
         }
 
+        result.sort_records();
         result.response_time = start_time.elapsed();
         result.queried_at = start_time;
 
@@ -811,6 +838,49 @@ impl Scanner for DnsScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sort_records_is_order_independent() {
+        let ns = |names: &[&str]| -> DnsResult {
+            let mut r = DnsResult::new();
+            for n in names {
+                r.NS.push(DnsRecord::new(n.to_string(), 300));
+            }
+            r.A.push(DnsRecord::new(Ipv4Addr::new(9, 9, 9, 9), 60));
+            r.A.push(DnsRecord::new(Ipv4Addr::new(1, 1, 1, 1), 60));
+            r.sort_records();
+            r
+        };
+        let one = ns(&["b.ns.example.", "a.ns.example.", "c.ns.example."]);
+        let two = ns(&["c.ns.example.", "b.ns.example.", "a.ns.example."]);
+        let values = |r: &DnsResult| r.NS.iter().map(|x| x.value.clone()).collect::<Vec<_>>();
+        assert_eq!(values(&one), values(&two));
+        assert_eq!(values(&one), vec!["a.ns.example.", "b.ns.example.", "c.ns.example."]);
+        assert_eq!(one.A[0].value, Ipv4Addr::new(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn test_sort_records_mx_by_priority() {
+        let mut r = DnsResult::new();
+        for (p, e) in [(20, "b."), (10, "z."), (10, "a.")] {
+            r.MX.push(DnsRecord::new(
+                MxRecord {
+                    priority: p,
+                    exchange: e.to_string(),
+                },
+                60,
+            ));
+        }
+        r.sort_records();
+        let got: Vec<_> =
+            r.MX.iter()
+                .map(|m| (m.value.priority, m.value.exchange.clone()))
+                .collect();
+        assert_eq!(
+            got,
+            vec![(10, "a.".to_string()), (10, "z.".to_string()), (20, "b.".to_string())]
+        );
+    }
 
     #[test]
     fn test_dns_record_ttl() {

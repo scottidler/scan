@@ -124,9 +124,15 @@ impl Default for TracerouteScanner {
 
 impl TracerouteScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::traceroute] new: interval=120s timeout=30s max_hops=20 probes_per_hop=3");
+        log::debug!(
+            "[scan::traceroute] new: interval={}s timeout={}s max_hops={} probes_per_hop={}",
+            TRACEROUTE_INTERVAL_SECS,
+            TRACEROUTE_TIMEOUT_SECS,
+            MAX_TRACEROUTE_HOPS,
+            PROBES_PER_HOP
+        );
         Self {
-            interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS), // 2 minutes
+            interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS),
             timeout: Duration::from_secs(TRACEROUTE_TIMEOUT_SECS),
             max_hops: MAX_TRACEROUTE_HOPS,
             probes_per_hop: PROBES_PER_HOP,
@@ -302,10 +308,7 @@ impl TracerouteScanner {
                 total_hops = hop.hop_number;
 
                 // Check if this hop reached the destination
-                if let Some(response) = hop.responses.first()
-                    && let Some(ip) = response.ip_address
-                    && ip == target_ip
-                {
+                if hop.responses.iter().any(|r| r.ip_address == Some(target_ip)) {
                     destination_reached = true;
                 }
 
@@ -613,6 +616,29 @@ mod tests {
         assert_eq!(scanner.name(), "traceroute");
         assert_eq!(scanner.max_hops, MAX_TRACEROUTE_HOPS);
         assert_eq!(scanner.probes_per_hop, PROBES_PER_HOP);
+    }
+
+    #[test]
+    fn test_parse_marks_reached_when_target_not_first_response() {
+        let scanner = TracerouteScanner::new();
+        let target = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let out = "traceroute to 1.1.1.1 (1.1.1.1), 30 hops max\n 1  192.168.1.1  1.0 ms  1.1 ms  1.2 ms\n 2  *  1.1.1.1  12.3 ms  1.1.1.1  12.5 ms\n";
+        let data = scanner
+            .parse_traceroute_output(out, target, false, Duration::from_secs(1))
+            .unwrap();
+        assert!(data.destination_reached);
+    }
+
+    #[test]
+    fn test_parse_not_reached_when_target_absent() {
+        let scanner = TracerouteScanner::new();
+        let target = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let out =
+            "traceroute to 1.1.1.1 (1.1.1.1), 30 hops max\n 1  192.168.1.1  1.0 ms  1.1 ms  1.2 ms\n 2  *  *  *\n";
+        let data = scanner
+            .parse_traceroute_output(out, target, false, Duration::from_secs(1))
+            .unwrap();
+        assert!(!data.destination_reached);
     }
 
     #[test]

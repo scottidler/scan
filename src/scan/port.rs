@@ -391,9 +391,16 @@ impl PortScanner {
     }
 
     async fn grab_banner(&self, stream: &mut TcpStream, port: u16) -> Option<String> {
+        if is_tls_port(port) {
+            log::debug!(
+                "[scan::port] grab_banner: port={} tls_port=true skipping plaintext probe",
+                port
+            );
+            return None;
+        }
         match port {
-            21 | 22 | 25 | 110 | 143 | 220 | 993 | 995 => self.read_banner(stream).await,
-            80 | 443 | 8080 | 8443 => self.grab_http_banner(stream).await,
+            21 | 22 | 25 | 110 | 143 | 220 => self.read_banner(stream).await,
+            80 | 8080 => self.grab_http_banner(stream).await,
             _ => {
                 if let Some(banner) = self.read_banner(stream).await {
                     Some(banner)
@@ -446,6 +453,14 @@ impl PortScanner {
     }
 }
 
+/// Ports that speak TLS from the first byte; a plaintext probe gets an error response
+/// (e.g. Cloudflare's 400) that would be misread as the service identity.
+const TLS_PORTS: [u16; 5] = [443, 8443, 993, 995, 465];
+
+fn is_tls_port(port: u16) -> bool {
+    TLS_PORTS.contains(&port)
+}
+
 fn get_service_name(port: u16) -> String {
     match port {
         21 => "ftp".to_string(),
@@ -457,6 +472,8 @@ fn get_service_name(port: u16) -> String {
         110 => "pop3".to_string(),
         143 => "imap".to_string(),
         443 => "https".to_string(),
+        465 => "smtps".to_string(),
+        8443 => "https-alt".to_string(),
         993 => "imaps".to_string(),
         995 => "pop3s".to_string(),
         3389 => "rdp".to_string(),
@@ -738,6 +755,61 @@ mod tests {
         assert_eq!(get_service_name(80), "http");
         assert_eq!(get_service_name(443), "https");
         assert_eq!(get_service_name(12345), "unknown");
+        assert_eq!(get_service_name(8443), "https-alt");
+        assert_eq!(get_service_name(465), "smtps");
+    }
+
+    #[test]
+    fn test_is_tls_port() {
+        for port in [443, 8443, 993, 995, 465] {
+            assert!(is_tls_port(port), "{} should be a TLS port", port);
+        }
+        for port in [80, 8080, 22, 25, 110, 143] {
+            assert!(!is_tls_port(port), "{} should not be a TLS port", port);
+        }
+    }
+
+    /// Listener that answers any plaintext bytes with a Cloudflare-style 400, like a TLS-only edge.
+    async fn spawn_plaintext_rejecting_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nServer: cloudflare\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_tls_port_never_sends_plaintext_and_keeps_port_name() {
+        let (addr, _handle) = spawn_plaintext_rejecting_listener().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let scanner = PortScanner::new();
+        // The stream is an ephemeral listener; the port argument is what selects the probe rule.
+        let info = scanner.detect_service(&mut stream, 443).await.unwrap();
+        assert_eq!(info.name, "https");
+        assert!(
+            info.banner.is_none(),
+            "TLS port must not carry a plaintext banner: {:?}",
+            info.banner
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_tls_http_port_still_probes() {
+        let (addr, _handle) = spawn_plaintext_rejecting_listener().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let scanner = PortScanner::new();
+        let info = scanner.detect_service(&mut stream, 8080).await.unwrap();
+        assert!(info.banner.is_some());
     }
 
     #[test]
