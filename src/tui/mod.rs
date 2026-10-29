@@ -9,6 +9,8 @@ pub mod scrollable;
 pub mod security;
 pub mod sparkline;
 pub mod target;
+#[cfg(test)]
+pub mod testing;
 pub mod traceroute;
 pub mod whois;
 

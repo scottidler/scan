@@ -9,6 +9,7 @@ use crate::types::{AppState, ScanResult, ScanState, ScanStatus, TimestampedResul
 
 const DEFAULT_MAX_HISTORY_RESULTS: usize = 10;
 
+#[allow(clippy::double_must_use)] // async_trait expansion trips newer clippy
 #[async_trait]
 pub trait Scanner {
     /// Scanner identifier for state storage
