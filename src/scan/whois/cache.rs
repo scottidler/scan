@@ -14,6 +14,10 @@ pub const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// leaves the rest of the RDAP budget for the RDAP query.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Time the outer timer gives past reqwest's own request timeout, so a hung fetch normally fails
+/// with reqwest's classified error, which names the stage, not the bare outer deadline.
+const FETCH_DEADLINE_GRACE: Duration = Duration::from_secs(1);
+
 /// Distinguishes temp files written by concurrent fetches inside one process.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -58,22 +62,7 @@ impl CachedSource<'_> {
             other => other,
         };
 
-        let limit = self
-            .fetch_timeout
-            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        let started = Instant::now();
-        let fetched = match tokio::time::timeout(limit, self.fetch(limit, started)).await {
-            Ok(fetched) => fetched,
-            Err(_) => {
-                log::warn!(
-                    "[scan::whois::cache] fetch_failed: url={} elapsed={}ms class=deadline limit={:?}",
-                    self.url,
-                    started.elapsed().as_millis(),
-                    limit
-                );
-                Err(eyre::eyre!("{} fetch timed out after {:?}", self.url, limit))
-            }
-        };
+        let fetched = self.bounded_fetch(deadline).await.map_err(|failure| failure.error);
         let refresh_error = match fetched.and_then(|text| parse(&text).map(|value| (text, value))) {
             Ok((text, value)) => {
                 self.write_cache(&text).await;
@@ -159,62 +148,86 @@ impl CachedSource<'_> {
         }
     }
 
-    /// One GET bounded by `limit` (reqwest's request timeout covers connect, TLS and body). A
-    /// failure is logged at WARN with its elapsed time, reqwest's error class and source chain, so
-    /// the log names the stage that failed.
-    async fn fetch(&self, limit: Duration, started: Instant) -> eyre::Result<String> {
-        log::debug!("[scan::whois::cache] fetch: url={} limit={:?}", self.url, limit);
-        let response = match self.client.get(self.url).timeout(limit).send().await {
-            Ok(response) => response,
-            Err(e) => {
-                self.log_fetch_failure(started, &e);
-                return Err(self.fetch_error("fetch failed", limit, &e));
-            }
+    /// One fetch within `deadline`: reqwest's request timeout is the smaller of `fetch_timeout` and
+    /// the time left, and the outer timer gives it `FETCH_DEADLINE_GRACE` more, still capped by the
+    /// time left. A failure is logged at WARN with its elapsed time, class and detail, so the log
+    /// names the stage that failed.
+    async fn bounded_fetch(&self, deadline: tokio::time::Instant) -> Result<String, FetchFailure> {
+        let (limit, window) = fetch_bounds(
+            self.fetch_timeout,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        );
+        log::debug!(
+            "[scan::whois::cache] bounded_fetch: url={} limit={:?} window={:?}",
+            self.url,
+            limit,
+            window
+        );
+        let started = Instant::now();
+        let fetched = match tokio::time::timeout(window, self.fetch(limit)).await {
+            Ok(fetched) => fetched,
+            Err(_) => Err(FetchFailure {
+                class: "deadline".to_string(),
+                detail: format!("window={:?}", window),
+                error: eyre::eyre!("{} fetch timed out after {:?}", self.url, window),
+            }),
         };
-        if !response.status().is_success() {
-            log::warn!(
-                "[scan::whois::cache] fetch_failed: url={} elapsed={}ms class=status status={}",
+        match &fetched {
+            Ok(text) => log::debug!(
+                "[scan::whois::cache] fetch_succeeded: url={} elapsed={}ms bytes={}",
                 self.url,
                 started.elapsed().as_millis(),
-                response.status()
-            );
-            return Err(eyre::eyre!("{} returned {}", self.url, response.status()));
+                text.len()
+            ),
+            Err(failure) => log::warn!(
+                "[scan::whois::cache] fetch_failed: url={} elapsed={}ms class={} {}",
+                self.url,
+                started.elapsed().as_millis(),
+                failure.class,
+                failure.detail
+            ),
         }
-        match response.text().await {
-            Ok(text) => {
-                log::debug!(
-                    "[scan::whois::cache] fetch_succeeded: url={} elapsed={}ms bytes={}",
-                    self.url,
-                    started.elapsed().as_millis(),
-                    text.len()
-                );
-                Ok(text)
-            }
-            Err(e) => {
-                self.log_fetch_failure(started, &e);
-                Err(self.fetch_error("body read failed", limit, &e))
-            }
-        }
+        fetched
     }
 
-    /// A timeout names the limit it hit; anything else carries reqwest's source chain, since
-    /// reqwest's own message ("error sending request") hides the cause.
-    fn fetch_error(&self, what: &str, limit: Duration, error: &reqwest::Error) -> eyre::Report {
-        if error.is_timeout() {
+    /// One GET bounded by `limit` (reqwest's request timeout covers connect, TLS and body).
+    async fn fetch(&self, limit: Duration) -> Result<String, FetchFailure> {
+        log::debug!("[scan::whois::cache] fetch: url={} limit={:?}", self.url, limit);
+        let response = self
+            .client
+            .get(self.url)
+            .timeout(limit)
+            .send()
+            .await
+            .map_err(|e| self.reqwest_failure("fetch failed", limit, &e))?;
+        if !response.status().is_success() {
+            return Err(FetchFailure {
+                class: "status".to_string(),
+                detail: format!("status={}", response.status()),
+                error: eyre::eyre!("{} returned {}", self.url, response.status()),
+            });
+        }
+        response
+            .text()
+            .await
+            .map_err(|e| self.reqwest_failure("body read failed", limit, &e))
+    }
+
+    /// reqwest's error class and source chain for the log; for the caller, a timeout names the
+    /// limit it hit and anything else carries the chain, since reqwest's own message ("error
+    /// sending request") hides the cause.
+    fn reqwest_failure(&self, what: &str, limit: Duration, error: &reqwest::Error) -> FetchFailure {
+        let chain = error_chain(error);
+        let report = if error.is_timeout() {
             eyre::eyre!("{} fetch timed out after {:?}", self.url, limit)
         } else {
-            eyre::eyre!("{} {}: {}", self.url, what, error_chain(error))
+            eyre::eyre!("{} {}: {}", self.url, what, chain)
+        };
+        FetchFailure {
+            class: reqwest_error_class(error),
+            detail: format!("chain={}", chain),
+            error: report,
         }
-    }
-
-    fn log_fetch_failure(&self, started: Instant, error: &reqwest::Error) {
-        log::warn!(
-            "[scan::whois::cache] fetch_failed: url={} elapsed={}ms class={} chain={}",
-            self.url,
-            started.elapsed().as_millis(),
-            reqwest_error_class(error),
-            error_chain(error)
-        );
     }
 
     /// Writes a temp file in the cache dir, then renames it over the cache file, so a concurrent
@@ -248,6 +261,24 @@ impl CachedSource<'_> {
             );
         }
     }
+}
+
+/// reqwest's request timeout and the outer timer for one fetch with `remaining` left on the
+/// deadline: the limit is the smaller of `fetch_timeout` and `remaining`, and the outer timer runs
+/// `FETCH_DEADLINE_GRACE` past it, never past `remaining`.
+fn fetch_bounds(fetch_timeout: Duration, remaining: Duration) -> (Duration, Duration) {
+    let limit = fetch_timeout.min(remaining);
+    (limit, (limit + FETCH_DEADLINE_GRACE).min(remaining))
+}
+
+/// A failed fetch: what the WARN logs, and the error the caller gets.
+struct FetchFailure {
+    /// reqwest's error flags (`connect`, `timeout+request`), `status`, or `deadline` when the outer
+    /// timer fired first.
+    class: String,
+    /// `chain=<reqwest source chain>`, `status=<code>` or `window=<outer timer>`.
+    detail: String,
+    error: eyre::Report,
 }
 
 /// The reqwest error flags that are set, e.g. `connect+timeout`; `other` when none is.
@@ -449,6 +480,74 @@ mod tests {
         assert!(err.to_string().contains("300ms"), "{err:#}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Audit round 1: the outer timer runs `FETCH_DEADLINE_GRACE` past reqwest's own timeout, so a
+    /// hung fetch fails with reqwest's timeout class, which names the stage, not `deadline`.
+    #[tokio::test]
+    async fn a_hung_fetch_fails_with_reqwests_timeout_class_not_the_deadline() {
+        let silent = crate::scan::testing::silent_http_url().await;
+        let dir = temp_dir("cache-fetch-class");
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        let failure = CachedSource {
+            fetch_timeout: Duration::from_millis(300),
+            ..source(&client, &silent, &dir)
+        }
+        .bounded_fetch(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect_err("the server never answers");
+
+        assert!(failure.class.contains("timeout"), "class={}", failure.class);
+        assert!(failure.detail.starts_with("chain="), "detail={}", failure.detail);
+        assert!(
+            failure.error.to_string().contains("timed out after 300ms"),
+            "{:#}",
+            failure.error
+        );
+    }
+
+    /// Audit round 1: the outer timer outlasts reqwest's timeout by the grace when the deadline
+    /// allows, and never outlasts the deadline.
+    #[test]
+    fn the_outer_timer_runs_a_grace_past_the_fetch_limit_within_the_deadline() {
+        let secs = Duration::from_secs;
+        assert_eq!(fetch_bounds(secs(10), secs(30)), (secs(10), secs(11)));
+        assert_eq!(
+            fetch_bounds(secs(10), Duration::from_millis(10_500)),
+            (secs(10), Duration::from_millis(10_500))
+        );
+        assert_eq!(
+            fetch_bounds(secs(10), Duration::from_millis(300)),
+            (Duration::from_millis(300), Duration::from_millis(300))
+        );
+        assert_eq!(fetch_bounds(secs(10), Duration::ZERO), (Duration::ZERO, Duration::ZERO));
+    }
+
+    /// The deadline still caps the outer timer: with less time left than the fetch limit plus the
+    /// grace, the fetch ends at the deadline.
+    #[tokio::test]
+    async fn the_grace_never_runs_past_the_deadline() {
+        let silent = crate::scan::testing::silent_http_url().await;
+        let dir = temp_dir("cache-fetch-grace-capped");
+        let client = Client::builder().no_proxy().build().unwrap();
+        let started = std::time::Instant::now();
+
+        let failure = source(&client, &silent, &dir)
+            .bounded_fetch(tokio::time::Instant::now() + Duration::from_millis(300))
+            .await
+            .expect_err("the server never answers");
+
+        assert!(
+            failure.error.to_string().contains("fetch timed out"),
+            "{:#}",
+            failure.error
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
             "took {:?}",
             started.elapsed()
         );

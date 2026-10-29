@@ -202,6 +202,19 @@ Each phase: one commit, `otto ci` green. Each new test is shown failing with its
   - `fit_line` unit tests cover truncation across spans, width 0, width 1, and a wide glyph at the cut.
   - `Protocol:` lines that fit are unchanged.
 
+#### Phase 9: Implementation audit fixes
+**Model:** opus
+- From implementation audit round 1: two must-fix, two cheap-win.
+- HTTP redirect rows (src/tui/http.rs): `<code> <from> → <to>` on one row when it fits the pane width, the two-row form only when it does not, each row fit.
+- WHOIS total failure (src/scan/whois.rs `scan_whois`): when the suffix list was unavailable and RDAP and WHOIS both fail, the error reads `RDAP: <e>; WHOIS: <e> (suffix list unavailable: <e>)`, so the pane's `failed:` header names it.
+- PSL parse (`parse_suffix_list`): a list without `===BEGIN ICANN DOMAINS===` is corrupt, so it is neither used nor cached, and it is refetched.
+- Fetch diagnostics (`CachedSource::load`, src/scan/whois/cache.rs): the outer timer runs 1s past reqwest's request timeout, still capped by the RDAP deadline, so reqwest's classified error is what normally logs.
+- **Success criteria:**
+  - At the 200x55 HTTP pane size (50x19), the audit's three fixtures (1 redirect and 7 issues, 2 tatari.tv redirects and 5 issues, 4 short redirects and 4 issues) show every issue name, and each redirect sits on one row.
+  - With the PSL fake down, no cache, and RDAP and WHOIS fakes failing, the error keeps its `RDAP: ...; WHOIS: ...` prefix and the pane render contains `suffix list unavailable`.
+  - `parse_suffix_list` on a PRIVATE-only list is an error, and a fetched PRIVATE-only list is not cached.
+  - A hung fetch with the deadline far away fails with reqwest's `timeout` class, not `deadline`, and the outer timer never runs past the deadline.
+
 ## Acceptance Criteria
 
 Live checks run the installed binary: `tui-test run --session ac --cols 200 --rows 55 -- scan <target>`, wait with `tui-test --session ac expect text "zz-never" --timeout 55000` (expected exit 1, used only as a wait; 55s covers the 50s WHOIS deadline), then the check, then `tui-test close --all`.
@@ -236,6 +249,7 @@ Live checks run the installed binary: `tui-test run --session ac --cols 200 --ro
 - 2026-10-29: rejected extra cache-concurrency scaffolding; temp file plus rename already covers it. The panel agreed.
 - 2026-10-29: the compiled-in `psl` crate stays rejected (architect re-raised it). Visible degradation to the raw host covers the cold start, and fetched data keeps the change-frequency rule.
 - 2026-10-29: WHOIS `Source:` renders directly under `Domain:`, so a long NS or status list cannot push it below the pane (AC2 at 200x55). Scott's ruling.
+- 2026-10-29, implementation audit round 1 (Gemini + Codex): 2 must-fix and 2 cheap-win folded in as Phase 9; connect_timeout on RDAP and the OS-agnostic privilege fallback deferred. Synthesis: `~/.cache/review-panel/runs/4HhtOXvO/synthesis.md`.
 
 ## Alternatives Considered
 

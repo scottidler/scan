@@ -170,19 +170,31 @@ impl Pane for HttpPane {
                             ),
                         ]));
 
-                        // One row per URL, so a long source URL cannot push its target off the row.
+                        // One row when it fits: the pane does not scroll, so a second row per
+                        // redirect pushes issue names off the bottom. A redirect too wide for one
+                        // row gets a row per URL, so a long source URL cannot push its target off.
                         for redirect in &primary_data.redirect_chain {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("  {} ", redirect.status_code),
-                                    Style::default().fg(Color::Yellow),
-                                ),
-                                Span::styled(redirect.from.clone(), Style::default().fg(Color::Gray)),
-                            ]));
-                            lines.push(Line::from(vec![
-                                Span::styled("    → ", Style::default().fg(Color::Magenta)),
-                                Span::styled(redirect.to.clone(), Style::default().fg(Color::Cyan)),
-                            ]));
+                            let code = Span::styled(
+                                format!("  {} ", redirect.status_code),
+                                Style::default().fg(Color::Yellow),
+                            );
+                            let from = Span::styled(redirect.from.clone(), Style::default().fg(Color::Gray));
+                            let to = Span::styled(redirect.to.clone(), Style::default().fg(Color::Cyan));
+                            let one_row = Line::from(vec![
+                                code.clone(),
+                                from.clone(),
+                                Span::styled(" → ", Style::default().fg(Color::Magenta)),
+                                to.clone(),
+                            ]);
+                            if one_row.width() <= usize::from(inner_area.width) {
+                                lines.push(one_row);
+                            } else {
+                                lines.push(Line::from(vec![code, from]));
+                                lines.push(Line::from(vec![
+                                    Span::styled("    → ", Style::default().fg(Color::Magenta)),
+                                    to,
+                                ]));
+                            }
                         }
                     }
 
@@ -444,6 +456,87 @@ mod tests {
             "redirect source row missing:\n{out}"
         );
         assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
+    }
+
+    const ALL_ISSUES: [(crate::scan::http::HttpVulnerability, &str); 7] = [
+        (crate::scan::http::HttpVulnerability::MissingHsts, "Missing HSTS"),
+        (
+            crate::scan::http::HttpVulnerability::MissingXFrameOptions,
+            "Missing X-Frame-Options",
+        ),
+        (
+            crate::scan::http::HttpVulnerability::MissingXContentTypeOptions,
+            "Missing X-Content-Type-Options",
+        ),
+        (crate::scan::http::HttpVulnerability::MissingCsp, "Missing CSP"),
+        (crate::scan::http::HttpVulnerability::WeakCsp, "Weak CSP"),
+        (crate::scan::http::HttpVulnerability::InsecureCors, "Insecure CORS"),
+        (
+            crate::scan::http::HttpVulnerability::InformationDisclosure,
+            "Information Disclosure",
+        ),
+    ];
+
+    fn render_redirects_and_issues(redirects: &[(&str, &str)], issues: usize) -> String {
+        let mut data = http_data("https://www.tatari.tv/", None, SecurityGrade::C);
+        data.redirect_chain = redirects
+            .iter()
+            .map(|(from, to)| crate::scan::http::RedirectInfo {
+                from: from.to_string(),
+                to: to.to_string(),
+                status_code: 301,
+            })
+            .collect();
+        data.vulnerabilities = ALL_ISSUES[..issues].iter().map(|(v, _)| v.clone()).collect();
+        render_pane(
+            &HttpPane::new(),
+            &state_with_http(data),
+            LIVE_PANE_WIDTH,
+            LIVE_PANE_HEIGHT,
+            false,
+        )
+    }
+
+    /// Audit round 1: a redirect that fits the pane takes one row, so at 200x55 the redirect rows
+    /// do not push issue names off the bottom of the pane, which does not scroll.
+    #[test]
+    fn redirects_that_fit_take_one_row_and_every_issue_name_stays_visible() {
+        type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, usize);
+        let cases: [Case; 3] = [
+            (
+                "1 redirect, 7 issues",
+                vec![("http://tatari.tv/", "https://tatari.tv/")],
+                7,
+            ),
+            (
+                "2 redirects, 5 issues",
+                vec![
+                    ("http://tatari.tv/", "https://tatari.tv/"),
+                    ("https://tatari.tv/", "https://www.tatari.tv/"),
+                ],
+                5,
+            ),
+            (
+                "4 short redirects, 4 issues",
+                vec![
+                    ("http://x/a", "http://x/b"),
+                    ("http://x/b", "http://x/c"),
+                    ("http://x/c", "http://x/d"),
+                    ("http://x/d", "http://x/e"),
+                ],
+                4,
+            ),
+        ];
+        for (name, redirects, issues) in cases {
+            let out = render_redirects_and_issues(&redirects, issues);
+            assert!(
+                out.contains(&format!("301 {} → {}", redirects[0].0, redirects[0].1)),
+                "{name}: redirect not on one row:\n{out}"
+            );
+            for (_, issue) in &ALL_ISSUES[..issues] {
+                assert!(out.contains(issue), "{name}: `{issue}` not visible:\n{out}");
+            }
+        }
     }
 
     #[test]

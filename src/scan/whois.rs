@@ -195,7 +195,16 @@ impl WhoisScanner {
                     e
                 );
 
-                Err(eyre::eyre!("RDAP: {:#}; WHOIS: {:#}", rdap_error, e))
+                // The result that would carry the suffix-list note does not exist, so the error does.
+                match &suffix_list_error {
+                    Some(psl_error) => Err(eyre::eyre!(
+                        "RDAP: {:#}; WHOIS: {:#} (suffix list unavailable: {})",
+                        rdap_error,
+                        e,
+                        psl_error
+                    )),
+                    None => Err(eyre::eyre!("RDAP: {:#}; WHOIS: {:#}", rdap_error, e)),
+                }
             }
         }
     }
@@ -1073,9 +1082,19 @@ fn normalized_host(host: &str) -> String {
     idna::domain_to_ascii(host).unwrap_or_else(|_| host.to_lowercase())
 }
 
+/// Marks the start of the ICANN section in the public suffix list.
+const PSL_ICANN_MARKER: &str = "===BEGIN ICANN DOMAINS===";
+
 /// The ICANN section only: the PRIVATE section would make `github.io` a public suffix, so
-/// `foo.github.io` would be its own registrable domain.
+/// `foo.github.io` would be its own registrable domain. A list without the ICANN marker is corrupt:
+/// the crate accepts PRIVATE rules alone, and an empty ICANN section maps `a.b.co.uk` to `co.uk`.
 fn parse_suffix_list(text: &str) -> eyre::Result<IcannList> {
+    if !text.contains(PSL_ICANN_MARKER) {
+        return Err(eyre::eyre!(
+            "public suffix list has no ICANN section ({} missing)",
+            PSL_ICANN_MARKER
+        ));
+    }
     text.parse::<IcannList>()
         .map_err(|e| eyre::eyre!("public suffix list does not parse: {}", e))
 }
@@ -1732,6 +1751,37 @@ mod tests {
         assert!(parse_suffix_list(PSL_FIXTURE).is_ok());
     }
 
+    /// Audit round 1: PRIVATE rules alone parse in the crate, which counts rules of either section,
+    /// and an empty ICANN section then makes `a.b.co.uk` resolve to `co.uk`.
+    #[test]
+    fn suffix_list_with_only_a_private_section_is_corrupt() {
+        let private_only = "// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n// ===END PRIVATE DOMAINS===\n";
+        let error = parse_suffix_list(private_only).expect_err("a list with no ICANN section must not parse");
+        assert!(error.to_string().contains("ICANN"), "{error:#}");
+    }
+
+    /// Audit round 1: a PRIVATE-only body is not cached, so the next lookup refetches it.
+    #[tokio::test]
+    async fn fetched_suffix_list_without_an_icann_section_is_not_cached() {
+        let fake = fake_sources(&[]).await;
+        fake.add_route(
+            "/private-only",
+            200,
+            "// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n// ===END PRIVATE DOMAINS===\n".to_string(),
+        );
+        let scanner = WhoisScanner {
+            psl_url: fake.url("/private-only"),
+            ..scanner_with_fakes(&fake, dead_whois().await)
+        };
+
+        for _ in 0..2 {
+            assert!(scanner.registrable_domain("a.b.co.uk", far_deadline()).await.is_err());
+        }
+
+        assert_eq!(fake.hits("/private-only"), 2);
+        assert!(!scanner.cache_dir.as_ref().unwrap().join(PSL_CACHE_FILE).exists());
+    }
+
     /// AC1 at the scanner seam: `www.tatari.tv` is looked up as `tatari.tv` over RDAP, and the
     /// pane names both.
     #[tokio::test]
@@ -1797,6 +1847,52 @@ mod tests {
             pane.contains("Domain: www.tatari.tv (suffix list unavailable: "),
             "{pane}"
         );
+    }
+
+    /// Audit round 1: with no suffix list, no cache, and both lookups failing, the scan error, and
+    /// so the pane's `failed:` header, still says the suffix list was unavailable.
+    #[tokio::test]
+    async fn total_failure_without_a_suffix_list_names_the_suffix_list_failure() {
+        use crate::tui::WhoisPane;
+        use crate::tui::testing::render_pane;
+        use crate::types::{AppState, ScanState, ScanStatus};
+        use std::sync::{Arc, Mutex};
+        let fake = fake_sources(&[]).await;
+        let dead_psl = dead_http_url().await;
+        let (iana, _) = fake_whois(vec!["domain: TV\n".to_string()]).await;
+        let scanner = WhoisScanner {
+            psl_url: dead_psl.clone(),
+            ..scanner_with_fakes(&fake, iana)
+        };
+        let target = Target::parse("www.tatari.tv").unwrap();
+
+        let outcome = Scanner::scan(&scanner, &target, Protocol::Both).await;
+        let message = format!("{:#}", outcome.as_ref().expect_err("RDAP and WHOIS both failed"));
+        assert!(message.starts_with("RDAP: "), "{message}");
+        assert!(message.contains("; WHOIS: "), "{message}");
+        assert!(message.contains("(suffix list unavailable: "), "{message}");
+        assert!(message.contains(&dead_psl), "{message}");
+
+        let state = Arc::new(Mutex::new(AppState::new("www.tatari.tv".to_string())));
+        state.lock().unwrap().scanners.insert(
+            "whois".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::scanner::record_outcome("whois", 10, Protocol::Both, Instant::now(), outcome, &state);
+        let pane = render_pane(&WhoisPane::new(), &state.lock().unwrap(), 100, 40, false);
+        let flat: String = pane
+            .lines()
+            .map(|l| l.trim_matches(['│', ' ']))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains("failed: RDAP"), "{pane}");
+        assert!(flat.contains("suffix list unavailable"), "{pane}");
     }
 
     /// Both files are cached: a second scan within 24h fetches neither.
