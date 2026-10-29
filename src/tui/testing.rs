@@ -144,4 +144,17 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn failed_http_traceroute_and_ports_panes_show_status_once() {
+        let panes: Vec<(&str, Box<dyn Pane>)> = vec![
+            ("http", Box::new(HttpPane::new())),
+            ("traceroute", Box::new(TraceroutePane::new())),
+            ("port", Box::new(PortsPane::new())),
+        ];
+        for (scanner, pane) in panes {
+            let out = render_pane(pane.as_ref(), &failed_first_scan(scanner), 100, 30, false);
+            assert_eq!(out.matches("Status:").count(), 1, "{scanner}:\n{out}");
+        }
+    }
 }

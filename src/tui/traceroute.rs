@@ -149,12 +149,8 @@ impl Pane for TraceroutePane {
                             Span::styled("tracing route...", Style::default().fg(Color::Yellow)),
                         ]));
                     }
-                    crate::types::ScanStatus::Failed => {
-                        lines.push(Line::from(vec![
-                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                            Span::styled("trace failed", Style::default().fg(Color::Red)),
-                        ]));
-                    }
+                    // The header carries the failure reason.
+                    crate::types::ScanStatus::Failed => {}
                     _ => {
                         lines.push(Line::from(vec![
                             Span::styled("📍 Status: ", Style::default().fg(Color::White)),

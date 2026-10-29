@@ -268,12 +268,8 @@ impl Pane for PortsPane {
                                     ]),
                                 ]
                             }
-                            crate::types::ScanStatus::Failed => {
-                                vec![Line::from(vec![
-                                    Span::styled("❌ Status: ", Style::default().fg(Color::White)),
-                                    Span::styled("scan failed", Style::default().fg(Color::Red)),
-                                ])]
-                            }
+                            // The header carries the failure reason.
+                            crate::types::ScanStatus::Failed => vec![],
                             _ => {
                                 vec![Line::from(vec![
                                     Span::styled("📊 Status: ", Style::default().fg(Color::White)),

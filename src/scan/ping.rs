@@ -333,6 +333,15 @@ impl PingScanner {
             target.has_ipv6()
         );
 
+        // A hostname with no AAAA would otherwise be handed to `ping -6`, which fails on the family.
+        if protocol == Protocol::Ipv6 && target.primary_ip_for_protocol(Protocol::Ipv6).is_none() {
+            eyre::bail!(
+                "No {} address available for target: {}",
+                protocol.as_str(),
+                target.display_name()
+            );
+        }
+
         let ping_target = match target.network_target_for_protocol(protocol) {
             Some(target_addr) => {
                 log::debug!(
@@ -630,6 +639,35 @@ mod tests {
         assert!(noisy.ends_with("stderr: ping: bad address"), "{noisy}");
     }
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ipv6_ping_without_aaaa_is_no_address_and_spawns_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("scan-ping-noaaaa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let script = dir.join("fake-ping");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut target = Target::parse("a-only.example").unwrap();
+        target.update_resolved_ips(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]);
+        let scanner = PingScanner::default().with_program(script.to_string_lossy());
+
+        let Ok(ScanResult::Ping(result)) = scanner.scan(&target, Protocol::Ipv6).await else {
+            panic!("ping scan should return a ping result");
+        };
+        let spawned = marker.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            matches!(result.ipv6_status, PingStatus::NoAddress),
+            "{:?}",
+            result.ipv6_status
+        );
+        assert!(!spawned, "ping must not be spawned when there is no AAAA");
+    }
 
     #[test]
     fn test_parse_ping_output() {

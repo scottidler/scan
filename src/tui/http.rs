@@ -238,10 +238,6 @@ impl Pane for HttpPane {
                 }
             } else if matches!(http_state.status, crate::types::ScanStatus::Failed) {
                 // The header carries the reason; nothing is still being checked.
-                lines.push(Line::from(vec![
-                    Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                    Span::styled("scan failed", Style::default().fg(Color::Red)),
-                ]));
             } else {
                 // No HTTP data available yet
                 lines.push(Line::from(vec![

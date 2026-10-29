@@ -473,6 +473,7 @@ fn get_service_name(port: u16) -> String {
         143 => "imap".to_string(),
         443 => "https".to_string(),
         465 => "smtps".to_string(),
+        8080 => "http-alt".to_string(),
         8443 => "https-alt".to_string(),
         993 => "imaps".to_string(),
         995 => "pop3s".to_string(),
@@ -726,6 +727,13 @@ impl Scanner for PortScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_name_labels_http_alt_and_leaves_others_unknown() {
+        assert_eq!(get_service_name(8080), "http-alt");
+        assert_eq!(get_service_name(8443), "https-alt");
+        assert_eq!(get_service_name(1), "unknown");
+    }
 
     #[test]
     fn test_port_scanner_creation() {
