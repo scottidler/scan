@@ -1069,6 +1069,10 @@ impl TlsScanner {
 
 #[async_trait]
 impl Scanner for TlsScanner {
+    fn deadline(&self) -> Duration {
+        self.total_scan_timeout
+    }
+
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
         log::debug!(
             "[scan::tls] scan: target={} protocol={} total_timeout={}s",
@@ -1276,6 +1280,13 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_is_the_total_scan_timeout() {
+        let scanner = TlsScanner::new();
+        assert_eq!(scanner.deadline(), Duration::from_secs(TLS_TOTAL_SCAN_TIMEOUT_SECS));
+        assert!(scanner.uses_protocol());
+    }
 
     #[test]
     fn test_tls_version_string() {

@@ -105,7 +105,10 @@ async fn main() -> Result<()> {
         let state_guard = state.lock().unwrap();
         state_guard.protocol
     };
-    scan::scan::spawn_scanner_tasks(scanners, target.clone(), protocol, Arc::clone(&state)).await;
+    // main owns the sender for the process lifetime: the TUI borrows it to switch protocol on `p`,
+    // debug mode holds it and never sends, so no scanner ever sees the channel close.
+    let (protocol_tx, protocol_rx) = tokio::sync::watch::channel(protocol);
+    scan::scan::spawn_scanner_tasks(scanners, target.clone(), protocol_rx, Arc::clone(&state)).await;
     log::debug!("[main] all_scanners_started: protocol={}", protocol.as_str());
 
     // Choose between TUI and debug mode
@@ -164,7 +167,7 @@ async fn main() -> Result<()> {
 
         // Run the TUI application
         let tui_start = Instant::now();
-        let result = app.run(&mut terminal, state);
+        let result = app.run(&mut terminal, state, &protocol_tx);
         let tui_duration = tui_start.elapsed();
 
         // Log first render timing (INFO level as requested)

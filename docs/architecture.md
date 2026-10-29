@@ -83,8 +83,9 @@ pub struct TimestampedResult {
 // src/scanner.rs
 use async_trait::async_trait;
 use eyre::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
 
 #[async_trait]
 pub trait Scanner {
@@ -94,62 +95,55 @@ pub trait Scanner {
     /// How frequently this scanner should run
     fn interval(&self) -> Duration;
 
+    /// Longest one scan may run before it is dropped and recorded `timed out after Ns` (default 30s)
+    fn deadline(&self) -> Duration;
+
+    /// `false` for scanners the protocol does not affect (WHOIS): protocol changes are ignored
+    fn uses_protocol(&self) -> bool;
+
     /// Perform the actual scan operation
-    async fn scan(&self, target: &str) -> Result<ScanResult, eyre::Error>;
+    async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error>;
 
     /// Default implementation of the scanner loop
-    async fn run(&self, target: String, state: Arc<AppState>) {
+    async fn run(&self, target: Target, mut protocol_rx: watch::Receiver<Protocol>, state: Arc<Mutex<AppState>>) {
         let mut ticker = tokio::time::interval(self.interval());
+        let mut follow_protocol = self.uses_protocol();
 
         loop {
-            ticker.tick().await;
-
-            // Flip to Running in place: result, error and history survive the cycle
-            match state.scanners.get_mut(self.name()) {
-                Some(mut scan_state) => scan_state.status = ScanStatus::Running,
-                None => {
-                    state.scanners.insert(
-                        self.name().to_string(),
-                        ScanState {
-                            result: None,
-                            error: None,
-                            status: ScanStatus::Running,
-                            last_updated: Instant::now(),
-                            history: VecDeque::new(),
-                        },
-                    );
+            // Wake on the tick, or at once on a protocol change (which also restarts the interval)
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = protocol_rx.changed(), if follow_protocol => {
+                    if changed.is_err() { follow_protocol = false; continue; } // sender gone: ticks only
+                    ticker.reset();
                 }
             }
 
-            // Perform scan
-            match self.scan(&target).await {
-                Ok(result) => {
-                    let timestamp = Instant::now();
-                    let timestamped = TimestampedResult {
-                        timestamp,
-                        result: result.clone(),
-                    };
+            loop {
+                let protocol = *protocol_rx.borrow_and_update();
+                mark_running(self.name(), &state); // in place: result, error and history survive
 
-                    if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
-                        scan_state.result = Some(result);
-                        scan_state.error = None;
-                        scan_state.status = ScanStatus::Complete;
-                        scan_state.last_updated = timestamp;
-                        scan_state.history.push_back(timestamped);
-
-                        // Keep last N results (`max_history()`, default 10)
-                        while scan_state.history.len() > self.max_history() {
-                            scan_state.history.pop_front();
+                // A protocol change mid-scan drops the in-flight scan (children are kill_on_drop)
+                // and starts over with the new protocol
+                let mut scan = Box::pin(tokio::time::timeout(self.deadline(), self.scan(&target, protocol)));
+                let outcome = loop {
+                    tokio::select! {
+                        outcome = &mut scan => break Some(outcome),
+                        changed = protocol_rx.changed(), if follow_protocol => {
+                            if changed.is_err() { follow_protocol = false; continue; }
+                            break None;
                         }
                     }
-                }
-                Err(error) => {
-                    if let Some(mut scan_state) = state.scanners.get_mut(self.name()) {
-                        scan_state.error = Some(error);
-                        scan_state.status = ScanStatus::Failed;
-                        scan_state.last_updated = Instant::now();
-                    }
-                }
+                };
+                let Some(outcome) = outcome else {
+                    ticker.reset();
+                    continue;
+                };
+
+                // Ok: set result, push history (capped at `max_history()`, default 10).
+                // Err or deadline: set error, keep the last good result and history.
+                record_outcome(self.name(), outcome, &state);
+                break;
             }
         }
     }
@@ -162,6 +156,7 @@ pub trait Scanner {
 - Default `run()` implementation ensures consistent behavior
 - History management is handled uniformly across all scanners
 - A running scan never clears the previous result; panes mark retained data `↻ refreshing` via `status_label`
+- Protocol changes arrive on a `watch` channel whose sender `main` owns; the TUI's `p` key sends on it, so a change reaches every scanner at once instead of waiting out its interval
 
 ### 3. Scanner Result Types
 

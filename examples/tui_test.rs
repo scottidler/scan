@@ -50,8 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = init_terminal()?;
 
     // Create and run TUI app
+    // No scanners run here, so `p` only relabels; the receiver is held so the send is delivered.
+    let (protocol_tx, _protocol_rx) = tokio::sync::watch::channel(scan::target::Protocol::Both);
     let app = TuiApp::new()?;
-    let result = app.run(&mut terminal, state);
+    let result = app.run(&mut terminal, state, &protocol_tx);
 
     // Restore terminal
     restore_terminal(&mut terminal)?;

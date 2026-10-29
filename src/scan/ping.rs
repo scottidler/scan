@@ -4,7 +4,6 @@ use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 
 const DEFAULT_PING_INTERVAL_SECS: u64 = 1;
 const DEFAULT_PING_TIMEOUT_SECS: u64 = 5;
@@ -386,7 +385,7 @@ impl PingScanner {
         );
 
         // Check if the ping command is available
-        let command_check = Command::new("which").arg(ping_command).output().await;
+        let command_check = super::kill_on_drop_command("which").arg(ping_command).output().await;
 
         match command_check {
             Ok(output) if !output.status.success() => {
@@ -412,7 +411,7 @@ impl PingScanner {
 
         let ping_start = Instant::now();
         log::debug!("[scan::ping] executing_ping_command: {} {:?}", ping_command, args);
-        let output = Command::new(ping_command).args(&args).output().await;
+        let output = super::kill_on_drop_command(ping_command).args(&args).output().await;
 
         let command_duration = ping_start.elapsed();
 
@@ -940,5 +939,66 @@ mod tests {
             }
             _ => panic!("expected Ping result"),
         }
+    }
+
+    /// Process state letter as `ps` reports it, or `None` once the process is gone.
+    #[cfg(target_os = "linux")]
+    fn process_state(pid: u32) -> Option<char> {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().chars().next()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_an_in_flight_scan_kills_the_ping_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("scan-kill-on-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let program = dir.join("ping");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let scanner = PingScanner::default().with_program(program.display().to_string());
+        let target = Target::parse("127.0.0.1").unwrap();
+        let scan = tokio::spawn(async move { scanner.scan(&target, Protocol::Ipv4).await });
+
+        let mut pid = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Some(p) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                pid = Some(p);
+                break;
+            }
+        }
+        let pid = pid.expect("fake ping started");
+        assert_eq!(process_state(pid), Some('S'), "child is running before the drop");
+
+        scan.abort();
+        let _ = scan.await;
+        let mut state = process_state(pid);
+        for _ in 0..200 {
+            if matches!(state, None | Some('Z')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            state = process_state(pid);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(state, None | Some('Z')),
+            "child must be killed when the scan is dropped, state={state:?}"
+        );
     }
 }

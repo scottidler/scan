@@ -6,7 +6,6 @@ use eyre::{Result, WrapErr};
 use log;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 
 const TRACEROUTE_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes - traceroute is slow and noisy if too frequent
 const TRACEROUTE_TIMEOUT_SECS: u64 = 3; // 3 seconds per hop (much faster like your example)
@@ -205,7 +204,7 @@ impl TracerouteScanner {
         );
 
         // Build traceroute command
-        let mut cmd = Command::new(if ipv6 { "traceroute6" } else { "traceroute" });
+        let mut cmd = super::kill_on_drop_command(if ipv6 { "traceroute6" } else { "traceroute" });
         cmd.args([
             "-n", // Don't resolve hostnames
             "-w",

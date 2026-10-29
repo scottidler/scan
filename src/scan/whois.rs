@@ -629,6 +629,11 @@ impl Scanner for WhoisScanner {
         Duration::from_secs(WHOIS_SCAN_INTERVAL_SECS) // 1 hour - WHOIS data changes infrequently
     }
 
+    /// WHOIS queries the registry by domain; the protocol only feeds a log line.
+    fn uses_protocol(&self) -> bool {
+        false
+    }
+
     async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
         log::debug!(
             "[scan::whois] scan: target={} protocol={}",
@@ -778,6 +783,11 @@ pub enum DataSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whois_ignores_protocol_changes() {
+        assert!(!WhoisScanner::new().uses_protocol());
+    }
 
     #[tokio::test]
     async fn test_whois_scanner_creation() {

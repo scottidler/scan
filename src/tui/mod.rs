@@ -30,6 +30,7 @@ pub use target::TargetPane;
 pub use traceroute::TraceroutePane;
 pub use whois::WhoisPane;
 
+use crate::target::Protocol;
 use crate::types::AppState;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -44,10 +45,35 @@ use ratatui::{
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 const TUI_TICK_RATE_MS: u64 = 250;
 const FRAME_STATS_LOG_INTERVAL: u64 = 100;
 const FALLBACK_TIMEOUT_SECS: u64 = 0;
+
+/// Cycle `AppState.protocol` (Both -> IPv4 -> IPv6 -> Both) and send the new value to the scanners.
+/// Returns the protocol now in effect.
+pub fn switch_protocol(state: &Mutex<AppState>, protocol_tx: &watch::Sender<Protocol>) -> Protocol {
+    let (old_protocol, new_protocol) = {
+        let mut state_guard = state.lock().unwrap();
+        let old = state_guard.protocol;
+        state_guard.cycle_protocol();
+        (old, state_guard.protocol)
+    };
+    match protocol_tx.send(new_protocol) {
+        Ok(()) => log::info!(
+            "[tui] protocol_changed: {} -> {} (scanners notified)",
+            old_protocol.as_str(),
+            new_protocol.as_str()
+        ),
+        Err(_) => log::error!(
+            "[tui] protocol_change_not_delivered: {} -> {} - no scanner is listening",
+            old_protocol.as_str(),
+            new_protocol.as_str()
+        ),
+    }
+    new_protocol
+}
 
 /// Main TUI application
 pub struct TuiApp {
@@ -90,8 +116,13 @@ impl TuiApp {
         })
     }
 
-    /// Run the TUI application
-    pub fn run<B: Backend>(mut self, terminal: &mut Terminal<B>, state: Arc<Mutex<AppState>>) -> io::Result<()> {
+    /// Run the TUI event loop. `protocol_tx` is lent by `main`, which owns it; `p` sends on it.
+    pub fn run<B: Backend>(
+        mut self,
+        terminal: &mut Terminal<B>,
+        state: Arc<Mutex<AppState>>,
+        protocol_tx: &watch::Sender<Protocol>,
+    ) -> io::Result<()> {
         log::debug!("[tui] run: starting TUI event loop");
 
         let mut frame_count = 0;
@@ -145,20 +176,7 @@ impl TuiApp {
                         self.focus_prev_pane();
                     }
                     KeyCode::Char('p') => {
-                        // Cycle through protocols: Both -> IPv4 -> IPv6 -> Both
-                        let (old_protocol, new_protocol) = {
-                            let mut state_guard = state.lock().unwrap();
-                            let old = state_guard.protocol;
-                            state_guard.cycle_protocol();
-                            let new = state_guard.protocol;
-                            (old, new)
-                        };
-                        log::info!(
-                            "[tui] protocol_changed: {} -> {} (scanner restart needed)",
-                            old_protocol.as_str(),
-                            new_protocol.as_str()
-                        );
-                        // TODO: Implement scanner restart when protocol changes
+                        switch_protocol(&state, protocol_tx);
                     }
                     // Handle scrolling and navigation for focused pane
                     _ => {
@@ -349,6 +367,32 @@ mod tests {
         assert!(pane_ids.contains(&"ports".to_string()));
         assert!(pane_ids.contains(&"traceroute".to_string()));
         assert!(pane_ids.contains(&"geoip".to_string()));
+    }
+
+    #[test]
+    fn switch_protocol_cycles_state_and_notifies_scanners() {
+        let state = Mutex::new(AppState::new("example.com".to_string()));
+        let (tx, mut rx) = watch::channel(Protocol::Both);
+
+        assert_eq!(switch_protocol(&state, &tx), Protocol::Ipv4);
+        assert_eq!(state.lock().unwrap().protocol, Protocol::Ipv4);
+        assert!(rx.has_changed().unwrap(), "scanners see the change");
+        assert_eq!(*rx.borrow_and_update(), Protocol::Ipv4);
+
+        assert_eq!(switch_protocol(&state, &tx), Protocol::Ipv6);
+        assert_eq!(*rx.borrow_and_update(), Protocol::Ipv6);
+        assert_eq!(switch_protocol(&state, &tx), Protocol::Both);
+        assert_eq!(*rx.borrow_and_update(), Protocol::Both);
+    }
+
+    #[test]
+    fn switch_protocol_without_listeners_still_updates_state() {
+        let state = Mutex::new(AppState::new("example.com".to_string()));
+        let (tx, rx) = watch::channel(Protocol::Both);
+        drop(rx);
+
+        assert_eq!(switch_protocol(&state, &tx), Protocol::Ipv4);
+        assert_eq!(state.lock().unwrap().protocol, Protocol::Ipv4);
     }
 
     #[test]
