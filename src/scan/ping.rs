@@ -1,3 +1,4 @@
+use super::{Family, RouteError, classify_route_error};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -100,15 +101,23 @@ impl PingResult {
         self.ipv4_result.as_ref().or(self.ipv6_result.as_ref())
     }
 
-    /// First per-protocol ping failure message, if any protocol failed.
+    /// Why ping failed. A family that was attempted (IPv4 first) wins over one that had no
+    /// address, so an IPv6 literal with no local route reports the route, not IPv4's
+    /// missing address.
     pub fn failure_reason(&self) -> Option<String> {
-        [&self.ipv4_status, &self.ipv6_status]
+        let statuses = [&self.ipv4_status, &self.ipv6_status];
+        statuses
             .into_iter()
             .find_map(|status| match status {
                 PingStatus::Failed(msg) => Some(msg.clone()),
                 PingStatus::ToolMissing(tool) => Some(format!("{tool} not installed")),
-                PingStatus::NoAddress => Some("no address".to_string()),
                 _ => None,
+            })
+            .or_else(|| {
+                statuses
+                    .into_iter()
+                    .any(|status| matches!(status, PingStatus::NoAddress))
+                    .then(|| "no address".to_string())
             })
     }
 }
@@ -234,7 +243,7 @@ impl Scanner for PingScanner {
                         result.ipv4_result = Some(ping_data);
                     }
                     Err(e) => {
-                        result.ipv4_status = Self::classify_ping_error(&e);
+                        result.ipv4_status = Self::classify_ping_error(&e, Family::Ipv4);
                         if result.ipv4_status.is_success() {
                             return Err(e); // Shouldn't happen, but just in case
                         }
@@ -249,7 +258,7 @@ impl Scanner for PingScanner {
                         result.ipv6_result = Some(ping_data);
                     }
                     Err(e) => {
-                        result.ipv6_status = Self::classify_ping_error(&e);
+                        result.ipv6_status = Self::classify_ping_error(&e, Family::Ipv6);
                         if result.ipv6_status.is_success() {
                             return Err(e); // Shouldn't happen, but just in case
                         }
@@ -266,7 +275,7 @@ impl Scanner for PingScanner {
                         result.ipv4_result = Some(ping_data);
                     }
                     Err(e) => {
-                        result.ipv4_status = Self::classify_ping_error(&e);
+                        result.ipv4_status = Self::classify_ping_error(&e, Family::Ipv4);
                         log::debug!("[scan::ping] ipv4_ping_failed: error={}", e);
                     }
                 }
@@ -286,7 +295,7 @@ impl Scanner for PingScanner {
                         );
                     }
                     Err(e) => {
-                        result.ipv6_status = Self::classify_ping_error(&e);
+                        result.ipv6_status = Self::classify_ping_error(&e, Family::Ipv6);
                         log::debug!(
                             "[scan::ping] ipv6_ping_failed: target={} error={} classified_as={:?}",
                             target.display_name(),
@@ -379,17 +388,15 @@ impl PingScanner {
         Ok((ping_data, ping_target))
     }
 
-    fn classify_ping_error(error: &eyre::Error) -> PingStatus {
+    fn classify_ping_error(error: &eyre::Error, family: Family) -> PingStatus {
         let error_msg = error.to_string();
 
         if error_msg.contains("Command") && error_msg.contains("not found") {
             PingStatus::ToolMissing("ping".to_string())
         } else if error_msg.contains("No") && error_msg.contains("address available") {
             PingStatus::NoAddress
-        } else if error_msg.contains("Network is unreachable") || error_msg.contains("No route to host") {
-            PingStatus::Failed("Network unreachable".to_string())
         } else {
-            PingStatus::Failed(error_msg)
+            PingStatus::Failed(classify_route_error(&error_msg, family).to_string())
         }
     }
 
@@ -486,9 +493,9 @@ impl PingScanner {
                 stderr.trim()
             );
 
-            // Check for specific IPv6 errors and provide better error messages
-            if stderr.contains("Network is unreachable") || stderr.contains("connect: Network is unreachable") {
-                eyre::bail!("Network is unreachable for target: {} (using {})", target, ping_command);
+            let route = Family::from_protocol(protocol).map(|family| classify_route_error(&stderr, family));
+            if let Some(route @ RouteError::NoRoute(_)) = route {
+                eyre::bail!(route);
             } else if stderr.contains("invalid option") || stderr.contains("unrecognized option") {
                 eyre::bail!(
                     "Ping command does not support IPv6 options: {} (stderr: {})",
@@ -627,6 +634,32 @@ impl PingScanner {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_reason_prefers_an_attempted_family_over_no_address() {
+        let mut result = PingResult::new();
+        result.ipv4_status = PingStatus::NoAddress;
+        result.ipv6_status = PingStatus::Failed("no IPv6 route on this host".to_string());
+        assert_eq!(result.failure_reason().as_deref(), Some("no IPv6 route on this host"));
+
+        result.ipv6_status = PingStatus::NotQueried;
+        assert_eq!(result.failure_reason().as_deref(), Some("no address"));
+    }
+
+    #[test]
+    fn classify_ping_error_names_the_missing_ipv6_route() {
+        let error = eyre::eyre!(RouteError::NoRoute(Family::Ipv6));
+        match PingScanner::classify_ping_error(&error, Family::Ipv6) {
+            PingStatus::Failed(reason) => assert_eq!(reason, "no IPv6 route on this host"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let error = eyre::eyre!("Ping failed for target: x (using ping) - stderr: connect: No route to host");
+        match PingScanner::classify_ping_error(&error, Family::Ipv4) {
+            PingStatus::Failed(reason) => assert_eq!(reason, "host unreachable"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -638,7 +671,6 @@ mod tests {
         let noisy = unsuccessful_ping_message("192.0.2.1", "ping", &status, "ping: bad address\n");
         assert!(noisy.ends_with("stderr: ping: bad address"), "{noisy}");
     }
-    use super::*;
 
     #[cfg(unix)]
     #[tokio::test]

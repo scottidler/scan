@@ -1,3 +1,4 @@
+use super::{Family, classify_route_error, family_failure_summary};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target, TargetType};
 use crate::types::ScanResult;
@@ -157,13 +158,15 @@ impl HttpScanner {
         self.perform_http_scan_for_ip(target, ip).await
     }
 
-    fn classify_http_error(error: &eyre::Error) -> HttpStatus {
+    /// `NoAddress` when the family had nothing to request, else the failure's root cause run
+    /// through the route classifier, e.g. `operation timed out` or `no IPv6 route on this host`.
+    fn classify_http_error(error: &eyre::Error, family: Family) -> HttpStatus {
         let error_msg = error.to_string();
 
         if error_msg.contains("No") && error_msg.contains("address available") {
             HttpStatus::NoAddress
         } else {
-            HttpStatus::Failed(error_msg)
+            HttpStatus::Failed(classify_route_error(&root_cause(error), family).to_string())
         }
     }
 
@@ -728,7 +731,7 @@ impl Scanner for HttpScanner {
                         result.ipv4_result = Some(http_data);
                     }
                     Err(e) => {
-                        result.ipv4_status = Self::classify_http_error(&e);
+                        result.ipv4_status = Self::classify_http_error(&e, Family::Ipv4);
                     }
                 }
             }
@@ -740,7 +743,7 @@ impl Scanner for HttpScanner {
                         result.ipv6_result = Some(http_data);
                     }
                     Err(e) => {
-                        result.ipv6_status = Self::classify_http_error(&e);
+                        result.ipv6_status = Self::classify_http_error(&e, Family::Ipv6);
                     }
                 }
             }
@@ -754,7 +757,7 @@ impl Scanner for HttpScanner {
                         result.ipv4_result = Some(http_data);
                     }
                     Err(e) => {
-                        result.ipv4_status = Self::classify_http_error(&e);
+                        result.ipv4_status = Self::classify_http_error(&e, Family::Ipv4);
                         log::debug!("[scan::http] ipv4_http_failed: error={}", e);
                     }
                 }
@@ -766,7 +769,7 @@ impl Scanner for HttpScanner {
                         result.ipv6_result = Some(http_data);
                     }
                     Err(e) => {
-                        result.ipv6_status = Self::classify_http_error(&e);
+                        result.ipv6_status = Self::classify_http_error(&e, Family::Ipv6);
                         log::debug!("[scan::http] ipv6_http_failed: error={}", e);
                     }
                 }
@@ -786,17 +789,13 @@ impl Scanner for HttpScanner {
             );
             Ok(ScanResult::Http(result))
         } else {
-            // All protocols failed
-            let error_msg = format!(
-                "All HTTP attempts failed for target: {} ({})",
-                target.display_name(),
-                protocol.as_str()
-            );
+            let error_msg = result.failure_summary(protocol);
             log::error!(
-                "[scan::http] all_http_failed: target={} protocol={} duration={}ms",
+                "[scan::http] all_http_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
-                result.total_duration.as_millis()
+                result.total_duration.as_millis(),
+                error_msg
             );
             Err(eyre::eyre!(error_msg))
         }
@@ -886,6 +885,19 @@ impl HttpResult {
 
     pub fn has_any_success(&self) -> bool {
         self.ipv4_status.is_success() || self.ipv6_status.is_success()
+    }
+
+    /// Why every attempted family failed, e.g. `IPv4: operation timed out; IPv6: no IPv6 route
+    /// on this host`. Families with no address are left out.
+    pub fn failure_summary(&self, protocol: Protocol) -> String {
+        let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
+            .into_iter()
+            .filter_map(|(family, status)| match status {
+                HttpStatus::Failed(reason) => Some((family, reason.clone())),
+                _ => None,
+            })
+            .collect();
+        family_failure_summary(&failures, protocol)
     }
 
     pub fn get_best_security_grade(&self) -> Option<&SecurityGrade> {
@@ -1067,6 +1079,89 @@ impl SecurityGrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener that accepts and never answers, so a request to it times out. Accepted
+    /// sockets are held open until the task is dropped with the runtime.
+    async fn silent_listener() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok(Ok((socket, _))) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn classify_http_error_keeps_the_root_cause_per_family() {
+        let error = eyre::Report::new(std::io::Error::from_raw_os_error(101)).wrap_err("error sending request");
+        match HttpScanner::classify_http_error(&error, Family::Ipv6) {
+            HttpStatus::Failed(reason) => assert_eq!(reason, "no IPv6 route on this host"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let error = eyre::eyre!("operation timed out").wrap_err("error sending request for url");
+        match HttpScanner::classify_http_error(&error, Family::Ipv4) {
+            HttpStatus::Failed(reason) => assert_eq!(reason, "operation timed out"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let error = eyre::eyre!("No IPv6 address available for target: x");
+        assert!(matches!(
+            HttpScanner::classify_http_error(&error, Family::Ipv6),
+            HttpStatus::NoAddress
+        ));
+    }
+
+    #[test]
+    fn failure_summary_names_each_attempted_family_and_skips_no_address() {
+        let mut result = HttpResult::new();
+        result.ipv4_status = HttpStatus::Failed("operation timed out".to_string());
+        result.ipv6_status = HttpStatus::Failed("no IPv6 route on this host".to_string());
+        assert_eq!(
+            result.failure_summary(Protocol::Both),
+            "IPv4: operation timed out; IPv6: no IPv6 route on this host"
+        );
+        result.ipv6_status = HttpStatus::NoAddress;
+        assert_eq!(result.failure_summary(Protocol::Both), "IPv4: operation timed out");
+    }
+
+    #[tokio::test]
+    async fn timed_out_scan_renders_operation_timed_out_in_the_pane() {
+        use crate::tui::HttpPane;
+        use crate::tui::testing::render_pane;
+        use crate::types::{AppState, ScanState, ScanStatus};
+        use std::sync::{Arc, Mutex};
+
+        let addr = silent_listener().await;
+        let scanner = HttpScanner {
+            timeout: Duration::from_millis(300),
+        };
+        let mut target = Target::parse(&format!("http://{addr}/")).unwrap();
+        target.resolve().await.unwrap();
+
+        let outcome = Scanner::scan(&scanner, &target, Protocol::Ipv4).await;
+        let error = outcome.as_ref().expect_err("a silent server must fail the scan");
+        assert_eq!(error.to_string(), "IPv4: operation timed out");
+
+        let state = Arc::new(Mutex::new(AppState::new(target.original.clone())));
+        state.lock().unwrap().scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::scanner::record_outcome("http", 10, Protocol::Ipv4, Instant::now(), outcome, &state);
+
+        let guard = state.lock().unwrap();
+        let pane = render_pane(&HttpPane::new(), &guard, 100, 30, false);
+        assert!(pane.contains("operation timed out"), "{pane}");
+        assert!(!pane.contains("All HTTP attempts failed"), "{pane}");
+    }
 
     #[test]
     fn test_csp_directive_parsing() {
