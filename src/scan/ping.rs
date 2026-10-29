@@ -99,6 +99,35 @@ impl PingResult {
         // Prefer IPv4, fallback to IPv6
         self.ipv4_result.as_ref().or(self.ipv6_result.as_ref())
     }
+
+    /// First per-protocol ping failure message, if any protocol failed.
+    pub fn failure_reason(&self) -> Option<String> {
+        [&self.ipv4_status, &self.ipv6_status]
+            .into_iter()
+            .find_map(|status| match status {
+                PingStatus::Failed(msg) => Some(msg.clone()),
+                PingStatus::ToolMissing(tool) => Some(format!("{tool} not installed")),
+                PingStatus::NoAddress => Some("no address".to_string()),
+                _ => None,
+            })
+    }
+}
+
+/// Why a ping exited unsuccessfully. A ping that got no reply exits non-zero with empty stderr,
+/// so the exit status is the reason then.
+fn unsuccessful_ping_message(
+    target: &str,
+    ping_command: &str,
+    status: &std::process::ExitStatus,
+    stderr: &str,
+) -> String {
+    match stderr.trim() {
+        "" => format!("no reply from {} (using {}, {})", target, ping_command, status),
+        stderr => format!(
+            "Ping failed for target: {} (using {}) - stderr: {}",
+            target, ping_command, stderr
+        ),
+    }
 }
 
 pub struct PingScanner {
@@ -458,12 +487,7 @@ impl PingScanner {
                     stderr.trim()
                 );
             } else {
-                eyre::bail!(
-                    "Ping failed for target: {} (using {}) - stderr: {}",
-                    target,
-                    ping_command,
-                    stderr.trim()
-                );
+                eyre::bail!(unsuccessful_ping_message(target, ping_command, &output.status, &stderr));
             }
         }
 
@@ -594,6 +618,17 @@ impl PingScanner {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn unsuccessful_ping_message_names_silent_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        let silent = unsuccessful_ping_message("192.0.2.1", "ping", &status, "  \n");
+        assert_eq!(silent, "no reply from 192.0.2.1 (using ping, exit status: 1)");
+        let noisy = unsuccessful_ping_message("192.0.2.1", "ping", &status, "ping: bad address\n");
+        assert!(noisy.ends_with("stderr: ping: bad address"), "{noisy}");
+    }
     use super::*;
 
     #[test]

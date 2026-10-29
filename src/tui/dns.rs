@@ -89,11 +89,7 @@ impl DnsPane {
     }
 
     fn truncate_txt(text: &str, max_len: usize) -> String {
-        if text.len() <= max_len {
-            text.to_string()
-        } else {
-            format!("{}...", &text[..max_len.saturating_sub(TXT_TRUNCATE_SUFFIX_LENGTH)])
-        }
+        crate::tui::text::ellipsize(text, max_len, max_len.saturating_sub(TXT_TRUNCATE_SUFFIX_LENGTH))
     }
 
     /// Build the actual content lines - SINGLE SOURCE OF TRUTH
@@ -124,6 +120,9 @@ impl DnsPane {
         let dns_lines = if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
                 Self::build_dns_result_lines(dns_result.clone())
+            } else if matches!(dns_state.status, crate::types::ScanStatus::Failed) {
+                // The header carries the reason; nothing is still resolving.
+                Vec::new()
             } else {
                 Self::build_dns_loading_lines()
             }
@@ -204,11 +203,7 @@ impl DnsPane {
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
                 let ipv6_str = record.value.to_string();
-                let display_str = if ipv6_str.len() > IPV6_DISPLAY_MAX_LENGTH {
-                    format!("{}...", &ipv6_str[..IPV6_TRUNCATE_LENGTH])
-                } else {
-                    ipv6_str
-                };
+                let display_str = crate::tui::text::ellipsize(&ipv6_str, IPV6_DISPLAY_MAX_LENGTH, IPV6_TRUNCATE_LENGTH);
 
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
@@ -563,6 +558,19 @@ impl Pane for DnsPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_txt_cuts_multibyte_by_chars() {
+        // 1 ASCII byte then 2-byte chars: the old byte cut at 42 lands inside a char.
+        let txt = format!("v{}", "é".repeat(60));
+        let out = DnsPane::truncate_txt(&txt, TXT_DISPLAY_MAX_LENGTH);
+        assert!(out.ends_with("..."), "{out}");
+        assert_eq!(out.chars().count(), TXT_DISPLAY_MAX_LENGTH, "{out}");
+        assert_eq!(
+            DnsPane::truncate_txt("v=spf1 -all", TXT_DISPLAY_MAX_LENGTH),
+            "v=spf1 -all"
+        );
+    }
 
     #[test]
     fn test_dns_pane_creation() {

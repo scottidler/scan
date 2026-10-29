@@ -97,4 +97,51 @@ mod tests {
         let out = render_pane(&DnsPane::new(), &state, 80, 24, false);
         assert!(!out.contains("SECURITY"));
     }
+
+    fn failed_first_scan(scanner: &str) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            scanner.to_string(),
+            crate::types::ScanState {
+                result: None,
+                error: Some(eyre::eyre!("timed out after 30s")),
+                status: crate::types::ScanStatus::Failed,
+                last_updated: std::time::Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn every_status_pane_names_a_failed_first_scan() {
+        let panes: Vec<(&str, Box<dyn Pane>)> = vec![
+            ("ping", Box::new(ConnectivityPane::new())),
+            ("dns", Box::new(DnsPane::new())),
+            ("tls", Box::new(SecurityPane::new())),
+            ("http", Box::new(HttpPane::new())),
+            ("whois", Box::new(WhoisPane::new())),
+            ("traceroute", Box::new(TraceroutePane::new())),
+            ("geoip", Box::new(GeoIpPane::new())),
+            ("port", Box::new(PortsPane::new())),
+        ];
+        for (scanner, pane) in panes {
+            let out = render_pane(pane.as_ref(), &failed_first_scan(scanner), 100, 30, false);
+            assert!(
+                out.contains("failed: timed out after 30s"),
+                "{scanner}: failure reason missing:\n{out}"
+            );
+            for pending in [
+                "checking",
+                "analyzing",
+                "resolving",
+                "scanning...",
+                "querying",
+                "locating",
+                "tracing",
+            ] {
+                assert!(!out.contains(pending), "{scanner}: still shows `{pending}`:\n{out}");
+            }
+        }
+    }
 }

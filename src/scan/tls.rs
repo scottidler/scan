@@ -85,6 +85,28 @@ pub enum TlsVulnerability {
     SslV3Enabled,
 }
 
+impl TlsVulnerability {
+    /// The text the Security pane and `--no-tui` show for this issue.
+    pub fn description(&self) -> String {
+        match self {
+            TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
+            TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
+            TlsVulnerability::Beast => "BEAST (CVE-2011-3389)".to_string(),
+            TlsVulnerability::Crime => "CRIME (CVE-2012-4929)".to_string(),
+            TlsVulnerability::WeakCipher(cipher) => format!("Weak cipher: {}", cipher),
+            TlsVulnerability::ExpiredCertificate => "Certificate expired".to_string(),
+            TlsVulnerability::SelfSignedCertificate => "Self-signed certificate".to_string(),
+            TlsVulnerability::UntrustedIssuer => "Untrusted certificate issuer".to_string(),
+            TlsVulnerability::HostnameMismatch => "Certificate hostname mismatch".to_string(),
+            TlsVulnerability::WeakSignatureAlgorithm(alg) => format!("Weak signature: {}", alg),
+            TlsVulnerability::InsecureRenegotiation => "Insecure renegotiation".to_string(),
+            TlsVulnerability::WeakDhParams => "Weak DH parameters".to_string(),
+            TlsVulnerability::SslV2Enabled => "SSLv2 enabled".to_string(),
+            TlsVulnerability::SslV3Enabled => "SSLv3 enabled".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SecurityGrade {
     APlus,

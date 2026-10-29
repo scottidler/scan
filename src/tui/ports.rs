@@ -79,15 +79,14 @@ impl Pane for PortsPane {
                 let status = port_state.status.clone();
                 let last_updated = port_state.last_updated;
 
+                let (label, label_color) = crate::tui::status_label(&port_state, "scanning...", "completed");
+                lines[0] = Line::from(vec![
+                    Span::styled("🔌 Status: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(label, Style::default().fg(label_color)),
+                ]);
+
                 match result {
                     Some(ScanResult::Port(port_result)) => {
-                        // Update header with current status
-                        let (label, label_color) = crate::tui::status_label(&port_state, "scanning...", "completed");
-                        lines[0] = Line::from(vec![
-                            Span::styled("🔌 Status: ", Style::default().fg(Color::Cyan)),
-                            Span::styled(label, Style::default().fg(label_color)),
-                        ]);
-
                         // Extract the data we need to avoid lifetime issues
                         let open_count = port_result.total_open_ports();
                         let (filtered_ports, closed_ports) = if let Some(primary) = port_result.get_primary_result() {

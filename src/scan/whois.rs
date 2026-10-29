@@ -6,10 +6,16 @@ use chrono::{DateTime, Utc};
 use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use whois_rust::{WhoIs, WhoIsLookupOptions};
 
-const WHOIS_TIMEOUT_SECS: u64 = 30;
+/// RDAP request timeout.
+const RDAP_TIMEOUT_SECS: u64 = 30;
+/// Socket timeout for the traditional WHOIS fallback (whois-rust defaults to 60s).
+const WHOIS_LOOKUP_TIMEOUT_SECS: u64 = 15;
+/// Headroom on the scan deadline past RDAP plus the fallback, for parsing and scheduling.
+const DEADLINE_SLACK_SECS: u64 = 5;
 const WHOIS_SCAN_INTERVAL_SECS: u64 = 60 * 60; // 1 hour
 const RECENT_REGISTRATION_THRESHOLD_DAYS: i64 = 30;
 const NEAR_EXPIRY_THRESHOLD_DAYS: i64 = 30;
@@ -17,8 +23,10 @@ const NEAR_EXPIRY_THRESHOLD_DAYS: i64 = 30;
 #[derive(Debug, Clone)]
 pub struct WhoisScanner {
     client: Client,
-    whois_client: WhoIs,
-    timeout: Duration,
+    /// Shared so the blocking lookup can own a handle on the `spawn_blocking` thread.
+    whois_client: Arc<WhoIs>,
+    rdap_timeout: Duration,
+    whois_timeout: Duration,
 }
 
 impl Default for WhoisScanner {
@@ -29,10 +37,14 @@ impl Default for WhoisScanner {
 
 impl WhoisScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::whois] new: timeout={}s", WHOIS_TIMEOUT_SECS);
+        log::debug!(
+            "[scan::whois] new: rdap_timeout={}s whois_timeout={}s",
+            RDAP_TIMEOUT_SECS,
+            WHOIS_LOOKUP_TIMEOUT_SECS
+        );
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(WHOIS_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(RDAP_TIMEOUT_SECS))
             .user_agent("scan/1.0")
             .build()
             .expect("Failed to create HTTP client");
@@ -48,8 +60,9 @@ impl WhoisScanner {
 
         Self {
             client,
-            whois_client,
-            timeout: Duration::from_secs(WHOIS_TIMEOUT_SECS),
+            whois_client: Arc::new(whois_client),
+            rdap_timeout: Duration::from_secs(RDAP_TIMEOUT_SECS),
+            whois_timeout: Duration::from_secs(WHOIS_LOOKUP_TIMEOUT_SECS),
         }
     }
 
@@ -69,7 +82,7 @@ impl WhoisScanner {
         // Try RDAP first (modern protocol)
         log::trace!("[scan::whois] trying_rdap: domain={}", domain);
         let rdap_start = Instant::now();
-        match self.query_rdap(&domain).await {
+        let rdap_error = match self.query_rdap(&domain).await {
             Ok(mut result) => {
                 let rdap_duration = rdap_start.elapsed();
                 result.data_source = DataSource::Rdap;
@@ -88,8 +101,9 @@ impl WhoisScanner {
                     rdap_duration.as_millis(),
                     e
                 );
+                e
             }
-        }
+        };
 
         // Fall back to traditional WHOIS
         log::trace!("[scan::whois] trying_traditional_whois: domain={}", domain);
@@ -132,7 +146,7 @@ impl WhoisScanner {
                     domain_age_days: None,
                     expires_in_days: None,
                     risk_indicators: vec![RiskIndicator::QueryFailed],
-                    data_source: DataSource::Failed,
+                    data_source: DataSource::Failed(format!("RDAP: {:#}; WHOIS: {:#}", rdap_error, e)),
                     scan_duration: Duration::from_millis(0),
                     raw_data: None,
                 };
@@ -149,7 +163,7 @@ impl WhoisScanner {
 
         let rdap_url = self.get_rdap_endpoint(tld, domain);
 
-        let response = self.client.get(&rdap_url).timeout(self.timeout).send().await?;
+        let response = self.client.get(&rdap_url).timeout(self.rdap_timeout).send().await?;
 
         if !response.status().is_success() {
             return Err(eyre::eyre!("RDAP query failed with status: {}", response.status()));
@@ -162,10 +176,20 @@ impl WhoisScanner {
     async fn query_traditional_whois(&self, domain: &str) -> eyre::Result<WhoisResult> {
         let start_time = Instant::now();
 
-        let lookup_options = WhoIsLookupOptions::from_string(domain)?;
-        let whois_text = self.whois_client.lookup(lookup_options)?;
+        let lookup_options = Self::lookup_options(domain, self.whois_timeout)?;
+        let whois_client = Arc::clone(&self.whois_client);
+        // whois-rust's lookup is blocking std socket I/O: on a runtime worker it would stall the
+        // worker and the scan deadline could not preempt it.
+        let whois_text = tokio::task::spawn_blocking(move || whois_client.lookup(lookup_options)).await??;
 
         self.parse_whois_text(domain, &whois_text, start_time.elapsed()).await
+    }
+
+    /// Lookup options for `domain` with the socket timeout set explicitly.
+    fn lookup_options(domain: &str, timeout: Duration) -> eyre::Result<WhoIsLookupOptions> {
+        let mut options = WhoIsLookupOptions::from_string(domain)?;
+        options.timeout = Some(timeout);
+        Ok(options)
     }
 
     fn get_rdap_endpoint(&self, tld: &str, domain: &str) -> String {
@@ -634,6 +658,11 @@ impl Scanner for WhoisScanner {
         false
     }
 
+    /// Covers a hung RDAP request plus the traditional fallback it falls through to.
+    fn deadline(&self) -> Duration {
+        self.rdap_timeout + self.whois_timeout + Duration::from_secs(DEADLINE_SLACK_SECS)
+    }
+
     async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
         log::debug!(
             "[scan::whois] scan: target={} protocol={}",
@@ -773,16 +802,73 @@ pub enum RiskIndicator {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataSource {
-    Rdap,          // Modern RDAP protocol
-    Whois,         // Traditional WHOIS protocol
-    Failed,        // Query failed
-    NotApplicable, // IP target: no domain to look up
+    Rdap,           // Modern RDAP protocol
+    Whois,          // Traditional WHOIS protocol
+    Failed(String), // Both RDAP and the WHOIS fallback failed; carries both errors
+    NotApplicable,  // IP target: no domain to look up
 }
 
 // Tests
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_covers_rdap_and_whois_fallback() {
+        let scanner = WhoisScanner::new();
+        let rdap = Duration::from_secs(RDAP_TIMEOUT_SECS);
+        let whois = Duration::from_secs(WHOIS_LOOKUP_TIMEOUT_SECS);
+        assert!(
+            scanner.deadline() > rdap + whois,
+            "deadline {:?} must exceed RDAP {:?} + WHOIS {:?}",
+            scanner.deadline(),
+            rdap,
+            whois
+        );
+    }
+
+    #[test]
+    fn lookup_options_set_the_socket_timeout() {
+        let options = WhoisScanner::lookup_options("example.com", Duration::from_secs(7)).unwrap();
+        assert_eq!(options.timeout, Some(Duration::from_secs(7)));
+        assert!(WhoisScanner::lookup_options("not a domain!", Duration::from_secs(7)).is_err());
+    }
+
+    /// A WHOIS server that accepts and never answers must not stall the async runtime: on a
+    /// single-threaded runtime a 300ms timer still fires while the lookup waits out its 3s socket timeout.
+    #[tokio::test]
+    async fn traditional_whois_does_not_block_the_runtime() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(Duration::from_secs(5));
+            drop(held);
+        });
+        let servers = format!(r#"{{"_": {{"ip": "{addr}"}}, "test": "{addr}"}}"#);
+        let scanner = WhoisScanner {
+            client: Client::new(),
+            whois_client: Arc::new(WhoIs::from_string(servers).unwrap()),
+            rdap_timeout: Duration::from_secs(1),
+            whois_timeout: Duration::from_secs(3),
+        };
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            scanner.query_traditional_whois("example.test"),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "lookup returned before the timer: {:?}",
+            outcome.map(|r| r.is_ok())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "runtime was blocked for {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn whois_ignores_protocol_changes() {
@@ -1018,12 +1104,12 @@ mod tests {
 
     #[test]
     fn test_data_source_types() {
-        let sources = [DataSource::Rdap, DataSource::Whois, DataSource::Failed];
+        let sources = [DataSource::Rdap, DataSource::Whois, DataSource::Failed("x".to_string())];
 
         assert_eq!(sources.len(), 3);
         assert!(matches!(sources[0], DataSource::Rdap));
         assert!(matches!(sources[1], DataSource::Whois));
-        assert!(matches!(sources[2], DataSource::Failed));
+        assert!(matches!(sources[2], DataSource::Failed(_)));
     }
 
     #[test]
@@ -1119,7 +1205,7 @@ mod tests {
         // Should handle timeout gracefully
         match result {
             Ok(ScanResult::Whois(whois_result)) => {
-                assert_eq!(whois_result.data_source, DataSource::Failed);
+                assert!(matches!(whois_result.data_source, DataSource::Failed(_)));
             }
             Ok(_) => panic!("Expected Whois result"),
             Err(_) => {

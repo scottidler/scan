@@ -12,6 +12,7 @@ pub mod status;
 pub mod target;
 #[cfg(test)]
 pub mod testing;
+pub mod text;
 pub mod traceroute;
 pub mod whois;
 
@@ -25,7 +26,7 @@ pub use ports::PortsPane;
 pub use scrollable::ScrollablePane;
 pub use security::SecurityPane;
 pub use sparkline::SparklineData;
-pub use status::status_label;
+pub use status::{failure_text, status_label};
 pub use target::TargetPane;
 pub use traceroute::TraceroutePane;
 pub use whois::WhoisPane;

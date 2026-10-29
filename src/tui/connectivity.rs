@@ -109,19 +109,6 @@ impl ConnectivityHistory {
     }
 }
 
-/// First per-protocol ping failure message, if any protocol failed.
-fn failure_reason(ping: &crate::scan::ping::PingResult) -> Option<String> {
-    use crate::scan::ping::PingStatus;
-    [&ping.ipv4_status, &ping.ipv6_status]
-        .into_iter()
-        .find_map(|status| match status {
-            PingStatus::Failed(msg) => Some(msg.clone()),
-            PingStatus::ToolMissing(tool) => Some(format!("{tool} not installed")),
-            PingStatus::NoAddress => Some("no address".to_string()),
-            _ => None,
-        })
-}
-
 /// CONNECTIVITY pane displays real-time ping latency and network connectivity metrics
 pub struct ConnectivityPane {
     title: &'static str,
@@ -347,10 +334,23 @@ impl Pane for ConnectivityPane {
             (false, false, "checking", Color::Gray)
         };
         let mut status_text = status_text.to_string();
-        if status_text == "disconnected"
+        let mut status_color = status_color;
+        // The latest ping scan's error (deadline hit). The smoothed label stays, since it reflects
+        // the last samples; the error rides next to it. With no samples yet it replaces
+        // `checking connectivity`, which would otherwise never change.
+        let mut scan_failure = state
+            .scanners
+            .get("ping")
+            .and_then(|ping_state| crate::tui::failure_text(&ping_state));
+        if status_text == "checking connectivity"
+            && let Some(failure) = scan_failure.take()
+        {
+            status_text = failure;
+            status_color = Color::Red;
+        } else if status_text == "disconnected"
             && let Some(ping_state) = state.scanners.get("ping")
             && let Some(ScanResult::Ping(ping)) = &ping_state.result
-            && let Some(reason) = failure_reason(ping)
+            && let Some(reason) = ping.failure_reason()
         {
             status_text = format!("disconnected: {reason}");
         }
@@ -364,10 +364,14 @@ impl Pane for ConnectivityPane {
         }
 
         // Status line
-        lines.push(Line::from(vec![
+        let mut status_spans = vec![
             Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
             Span::styled(status_text, Style::default().fg(status_color)),
-        ]));
+        ];
+        if let Some(failure) = scan_failure {
+            status_spans.push(Span::styled(format!(", {failure}"), Style::default().fg(Color::Red)));
+        }
+        lines.push(Line::from(status_spans));
 
         lines.push(Line::from(""));
 
@@ -441,13 +445,24 @@ impl Pane for ConnectivityPane {
         let status_paragraph = Paragraph::new(lines).alignment(Alignment::Left);
         status_paragraph.render(chunks[0], frame.buffer_mut());
 
+        // A failed ping scan with no samples has nothing pending: the families have no data.
+        let checking_text = if state
+            .scanners
+            .get("ping")
+            .is_some_and(|ping_state| crate::tui::failure_text(&ping_state).is_some())
+        {
+            "no data"
+        } else {
+            "checking"
+        };
+
         // IPv4 section - use connectivity state for consistent display
         let ipv4_status_text = if let Ok(history) = self.connectivity_history.lock() {
             match history.ipv4_state {
                 ConnectivityState::Connected => format!("{} avg:{}", ipv4_current, ipv4_avg),
                 ConnectivityState::Disconnected => "disconnected".to_string(),
                 ConnectivityState::Intermittent => format!("intermittent {} avg:{}", ipv4_current, ipv4_avg),
-                ConnectivityState::Checking => "checking".to_string(),
+                ConnectivityState::Checking => checking_text.to_string(),
             }
         } else {
             format!("{} avg:{}", ipv4_current, ipv4_avg)
@@ -491,7 +506,7 @@ impl Pane for ConnectivityPane {
                 ConnectivityState::Connected => format!("{} avg:{}", ipv6_current, ipv6_avg),
                 ConnectivityState::Disconnected => "network unreachable".to_string(),
                 ConnectivityState::Intermittent => format!("intermittent {} avg:{}", ipv6_current, ipv6_avg),
-                ConnectivityState::Checking => "checking".to_string(),
+                ConnectivityState::Checking => checking_text.to_string(),
             }
         } else {
             format!("{} avg:{}", ipv6_current, ipv6_avg)
@@ -639,5 +654,33 @@ mod tests {
             out = render_pane(&pane, &state_with_ping(failed_ping("x")), 100, 20, false);
         }
         assert!(out.contains("checking"), "{out}");
+    }
+
+    #[test]
+    fn failed_refresh_after_history_shows_error_next_to_smoothed_label() {
+        let pane = ConnectivityPane::new();
+        let start = Instant::now();
+        let ok = |sample: u64| {
+            let mut ping = PingResult::new();
+            ping.ipv4_status = PingStatus::Success(Duration::from_millis(12));
+            ping.ipv6_status = PingStatus::Success(Duration::from_millis(14));
+            // Distinct timestamps: the pane skips a sample it has already counted.
+            ping.queried_at = start + Duration::from_millis(sample);
+            ping
+        };
+        for sample in 1..=5 {
+            render_pane(&pane, &state_with_ping(ok(sample)), 100, 20, false);
+        }
+        let state = state_with_ping(ok(5));
+        if let Some(mut ping_state) = state.scanners.get_mut("ping") {
+            ping_state.status = ScanStatus::Failed;
+            ping_state.error = Some(eyre::eyre!("timed out after 30s"));
+        }
+        let out = render_pane(&pane, &state, 100, 20, false);
+        assert!(out.contains("dual-stack"), "smoothed label dropped:\n{out}");
+        assert!(
+            out.contains("failed: timed out after 30s"),
+            "failed refresh hidden:\n{out}"
+        );
     }
 }

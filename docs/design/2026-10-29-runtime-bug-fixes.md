@@ -174,6 +174,29 @@ Each phase: one commit, `otto ci` green, and its new tests shown failing against
 - `watch` channel through `main.rs`, `spawn_scanner_tasks`, `Scanner::run`, `TuiApp`; `deadline()`, `uses_protocol()`, `kill_on_drop` (#4).
 - **Success criteria:** with a paused tokio clock, a stub scanner whose `scan()` sleeps 60s receives `send(Protocol::Ipv4)` mid-scan and the next `scan()` call starts with `Ipv4` without the clock advancing; a stub that never returns records `timed out after 30s` once the clock advances 30s; a `uses_protocol() == false` stub is not rescanned on `send`.
 
+#### Phase 9: Implementation audit fixes
+**Model:** opus
+- Added 2026-10-29 from the implementation audit (`~/.cache/review-panel/runs/vE8TbDrM/synthesis.md`). Every item is a regression or a gap against this doc's Goals, found in the committed code.
+- **CN truncation panic:** `src/tui/security.rs` cuts subject and issuer CN at byte 25, and that panics on a non-ASCII char boundary. Fixing #6 made this code reachable for the first time. Truncate by chars.
+- **`--no-tui` output (`src/pretty.rs`) never followed the new states.** Ping all-failed prints a success icon, and WHOIS `NotApplicable` prints as an empty successful lookup. Bring it to parity with the panes:
+  - all-failed ping prints `❌` with the reason
+  - WHOIS n/a prints neutral
+  - an error that follows a retained result is printed
+  - `https_failure` is printed
+  - the HTTP grade comes from the primary result, via `as_str()`
+- **Failed scans show their reason in every pane.** `status_label` also covers the no-result path:
+  - `Failed` with no result renders `failed: <error>`, never `analyzing...` or `checking...` forever.
+  - `Failed` with a retained result shows the error next to the old data.
+  - This covers the Security pane's stuck first-scan case.
+- **WHOIS deadline:**
+  - The traditional whois fallback (whois-rust, synchronous, 60s socket timeout) moves into `spawn_blocking`.
+  - WHOIS `deadline()` = RDAP timeout + whois timeout + slack, so the fallback runs when RDAP hangs.
+- **Success criteria:**
+  - A security render with a CN of 30 multi-byte chars does not panic.
+  - `pretty` tests: an all-failed ping output contains `❌` and the reason; WHOIS `NotApplicable` contains `n/a` and no `✅`.
+  - A security render of `Failed` with no result and error `timed out after 30s` contains that text, and not `analyzing`.
+  - WHOIS `deadline()` exceeds the RDAP timeout plus the whois timeout.
+
 ## Acceptance Criteria
 
 Live checks use a release build: `cargo build --release`, then `tui-test run --cols 200 --rows 55 -- env RUST_LOG=debug ./target/release/scan <target>`, then `tui-test close --all` after each. Debug level is needed because ping logs only at DEBUG. Log timestamps are UTC.

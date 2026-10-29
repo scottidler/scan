@@ -106,11 +106,17 @@ impl SecurityPane {
         // Empty line for spacing
         lines.push(Line::from(""));
 
-        let (tls_status_label, tls_status_color) = state
+        let tls_failed = state
             .scanners
             .get("tls")
-            .map(|tls_state| crate::tui::status_label(&tls_state, "analyzing...", "analyzed"))
-            .unwrap_or(("analyzing...", Color::Yellow));
+            .is_some_and(|tls_state| matches!(tls_state.status, crate::types::ScanStatus::Failed));
+        if let Some(tls_state) = state.scanners.get("tls") {
+            let (label, color) = crate::tui::status_label(&tls_state, "analyzing...", "analyzed");
+            lines[0] = Line::from(vec![
+                Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled(label, Style::default().fg(color)),
+            ]);
+        }
 
         // Extract TLS data upfront
         let tls_data = if let Some(tls_state) = state.scanners.get("tls") {
@@ -287,34 +293,7 @@ impl SecurityPane {
                     primary_data
                         .vulnerabilities
                         .iter()
-                        .map(|vuln| match vuln {
-                            crate::scan::tls::TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
-                            crate::scan::tls::TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
-                            crate::scan::tls::TlsVulnerability::Beast => "BEAST (CVE-2011-3389)".to_string(),
-                            crate::scan::tls::TlsVulnerability::Crime => "CRIME (CVE-2012-4929)".to_string(),
-                            crate::scan::tls::TlsVulnerability::WeakCipher(cipher) => {
-                                format!("Weak cipher: {}", cipher)
-                            }
-                            crate::scan::tls::TlsVulnerability::ExpiredCertificate => "Certificate expired".to_string(),
-                            crate::scan::tls::TlsVulnerability::SelfSignedCertificate => {
-                                "Self-signed certificate".to_string()
-                            }
-                            crate::scan::tls::TlsVulnerability::UntrustedIssuer => {
-                                "Untrusted certificate issuer".to_string()
-                            }
-                            crate::scan::tls::TlsVulnerability::HostnameMismatch => {
-                                "Certificate hostname mismatch".to_string()
-                            }
-                            crate::scan::tls::TlsVulnerability::WeakSignatureAlgorithm(alg) => {
-                                format!("Weak signature: {}", alg)
-                            }
-                            crate::scan::tls::TlsVulnerability::InsecureRenegotiation => {
-                                "Insecure renegotiation".to_string()
-                            }
-                            crate::scan::tls::TlsVulnerability::WeakDhParams => "Weak DH parameters".to_string(),
-                            crate::scan::tls::TlsVulnerability::SslV2Enabled => "SSLv2 enabled".to_string(),
-                            crate::scan::tls::TlsVulnerability::SslV3Enabled => "SSLv3 enabled".to_string(),
-                        })
+                        .map(|vuln| vuln.description())
                         .chain(primary_data.certificate_errors.iter().cloned())
                         .take(MAX_TLS_VULNERABILITIES_DISPLAYED)
                         .collect::<Vec<_>>()
@@ -340,12 +319,6 @@ impl SecurityPane {
             cert_info,
         )) = tls_data
         {
-            // Update header based on status
-            lines[0] = Line::from(vec![
-                Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled(tls_status_label, Style::default().fg(tls_status_color)),
-            ]);
-
             // TLS Connection
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
@@ -368,11 +341,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("🔑 Cipher: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if cipher.len() > CIPHER_DISPLAY_MAX_LENGTH {
-                            format!("{}...", &cipher[..CIPHER_TRUNCATE_LENGTH])
-                        } else {
-                            cipher
-                        },
+                        crate::tui::text::ellipsize(&cipher, CIPHER_DISPLAY_MAX_LENGTH, CIPHER_TRUNCATE_LENGTH),
                         Style::default().fg(Color::Yellow),
                     ),
                 ]));
@@ -416,38 +385,14 @@ impl SecurityPane {
                     Span::styled(if cert_valid { "yes" } else { "no" }, Style::default().fg(cert_color)),
                 ]));
 
-                // Subject (extract CN)
-                let subject_display = if let Some(cn_start) = subject.find("CN=") {
-                    let cn_part = &subject[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
-                    if let Some(comma) = cn_part.find(',') {
-                        &cn_part[..comma.min(CN_DISPLAY_MAX_LENGTH)]
-                    } else {
-                        &cn_part[..cn_part.len().min(CN_DISPLAY_MAX_LENGTH)]
-                    }
-                } else {
-                    "unknown"
-                };
-
                 lines.push(Line::from(vec![
                     Span::styled("  Subject: ", Style::default().fg(Color::White)),
-                    Span::styled(subject_display.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::styled(common_name_display(&subject), Style::default().fg(Color::Yellow)),
                 ]));
-
-                // Issuer (extract CN)
-                let issuer_display = if let Some(cn_start) = issuer.find("CN=") {
-                    let cn_part = &issuer[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
-                    if let Some(comma) = cn_part.find(',') {
-                        &cn_part[..comma.min(CN_DISPLAY_MAX_LENGTH)]
-                    } else {
-                        &cn_part[..cn_part.len().min(CN_DISPLAY_MAX_LENGTH)]
-                    }
-                } else {
-                    "unknown"
-                };
 
                 lines.push(Line::from(vec![
                     Span::styled("  Issuer: ", Style::default().fg(Color::White)),
-                    Span::styled(issuer_display.to_string(), Style::default().fg(Color::Green)),
+                    Span::styled(common_name_display(&issuer), Style::default().fg(Color::Green)),
                 ]));
 
                 // Certificate expiry
@@ -514,6 +459,12 @@ impl SecurityPane {
                     Span::styled(issue, Style::default().fg(Color::Red)),
                 ]));
             }
+        } else if tls_failed {
+            // The first scan failed: the header carries the reason, nothing is still pending.
+            lines.push(Line::from(vec![
+                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
+                Span::styled("failed", Style::default().fg(Color::Red)),
+            ]));
         } else if state.scanners.contains_key("tls") {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![
@@ -636,11 +587,11 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    Policy: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if header_value.len() > CSP_HEADER_DISPLAY_MAX_LENGTH {
-                            format!("{}...", &header_value[..CSP_HEADER_TRUNCATE_LENGTH])
-                        } else {
-                            header_value.clone()
-                        },
+                        crate::tui::text::ellipsize(
+                            &header_value,
+                            CSP_HEADER_DISPLAY_MAX_LENGTH,
+                            CSP_HEADER_TRUNCATE_LENGTH,
+                        ),
                         Style::default().fg(Color::Gray),
                     ),
                 ]));
@@ -650,11 +601,7 @@ impl SecurityPane {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
                         Span::styled(
-                            if issue.len() > ISSUE_DISPLAY_MAX_LENGTH {
-                                format!("{}...", &issue[..ISSUE_TRUNCATE_LENGTH])
-                            } else {
-                                issue
-                            },
+                            crate::tui::text::ellipsize(&issue, ISSUE_DISPLAY_MAX_LENGTH, ISSUE_TRUNCATE_LENGTH),
                             Style::default().fg(Color::Red),
                         ),
                     ]));
@@ -693,11 +640,11 @@ impl SecurityPane {
                     lines.push(Line::from(vec![
                         Span::styled("    Origin: ", Style::default().fg(Color::White)),
                         Span::styled(
-                            if origin.len() > CORS_ORIGIN_DISPLAY_MAX_LENGTH {
-                                format!("{}...", &origin[..CORS_ORIGIN_TRUNCATE_LENGTH])
-                            } else {
-                                origin.clone()
-                            },
+                            crate::tui::text::ellipsize(
+                                origin,
+                                CORS_ORIGIN_DISPLAY_MAX_LENGTH,
+                                CORS_ORIGIN_TRUNCATE_LENGTH,
+                            ),
                             Style::default().fg(Color::Gray),
                         ),
                     ]));
@@ -728,11 +675,7 @@ impl SecurityPane {
                     lines.push(Line::from(vec![
                         Span::styled("    • ", Style::default().fg(Color::Red)),
                         Span::styled(
-                            if issue.len() > ISSUE_DISPLAY_MAX_LENGTH {
-                                format!("{}...", &issue[..ISSUE_TRUNCATE_LENGTH])
-                            } else {
-                                issue
-                            },
+                            crate::tui::text::ellipsize(&issue, ISSUE_DISPLAY_MAX_LENGTH, ISSUE_TRUNCATE_LENGTH),
                             Style::default().fg(Color::Red),
                         ),
                     ]));
@@ -824,11 +767,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    SPF: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if spf.len() > SPF_DISPLAY_MAX_LENGTH {
-                            format!("{}...", &spf[..SPF_TRUNCATE_LENGTH])
-                        } else {
-                            spf.clone()
-                        },
+                        crate::tui::text::ellipsize(spf, SPF_DISPLAY_MAX_LENGTH, SPF_TRUNCATE_LENGTH),
                         Style::default().fg(Color::Gray),
                     ),
                 ]));
@@ -838,11 +777,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    DMARC: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        if dmarc.len() > DMARC_DISPLAY_MAX_LENGTH {
-                            format!("{}...", &dmarc[..DMARC_TRUNCATE_LENGTH])
-                        } else {
-                            dmarc.clone()
-                        },
+                        crate::tui::text::ellipsize(dmarc, DMARC_DISPLAY_MAX_LENGTH, DMARC_TRUNCATE_LENGTH),
                         Style::default().fg(Color::Gray),
                     ),
                 ]));
@@ -943,6 +878,17 @@ impl Pane for SecurityPane {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+/// The `CN=` value of a distinguished name, cut at the next `,` and to `CN_DISPLAY_MAX_LENGTH` chars.
+/// Counted in chars, not bytes: a byte cut inside a multibyte char panics the draw loop.
+fn common_name_display(distinguished_name: &str) -> String {
+    let Some(cn_start) = distinguished_name.find("CN=") else {
+        return "unknown".to_string();
+    };
+    let cn_part = &distinguished_name[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
+    let cn = cn_part.split(',').next().unwrap_or_default();
+    cn.chars().take(CN_DISPLAY_MAX_LENGTH).collect()
 }
 
 #[cfg(test)]
@@ -1733,5 +1679,114 @@ mod tests {
         let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 68, 22, true);
         assert!(out.contains("Issues: 1"), "missing issue count:\n{}", out);
         assert!(out.contains("Certificate expired"), "reason below the fold:\n{}", out);
+    }
+
+    fn state_with_cert(subject: &str, issuer: &str) -> AppState {
+        let state = state_with_tls(ScanStatus::Complete);
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.certificate_chain = vec![CertificateInfo {
+                subject: subject.to_string(),
+                issuer: issuer.to_string(),
+                serial_number: "1".to_string(),
+                not_before: Utc::now(),
+                not_after: Utc::now() + chrono::Duration::days(90),
+                signature_algorithm: "SHA256withRSA".to_string(),
+                public_key_algorithm: "RSA".to_string(),
+                key_size: Some(2048),
+                san_domains: vec![],
+                is_self_signed: false,
+                is_ca: false,
+            }];
+        }
+        state
+    }
+
+    #[test]
+    fn render_multibyte_cn_truncates_by_chars_without_panic() {
+        let cn = "é".repeat(30);
+        let state = state_with_cert(&format!("CN={cn}"), &format!("CN={cn},O=Example"));
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        let shown = "é".repeat(CN_DISPLAY_MAX_LENGTH);
+        assert!(
+            out.contains(&format!("Subject: {shown}")),
+            "subject CN not shown:\n{}",
+            out
+        );
+        assert!(
+            out.contains(&format!("Issuer: {shown}")),
+            "issuer CN not shown:\n{}",
+            out
+        );
+        assert!(
+            !out.contains(&"é".repeat(CN_DISPLAY_MAX_LENGTH + 1)),
+            "CN not truncated:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn render_ascii_cn_stops_at_comma() {
+        let state = state_with_cert("CN=example.com,O=Example Corp", "CN=R3,O=Let's Encrypt");
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(out.contains("Subject: example.com "), "subject CN wrong:\n{}", out);
+        assert!(out.contains("Issuer: R3 "), "issuer CN wrong:\n{}", out);
+    }
+
+    fn failed_tls_state(with_result: bool) -> AppState {
+        let state = if with_result {
+            state_with_tls(ScanStatus::Failed)
+        } else {
+            let state = AppState::new("example.com".to_string());
+            state.scanners.insert(
+                "tls".to_string(),
+                ScanState {
+                    result: None,
+                    error: None,
+                    status: ScanStatus::Failed,
+                    last_updated: Instant::now(),
+                    history: std::collections::VecDeque::new(),
+                },
+            );
+            state
+        };
+        if let Some(mut tls_state) = state.scanners.get_mut("tls") {
+            tls_state.error = Some(eyre::eyre!("timed out after 30s"));
+        }
+        state
+    }
+
+    #[test]
+    fn render_failed_first_scan_shows_reason_not_analyzing() {
+        let state = failed_tls_state(false);
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(out.contains("timed out after 30s"), "failure reason missing:\n{}", out);
+        assert!(!out.contains("analyzing"), "failed scan still analyzing:\n{}", out);
+        assert!(!out.contains("checking"), "failed scan still checking:\n{}", out);
+    }
+
+    #[test]
+    fn render_failed_refresh_shows_reason_next_to_retained_data() {
+        let state = failed_tls_state(true);
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(
+            out.contains("failed: timed out after 30s"),
+            "failure reason missing:\n{}",
+            out
+        );
+        assert!(out.contains("TLSv1.3"), "retained result dropped:\n{}", out);
+    }
+
+    #[test]
+    fn common_name_display_cases() {
+        assert_eq!(common_name_display("O=Example,CN=host.example,C=US"), "host.example");
+        assert_eq!(common_name_display("O=No Common Name"), "unknown");
+        assert_eq!(
+            common_name_display(&format!("CN={}", "ü".repeat(40))).chars().count(),
+            CN_DISPLAY_MAX_LENGTH
+        );
+        assert_eq!(common_name_display("CN="), "");
     }
 }

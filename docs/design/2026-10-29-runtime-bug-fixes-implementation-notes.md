@@ -185,3 +185,95 @@ Success criteria (all `#[tokio::test(start_paused = true)]` in src/scanner.rs):
 Break-it evidence: each fix was reverted on its own and the tests rerun. With both `changed()` arms gated `if false` (the old behavior, where the protocol is read only at tick time), `protocol_change_mid_scan_...` and `protocol_change_while_idle_...` fail. With the deadline set to `Duration::MAX`, `scan_past_deadline_records_timeout` fails. With `follow_protocol = true` regardless of `uses_protocol()`, `protocol_agnostic_scanner_is_not_rescanned_on_change` fails. With `kill_on_drop(false)` in the helper, `kill_on_drop_command_sets_kill_on_drop` and `dropping_an_in_flight_scan_kills_the_ping_child` fail (the child is still `S` after the abort). With `switch_protocol` not sending, `switch_protocol_cycles_state_and_notifies_scanners` fails. All restored: 272 pass, `otto ci` green.
 
 Live AC5 (release build, 200x55, `RUST_LOG=debug scan google.com`): `expect text "avg:"` 0; `key press p` 0; 3s wait (`expect text "zz-never-present" --timeout 3000`) 1, as expected; the last `scan::ping] scan: target=` line is `2026-10-29 14:59:05.109 [DEBUG] scan::scan::ping - [scan::ping] scan: target=google.com protocol=IPv4`; `close --all` 0. The log has `[tui] protocol_changed: IPv4+IPv6 -> IPv4 (scanners notified)` at 14:59:02.107. Within 1ms, dns, geoip, traceroute, http, port, tls and ping each logged `protocol_changed_while_idle` + `scan_cycle_starting ... protocol=IPv4`, and whois logged nothing (opted out).
+
+## Phase 9: Implementation audit fixes
+### Design decisions
+- `common_name_display(dn) -> String` (src/tui/security.rs) replaces the two copy-pasted byte slices for subject and issuer. It cuts at the first `,`, then takes `CN_DISPLAY_MAX_LENGTH` chars, so a multibyte char can no longer land on the cut.
+- `status_label` (src/tui/status.rs) now returns `(String, Color)`. `Failed` renders `failed: <error:#>` whenever the scanner recorded an error, with or without a retained result. `failure_text(&ScanState) -> Option<String>` is the shared piece, and the connectivity pane uses it too.
+- Security pane: the header comes from `status_label` whenever a `tls` scanner exists, not only inside the has-result branch. A `Failed` scanner with no result now shows `🔗 Status: failed` under the header instead of `checking...` / `detecting...` / `validating...`.
+- Panes outside the Security pane: the HTTP no-result branch shows `scan failed` instead of `checking...`. Ports now takes its header from `status_label` on the no-result path too. DNS drops its `resolving...` placeholder lines on `Failed`. In the connectivity pane, `checking connectivity` turns into the scanner's `failed: <error>` (a ping deadline hit before any sample), and the per-family labels read `no data` instead of `checking`. A test in src/tui/testing.rs walks all eight status panes.
+- `--no-tui` output (src/pretty.rs): `format_scan_state(name, &ScanState) -> String` returns the lines and `print_scan_state` prints them, so the output can be tested. `describe_result` returns an `Outcome` (`Ok` / `Failed` / `NotApplicable`) with the text, and the icon follows from it. All-failed ping prints `❌ PING: Ping failed: <reason>`. WHOIS `NotApplicable` prints `⚫ WHOIS: n/a for IP targets (see GEOIP)`. A `Failed` state with a retained result prints `└─ Error: <error>` under the result. `https_failure` prints as `└─ plain HTTP (HTTPS failed: <reason>)`. The HTTP grade is `primary_data.security_grade.as_str()`.
+- The icon rule puts a failed or n/a outcome ahead of `Running`. Ping is mid-scan at nearly every 5s print, so with `Running` first, an all-failed ping always printed `🔄` and never `❌`. That was observed live on `192.0.2.1` before this rule went in.
+- `failure_reason` moved from src/tui/connectivity.rs to `PingResult::failure_reason` (src/scan/ping.rs), so the pane and `--no-tui` give the same reason.
+- WHOIS (src/scan/whois.rs): the whois-rust lookup runs in `tokio::task::spawn_blocking` on an `Arc<WhoIs>`. `lookup_options` sets the socket timeout to `WHOIS_LOOKUP_TIMEOUT_SECS` (15s) instead of whois-rust's 60s default. `deadline()` is `rdap_timeout + whois_timeout + DEADLINE_SLACK_SECS` = 30 + 15 + 5 = 50s. The RDAP constant was renamed `WHOIS_TIMEOUT_SECS` -> `RDAP_TIMEOUT_SECS` because it only ever timed RDAP.
+### Deviations
+- An unsuccessful ping with empty stderr now reads `no reply from <target> (using ping, exit status: 1)` (`unsuccessful_ping_message`, src/scan/ping.rs). Before, it read `Ping failed for target: ... - stderr: ` with nothing after it. That was the live `--no-tui` reason for `192.0.2.1`, so "prints `❌` with the reason" was not met until this changed. The connectivity pane's `disconnected: <reason>` shows the same text.
+- The `--no-tui` TLS line prints version and grade with `as_str()` (`TLSv1.3`, `A+`) instead of `{:?}` (`V1_3`, `APlus`). The spec names only the HTTP grade. Without this, the same output block would print HTTP `grade B` next to TLS `grade APlus`. TLS keeps best-of-families, which is what the Security pane shows.
+- The spec's "Failed scans show their reason in every pane" covers the connectivity pane here as well, although Phase 2 left it off `status_label`. Only the no-sample case changes. Once samples exist, its 5-sample smoothing still decides the label.
+### Tradeoffs
+- The WHOIS socket timeout is per operation (connect, write, read), and whois-rust follows up to 2 referrals, so a slow server chain can outlast `whois_timeout`. The deadline still bounds the scan, and the blocking thread ends at its own socket timeouts. I preferred this to the async `lookup_async`, which needs whois-rust's `tokio` feature and a dependency change. The spec names `spawn_blocking`.
+- `traditional_whois_does_not_block_the_runtime` uses a local listener that accepts and never answers, with a 3s socket timeout and a 300ms `tokio::time::timeout` on the single-threaded test runtime. It needs no network. The blocking thread holds the test about 3s at runtime shutdown.
+- `failed: <error>` uses `{:#}` so the eyre chain shows (`outer: cause`). Long chains get clipped by the pane width, and the full text stays in the log.
+### Open questions
+- The traditional WHOIS fallback has never worked in production. `WhoisScanner::new` builds `WhoIs::from_path("/usr/bin/whois")`, which parses the whois binary as a JSON server list and fails. `from_string("whois")` fails the same way. That leaves `from_host("whois.iana.org")`, which has an empty TLD map, so every domain lookup returns `No whois server is known for this kind of object.` A probe of `query_traditional_whois("google.com")` returned exactly that. The deadline and `spawn_blocking` work is correct for when it does run. Fixing the server list (whois-rust's bundled `servers.json`, or the `whois` CLI) is outside this phase.
+- `--no-tui` for `192.0.2.1` still prints `✅ TLS: Unknown, cert invalid, grade F (0ms)` for a host that never answered (audit P3, unchanged since v0.5.4). WHOIS `DataSource::Failed` also still prints `✅` with unknowns. Neither is in Phase 9's list. Should they print `❌`?
+- The other byte-index truncations named in the audit (security.rs cipher/vuln text, tui/http.rs URL, tui/dns.rs TXT) are left alone. Their inputs are ASCII today.
+
+Success criteria:
+- PASS `render_multibyte_cn_truncates_by_chars_without_panic`: a subject and issuer CN of 30 `é` render as 25 `é` with no panic. Also `render_ascii_cn_stops_at_comma` and `common_name_display_cases`.
+- PASS `all_failed_ping_prints_failure_icon_and_reason`: the output starts `❌ PING: ` and contains `100% packet loss`, with no `✅`. PASS `whois_not_applicable_prints_neutral`: contains `n/a`, with no `✅` and no `unknown registrar`. Also `failed_refresh_prints_retained_result_and_its_error`, `failed_first_scan_prints_error`, `http_prints_https_failure_and_primary_grade`, `http_grade_uses_display_form`, `tls_version_and_grade_use_display_form`, `refreshing_all_failed_ping_keeps_failure_icon`, `refreshing_successful_ping_shows_refresh_icon`, `successful_ping_keeps_success_icon`.
+- PASS `render_failed_first_scan_shows_reason_not_analyzing`: a Security render of `Failed` with no result and error `timed out after 30s` contains that text and not `analyzing` (nor `checking`). Also `render_failed_refresh_shows_reason_next_to_retained_data`, `every_status_pane_names_a_failed_first_scan`, and the status.rs `failed_with_error_names_the_reason` / `failed_with_retained_result_still_names_the_reason` / `failure_text_is_none_unless_failed`.
+- PASS `deadline_covers_rdap_and_whois_fallback`: 50s > 30s + 15s. Also `lookup_options_set_the_socket_timeout` and `traditional_whois_does_not_block_the_runtime`.
+- 295 tests pass, and `otto ci` is green.
+
+Break-it evidence:
+- Security tests run against unmodified HEAD 68077ba: `render_multibyte_cn_...` panicked `end byte index 25 is not a char boundary; it is inside 'é' (bytes 24..26 of string)` at security.rs:425. `render_failed_first_scan_...` rendered `Status: analyzing...` / `checking...`. `render_failed_refresh_...` had no reason.
+- `every_status_pane_names_a_failed_first_scan` in a HEAD 68077ba worktree: no pane had the reason. Status lines were ping `checking connectivity`, tls `analyzing...`, port `scanning...`, and dns/http/whois/traceroute/geoip a bare `failed`.
+- pretty.rs with the old semantics restored (Ok outcome for all-failed ping, no retained-error line, best grade `{:?}`, no `https_failure`, no n/a branch): 5 of 7 tests failed, printing `✅ PING: Ping failed (no response from any protocol)`, `✅ WHOIS: unknown age, unknown expiry, Unknown privacy, unknown registrar (0ms)`, and `grade APlus`. The old `Running`-first icon order fails `refreshing_all_failed_ping_keeps_failure_icon` (`🔄 PING: ...`). The old `{:?}` TLS format fails `tls_version_and_grade_use_display_form` (`V1_3`, `APlus`). The old empty-stderr message fails `unsuccessful_ping_message_names_silent_failure`.
+- WHOIS with the direct (non-`spawn_blocking`) lookup and no `deadline()` override: `deadline 30s must exceed RDAP 30s + WHOIS 15s`, and the non-blocking test got `Ok(false)` (the lookup finished before the 300ms timer could fire).
+
+`--no-tui` (release build, `timeout 45 ./target/release/scan --no-tui 192.0.2.1`, last block): `❌ PING: Ping failed: no reply from 192.0.2.1 (using ping, exit status: 1)`, `⚫ WHOIS: n/a for IP targets (see GEOIP)`, `❌ HTTP: Error - All HTTP attempts failed for target: 192.0.2.1 (IPv4+IPv6)`, `✅ TLS: Unknown, cert invalid, grade F (0ms)`, `✅ TRACEROUTE: IPv4 30 hops, unreached (timeout, 28 timeouts, 18021ms)`, `✅ DNS: 0 A records`, `✅ GEOIP: Unknown location - Unknown network`, `✅ PORT: No open ports found`. The output never exits on its own (a 5s print loop), so `timeout` ends it with 124.
+
+Live AC (release build, 200x55, `RUST_LOG=debug`): AC2 `avg:` 0, `bad linger` 949 -> 949 (0 added). AC3 0/0/0/0/0 (`Status: analyzed`, `https://google.com`, not `http://142.`, `Expires:` after SECURITY, `PFS: yes`). AC4 0/0/0. AC5 `key press p` 0, and the last ping line 3s later is `2026-10-29 15:35:21.582 [DEBUG] scan::scan::ping - [scan::ping] scan: target=google.com protocol=IPv4`. AC6 `IPv4: 1.1.1.1` 0.
+
+### Phase 9 amendment (supersedes the Phase 9 open questions)
+- Orchestrator rulings on the three Phase 9 open questions: Q2 fix, Q3 fix, Q1 record and do not fix.
+- **Q2, `--no-tui` TLS and WHOIS failures (src/pretty.rs):**
+  - A TLS result whose primary connection failed now prints `❌` with the first `certificate_errors` entry. That is where the handshake error lands (`Connection failed: <cause>`).
+  - A TLS result with no successful family prints `❌ TLS: Connection failed: <TlsStatus::Failed message>` (`tls_status_failure`).
+  - WHOIS `DataSource::Failed` now carries the reason as `DataSource::Failed(String)`: `RDAP: <rdap error>; WHOIS: <whois error>`. Before, the RDAP error went only to a debug log. `--no-tui` prints `❌ WHOIS: Lookup failed: <reason>`, and the WHOIS pane's source line reads `Failed: <reason>` instead of `Failed`. I chose the variant over a separate `error` field so the failure is encoded once.
+- **Q3, char-safe truncation:** a new `src/tui/text.rs` holds `ellipsize(text, max_chars, keep_chars)`, which counts chars, not bytes. Every byte-index `[..N]` cut in the panes goes through it:
+  - Security pane: cipher, CSP policy, CSP issues, CORS origin, CORS issues, SPF, DMARC.
+  - `tui/http.rs`: `truncate_url`, whose length checks now count chars too.
+  - `tui/dns.rs`: `truncate_txt` and the AAAA cut.
+  - Afterwards, `rg` for string slicing in src/tui finds only `common_name_display`'s slice. That one starts right after an ASCII `CN=` match, so it lands on a char boundary.
+- **Q1, WHOIS fallback server list:** found, not fixed. Root cause: `WhoisScanner::new` calls `WhoIs::from_path("/usr/bin/whois")`, which reads the whois ELF binary as a JSON server list and fails. `WhoIs::from_string("whois")` fails the same way, because `"whois"` is not JSON. That leaves `WhoIs::from_host("whois.iana.org")`, whose TLD map is empty, so `lookup` on any domain returns `No whois server is known for this kind of object.` without opening a socket. The probe `query_traditional_whois("google.com")` returned exactly that. This is a pre-existing bug outside the 14 findings, and the orchestrator is taking it to Scott. Once a working server list is in place, the Phase 9 `spawn_blocking`, socket timeout and deadline apply to it.
+- **Deviation:** `tls_version_and_grade_use_display_form` now sets `connection_successful = true` on its fixture. The expired-handshake fixture is a failed connection, and under Q2 that correctly prints `❌` with the cause.
+- **Tests:**
+  - `truncate_txt_cuts_multibyte_by_chars` and `truncate_url_cuts_multibyte_by_chars`, plus `text::tests` (including a 4-byte crab).
+  - `tls_connection_failure_prints_failure_icon_and_reason`, `tls_with_no_successful_family_prints_status_reason` and `whois_failed_lookup_prints_failure_icon_and_reason`.
+  - 302 tests pass, and `otto ci` is green.
+- **Break-it:**
+  - With only the two truncation tests added to 8fadeca's source, both panicked: `end byte index 42 is not a char boundary; it is inside 'é' (bytes 41..43 of string)` at dns.rs:95, and `end byte index 32 is not a char boundary; it is inside 'ü' (bytes 31..33 of string)` at http.rs:57.
+  - With the TLS connection check, the TLS status reason and the WHOIS `Failed` arm reverted, all three new pretty tests failed. They printed `✅ TLS: Unknown, cert invalid, grade F (0ms)`, `❌ TLS: Connection failed` (no reason), and `✅ WHOIS: unknown age, unknown expiry, Unknown privacy, unknown registrar (0ms)`.
+- **`--no-tui 192.0.2.1`** (release build, `timeout 45`, exit 124): `❌ TLS: Connection failed: TLS connection timeout after 10s`. The other lines are unchanged from the Phase 9 entry: `⚫ WHOIS: n/a ...`, `❌ PING: Ping failed: no reply from 192.0.2.1 (using ping, exit status: 1)`, and `❌ HTTP: Error - All HTTP attempts failed ...`.
+
+### Phase 9 amendment 2 (round 2 audit, `~/.cache/review-panel/runs/vE8TbDrM/synthesis.md`)
+This supersedes two earlier Phase 9 notes:
+- The open question "The other byte-index truncations ... are left alone." Amendment 1 made them all char-safe.
+- The deviation note "Only the no-sample case changes" for the connectivity pane. That pane now also shows a failed refresh after history exists.
+
+**`--no-tui` rejected TLS handshake (src/pretty.rs):**
+- The gap: `HandshakeOutcome::Rejected` (src/scan/tls.rs, phase 1) records the cause in `vulnerabilities` and leaves `certificate_errors` empty. Amendment 1 read only `certificate_errors.first()`, so expired.badssl.com, self-signed.badssl.com and wrong.host.badssl.com printed a bare `❌ TLS: Connection failed`.
+- The fix: the reason falls back to the primary result's first vulnerability. The line keeps the grade: `<reason>, grade <grade>`.
+- The vulnerability text now comes from `TlsVulnerability::description()` (src/scan/tls.rs). The Security pane's inline 14-arm `match` moved there, so the pane and `--no-tui` print the same words.
+
+**Connectivity pane (src/tui/connectivity.rs):**
+- The 5-sample smoothing is unchanged.
+- Whenever the latest ping scan failed (`failure_text`), the status line appends `, failed: <error>` in red after the smoothed label, for example `dual-stack, failed: timed out after 30s`.
+- With no samples yet, the error still replaces `checking connectivity`.
+
+**Tests:**
+- `tls_rejected_handshake_prints_vulnerability_reason_and_grade` runs on `fixtures::expired_handshake_result()` and expects `❌ TLS: Certificate expired` with `grade F`.
+- `failed_refresh_after_history_shows_error_next_to_smoothed_label` renders 5 successful samples with distinct `queried_at` values (the pane skips a sample it has already counted), then the same result with `Failed` and `timed out after 30s`. It expects both `dual-stack` and `failed: timed out after 30s`.
+- `tls_connection_failure_prints_failure_icon_and_reason` now also expects `, grade F`.
+- 304 tests pass, and `otto ci` is green.
+
+**Break-it:** both new tests failed on cc2e510's code.
+- The TLS test printed `❌ TLS: Connection failed`.
+- The connectivity test rendered `🌐 Status: dual-stack` with no error.
+
+**Live `--no-tui` (release build, `timeout 45`, exit 124 each):**
+- expired.badssl.com: `❌ TLS: Certificate expired, grade F`
+- self-signed.badssl.com: `❌ TLS: Self-signed certificate, grade F`
+- wrong.host.badssl.com: `❌ TLS: Certificate hostname mismatch, grade F`

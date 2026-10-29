@@ -42,7 +42,7 @@ impl HttpPane {
 
     /// Truncate URL to fit in the display
     fn truncate_url(url: &str) -> String {
-        if url.len() <= URL_DISPLAY_MAX_LENGTH {
+        if url.chars().count() <= URL_DISPLAY_MAX_LENGTH {
             url.to_string()
         } else {
             // Remove protocol and show domain + path
@@ -50,12 +50,7 @@ impl HttpPane {
                 .strip_prefix("https://")
                 .or_else(|| url.strip_prefix("http://"))
                 .unwrap_or(url);
-
-            if url_without_protocol.len() <= URL_DISPLAY_MAX_LENGTH {
-                url_without_protocol.to_string()
-            } else {
-                format!("{}...", &url_without_protocol[..URL_TRUNCATE_LENGTH])
-            }
+            crate::tui::text::ellipsize(url_without_protocol, URL_DISPLAY_MAX_LENGTH, URL_TRUNCATE_LENGTH)
         }
     }
 }
@@ -241,6 +236,12 @@ impl Pane for HttpPane {
                         Span::styled("all protocols failed", Style::default().fg(Color::Red)),
                     ]));
                 }
+            } else if matches!(http_state.status, crate::types::ScanStatus::Failed) {
+                // The header carries the reason; nothing is still being checked.
+                lines.push(Line::from(vec![
+                    Span::styled("📊 Status: ", Style::default().fg(Color::White)),
+                    Span::styled("scan failed", Style::default().fg(Color::Red)),
+                ]));
             } else {
                 // No HTTP data available yet
                 lines.push(Line::from(vec![
@@ -303,6 +304,17 @@ impl Pane for HttpPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_url_cuts_multibyte_by_chars() {
+        // `/` then 2-byte chars: the old byte cut at 32 lands inside a char.
+        let url = format!("https://ex.com/{}", "ü".repeat(40));
+        let out = HttpPane::truncate_url(&url);
+        assert!(out.starts_with("ex.com/ü"), "{out}");
+        assert!(out.ends_with("..."), "{out}");
+        assert_eq!(out.chars().count(), URL_TRUNCATE_LENGTH + 3, "{out}");
+        assert_eq!(HttpPane::truncate_url("https://example.com/"), "https://example.com/");
+    }
     use crate::scan::http::{CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade, SecurityHeaders};
     use crate::tui::testing::render_pane;
     use crate::types::{ScanState, ScanStatus};

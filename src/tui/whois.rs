@@ -221,17 +221,20 @@ impl Pane for WhoisPane {
                 }
 
                 // Data source
-                let source_color = match whois_result.data_source {
+                let source_color = match &whois_result.data_source {
                     crate::scan::whois::DataSource::Rdap => Color::Green,
                     crate::scan::whois::DataSource::Whois => Color::Yellow,
-                    crate::scan::whois::DataSource::Failed => Color::Red,
+                    crate::scan::whois::DataSource::Failed(_) => Color::Red,
                     crate::scan::whois::DataSource::NotApplicable => Color::Gray,
                 };
 
                 lines.push(Line::from(vec![
                     Span::styled("📡 Source: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        format!("{:?}", whois_result.data_source),
+                        match &whois_result.data_source {
+                            crate::scan::whois::DataSource::Failed(reason) => format!("Failed: {}", reason),
+                            source => format!("{:?}", source),
+                        },
                         Style::default().fg(source_color),
                     ),
                 ]));
