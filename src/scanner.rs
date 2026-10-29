@@ -157,7 +157,7 @@ fn mark_running(name: &str, state: &Arc<Mutex<AppState>>) {
 }
 
 /// Store a finished scan: a result is pushed to history (capped), an error keeps the last good result.
-fn record_outcome(
+pub(crate) fn record_outcome(
     name: &str,
     max_history: usize,
     protocol: Protocol,

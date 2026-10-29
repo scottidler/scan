@@ -132,31 +132,7 @@ impl WhoisScanner {
                     e
                 );
 
-                // Return a failed result rather than error
-                let mut result = WhoisResult {
-                    domain: domain.clone(),
-                    registration_date: None,
-                    expiry_date: None,
-                    last_updated: None,
-                    nameservers: Vec::new(),
-                    status: Vec::new(),
-                    dnssec: None,
-                    registrar: None,
-                    abuse_contact: None,
-                    registrant: None,
-                    admin_contact: None,
-                    tech_contact: None,
-                    privacy_score: PrivacyLevel::Unknown,
-                    domain_age_days: None,
-                    expires_in_days: None,
-                    risk_indicators: vec![RiskIndicator::QueryFailed],
-                    data_source: DataSource::Failed(format!("RDAP: {:#}; WHOIS: {:#}", rdap_error, e)),
-                    scan_duration: Duration::from_millis(0),
-                    raw_data: None,
-                };
-
-                self.calculate_derived_fields(&mut result);
-                Ok(result)
+                Err(eyre::eyre!("RDAP: {:#}; WHOIS: {:#}", rdap_error, e))
             }
         }
     }
@@ -865,15 +841,13 @@ pub enum RiskIndicator {
     SuspiciousRegistrar, // Known problematic registrar (would need reputation data)
     NoAbuseContact,      // Missing abuse contact
     WeakDnssec,          // DNSSEC not enabled
-    QueryFailed,         // Could not retrieve WHOIS data
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataSource {
-    Rdap,           // Modern RDAP protocol
-    Whois,          // Traditional WHOIS protocol
-    Failed(String), // Both RDAP and the WHOIS fallback failed; carries both errors
-    NotApplicable,  // IP target: no domain to look up
+    Rdap,          // Modern RDAP protocol
+    Whois,         // Traditional WHOIS protocol
+    NotApplicable, // IP target: no domain to look up
 }
 
 impl std::fmt::Display for DataSource {
@@ -882,7 +856,6 @@ impl std::fmt::Display for DataSource {
         match self {
             DataSource::Rdap => write!(f, "RDAP"),
             DataSource::Whois => write!(f, "WHOIS"),
-            DataSource::Failed(reason) => write!(f, "Failed: {}", reason),
             DataSource::NotApplicable => write!(f, "n/a"),
         }
     }
@@ -1298,10 +1271,6 @@ mod tests {
         assert_eq!(DataSource::Rdap.to_string(), "RDAP");
         assert_eq!(DataSource::Whois.to_string(), "WHOIS");
         assert_eq!(DataSource::NotApplicable.to_string(), "n/a");
-        assert_eq!(
-            DataSource::Failed("both down".to_string()).to_string(),
-            "Failed: both down"
-        );
     }
 
     /// AC5: RDAP fails (its only route is a proxy that refuses CONNECT), the scanner falls back to
@@ -1354,6 +1323,58 @@ mod tests {
         let out = render_pane(&WhoisPane::new(), &state, 100, 40, false);
         assert!(out.contains("Source: WHOIS"), "{out}");
         assert!(out.contains("Fixture Registrar"), "{out}");
+    }
+
+    /// Defect #3: RDAP (refusing proxy) and WHOIS (an IANA answer with no referral) both fail, so
+    /// the scan is an error, the state is `Failed`, and neither surface claims data was retrieved.
+    #[tokio::test]
+    async fn total_failure_is_an_error_the_pane_and_no_tui_output_report() {
+        use crate::tui::WhoisPane;
+        use crate::tui::testing::render_pane;
+        use crate::types::{AppState, ScanState, ScanStatus};
+        use std::sync::{Arc, Mutex};
+        let proxy = refusing_proxy().await;
+        let (iana, _) = fake_whois(vec!["domain: TEST\n".to_string()]).await;
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy}")).unwrap())
+            .build()
+            .unwrap();
+        let scanner = WhoisScanner {
+            client,
+            iana_server: iana,
+            rdap_timeout: Duration::from_secs(5),
+            whois_timeout: Duration::from_secs(5),
+        };
+        let target = Target::parse("example.test").unwrap();
+
+        let outcome = Scanner::scan(&scanner, &target, Protocol::Both).await;
+        let error = outcome
+            .as_ref()
+            .expect_err("both lookups failed, so the scan must be an error");
+        assert!(error.to_string().starts_with("RDAP: "), "{error:#}");
+        assert!(error.to_string().contains("; WHOIS: "), "{error:#}");
+
+        let state = Arc::new(Mutex::new(AppState::new("example.test".to_string())));
+        state.lock().unwrap().scanners.insert(
+            "whois".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::scanner::record_outcome("whois", 10, Protocol::Both, Instant::now(), outcome, &state);
+
+        let guard = state.lock().unwrap();
+        let whois_state = guard.scanners.get("whois").unwrap();
+        assert!(matches!(whois_state.status, ScanStatus::Failed));
+        let pane = render_pane(&WhoisPane::new(), &guard, 100, 40, false);
+        assert!(pane.contains("failed: RDAP"), "{pane}");
+        assert!(!pane.contains("retrieved"), "{pane}");
+        let printed = crate::pretty::format_scan_state("whois", &whois_state);
+        assert!(printed.contains("❌ WHOIS:"), "{printed}");
     }
 
     #[test]
@@ -1590,12 +1611,12 @@ mod tests {
 
     #[test]
     fn test_data_source_types() {
-        let sources = [DataSource::Rdap, DataSource::Whois, DataSource::Failed("x".to_string())];
+        let sources = [DataSource::Rdap, DataSource::Whois, DataSource::NotApplicable];
 
         assert_eq!(sources.len(), 3);
         assert!(matches!(sources[0], DataSource::Rdap));
         assert!(matches!(sources[1], DataSource::Whois));
-        assert!(matches!(sources[2], DataSource::Failed(_)));
+        assert!(matches!(sources[2], DataSource::NotApplicable));
     }
 
     #[test]
@@ -1691,7 +1712,7 @@ mod tests {
         // Should handle timeout gracefully
         match result {
             Ok(ScanResult::Whois(whois_result)) => {
-                assert!(matches!(whois_result.data_source, DataSource::Failed(_)));
+                assert_ne!(whois_result.data_source, DataSource::NotApplicable);
             }
             Ok(_) => panic!("Expected Whois result"),
             Err(_) => {

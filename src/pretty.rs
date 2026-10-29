@@ -211,7 +211,6 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
         ScanResult::Whois(whois) => {
             match &whois.data_source {
                 DataSource::NotApplicable => return (Outcome::NotApplicable, WHOIS_NOT_APPLICABLE_TEXT.to_string()),
-                DataSource::Failed(reason) => return (Outcome::Failed, format!("Lookup failed: {}", reason)),
                 DataSource::Rdap | DataSource::Whois => {}
             }
             let age_str = whois
@@ -690,21 +689,6 @@ mod tests {
         tls.ipv4_status = TlsStatus::Failed("handshake refused".to_string());
         let out = format_scan_state("tls", &state(ScanStatus::Complete, Some(ScanResult::Tls(tls)), None));
         assert!(out.starts_with("❌ TLS: Connection failed: handshake refused"), "{out}");
-    }
-
-    #[test]
-    fn whois_failed_lookup_prints_failure_icon_and_reason() {
-        let mut result = WhoisResult::not_applicable("example.com".to_string());
-        result.data_source = DataSource::Failed("RDAP: 503; WHOIS: no server".to_string());
-        let out = format_scan_state(
-            "whois",
-            &state(ScanStatus::Complete, Some(ScanResult::Whois(result)), None),
-        );
-        assert!(
-            out.starts_with("❌ WHOIS: Lookup failed: RDAP: 503; WHOIS: no server"),
-            "{out}"
-        );
-        assert!(!out.contains("unknown registrar"), "{out}");
     }
 
     #[test]

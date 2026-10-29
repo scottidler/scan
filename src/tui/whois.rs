@@ -210,7 +210,6 @@ impl Pane for WhoisPane {
                             crate::scan::whois::RiskIndicator::SuspiciousRegistrar => "Suspicious Registrar",
                             crate::scan::whois::RiskIndicator::NoAbuseContact => "No Abuse Contact",
                             crate::scan::whois::RiskIndicator::WeakDnssec => "Weak DNSSEC",
-                            crate::scan::whois::RiskIndicator::QueryFailed => "Query Failed",
                         };
 
                         lines.push(Line::from(vec![
@@ -224,7 +223,6 @@ impl Pane for WhoisPane {
                 let source_color = match &whois_result.data_source {
                     crate::scan::whois::DataSource::Rdap => Color::Green,
                     crate::scan::whois::DataSource::Whois => Color::Yellow,
-                    crate::scan::whois::DataSource::Failed(_) => Color::Red,
                     crate::scan::whois::DataSource::NotApplicable => Color::Gray,
                 };
 
