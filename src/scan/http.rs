@@ -1,10 +1,11 @@
 use crate::scanner::Scanner;
-use crate::target::{Protocol, Target};
+use crate::target::{Protocol, Target, TargetType};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -23,10 +24,7 @@ const CSP_MODERATE_PENALTY: i32 = 5;
 const CORS_DANGEROUS_PENALTY: i32 = 25;
 const CORS_WEAK_PENALTY: i32 = 10;
 const CORS_MODERATE_PENALTY: i32 = 5;
-const INSECURE_CORS_VULN_PENALTY: i32 = 20;
-const WEAK_CSP_VULN_PENALTY: i32 = 15;
-const MISSING_HSTS_VULN_PENALTY: i32 = 10;
-const OTHER_VULN_PENALTY: i32 = 5;
+const INFORMATION_DISCLOSURE_PENALTY: i32 = 5;
 const GRADE_A_PLUS_MIN: i32 = 90;
 const GRADE_A_MIN: i32 = 80;
 const GRADE_B_MIN: i32 = 70;
@@ -40,7 +38,6 @@ const CORS_MODERATE_ISSUES: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct HttpScanner {
-    client: Client,
     timeout: Duration,
 }
 
@@ -50,23 +47,88 @@ impl Default for HttpScanner {
     }
 }
 
+/// The URLs one family attempt requests, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestPlan {
+    /// Requested first; its scheme is the one the target asked for (HTTPS for bare targets).
+    pub primary: Url,
+    /// Plain-HTTP URL tried only when `primary` fails; `None` for URL targets.
+    pub plain_http_fallback: Option<Url>,
+}
+
+/// Build the request URLs for `target`. The host stays the target's name, so SNI, `Host:`
+/// and certificate validation all use it; the IP is pinned separately in the client.
+pub fn request_plan(target: &Target) -> eyre::Result<RequestPlan> {
+    let plan = match &target.target_type {
+        TargetType::Url(url) => RequestPlan {
+            primary: url.clone(),
+            plain_http_fallback: None,
+        },
+        TargetType::Domain(domain) => RequestPlan {
+            primary: Url::parse(&format!("https://{}/", domain))?,
+            plain_http_fallback: Some(Url::parse(&format!("http://{}/", domain))?),
+        },
+        TargetType::IpAddress(ip) => {
+            let host = match ip {
+                IpAddr::V4(v4) => v4.to_string(),
+                IpAddr::V6(v6) => format!("[{}]", v6),
+            };
+            RequestPlan {
+                primary: Url::parse(&format!("https://{}/", host))?,
+                plain_http_fallback: Some(Url::parse(&format!("http://{}/", host))?),
+            }
+        }
+    };
+    log::debug!(
+        "[scan::http] request_plan: target={} primary={} fallback={:?}",
+        target.display_name(),
+        plan.primary,
+        plan.plain_http_fallback.as_ref().map(Url::as_str)
+    );
+    Ok(plan)
+}
+
+/// The host name to pin to the resolved IP, or `None` when the URL host is already an IP.
+fn pinned_host(url: &Url) -> Option<&str> {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => Some(domain),
+        _ => None,
+    }
+}
+
+/// The innermost cause of an error chain, e.g. `invalid peer certificate: UnknownIssuer`.
+fn root_cause(error: &eyre::Error) -> String {
+    error
+        .chain()
+        .last()
+        .map(|cause| cause.to_string())
+        .unwrap_or_else(|| error.to_string())
+}
+
 impl HttpScanner {
     pub fn new() -> Self {
-        log::debug!("[scan::http] new: timeout=10s");
-
-        let timeout = Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS);
-        let client = Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::limited(HTTP_REDIRECT_LIMIT))
-            .user_agent("scan/1.0")
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self { client, timeout }
+        log::debug!("[scan::http] new: timeout={}s", HTTP_CLIENT_TIMEOUT_SECS);
+        Self {
+            timeout: Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS),
+        }
     }
 
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// One client per family attempt: `resolve` is builder-level, and one pin is one family.
+    /// The pin covers only `host`; redirects to other hosts resolve normally.
+    fn pinned_client(&self, host: Option<&str>, ip: IpAddr) -> eyre::Result<Client> {
+        log::debug!("[scan::http] pinned_client: host={:?} ip={}", host, ip);
+        let mut builder = Client::builder()
+            .timeout(self.timeout)
+            .redirect(reqwest::redirect::Policy::limited(HTTP_REDIRECT_LIMIT))
+            .user_agent("scan/1.0");
+        if let Some(host) = host {
+            builder = builder.resolve(host, SocketAddr::new(ip, 0));
+        }
+        Ok(builder.build()?)
     }
 
     async fn http_protocol(&self, target: &Target, protocol: Protocol) -> eyre::Result<HttpData> {
@@ -76,26 +138,11 @@ impl HttpScanner {
             protocol.as_str()
         );
 
-        // Check if target supports this protocol
-        if !target.supports_protocol(protocol) {
-            log::debug!(
-                "[scan::http] protocol_not_supported: target={} protocol={}",
-                target.display_name(),
-                protocol.as_str()
-            );
-            return Err(eyre::eyre!(
-                "No {} address available for target: {}",
-                protocol.as_str(),
-                target.display_name()
-            ));
-        }
-
-        // Get protocol-specific network target
-        let network_target = match target.network_target_for_protocol(protocol) {
-            Some(target_addr) => target_addr,
-            None => {
-                log::warn!(
-                    "[scan::http] no_target_for_protocol: target={} protocol={}",
+        let ip = match target.primary_ip_for_protocol(protocol) {
+            Some(ip) if target.supports_protocol(protocol) => ip,
+            _ => {
+                log::debug!(
+                    "[scan::http] protocol_not_supported: target={} protocol={}",
                     target.display_name(),
                     protocol.as_str()
                 );
@@ -107,15 +154,7 @@ impl HttpScanner {
             }
         };
 
-        log::debug!(
-            "[scan::http] protocol_target: {} -> {} ({})",
-            target.display_name(),
-            network_target,
-            protocol.as_str()
-        );
-
-        let http_data = self.perform_http_scan_for_target(target, &network_target).await?;
-        Ok(http_data)
+        self.perform_http_scan_for_ip(target, ip).await
     }
 
     fn classify_http_error(error: &eyre::Error) -> HttpStatus {
@@ -128,97 +167,85 @@ impl HttpScanner {
         }
     }
 
-    async fn perform_http_scan_for_target(&self, target: &Target, target_addr: &str) -> eyre::Result<HttpData> {
+    async fn perform_http_scan_for_ip(&self, target: &Target, ip: IpAddr) -> eyre::Result<HttpData> {
         log::debug!(
-            "[scan::http] perform_http_scan_for_target: target={} target_addr={}",
+            "[scan::http] perform_http_scan_for_ip: target={} ip={}",
             target.display_name(),
-            target_addr
+            ip
         );
 
+        let plan = request_plan(target)?;
+        self.scan_plan(&plan, ip).await
+    }
+
+    /// Request `plan.primary` pinned to `ip`; on failure, try the plain-HTTP fallback (if any)
+    /// and keep the HTTPS failure reason on the result, graded F.
+    async fn scan_plan(&self, plan: &RequestPlan, ip: IpAddr) -> eyre::Result<HttpData> {
+        log::debug!("[scan::http] scan_plan: primary={} ip={}", plan.primary, ip);
+
         let scan_start = Instant::now();
+        let client = self.pinned_client(pinned_host(&plan.primary), ip)?;
 
-        // Determine URL to scan - use the specific target address
-        let url = match &target.target_type {
-            crate::target::TargetType::Url(url) => {
-                // For URLs, we need to replace the host with the specific IP
-                let mut parsed_url = url.clone();
-                parsed_url.set_host(Some(target_addr))?;
-                parsed_url.to_string()
-            }
-            _ => {
-                // For domains and IPs, try both HTTPS and HTTP with the specific address
-                let https_url = format!("https://{}", target_addr);
-                let http_url = format!("http://{}", target_addr);
-
-                log::debug!("[scan::http] trying_https_first: url={}", https_url);
-
-                // Try HTTPS first
-                match self.perform_scan(&https_url, target_addr).await {
+        let mut result = match self.perform_scan(&client, &plan.primary, ip).await {
+            Ok(result) => result,
+            Err(https_error) => {
+                let Some(fallback) = &plan.plain_http_fallback else {
+                    log::debug!(
+                        "[scan::http] request_failed: url={} error={}",
+                        plan.primary,
+                        root_cause(&https_error)
+                    );
+                    return Err(https_error);
+                };
+                let reason = root_cause(&https_error);
+                log::debug!(
+                    "[scan::http] https_failed_trying_plain_http: url={} reason={}",
+                    plan.primary,
+                    reason
+                );
+                match self.perform_scan(&client, fallback, ip).await {
                     Ok(mut result) => {
-                        result.scan_duration = scan_start.elapsed();
-                        log::trace!(
-                            "[scan::http] https_scan_successful: url={} status={} duration={}ms",
-                            https_url,
-                            result.status_code,
-                            result.scan_duration.as_millis()
-                        );
-                        return Ok(result);
+                        result.https_failure = Some(reason);
+                        result.security_grade = SecurityGrade::F;
+                        result
                     }
-                    Err(e) => {
+                    Err(http_error) => {
                         log::debug!(
-                            "[scan::http] https_failed_trying_http: https_error={} http_url={}",
-                            e,
-                            http_url
+                            "[scan::http] both_schemes_failed: https_error={} http_error={}",
+                            reason,
+                            root_cause(&http_error)
                         );
-                        // Fall back to HTTP
-                        match self.perform_scan(&http_url, target_addr).await {
-                            Ok(mut result) => {
-                                result.scan_duration = scan_start.elapsed();
-                                log::trace!(
-                                    "[scan::http] http_scan_successful: url={} status={} duration={}ms",
-                                    http_url,
-                                    result.status_code,
-                                    result.scan_duration.as_millis()
-                                );
-                                return Ok(result);
-                            }
-                            Err(http_err) => {
-                                log::error!(
-                                    "[scan::http] both_protocols_failed: https_error={} http_error={}",
-                                    e,
-                                    http_err
-                                );
-                                return Err(http_err);
-                            }
-                        }
+                        return Err(eyre::eyre!(
+                            "HTTPS failed: {}; plain HTTP failed: {}",
+                            reason,
+                            root_cause(&http_error)
+                        ));
                     }
                 }
             }
         };
-
-        let mut result = self.perform_scan(&url, target_addr).await?;
         result.scan_duration = scan_start.elapsed();
 
         log::debug!(
-            "[scan::http] scan_completed: url={} status={} duration={}ms grade={:?}",
-            url,
+            "[scan::http] scan_completed: url={} status={} duration={}ms grade={:?} https_failure={:?}",
+            result.url,
             result.status_code,
             result.scan_duration.as_millis(),
-            result.security_grade
+            result.security_grade,
+            result.https_failure
         );
 
         Ok(result)
     }
 
-    async fn perform_scan(&self, url: &str, target_ip: &str) -> eyre::Result<HttpData> {
-        log::debug!("[scan::http] perform_scan: url={} target_ip={}", url, target_ip);
+    async fn perform_scan(&self, client: &Client, url: &Url, ip: IpAddr) -> eyre::Result<HttpData> {
+        log::debug!("[scan::http] perform_scan: url={} ip={}", url, ip);
 
         let start_time = Instant::now();
-        let original_url = Url::parse(url)?;
 
         log::trace!("[scan::http] sending_request: url={}", url);
         let request_start = Instant::now();
-        let response = self.client.get(url).send().await?;
+        let response = client.get(url.clone()).send().await?;
         let request_duration = request_start.elapsed();
 
         let status_code = response.status().as_u16();
@@ -234,7 +261,7 @@ impl HttpScanner {
         );
 
         // Analyze redirects
-        let redirect_chain = self.analyze_redirects(&original_url, &final_url);
+        let redirect_chain = self.analyze_redirects(url, &final_url);
         log::trace!(
             "[scan::http] redirect_analysis: url={} redirect_count={}",
             url,
@@ -295,7 +322,8 @@ impl HttpScanner {
             vulnerabilities,
             security_grade,
             scan_duration: start_time.elapsed(),
-            target_ip: target_ip.to_string(),
+            target_ip: ip.to_string(),
+            https_failure: None,
         };
 
         log::debug!(
@@ -595,9 +623,34 @@ impl HttpScanner {
         cors: &Option<CorsPolicy>,
         vulnerabilities: &[HttpVulnerability],
     ) -> SecurityGrade {
+        let score = self.calculate_security_score(security_headers, csp, cors, vulnerabilities);
+        let grade = match score {
+            s if s >= GRADE_A_PLUS_MIN => SecurityGrade::APlus,
+            s if s >= GRADE_A_MIN => SecurityGrade::A,
+            s if s >= GRADE_B_MIN => SecurityGrade::B,
+            s if s >= GRADE_C_MIN => SecurityGrade::C,
+            s if s >= GRADE_D_MIN => SecurityGrade::D,
+            _ => SecurityGrade::F,
+        };
+        log::debug!(
+            "[scan::http] calculate_security_grade: score={} grade={:?}",
+            score,
+            grade
+        );
+        grade
+    }
+
+    /// Each finding is penalized once. Header, CSP and CORS findings are scored from the
+    /// policies themselves; a vulnerability that restates one of them adds nothing.
+    fn calculate_security_score(
+        &self,
+        security_headers: &SecurityHeaders,
+        csp: &Option<CspPolicy>,
+        cors: &Option<CorsPolicy>,
+        vulnerabilities: &[HttpVulnerability],
+    ) -> i32 {
         let mut score = INITIAL_SECURITY_SCORE;
 
-        // Deduct points for missing security headers
         if security_headers.strict_transport_security.is_none() {
             score -= HSTS_MISSING_PENALTY;
         }
@@ -611,45 +664,38 @@ impl HttpScanner {
             score -= XSS_PROTECTION_MISSING_PENALTY;
         }
 
-        // CSP scoring
         match csp {
             None => score -= CSP_MISSING_PENALTY,
             Some(csp_policy) => match csp_policy.strength {
                 CspStrength::None => score -= CSP_MISSING_PENALTY,
                 CspStrength::Weak => score -= CSP_WEAK_PENALTY,
                 CspStrength::Moderate => score -= CSP_MODERATE_PENALTY,
-                CspStrength::Strong => {} // No deduction
+                CspStrength::Strong => {}
             },
         }
 
-        // CORS scoring
         if let Some(cors_policy) = cors {
             match cors_policy.security_level {
                 CorsSecurityLevel::Dangerous => score -= CORS_DANGEROUS_PENALTY,
                 CorsSecurityLevel::Weak => score -= CORS_WEAK_PENALTY,
                 CorsSecurityLevel::Moderate => score -= CORS_MODERATE_PENALTY,
-                CorsSecurityLevel::Secure => {} // No deduction
+                CorsSecurityLevel::Secure => {}
             }
         }
 
-        // Additional vulnerability penalties
         for vulnerability in vulnerabilities {
             match vulnerability {
-                HttpVulnerability::InsecureCors => score -= INSECURE_CORS_VULN_PENALTY,
-                HttpVulnerability::WeakCsp => score -= WEAK_CSP_VULN_PENALTY,
-                HttpVulnerability::MissingHsts => score -= MISSING_HSTS_VULN_PENALTY,
-                _ => score -= OTHER_VULN_PENALTY,
+                HttpVulnerability::MissingHsts
+                | HttpVulnerability::MissingXFrameOptions
+                | HttpVulnerability::MissingXContentTypeOptions
+                | HttpVulnerability::MissingCsp
+                | HttpVulnerability::WeakCsp
+                | HttpVulnerability::InsecureCors => {}
+                HttpVulnerability::InformationDisclosure => score -= INFORMATION_DISCLOSURE_PENALTY,
             }
         }
 
-        match score {
-            s if s >= GRADE_A_PLUS_MIN => SecurityGrade::APlus,
-            s if s >= GRADE_A_MIN => SecurityGrade::A,
-            s if s >= GRADE_B_MIN => SecurityGrade::B,
-            s if s >= GRADE_C_MIN => SecurityGrade::C,
-            s if s >= GRADE_D_MIN => SecurityGrade::D,
-            _ => SecurityGrade::F,
-        }
+        score
     }
 }
 
@@ -774,7 +820,10 @@ pub struct HttpData {
     pub vulnerabilities: Vec<HttpVulnerability>,
     pub security_grade: SecurityGrade,
     pub scan_duration: Duration,
+    /// The pinned IP of the first request.
     pub target_ip: String,
+    /// Why HTTPS failed when this result came from the plain-HTTP fallback.
+    pub https_failure: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1000,6 +1049,19 @@ pub enum SecurityGrade {
     C,
     D,
     F,
+}
+
+impl SecurityGrade {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SecurityGrade::APlus => "A+",
+            SecurityGrade::A => "A",
+            SecurityGrade::B => "B",
+            SecurityGrade::C => "C",
+            SecurityGrade::D => "D",
+            SecurityGrade::F => "F",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1273,6 +1335,191 @@ mod tests {
 
         let bad_grade = scanner.calculate_security_grade(&terrible_headers, &None, &None, &many_vulnerabilities);
         assert_eq!(bad_grade, SecurityGrade::F);
+    }
+
+    fn all_headers_present() -> SecurityHeaders {
+        SecurityHeaders {
+            strict_transport_security: Some("max-age=31536000".to_string()),
+            x_frame_options: Some("DENY".to_string()),
+            x_content_type_options: Some("nosniff".to_string()),
+            x_xss_protection: Some("1; mode=block".to_string()),
+            referrer_policy: None,
+            permissions_policy: None,
+        }
+    }
+
+    fn strong_csp() -> Option<CspPolicy> {
+        Some(CspPolicy {
+            header_value: "default-src 'self'".to_string(),
+            directives: HashMap::new(),
+            issues: vec![],
+            strength: CspStrength::Strong,
+        })
+    }
+
+    #[test]
+    fn request_plan_keeps_github_host_for_url_target() {
+        let target = Target::parse("https://github.com/scottidler/scan").unwrap();
+        let plan = request_plan(&target).unwrap();
+        assert_eq!(plan.primary.host_str(), Some("github.com"));
+        assert_eq!(plan.primary.as_str(), "https://github.com/scottidler/scan");
+        assert_eq!(plan.plain_http_fallback, None);
+        assert_eq!(pinned_host(&plan.primary), Some("github.com"));
+    }
+
+    #[test]
+    fn request_plan_uses_http_url_scheme_as_given() {
+        let target = Target::parse("http://example.com/path").unwrap();
+        let plan = request_plan(&target).unwrap();
+        assert_eq!(plan.primary.as_str(), "http://example.com/path");
+        assert_eq!(plan.plain_http_fallback, None);
+    }
+
+    #[test]
+    fn request_plan_brackets_ipv6_ip_target() {
+        let target = Target::parse("2606:4700:4700::1111").unwrap();
+        let plan = request_plan(&target).unwrap();
+        assert_eq!(plan.primary.as_str(), "https://[2606:4700:4700::1111]/");
+        assert_eq!(
+            plan.plain_http_fallback.as_ref().map(Url::as_str),
+            Some("http://[2606:4700:4700::1111]/")
+        );
+        assert_eq!(pinned_host(&plan.primary), None);
+    }
+
+    #[test]
+    fn request_plan_domain_target_keeps_hostname_and_falls_back_to_plain_http() {
+        let target = Target::parse("google.com").unwrap();
+        let plan = request_plan(&target).unwrap();
+        assert_eq!(plan.primary.as_str(), "https://google.com/");
+        assert_eq!(
+            plan.plain_http_fallback.as_ref().map(Url::as_str),
+            Some("http://google.com/")
+        );
+        assert_eq!(pinned_host(&plan.primary), Some("google.com"));
+    }
+
+    #[test]
+    fn missing_hsts_lowers_score_exactly_once() {
+        let scanner = HttpScanner::new();
+        let cors = None;
+
+        let full = all_headers_present();
+        let full_vulns = scanner.assess_vulnerabilities(&full, &strong_csp(), &cors);
+        let full_score = scanner.calculate_security_score(&full, &strong_csp(), &cors, &full_vulns);
+
+        let no_hsts = SecurityHeaders {
+            strict_transport_security: None,
+            ..all_headers_present()
+        };
+        let no_hsts_vulns = scanner.assess_vulnerabilities(&no_hsts, &strong_csp(), &cors);
+        assert!(no_hsts_vulns.contains(&HttpVulnerability::MissingHsts));
+        let no_hsts_score = scanner.calculate_security_score(&no_hsts, &strong_csp(), &cors, &no_hsts_vulns);
+
+        assert_eq!(full_score - no_hsts_score, HSTS_MISSING_PENALTY);
+    }
+
+    #[test]
+    fn information_disclosure_is_still_penalized() {
+        let scanner = HttpScanner::new();
+        let headers = all_headers_present();
+        let clean = scanner.calculate_security_score(&headers, &strong_csp(), &None, &[]);
+        let disclosed = scanner.calculate_security_score(
+            &headers,
+            &strong_csp(),
+            &None,
+            &[HttpVulnerability::InformationDisclosure],
+        );
+        assert_eq!(clean - disclosed, INFORMATION_DISCLOSURE_PENALTY);
+    }
+
+    #[test]
+    fn security_grade_labels() {
+        assert_eq!(SecurityGrade::APlus.as_str(), "A+");
+        assert_eq!(SecurityGrade::F.as_str(), "F");
+    }
+
+    #[test]
+    fn root_cause_returns_innermost_error() {
+        let error = eyre::eyre!("connection refused").wrap_err("error sending request");
+        assert_eq!(root_cause(&error), "connection refused");
+    }
+
+    /// Serves `connections` requests on loopback with a fixed plain-HTTP 200, returning each
+    /// connection's raw request bytes. A TLS ClientHello gets the same plain-HTTP reply.
+    async fn plain_http_server(connections: usize) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..connections {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+            requests
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn pinned_request_keeps_hostname_and_connects_to_pinned_ip() {
+        let (port, server) = plain_http_server(1).await;
+        let plan = RequestPlan {
+            primary: Url::parse(&format!("http://pinned.invalid:{}/", port)).unwrap(),
+            plain_http_fallback: None,
+        };
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let result = HttpScanner::new().scan_plan(&plan, ip).await.unwrap();
+
+        assert_eq!(result.status_code, 200);
+        assert_eq!(result.target_ip, "127.0.0.1");
+        assert_eq!(result.https_failure, None);
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains(&format!("host: pinned.invalid:{}", port)),
+            "Host header should carry the name: {:?}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn https_failure_falls_back_to_plain_http_visibly_with_grade_f() {
+        let (port, server) = plain_http_server(2).await;
+        let plan = RequestPlan {
+            primary: Url::parse(&format!("https://pinned.invalid:{}/", port)).unwrap(),
+            plain_http_fallback: Some(Url::parse(&format!("http://pinned.invalid:{}/", port)).unwrap()),
+        };
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let result = HttpScanner::new().scan_plan(&plan, ip).await.unwrap();
+
+        assert!(result.url.starts_with("http://pinned.invalid"), "url={}", result.url);
+        assert!(result.https_failure.is_some(), "fallback must record why HTTPS failed");
+        assert_eq!(result.security_grade, SecurityGrade::F);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn https_url_target_does_not_fall_back() {
+        let (port, server) = plain_http_server(1).await;
+        let plan = RequestPlan {
+            primary: Url::parse(&format!("https://pinned.invalid:{}/", port)).unwrap(),
+            plain_http_fallback: None,
+        };
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        assert!(HttpScanner::new().scan_plan(&plan, ip).await.is_err());
+        server.await.unwrap();
     }
 
     #[tokio::test]

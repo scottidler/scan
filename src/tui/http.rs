@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use std::any::Any;
 
@@ -106,6 +106,16 @@ impl Pane for HttpPane {
 
             if let Some(ScanResult::Http(http_result)) = &http_state.result {
                 if let Some(primary_data) = http_result.get_primary_result() {
+                    if let Some(reason) = &primary_data.https_failure {
+                        lines.push(Line::from(vec![
+                            Span::styled("⚠️  ", Style::default().fg(Color::Red)),
+                            Span::styled(
+                                format!("plain HTTP (HTTPS failed: {})", reason),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ]));
+                    }
+
                     // Status code
                     let status_color = match primary_data.status_code {
                         HTTP_SUCCESS_STATUS_MIN..=HTTP_SUCCESS_STATUS_MAX => Color::Green,
@@ -155,21 +165,18 @@ impl Pane for HttpPane {
                         ),
                     ]));
 
-                    // Security grade - use the best grade from all protocols
-                    if let Some(security_grade) = http_result.get_best_security_grade() {
-                        let grade_color = match security_grade {
-                            crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => {
-                                Color::Green
-                            }
-                            crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
-                            crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
-                        };
+                    // Grade of the primary result: the same result whose fallback line shows above.
+                    let security_grade = &primary_data.security_grade;
+                    let grade_color = match security_grade {
+                        crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => Color::Green,
+                        crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
+                        crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
+                    };
 
-                        lines.push(Line::from(vec![
-                            Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
-                            Span::styled(format!("{:?}", security_grade), Style::default().fg(grade_color)),
-                        ]));
-                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
+                        Span::styled(security_grade.as_str(), Style::default().fg(grade_color)),
+                    ]));
 
                     // Redirect chain - show details
                     if !primary_data.redirect_chain.is_empty() {
@@ -265,7 +272,10 @@ impl Pane for HttpPane {
         }
 
         // Create and render the paragraph
-        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
+        // Wrap so a long HTTPS failure reason stays readable instead of clipping at the border.
+        let paragraph = Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
         paragraph.render(inner_area, frame.buffer_mut());
     }
 
@@ -293,6 +303,119 @@ impl Pane for HttpPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::http::{CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade, SecurityHeaders};
+    use crate::tui::testing::render_pane;
+    use crate::types::{ScanState, ScanStatus};
+    use std::time::{Duration, Instant};
+
+    // The HTTP pane at 200x55: a quarter of the width, the 35% middle row.
+    const LIVE_PANE_WIDTH: u16 = 50;
+    const LIVE_PANE_HEIGHT: u16 = 19;
+
+    fn http_data(url: &str, https_failure: Option<&str>, grade: SecurityGrade) -> HttpData {
+        HttpData {
+            url: url.to_string(),
+            status_code: 200,
+            response_time: Duration::from_millis(40),
+            content_length: 2,
+            content_type: Some("text/html".to_string()),
+            redirect_chain: vec![],
+            security_headers: SecurityHeaders {
+                strict_transport_security: None,
+                x_frame_options: None,
+                x_content_type_options: None,
+                x_xss_protection: None,
+                referrer_policy: None,
+                permissions_policy: None,
+            },
+            csp: None,
+            cors: None,
+            caching: CachingPolicy {
+                cache_control: None,
+                expires: None,
+                etag: None,
+                last_modified: None,
+            },
+            vulnerabilities: vec![],
+            security_grade: grade,
+            scan_duration: Duration::from_millis(50),
+            target_ip: "192.0.2.1".to_string(),
+            https_failure: https_failure.map(String::from),
+        }
+    }
+
+    fn state_with_http(data: HttpData) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        let mut result = HttpResult::new();
+        result.ipv4_status = HttpStatus::Success(data.security_grade.clone());
+        result.ipv4_result = Some(data);
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: Some(ScanResult::Http(result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn render_plain_http_fallback_names_https_failure_and_grade_f() {
+        let reason = "invalid peer certificate: UnknownIssuer";
+        let state = state_with_http(http_data("http://example.com/", Some(reason), SecurityGrade::F));
+        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+        let flat: String = out
+            .lines()
+            .map(|l| l.trim_matches(['│', ' ']))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            out.contains("plain HTTP (HTTPS failed:"),
+            "fallback not shown:\n{}",
+            out
+        );
+        assert!(flat.contains("UnknownIssuer"), "reason not visible:\n{}", out);
+        assert!(out.contains("Grade: F"), "fallback must grade F:\n{}", out);
+    }
+
+    #[test]
+    fn render_grade_comes_from_primary_result_not_best_family() {
+        let reason = "invalid peer certificate: UnknownIssuer";
+        let state = state_with_http(http_data("http://example.com/", Some(reason), SecurityGrade::F));
+        if let Some(mut http_state) = state.scanners.get_mut("http")
+            && let Some(ScanResult::Http(result)) = http_state.result.as_mut()
+        {
+            let ipv6 = http_data("https://example.com/", None, SecurityGrade::A);
+            result.ipv6_status = HttpStatus::Success(ipv6.security_grade.clone());
+            result.ipv6_result = Some(ipv6);
+        }
+        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+        assert!(out.contains("HTTPS failed"), "fallback not shown:\n{}", out);
+        assert!(out.contains("Grade: F"), "primary (fallback) grade must show:\n{}", out);
+        assert!(
+            !out.contains("Grade: A"),
+            "other family's grade must not show:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn render_a_plus_grade_as_a_plus() {
+        let state = state_with_http(http_data("https://example.com/", None, SecurityGrade::APlus));
+        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+        assert!(out.contains("Grade: A+"), "A+ label missing:\n{}", out);
+        assert!(!out.contains("APlus"), "enum Debug leaked:\n{}", out);
+    }
+
+    #[test]
+    fn render_https_success_has_no_fallback_line() {
+        let state = state_with_http(http_data("https://example.com/", None, SecurityGrade::A));
+        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+        assert!(!out.contains("HTTPS failed"), "unexpected fallback line:\n{}", out);
+    }
 
     #[test]
     fn test_http_pane_creation() {

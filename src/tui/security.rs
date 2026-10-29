@@ -1133,6 +1133,7 @@ mod tests {
             security_grade: HttpSecurityGrade::C,
             scan_duration: Duration::from_millis(300),
             target_ip: "1.2.3.4".to_string(),
+            https_failure: None,
         };
 
         let http_result = crate::scan::http::HttpResult {
@@ -1354,6 +1355,7 @@ mod tests {
             security_grade: HttpSecurityGrade::B,
             scan_duration: Duration::from_millis(200),
             target_ip: "1.2.3.4".to_string(),
+            https_failure: None,
         };
 
         let http_result = crate::scan::http::HttpResult {
@@ -1708,6 +1710,7 @@ mod tests {
             security_grade: HttpSecurityGrade::F,
             scan_duration: Duration::from_millis(300),
             target_ip: "192.0.2.1".to_string(),
+            https_failure: None,
         };
         state.scanners.insert(
             "http".to_string(),
