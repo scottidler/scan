@@ -2,13 +2,14 @@ use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use log;
+use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
+use rustls::{CertificateError, ClientConfig, ProtocolVersion};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
@@ -74,6 +75,8 @@ pub enum TlsVulnerability {
     WeakCipher(String),
     ExpiredCertificate,
     SelfSignedCertificate,
+    UntrustedIssuer,
+    HostnameMismatch,
     WeakSignatureAlgorithm(String),
     InsecureRenegotiation,
     WeakDhParams,
@@ -158,6 +161,11 @@ impl TlsData {
             target_ip,
             queried_at: Instant::now(),
         }
+    }
+
+    /// Issues shown in the Security pane. One cause lives in exactly one list, so it counts once.
+    pub fn issue_count(&self) -> usize {
+        self.vulnerabilities.len() + self.certificate_errors.len()
     }
 }
 
@@ -282,6 +290,125 @@ impl TlsResult {
     }
 }
 
+/// Convert an ASN.1 time to UTC by diffing it against the Unix epoch; no string parsing.
+pub fn asn1_to_utc(t: &Asn1TimeRef) -> Result<DateTime<Utc>> {
+    let epoch = Asn1Time::from_unix(0).wrap_err("Failed to build ASN.1 epoch")?;
+    let diff = epoch.diff(t).wrap_err("Failed to diff ASN.1 time against epoch")?;
+    let secs = i64::from(diff.days) * 86_400 + i64::from(diff.secs);
+    DateTime::from_timestamp(secs, 0).ok_or_else(|| eyre::eyre!("ASN.1 time out of range: {}s since epoch", secs))
+}
+
+/// Forward secrecy: every TLS 1.3 suite has it; TLS 1.2 only with an ephemeral (EC)DHE key exchange.
+pub fn has_pfs(version: ProtocolVersion, suite: rustls::CipherSuite) -> bool {
+    match version {
+        ProtocolVersion::TLSv1_3 => true,
+        ProtocolVersion::TLSv1_2 => suite
+            .as_str()
+            .is_some_and(|name| name.starts_with("TLS_ECDHE_") || name.starts_with("TLS_DHE_")),
+        _ => false,
+    }
+}
+
+/// Describe the negotiated suite from its IANA name (`TLS_<kx>_<auth>_WITH_<enc>_<mac>` or `TLS13_<enc>_<mac>`).
+fn cipher_suite_info(version: ProtocolVersion, suite: rustls::CipherSuite) -> CipherSuite {
+    let name = suite
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:?}", suite));
+    let (key_exchange, authentication, bulk) = if version == ProtocolVersion::TLSv1_3 {
+        // rustls' ring provider only offers ECDHE groups; TLS 1.3 authenticates via the certificate.
+        (
+            "ECDHE".to_string(),
+            "certificate".to_string(),
+            name.trim_start_matches("TLS13_").to_string(),
+        )
+    } else if let Some((kx_auth, bulk)) = name.trim_start_matches("TLS_").split_once("_WITH_") {
+        let (kx, auth) = kx_auth.split_once('_').unwrap_or((kx_auth, kx_auth));
+        (kx.to_string(), auth.to_string(), bulk.to_string())
+    } else {
+        ("unknown".to_string(), "unknown".to_string(), name.clone())
+    };
+    let (encryption, mac) = match bulk.rsplit_once('_') {
+        Some((enc, mac)) => (enc.to_string(), mac.to_string()),
+        None => (bulk.clone(), "unknown".to_string()),
+    };
+    let aead = encryption.contains("GCM") || encryption.contains("CHACHA20");
+    CipherSuite {
+        protocol_version: format!("{:?}", version),
+        is_secure: has_pfs(version, suite) && aead,
+        name,
+        key_exchange,
+        authentication,
+        encryption,
+        mac,
+    }
+}
+
+/// Map a certificate-verification failure from the handshake to the vulnerability it proves.
+pub fn vulnerability_for_handshake_error(error: &rustls::Error) -> Option<TlsVulnerability> {
+    match error {
+        rustls::Error::InvalidCertificate(cert_error) => match cert_error {
+            CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+                Some(TlsVulnerability::ExpiredCertificate)
+            }
+            CertificateError::UnknownIssuer => Some(TlsVulnerability::UntrustedIssuer),
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+                Some(TlsVulnerability::HostnameMismatch)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// tokio-rustls surfaces handshake failures as `io::Error` wrapping the `rustls::Error`.
+fn handshake_rejection(error: &std::io::Error) -> Option<TlsVulnerability> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .and_then(vulnerability_for_handshake_error)
+}
+
+/// Handshake rejection first, then detected causes not already present. A self-signed leaf is the
+/// reason its issuer is untrusted, so it is one cause and keeps only `SelfSignedCertificate`.
+fn merge_vulnerabilities(
+    handshake: Option<TlsVulnerability>,
+    detected: Vec<TlsVulnerability>,
+) -> Vec<TlsVulnerability> {
+    let mut merged: Vec<TlsVulnerability> = handshake.into_iter().collect();
+    for vulnerability in detected {
+        if !merged.contains(&vulnerability) {
+            merged.push(vulnerability);
+        }
+    }
+    if merged.contains(&TlsVulnerability::SelfSignedCertificate) {
+        merged.retain(|v| *v != TlsVulnerability::UntrustedIssuer);
+    }
+    merged
+}
+
+/// Leaf expiry fields derive from the chain's first certificate.
+fn apply_certificate_chain(result: &mut TlsData, cert_chain: Vec<CertificateInfo>, now: DateTime<Utc>) {
+    if let Some(leaf_cert) = cert_chain.first() {
+        result.expiry_date = Some(leaf_cert.not_after);
+        result.days_until_expiry = Some((leaf_cert.not_after - now).num_days());
+    }
+    result.certificate_chain = cert_chain;
+}
+
+struct Handshake {
+    time: Duration,
+    version: Option<TlsVersion>,
+    cipher: Option<CipherSuite>,
+    pfs: bool,
+}
+
+enum HandshakeOutcome {
+    Established(Handshake),
+    /// The server's certificate failed verification for a cause that maps to a vulnerability.
+    Rejected(TlsVulnerability),
+}
+
 pub struct TlsScanner {
     interval: Duration,
     connection_timeout: Duration,
@@ -385,12 +512,7 @@ impl TlsScanner {
         ports
     }
 
-    async fn test_basic_connection(
-        &self,
-        target: &Target,
-        target_ip: &str,
-        port: u16,
-    ) -> Result<(bool, Duration, Option<TlsVersion>)> {
+    async fn test_basic_connection(&self, target: &Target, target_ip: &str, port: u16) -> Result<HandshakeOutcome> {
         let domain = target
             .domain
             .as_ref()
@@ -421,37 +543,49 @@ impl TlsScanner {
             let socket = tokio::net::TcpStream::connect(&addr).await?;
             // Use handshake_timeout for the TLS handshake specifically
             let tls_stream =
-                tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await??;
+                match tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await? {
+                    Ok(stream) => stream,
+                    Err(io_error) => {
+                        if let Some(vulnerability) = handshake_rejection(&io_error) {
+                            log::debug!(
+                                "[scan::tls] handshake_rejected: addr={} vulnerability={:?} error={}",
+                                addr,
+                                vulnerability,
+                                io_error
+                            );
+                            return Ok(HandshakeOutcome::Rejected(vulnerability));
+                        }
+                        return Err(io_error.into());
+                    }
+                };
 
-            // Get TLS version from the connection
             let (_, connection) = tls_stream.into_inner();
-            let protocol_version = connection.protocol_version();
-
-            let tls_version = match protocol_version {
-                Some(rustls::ProtocolVersion::TLSv1_2) => Some(TlsVersion::V1_2),
-                Some(rustls::ProtocolVersion::TLSv1_3) => Some(TlsVersion::V1_3),
+            let negotiated = match (connection.protocol_version(), connection.negotiated_cipher_suite()) {
+                (Some(version), Some(suite)) => Some((version, suite.suite())),
                 _ => None,
             };
 
-            Ok::<(bool, Option<TlsVersion>), eyre::Error>((true, tls_version))
+            let version = match connection.protocol_version() {
+                Some(ProtocolVersion::TLSv1_2) => Some(TlsVersion::V1_2),
+                Some(ProtocolVersion::TLSv1_3) => Some(TlsVersion::V1_3),
+                _ => None,
+            };
+
+            Ok::<HandshakeOutcome, eyre::Error>(HandshakeOutcome::Established(Handshake {
+                time: start_time.elapsed(),
+                version,
+                cipher: negotiated.map(|(version, suite)| cipher_suite_info(version, suite)),
+                pfs: negotiated.is_some_and(|(version, suite)| has_pfs(version, suite)),
+            }))
         })
         .await
         {
-            Ok(Ok((success, version))) => {
-                let _handshake_time = start_time.elapsed();
-                Ok((success, _handshake_time, version))
-            }
-            Ok(Err(e)) => {
-                let _handshake_time = start_time.elapsed();
-                Err(e.wrap_err("TLS handshake failed"))
-            }
-            Err(_) => {
-                let _handshake_time = start_time.elapsed();
-                Err(eyre::eyre!(
-                    "TLS connection timeout after {:?}",
-                    self.connection_timeout
-                ))
-            }
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(e)) => Err(e.wrap_err("TLS handshake failed")),
+            Err(_) => Err(eyre::eyre!(
+                "TLS connection timeout after {:?}",
+                self.connection_timeout
+            )),
         }
     }
 
@@ -459,9 +593,8 @@ impl TlsScanner {
         let mut supported_versions = Vec::new();
 
         // Test TLS 1.2 and 1.3 with rustls (modern versions)
-        if let Ok((success, _, version)) = self.test_basic_connection(target, target_ip, port).await
-            && success
-            && let Some(v) = version
+        if let Ok(HandshakeOutcome::Established(handshake)) = self.test_basic_connection(target, target_ip, port).await
+            && let Some(v) = handshake.version
         {
             supported_versions.push(v);
         }
@@ -472,16 +605,35 @@ impl TlsScanner {
         Ok(supported_versions)
     }
 
-    fn analyze_certificate_with_openssl(
-        &self,
-        target: &Target,
-        target_ip: &str,
-        port: u16,
-    ) -> Result<Vec<CertificateInfo>> {
+    /// Blocking OpenSSL work runs on the blocking pool so dropping the scan future never stalls a runtime worker.
+    async fn analyze_certificate(&self, target: &Target, target_ip: &str, port: u16) -> Result<Vec<CertificateInfo>> {
         let domain = target
             .domain
-            .as_ref()
+            .clone()
             .ok_or_else(|| eyre::eyre!("Domain required for certificate analysis"))?;
+        let addr = format!("{}:{}", target_ip, port);
+        let connection_timeout = self.connection_timeout;
+        let io_timeout = self.total_scan_timeout;
+        tokio::task::spawn_blocking(move || {
+            Self::analyze_certificate_with_openssl(&domain, &addr, connection_timeout, io_timeout)
+        })
+        .await
+        .wrap_err("Certificate analysis task failed")?
+    }
+
+    fn analyze_certificate_with_openssl(
+        domain: &str,
+        addr: &str,
+        connection_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<Vec<CertificateInfo>> {
+        log::debug!(
+            "[scan::tls] analyze_certificate_with_openssl: domain={} addr={} connection_timeout={}s io_timeout={}s",
+            domain,
+            addr,
+            connection_timeout.as_secs(),
+            io_timeout.as_secs()
+        );
 
         // Create OpenSSL connector for detailed certificate analysis
         let mut builder = SslConnector::builder(SslMethod::tls()).wrap_err("Failed to create SSL connector")?;
@@ -491,10 +643,15 @@ impl TlsScanner {
         let connector = builder.build();
 
         // Connect and get certificate chain
-        let addr = format!("{}:{}", target_ip, port);
         let stream =
-            std::net::TcpStream::connect_timeout(&addr.parse().wrap_err("Invalid address")?, self.connection_timeout)
+            std::net::TcpStream::connect_timeout(&addr.parse().wrap_err("Invalid address")?, connection_timeout)
                 .wrap_err("TCP connection failed")?;
+        stream
+            .set_read_timeout(Some(io_timeout))
+            .wrap_err("Failed to set socket read timeout")?;
+        stream
+            .set_write_timeout(Some(io_timeout))
+            .wrap_err("Failed to set socket write timeout")?;
 
         let ssl_stream = connector.connect(domain, stream).wrap_err("SSL connection failed")?;
 
@@ -502,7 +659,7 @@ impl TlsScanner {
 
         // Get peer certificate
         if let Some(cert) = ssl_stream.ssl().peer_certificate() {
-            cert_chain.push(self.parse_certificate(&cert)?);
+            cert_chain.push(Self::parse_certificate(&cert)?);
         }
 
         // Get certificate chain
@@ -510,14 +667,19 @@ impl TlsScanner {
             for cert in chain {
                 // Convert X509Ref to X509
                 let owned_cert = cert.to_owned();
-                cert_chain.push(self.parse_certificate(&owned_cert)?);
+                cert_chain.push(Self::parse_certificate(&owned_cert)?);
             }
         }
 
+        log::debug!(
+            "[scan::tls] analyze_certificate_with_openssl: addr={} cert_count={}",
+            addr,
+            cert_chain.len()
+        );
         Ok(cert_chain)
     }
 
-    fn parse_certificate(&self, cert: &X509) -> Result<CertificateInfo> {
+    fn parse_certificate(cert: &X509) -> Result<CertificateInfo> {
         let subject = cert
             .subject_name()
             .entries()
@@ -561,8 +723,8 @@ impl TlsScanner {
             .to_string();
 
         // Convert ASN1 time to DateTime<Utc>
-        let not_before = self.asn1_time_to_datetime(cert.not_before())?;
-        let not_after = self.asn1_time_to_datetime(cert.not_after())?;
+        let not_before = asn1_to_utc(cert.not_before())?;
+        let not_after = asn1_to_utc(cert.not_after())?;
 
         let signature_algorithm = cert
             .signature_algorithm()
@@ -614,44 +776,6 @@ impl TlsScanner {
             is_self_signed,
             is_ca,
         })
-    }
-
-    fn asn1_time_to_datetime(&self, asn1_time: &openssl::asn1::Asn1TimeRef) -> Result<DateTime<Utc>> {
-        let time_str = asn1_time.to_string();
-
-        // Parse ASN1 time format (YYMMDDHHMMSSZ or YYYYMMDDHHMMSSZ)
-        let datetime = if time_str.len() == 13 && time_str.ends_with('Z') {
-            // YY format - assume 20YY for years 00-49, 19YY for 50-99
-            let year_suffix: i32 = time_str[0..2].parse().wrap_err("Invalid year")?;
-            let year = if year_suffix <= 49 { 2000 + year_suffix } else { 1900 + year_suffix };
-            let month: u32 = time_str[2..4].parse().wrap_err("Invalid month")?;
-            let day: u32 = time_str[4..6].parse().wrap_err("Invalid day")?;
-            let hour: u32 = time_str[6..8].parse().wrap_err("Invalid hour")?;
-            let minute: u32 = time_str[8..10].parse().wrap_err("Invalid minute")?;
-            let second: u32 = time_str[10..12].parse().wrap_err("Invalid second")?;
-
-            chrono::Utc
-                .with_ymd_and_hms(year, month, day, hour, minute, second)
-                .single()
-                .ok_or_else(|| eyre::eyre!("Invalid datetime"))?
-        } else if time_str.len() == 15 && time_str.ends_with('Z') {
-            // YYYY format
-            let year: i32 = time_str[0..4].parse().wrap_err("Invalid year")?;
-            let month: u32 = time_str[4..6].parse().wrap_err("Invalid month")?;
-            let day: u32 = time_str[6..8].parse().wrap_err("Invalid day")?;
-            let hour: u32 = time_str[8..10].parse().wrap_err("Invalid hour")?;
-            let minute: u32 = time_str[10..12].parse().wrap_err("Invalid minute")?;
-            let second: u32 = time_str[12..14].parse().wrap_err("Invalid second")?;
-
-            chrono::Utc
-                .with_ymd_and_hms(year, month, day, hour, minute, second)
-                .single()
-                .ok_or_else(|| eyre::eyre!("Invalid datetime"))?
-        } else {
-            return Err(eyre::eyre!("Unsupported ASN1 time format: {}", time_str));
-        };
-
-        Ok(datetime)
     }
 
     fn detect_vulnerabilities(&self, result: &TlsData) -> Vec<TlsVulnerability> {
@@ -766,24 +890,39 @@ impl TlsScanner {
             port
         );
         let phase1_start = Instant::now();
-        match self.test_basic_connection(target, target_ip, port).await {
-            Ok((success, handshake_time, version)) => {
+        let handshake_vulnerability = match self.test_basic_connection(target, target_ip, port).await {
+            Ok(HandshakeOutcome::Established(handshake)) => {
                 let phase1_duration = phase1_start.elapsed();
-                result.connection_successful = success;
-                result.handshake_time = handshake_time;
-                if let Some(v) = version {
+                result.connection_successful = true;
+                result.handshake_time = handshake.time;
+                result.perfect_forward_secrecy = handshake.pfs;
+                result.negotiated_cipher = handshake.cipher;
+                if let Some(v) = handshake.version {
                     result.negotiated_version = Some(v.clone());
                     result.supported_versions.push(v);
                 }
                 log::trace!(
-                    "[scan::tls] phase1_completed: target={} port={} success={} handshake_time={}ms phase_duration={}ms version={:?}",
+                    "[scan::tls] phase1_completed: target={} port={} handshake_time={}ms phase_duration={}ms version={:?} pfs={}",
                     target.display_name(),
                     port,
-                    success,
-                    handshake_time.as_millis(),
+                    result.handshake_time.as_millis(),
                     phase1_duration.as_millis(),
-                    result.negotiated_version
+                    result.negotiated_version,
+                    result.perfect_forward_secrecy
                 );
+                None
+            }
+            Ok(HandshakeOutcome::Rejected(vulnerability)) => {
+                // The handshake reached certificate verification and failed it: keep going so the
+                // certificate analysis below still fills in what the certificate says.
+                result.handshake_time = phase1_start.elapsed();
+                log::warn!(
+                    "[scan::tls] phase1_rejected: target={} port={} vulnerability={:?}",
+                    target.display_name(),
+                    port,
+                    vulnerability
+                );
+                Some(vulnerability)
             }
             Err(e) => {
                 let phase1_duration = phase1_start.elapsed();
@@ -798,40 +937,42 @@ impl TlsScanner {
                 result.scan_time = start_time.elapsed();
                 return Ok(result);
             }
-        }
+        };
 
-        // Phase 2: TLS version enumeration
-        log::debug!(
-            "[scan::tls] phase2_version_enumeration: target={} ip={} port={}",
-            target.display_name(),
-            target_ip,
-            port
-        );
-        let phase2_start = Instant::now();
-        match self.test_tls_versions(target, target_ip, port).await {
-            Ok(versions) => {
-                let phase2_duration = phase2_start.elapsed();
-                result.supported_versions = versions.clone();
-                log::trace!(
-                    "[scan::tls] phase2_completed: target={} port={} duration={}ms versions={:?}",
-                    target.display_name(),
-                    port,
-                    phase2_duration.as_millis(),
-                    versions
-                );
-            }
-            Err(e) => {
-                let phase2_duration = phase2_start.elapsed();
-                log::warn!(
-                    "[scan::tls] phase2_failed: target={} port={} duration={}ms error={}",
-                    target.display_name(),
-                    port,
-                    phase2_duration.as_millis(),
-                    e
-                );
-                result
-                    .certificate_errors
-                    .push(format!("Version enumeration failed: {}", e));
+        // Phase 2: TLS version enumeration (a rejected handshake would only be rejected again)
+        if handshake_vulnerability.is_none() {
+            log::debug!(
+                "[scan::tls] phase2_version_enumeration: target={} ip={} port={}",
+                target.display_name(),
+                target_ip,
+                port
+            );
+            let phase2_start = Instant::now();
+            match self.test_tls_versions(target, target_ip, port).await {
+                Ok(versions) => {
+                    let phase2_duration = phase2_start.elapsed();
+                    result.supported_versions = versions.clone();
+                    log::trace!(
+                        "[scan::tls] phase2_completed: target={} port={} duration={}ms versions={:?}",
+                        target.display_name(),
+                        port,
+                        phase2_duration.as_millis(),
+                        versions
+                    );
+                }
+                Err(e) => {
+                    let phase2_duration = phase2_start.elapsed();
+                    log::warn!(
+                        "[scan::tls] phase2_failed: target={} port={} duration={}ms error={}",
+                        target.display_name(),
+                        port,
+                        phase2_duration.as_millis(),
+                        e
+                    );
+                    result
+                        .certificate_errors
+                        .push(format!("Version enumeration failed: {}", e));
+                }
             }
         }
 
@@ -843,22 +984,17 @@ impl TlsScanner {
             port
         );
         let phase3_start = Instant::now();
-        match self.analyze_certificate_with_openssl(target, target_ip, port) {
+        match self.analyze_certificate(target, target_ip, port).await {
             Ok(cert_chain) => {
                 let phase3_duration = phase3_start.elapsed();
-                result.certificate_valid = !cert_chain.is_empty();
-                if let Some(leaf_cert) = cert_chain.first() {
-                    result.expiry_date = Some(leaf_cert.not_after);
-                    let days_until_expiry = (leaf_cert.not_after - chrono::Utc::now()).num_days();
-                    result.days_until_expiry = Some(days_until_expiry);
-                }
-                result.certificate_chain = cert_chain.clone();
+                result.certificate_valid = !cert_chain.is_empty() && handshake_vulnerability.is_none();
+                apply_certificate_chain(&mut result, cert_chain, chrono::Utc::now());
                 log::trace!(
                     "[scan::tls] phase3_completed: target={} port={} duration={}ms cert_count={} valid={} days_until_expiry={:?}",
                     target.display_name(),
                     port,
                     phase3_duration.as_millis(),
-                    cert_chain.len(),
+                    result.certificate_chain.len(),
                     result.certificate_valid,
                     result.days_until_expiry
                 );
@@ -884,7 +1020,7 @@ impl TlsScanner {
             target.display_name()
         );
         let phase4_start = Instant::now();
-        result.vulnerabilities = self.detect_vulnerabilities(&result);
+        result.vulnerabilities = merge_vulnerabilities(handshake_vulnerability, self.detect_vulnerabilities(&result));
         let phase4_duration = phase4_start.elapsed();
         log::trace!(
             "[scan::tls] phase4_completed: target={} duration={}μs vulnerabilities={:?}",
@@ -1022,6 +1158,69 @@ impl Scanner for TlsScanner {
 
     fn name(&self) -> &'static str {
         "tls"
+    }
+}
+
+/// In-memory certificates and TLS results for tests; no network.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::{PKey, Private};
+    use openssl::x509::{X509Builder, X509Name, X509NameBuilder};
+
+    fn key() -> PKey<Private> {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("P-256 group");
+        PKey::from_ec_key(EcKey::generate(&group).expect("EC key")).expect("PKey")
+    }
+
+    fn name(common_name: &str) -> X509Name {
+        let mut builder = X509NameBuilder::new().expect("name builder");
+        builder
+            .append_entry_by_nid(Nid::COMMONNAME, common_name)
+            .expect("CN entry");
+        builder.build()
+    }
+
+    /// A leaf for `fixture.test` signed by a separate CA key, so it is not self-signed.
+    pub(crate) fn leaf_certificate(not_before_unix: i64, not_after_unix: i64) -> X509 {
+        let ca_key = key();
+        let leaf_key = key();
+        let mut builder = X509Builder::new().expect("x509 builder");
+        builder.set_version(2).expect("version");
+        builder.set_subject_name(&name("fixture.test")).expect("subject");
+        builder.set_issuer_name(&name("Fixture CA")).expect("issuer");
+        builder.set_pubkey(&leaf_key).expect("pubkey");
+        builder
+            .set_not_before(&Asn1Time::from_unix(not_before_unix).expect("not_before"))
+            .expect("set not_before");
+        builder
+            .set_not_after(&Asn1Time::from_unix(not_after_unix).expect("not_after"))
+            .expect("set not_after");
+        builder.sign(&ca_key, MessageDigest::sha256()).expect("sign");
+        builder.build()
+    }
+
+    /// What `perform_tls_scan_for_ip` records when rustls rejects an expired certificate and the
+    /// OpenSSL pass still reads it: the same functions, in the same order.
+    pub(crate) fn expired_handshake_result() -> TlsData {
+        let scanner = TlsScanner::new();
+        let now = Utc::now();
+        let handshake =
+            vulnerability_for_handshake_error(&rustls::Error::InvalidCertificate(CertificateError::Expired));
+        let leaf = leaf_certificate(
+            (now - chrono::Duration::days(400)).timestamp(),
+            (now - chrono::Duration::days(30)).timestamp(),
+        );
+        let mut result = TlsData::new("192.0.2.1".to_string());
+        let chain = vec![TlsScanner::parse_certificate(&leaf).expect("parse fixture leaf")];
+        result.certificate_valid = !chain.is_empty() && handshake.is_none();
+        apply_certificate_chain(&mut result, chain, now);
+        result.vulnerabilities = merge_vulnerabilities(handshake, scanner.detect_vulnerabilities(&result));
+        result.security_grade = scanner.calculate_security_grade(&result);
+        result
     }
 }
 
@@ -1328,5 +1527,209 @@ mod tests {
         assert_eq!(versions[1].as_str(), "TLSv1.1");
         assert_eq!(versions[2].as_str(), "TLSv1.2");
         assert_eq!(versions[3].as_str(), "TLSv1.3");
+    }
+
+    #[test]
+    fn asn1_to_utc_round_trips_fixture_validity_exactly() {
+        let not_before = 1_700_000_123;
+        let not_after = 1_900_000_456;
+        let cert = fixtures::leaf_certificate(not_before, not_after);
+        let info = TlsScanner::parse_certificate(&cert).expect("fixture parses");
+        assert_eq!(info.not_before.timestamp(), not_before);
+        assert_eq!(info.not_after.timestamp(), not_after);
+        assert_eq!(info.issuer, "CN=Fixture CA");
+        assert!(!info.is_self_signed);
+    }
+
+    #[test]
+    fn asn1_to_utc_handles_epoch_and_pre_epoch() {
+        let epoch = Asn1Time::from_unix(0).unwrap();
+        assert_eq!(asn1_to_utc(&epoch).unwrap().timestamp(), 0);
+        let before = Asn1Time::from_unix(-86_400 * 365 - 17).unwrap();
+        assert_eq!(asn1_to_utc(&before).unwrap().timestamp(), -86_400 * 365 - 17);
+    }
+
+    #[test]
+    fn expired_fixture_certificate_yields_expired_vulnerability() {
+        let now = Utc::now();
+        let cert = fixtures::leaf_certificate(
+            (now - chrono::Duration::days(400)).timestamp(),
+            (now - chrono::Duration::days(30)).timestamp(),
+        );
+        let mut result = TlsData::new("192.0.2.1".to_string());
+        apply_certificate_chain(&mut result, vec![TlsScanner::parse_certificate(&cert).unwrap()], now);
+        assert_eq!(result.days_until_expiry, Some(-30));
+        let vulnerabilities = TlsScanner::new().detect_vulnerabilities(&result);
+        assert!(vulnerabilities.contains(&TlsVulnerability::ExpiredCertificate));
+    }
+
+    #[test]
+    fn valid_fixture_certificate_is_not_expired() {
+        let now = Utc::now();
+        let cert = fixtures::leaf_certificate(
+            (now - chrono::Duration::days(10)).timestamp(),
+            (now + chrono::Duration::days(80) + chrono::Duration::hours(1)).timestamp(),
+        );
+        let mut result = TlsData::new("192.0.2.1".to_string());
+        apply_certificate_chain(&mut result, vec![TlsScanner::parse_certificate(&cert).unwrap()], now);
+        assert_eq!(result.days_until_expiry, Some(80));
+        assert!(TlsScanner::new().detect_vulnerabilities(&result).is_empty());
+    }
+
+    #[test]
+    fn has_pfs_true_for_tls13_and_ephemeral_tls12() {
+        assert!(has_pfs(
+            ProtocolVersion::TLSv1_3,
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+        ));
+        assert!(has_pfs(
+            ProtocolVersion::TLSv1_2,
+            rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        ));
+        assert!(has_pfs(
+            ProtocolVersion::TLSv1_2,
+            rustls::CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256
+        ));
+    }
+
+    #[test]
+    fn has_pfs_false_for_static_rsa_and_old_versions() {
+        assert!(!has_pfs(
+            ProtocolVersion::TLSv1_2,
+            rustls::CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256
+        ));
+        assert!(!has_pfs(
+            ProtocolVersion::TLSv1_1,
+            rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+        ));
+    }
+
+    #[test]
+    fn cipher_suite_info_splits_iana_names() {
+        let tls13 = cipher_suite_info(ProtocolVersion::TLSv1_3, rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+        assert_eq!(tls13.name, "TLS13_AES_128_GCM_SHA256");
+        assert_eq!(tls13.encryption, "AES_128_GCM");
+        assert_eq!(tls13.mac, "SHA256");
+        assert!(tls13.is_secure);
+
+        let tls12 = cipher_suite_info(
+            ProtocolVersion::TLSv1_2,
+            rustls::CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+        );
+        assert_eq!(tls12.key_exchange, "RSA");
+        assert_eq!(tls12.authentication, "RSA");
+        assert!(!tls12.is_secure);
+
+        let ecdhe = cipher_suite_info(
+            ProtocolVersion::TLSv1_2,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        );
+        assert_eq!(ecdhe.key_exchange, "ECDHE");
+        assert_eq!(ecdhe.authentication, "ECDSA");
+        assert!(ecdhe.is_secure);
+    }
+
+    #[test]
+    fn handshake_verify_errors_map_to_vulnerabilities() {
+        let cert = |e| rustls::Error::InvalidCertificate(e);
+        assert_eq!(
+            vulnerability_for_handshake_error(&cert(CertificateError::Expired)),
+            Some(TlsVulnerability::ExpiredCertificate)
+        );
+        assert_eq!(
+            vulnerability_for_handshake_error(&cert(CertificateError::UnknownIssuer)),
+            Some(TlsVulnerability::UntrustedIssuer)
+        );
+        assert_eq!(
+            vulnerability_for_handshake_error(&cert(CertificateError::NotValidForName)),
+            Some(TlsVulnerability::HostnameMismatch)
+        );
+        assert_eq!(
+            vulnerability_for_handshake_error(&cert(CertificateError::BadSignature)),
+            None
+        );
+        assert_eq!(
+            vulnerability_for_handshake_error(&rustls::Error::HandshakeNotComplete),
+            None
+        );
+    }
+
+    #[test]
+    fn handshake_rejection_unwraps_tokio_rustls_io_error() {
+        let wrapped = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(CertificateError::Expired),
+        );
+        assert_eq!(
+            handshake_rejection(&wrapped),
+            Some(TlsVulnerability::ExpiredCertificate)
+        );
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(handshake_rejection(&refused), None);
+    }
+
+    #[test]
+    fn merge_vulnerabilities_records_each_cause_once() {
+        let merged = merge_vulnerabilities(
+            Some(TlsVulnerability::ExpiredCertificate),
+            vec![TlsVulnerability::ExpiredCertificate],
+        );
+        assert_eq!(merged, vec![TlsVulnerability::ExpiredCertificate]);
+
+        let self_signed = merge_vulnerabilities(
+            Some(TlsVulnerability::UntrustedIssuer),
+            vec![TlsVulnerability::SelfSignedCertificate],
+        );
+        assert_eq!(self_signed, vec![TlsVulnerability::SelfSignedCertificate]);
+
+        let untrusted = merge_vulnerabilities(Some(TlsVulnerability::UntrustedIssuer), vec![]);
+        assert_eq!(untrusted, vec![TlsVulnerability::UntrustedIssuer]);
+    }
+
+    #[test]
+    fn expired_handshake_counts_one_issue_and_grades_f() {
+        let result = fixtures::expired_handshake_result();
+        assert_eq!(result.vulnerabilities, vec![TlsVulnerability::ExpiredCertificate]);
+        assert!(result.certificate_errors.is_empty());
+        assert_eq!(result.issue_count(), 1);
+        assert!(!result.certificate_valid);
+        assert_eq!(result.security_grade, SecurityGrade::F);
+    }
+
+    #[test]
+    fn issue_count_sums_vulnerabilities_and_unmapped_errors() {
+        let mut result = TlsData::new("192.0.2.1".to_string());
+        assert_eq!(result.issue_count(), 0);
+        result.vulnerabilities.push(TlsVulnerability::HostnameMismatch);
+        result
+            .certificate_errors
+            .push("Version enumeration failed: x".to_string());
+        assert_eq!(result.issue_count(), 2);
+    }
+
+    #[test]
+    fn openssl_analysis_gives_up_on_a_silent_server_after_io_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap().to_string();
+        // Accept and hold the socket open without ever answering the ClientHello.
+        let _server = std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(Duration::from_secs(10));
+            drop(held);
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = TlsScanner::analyze_certificate_with_openssl(
+                "fixture.test",
+                &addr,
+                Duration::from_secs(1),
+                Duration::from_millis(200),
+            );
+            let _ = tx.send(outcome.is_err());
+        });
+        let errored = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("OpenSSL handshake hung past its socket timeout");
+        assert!(errored);
     }
 }

@@ -128,7 +128,7 @@ impl SecurityPane {
                             .get_best_security_grade()
                             .map(|g| g.as_str().to_string())
                             .unwrap_or_else(|| "F".to_string()),
-                        tls_result.total_vulnerabilities(),
+                        primary_data.issue_count(),
                         primary_data.certificate_chain.first().map(|cert| {
                             (
                                 cert.subject.clone(),
@@ -280,14 +280,13 @@ impl SecurityPane {
             None
         };
 
-        // Extract TLS vulnerability details
-        let tls_vulnerabilities = if let Some(tls_state) = state.scanners.get("tls") {
+        // Extract TLS issue details: the same primary result and lists that `Issues:` counts
+        let tls_issues = if let Some(tls_state) = state.scanners.get("tls") {
             if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                Some(
-                    tls_result
-                        .get_all_vulnerabilities()
+                tls_result.get_primary_result().map(|primary_data| {
+                    primary_data
+                        .vulnerabilities
                         .iter()
-                        .take(MAX_TLS_VULNERABILITIES_DISPLAYED)
                         .map(|vuln| match vuln {
                             crate::scan::tls::TlsVulnerability::Heartbleed => "Heartbleed (CVE-2014-0160)".to_string(),
                             crate::scan::tls::TlsVulnerability::Poodle => "POODLE (CVE-2014-3566)".to_string(),
@@ -300,6 +299,12 @@ impl SecurityPane {
                             crate::scan::tls::TlsVulnerability::SelfSignedCertificate => {
                                 "Self-signed certificate".to_string()
                             }
+                            crate::scan::tls::TlsVulnerability::UntrustedIssuer => {
+                                "Untrusted certificate issuer".to_string()
+                            }
+                            crate::scan::tls::TlsVulnerability::HostnameMismatch => {
+                                "Certificate hostname mismatch".to_string()
+                            }
                             crate::scan::tls::TlsVulnerability::WeakSignatureAlgorithm(alg) => {
                                 format!("Weak signature: {}", alg)
                             }
@@ -310,8 +315,10 @@ impl SecurityPane {
                             crate::scan::tls::TlsVulnerability::SslV2Enabled => "SSLv2 enabled".to_string(),
                             crate::scan::tls::TlsVulnerability::SslV3Enabled => "SSLv3 enabled".to_string(),
                         })
-                        .collect::<Vec<_>>(),
-                )
+                        .chain(primary_data.certificate_errors.iter().cloned())
+                        .take(MAX_TLS_VULNERABILITIES_DISPLAYED)
+                        .collect::<Vec<_>>()
+                })
             } else {
                 None
             }
@@ -499,6 +506,14 @@ impl SecurityPane {
                     Style::default().fg(if vuln_count == 0 { Color::Green } else { Color::Red }),
                 ),
             ]));
+
+            // The reasons `Issues:` counts sit right under it, so a failed handshake's cause is above the fold.
+            for issue in tls_issues.into_iter().flatten() {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", Style::default().fg(Color::Red)),
+                    Span::styled(issue, Style::default().fg(Color::Red)),
+                ]));
+            }
         } else if state.scanners.contains_key("tls") {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![
@@ -837,24 +852,6 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    DKIM: ", Style::default().fg(Color::White)),
                     Span::styled(dkim_domains.join(", "), Style::default().fg(Color::Gray)),
-                ]));
-            }
-        }
-
-        // TLS Vulnerabilities section
-        if let Some(vulnerabilities) = tls_vulnerabilities
-            && !vulnerabilities.is_empty()
-        {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(
-                "⚠️ TLS Vulnerabilities",
-                Style::default().fg(Color::Red),
-            )]));
-
-            for vuln in vulnerabilities {
-                lines.push(Line::from(vec![
-                    Span::styled("  • ", Style::default().fg(Color::Red)),
-                    Span::styled(vuln, Style::default().fg(Color::Red)),
                 ]));
             }
         }
@@ -1495,6 +1492,8 @@ mod tests {
                 TlsVulnerability::WeakCipher(cipher) => format!("Weak cipher: {}", cipher),
                 TlsVulnerability::ExpiredCertificate => "Certificate expired".to_string(),
                 TlsVulnerability::SelfSignedCertificate => "Self-signed certificate".to_string(),
+                TlsVulnerability::UntrustedIssuer => "Untrusted certificate issuer".to_string(),
+                TlsVulnerability::HostnameMismatch => "Certificate hostname mismatch".to_string(),
                 TlsVulnerability::WeakSignatureAlgorithm(alg) => format!("Weak signature: {}", alg),
                 TlsVulnerability::InsecureRenegotiation => "Insecure renegotiation".to_string(),
                 TlsVulnerability::WeakDhParams => "Weak DH parameters".to_string(),
@@ -1586,5 +1585,150 @@ mod tests {
         let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
         assert!(out.contains("analyzed"), "missing analyzed:\n{}", out);
         assert!(!out.contains("refreshing"), "unexpected refreshing marker:\n{}", out);
+    }
+
+    #[test]
+    fn render_expired_handshake_counts_one_issue_and_names_it() {
+        let state = AppState::new("expired.example".to_string());
+        let mut tls_result = TlsResult::new();
+        let data = crate::scan::tls::fixtures::expired_handshake_result();
+        tls_result.ipv4_status = TlsStatus::Success(data.security_grade.clone());
+        tls_result.ipv4_result = Some(data);
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: Some(ScanResult::Tls(tls_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(out.contains("Issues: 1"), "expected one issue:\n{}", out);
+        assert!(out.contains("Certificate expired"), "missing expiry issue:\n{}", out);
+        assert!(
+            out.contains("Expires: -30 days"),
+            "missing certificate expiry:\n{}",
+            out
+        );
+        assert!(out.contains("Valid: no"), "expired cert shown valid:\n{}", out);
+    }
+
+    #[test]
+    fn render_issue_count_is_primary_vulnerabilities_plus_certificate_errors() {
+        let state = AppState::new("expired.example".to_string());
+        let mut tls_result = TlsResult::new();
+        let mut ipv4 = crate::scan::tls::fixtures::expired_handshake_result();
+        ipv4.certificate_errors
+            .push("Version enumeration failed: reset".to_string());
+        ipv4.certificate_errors
+            .push("Certificate analysis failed: timeout".to_string());
+        let ipv6 = crate::scan::tls::fixtures::expired_handshake_result();
+        tls_result.ipv4_status = TlsStatus::Success(ipv4.security_grade.clone());
+        tls_result.ipv6_status = TlsStatus::Success(ipv6.security_grade.clone());
+        tls_result.ipv4_result = Some(ipv4);
+        tls_result.ipv6_result = Some(ipv6);
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: Some(ScanResult::Tls(tls_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(
+            out.contains("Issues: 3"),
+            "expected expiry + two unmapped errors:\n{}",
+            out
+        );
+        assert!(
+            out.contains("Version enumeration failed"),
+            "unmapped error not listed:\n{}",
+            out
+        );
+        assert_eq!(
+            out.matches("Certificate expired").count(),
+            1,
+            "expiry listed twice:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn render_expired_handshake_reason_visible_without_scrolling() {
+        let state = AppState::new("expired.example".to_string());
+        let mut tls_result = TlsResult::new();
+        let data = crate::scan::tls::fixtures::expired_handshake_result();
+        tls_result.ipv4_status = TlsStatus::Success(data.security_grade.clone());
+        tls_result.ipv4_result = Some(data);
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: Some(ScanResult::Tls(tls_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        // expired.badssl.com serves no security headers, which fills the pane past the fold.
+        let http_data = crate::scan::http::HttpData {
+            url: "https://expired.example".to_string(),
+            status_code: 200,
+            response_time: Duration::from_millis(200),
+            content_length: 1024,
+            content_type: Some("text/html".to_string()),
+            redirect_chain: vec![],
+            security_headers: SecurityHeaders {
+                strict_transport_security: None,
+                x_frame_options: None,
+                x_content_type_options: None,
+                x_xss_protection: None,
+                referrer_policy: None,
+                permissions_policy: None,
+            },
+            csp: None,
+            cors: None,
+            caching: crate::scan::http::CachingPolicy {
+                cache_control: None,
+                expires: None,
+                etag: None,
+                last_modified: None,
+            },
+            vulnerabilities: vec![
+                HttpVulnerability::MissingHsts,
+                HttpVulnerability::MissingXFrameOptions,
+                HttpVulnerability::MissingXContentTypeOptions,
+                HttpVulnerability::MissingCsp,
+            ],
+            security_grade: HttpSecurityGrade::F,
+            scan_duration: Duration::from_millis(300),
+            target_ip: "192.0.2.1".to_string(),
+        };
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: Some(ScanResult::Http(crate::scan::http::HttpResult {
+                    ipv4_status: crate::scan::http::HttpStatus::Success(HttpSecurityGrade::F),
+                    ipv4_result: Some(http_data),
+                    ipv6_result: None,
+                    ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+                    queried_at: Instant::now(),
+                    total_duration: Duration::from_millis(300),
+                })),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        // The Security pane at a 200x55 terminal: 68 wide, 20 inner lines plus borders.
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 68, 22, true);
+        assert!(out.contains("Issues: 1"), "missing issue count:\n{}", out);
+        assert!(out.contains("Certificate expired"), "reason below the fold:\n{}", out);
     }
 }
