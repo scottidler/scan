@@ -16,6 +16,9 @@ const PROBES_PER_HOP: u8 = 3;
 const HOP_SUMMARY_DISPLAY_COUNT: usize = 5;
 const MS_TO_MICROSECONDS_MULTIPLIER: f64 = 1000.0;
 const FULL_PACKET_LOSS: f32 = 1.0;
+/// What Linux `traceroute` prints when the host refuses it an unprivileged ICMP socket
+/// (`net.ipv4.ping_group_range` excludes the user).
+const ICMP_PRIVILEGE_ERROR: &str = "You do not have enough privileges to use this traceroute method";
 
 #[derive(Debug, Clone)]
 pub struct TracerouteScanner {
@@ -23,6 +26,43 @@ pub struct TracerouteScanner {
     timeout: Duration,
     max_hops: u8,
     probes_per_hop: u8,
+    program_override: Option<String>,
+}
+
+/// Program and arguments for one traceroute of `target` on `target_os`.
+///
+/// `-I` (ICMP echo) is documented for Linux and macOS `traceroute`/`traceroute6`; CDN edges
+/// that drop the default UDP probes still answer it. Other platforms get the UDP default.
+pub fn traceroute_args(
+    target_os: &str,
+    ipv6: bool,
+    wait: u64,
+    max_hops: u8,
+    probes: u8,
+    use_icmp: bool,
+    target: IpAddr,
+) -> (&'static str, Vec<String>) {
+    let program = if ipv6 { "traceroute6" } else { "traceroute" };
+    let mut args = vec!["-n".to_string()];
+    if use_icmp && matches!(target_os, "linux" | "macos") {
+        args.push("-I".to_string());
+    }
+    args.extend([
+        "-w".to_string(),
+        wait.to_string(),
+        "-m".to_string(),
+        max_hops.to_string(),
+        "-q".to_string(),
+        probes.to_string(),
+        target.to_string(),
+    ]);
+    (program, args)
+}
+
+/// Whether a failed ICMP run should be retried once over UDP. Only the privilege refusal
+/// qualifies: a silent target is not a failure, and retrying it would double the run time.
+fn icmp_refused(stderr: &str) -> bool {
+    stderr.contains(ICMP_PRIVILEGE_ERROR)
 }
 
 // Dual-protocol Traceroute result structure
@@ -44,6 +84,29 @@ pub struct TracerouteData {
     pub target_ip: IpAddr,
     pub scan_duration: Duration,
     pub ipv6: bool,
+}
+
+impl TracerouteData {
+    /// The highest hop that answered at least one probe.
+    pub fn last_reply_hop(&self) -> Option<u8> {
+        self.hops
+            .iter()
+            .filter(|hop| hop.responses.iter().any(|r| !r.timeout))
+            .map(|hop| hop.hop_number)
+            .max()
+    }
+
+    /// `reached`, or why not: `target silent (last reply: hop N)` / `target silent (no hop replied)`.
+    pub fn reach_label(&self) -> String {
+        if self.destination_reached {
+            "reached".to_string()
+        } else {
+            match self.last_reply_hop() {
+                Some(hop) => format!("target silent (last reply: hop {hop})"),
+                None => "target silent (no hop replied)".to_string(),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +262,65 @@ impl TracerouteScanner {
             timeout: Duration::from_secs(TRACEROUTE_TIMEOUT_SECS),
             max_hops: MAX_TRACEROUTE_HOPS,
             probes_per_hop: PROBES_PER_HOP,
+            program_override: None,
         }
+    }
+
+    /// Use `program` instead of the platform's `traceroute`/`traceroute6` binary.
+    pub fn with_program(mut self, program: impl Into<String>) -> Self {
+        self.program_override = Some(program.into());
+        self
+    }
+
+    /// One traceroute run; returns stdout, or an error carrying the tool's stderr.
+    async fn run_traceroute(&self, target: &Target, target_ip: IpAddr, use_icmp: bool) -> Result<String> {
+        let (default_program, args) = traceroute_args(
+            std::env::consts::OS,
+            target_ip.is_ipv6(),
+            self.timeout.as_secs(),
+            self.max_hops,
+            self.probes_per_hop,
+            use_icmp,
+            target_ip,
+        );
+        let program: &str = self.program_override.as_deref().unwrap_or(default_program);
+        log::debug!(
+            "[scan::traceroute] run_traceroute: target={} program={} args={:?}",
+            target.display_name(),
+            program,
+            args
+        );
+
+        let command_start = Instant::now();
+        let output = super::kill_on_drop_command(program)
+            .args(&args)
+            .output()
+            .await
+            .wrap_err("Failed to execute traceroute command")?;
+        let command_duration = command_start.elapsed();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!(
+                "[scan::traceroute] command_failed: target={} icmp={} duration={}ms status={} stderr={}",
+                target.display_name(),
+                use_icmp,
+                command_duration.as_millis(),
+                output.status,
+                stderr.trim()
+            );
+            return Err(eyre::eyre!("Traceroute command failed: {}", stderr));
+        }
+
+        let stdout = String::from_utf8(output.stdout).wrap_err("Invalid UTF-8 in traceroute output")?;
+        log::trace!(
+            "[scan::traceroute] command_completed: target={} icmp={} duration={}ms output_len={}",
+            target.display_name(),
+            use_icmp,
+            command_duration.as_millis(),
+            stdout.len()
+        );
+        Ok(stdout)
     }
 
     async fn traceroute_protocol(&self, target: &Target, protocol: Protocol) -> Result<TracerouteData> {
@@ -267,49 +388,17 @@ impl TracerouteScanner {
             ipv6
         );
 
-        // Build traceroute command
-        let mut cmd = super::kill_on_drop_command(if ipv6 { "traceroute6" } else { "traceroute" });
-        cmd.args([
-            "-n", // Don't resolve hostnames
-            "-w",
-            &self.timeout.as_secs().to_string(), // Wait time
-            "-m",
-            &self.max_hops.to_string(), // Max hops
-            "-q",
-            &self.probes_per_hop.to_string(), // Probes per hop
-            &target_ip.to_string(),
-        ]);
-
-        log::trace!(
-            "[scan::traceroute] executing_command: target={} cmd={:?}",
-            target.display_name(),
-            cmd
-        );
-
-        let command_start = Instant::now();
-        let output = cmd.output().await.wrap_err("Failed to execute traceroute command")?;
-        let command_duration = command_start.elapsed();
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!(
-                "[scan::traceroute] command_failed: target={} duration={}ms status={} stderr={}",
-                target.display_name(),
-                command_duration.as_millis(),
-                output.status,
-                stderr.trim()
-            );
-            return Err(eyre::eyre!("Traceroute command failed: {}", stderr));
-        }
-
-        let stdout = String::from_utf8(output.stdout).wrap_err("Invalid UTF-8 in traceroute output")?;
-
-        log::trace!(
-            "[scan::traceroute] command_completed: target={} duration={}ms output_len={}",
-            target.display_name(),
-            command_duration.as_millis(),
-            stdout.len()
-        );
+        let stdout = match self.run_traceroute(target, target_ip, true).await {
+            Err(e) if icmp_refused(&format!("{e:#}")) => {
+                log::warn!(
+                    "[scan::traceroute] icmp_refused_retrying_udp: target={} ip={}",
+                    target.display_name(),
+                    target_ip
+                );
+                self.run_traceroute(target, target_ip, false).await?
+            }
+            outcome => outcome?,
+        };
 
         let parse_start = Instant::now();
         let result = self.parse_traceroute_output(&stdout, target_ip, ipv6, start_time.elapsed())?;
@@ -639,6 +728,208 @@ mod tests {
         assert!(pane.contains("no IPv6 route on this host"), "{pane}");
         assert!(!pane.contains("NoAddress"), "{pane}");
         assert!(!pane.contains("Failed("), "{pane}");
+    }
+
+    fn hop(hop_number: u8, reply: Option<IpAddr>) -> TracerouteHop {
+        TracerouteHop {
+            hop_number,
+            responses: vec![HopResponse {
+                ip_address: reply,
+                rtt: reply.map(|_| Duration::from_millis(5)),
+                timeout: reply.is_none(),
+            }],
+            best_rtt: None,
+            avg_rtt: None,
+            worst_rtt: None,
+            packet_loss: if reply.is_some() { 0.0 } else { FULL_PACKET_LOSS },
+        }
+    }
+
+    fn route(hops: Vec<TracerouteHop>, destination_reached: bool) -> TracerouteData {
+        TracerouteData {
+            total_hops: hops.len() as u8,
+            hops,
+            destination_reached,
+            max_hops: MAX_TRACEROUTE_HOPS,
+            target_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            scan_duration: Duration::from_secs(1),
+            ipv6: false,
+        }
+    }
+
+    #[test]
+    fn traceroute_args_use_icmp_on_linux_and_macos() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        for os in ["linux", "macos"] {
+            let (program, args) = traceroute_args(os, false, 3, 30, 3, true, v4);
+            assert_eq!(program, "traceroute");
+            assert_eq!(
+                args,
+                ["-n", "-I", "-w", "3", "-m", "30", "-q", "3", "192.0.2.1"],
+                "{os}"
+            );
+            let (program, args) = traceroute_args(os, true, 3, 30, 3, true, v6);
+            assert_eq!(program, "traceroute6");
+            assert!(args.contains(&"-I".to_string()), "{os}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn traceroute_args_without_icmp_or_on_other_platforms_use_udp() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let (_, udp) = traceroute_args("linux", false, 3, 30, 3, false, v4);
+        assert!(!udp.contains(&"-I".to_string()), "{udp:?}");
+        let (_, other) = traceroute_args("windows", false, 3, 30, 3, true, v4);
+        assert!(!other.contains(&"-I".to_string()), "{other:?}");
+    }
+
+    #[test]
+    fn icmp_refused_matches_only_the_privilege_text() {
+        assert!(icmp_refused(
+            "Traceroute command failed: You do not have enough privileges to use this traceroute method.\nsocket: Operation not permitted\n"
+        ));
+        assert!(!icmp_refused(
+            "Traceroute command failed: connect: Network is unreachable"
+        ));
+        assert!(!icmp_refused(""));
+    }
+
+    /// A fake traceroute that appends its arguments to `runs` per call, then runs `body`.
+    #[cfg(unix)]
+    fn fake_traceroute(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("scan-traceroute-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.join("runs");
+        let script = dir.join("fake-traceroute");
+        crate::scan::testing::write_executable_script(
+            &script,
+            &format!("#!/bin/sh\necho \"$*\" >> {}\n{body}\n", runs.display()),
+        );
+        let program = script.to_string_lossy().into_owned();
+        (dir, runs, program)
+    }
+
+    #[cfg(unix)]
+    async fn scan_with_fake(name: &str, body: &str) -> (Result<ScanResult>, Vec<String>) {
+        let (dir, runs, program) = fake_traceroute(name, body);
+        let target = Target::parse("192.0.2.1").unwrap();
+        let outcome = TracerouteScanner::new()
+            .with_program(program)
+            .scan(&target, Protocol::Ipv4)
+            .await;
+        let lines = std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (outcome, lines)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn icmp_privilege_refusal_retries_exactly_once_over_udp() {
+        let body = r#"case " $* " in
+  *" -I "*) echo "You do not have enough privileges to use this traceroute method." >&2; echo "socket: Operation not permitted" >&2; exit 1 ;;
+esac
+echo " 1  192.0.2.1  1.000 ms  1.100 ms  1.200 ms"
+exit 0"#;
+        let (outcome, runs) = scan_with_fake("privilege", body).await;
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert!(runs[0].split(' ').any(|a| a == "-I"), "{runs:?}");
+        assert!(!runs[1].split(' ').any(|a| a == "-I"), "{runs:?}");
+        let Ok(ScanResult::Traceroute(result)) = outcome else {
+            panic!("UDP retry should succeed: {outcome:?}");
+        };
+        assert!(result.any_destination_reached());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn other_icmp_failure_is_not_retried() {
+        let (outcome, runs) =
+            scan_with_fake("unreachable", r#"echo "connect: Network is unreachable" >&2; exit 1"#).await;
+        assert_eq!(runs.len(), 1, "{runs:?} {outcome:?}");
+        assert!(outcome.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_icmp_target_is_not_retried() {
+        let (outcome, runs) = scan_with_fake("silent", r#"echo " 1  * * *"; echo " 2  * * *"; exit 0"#).await;
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let Ok(ScanResult::Traceroute(result)) = outcome else {
+            panic!("a silent run is a result: {outcome:?}");
+        };
+        assert_eq!(
+            result.get_primary_result().unwrap().reach_label(),
+            "target silent (no hop replied)"
+        );
+    }
+
+    #[test]
+    fn reach_label_names_the_last_replying_hop() {
+        let gw = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        let isp = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(route(vec![hop(1, gw)], true).reach_label(), "reached");
+        assert_eq!(
+            route(vec![hop(1, gw), hop(2, isp), hop(3, None), hop(4, None)], false).reach_label(),
+            "target silent (last reply: hop 2)"
+        );
+        assert_eq!(
+            route(vec![hop(1, None), hop(2, None)], false).reach_label(),
+            "target silent (no hop replied)"
+        );
+        assert_eq!(route(vec![], false).reach_label(), "target silent (no hop replied)");
+    }
+
+    fn render_traceroute(outcome: Result<ScanResult>) -> String {
+        use crate::tui::TraceroutePane;
+        use crate::tui::testing::render_pane;
+        use crate::types::{AppState, ScanState, ScanStatus};
+        use std::sync::{Arc, Mutex};
+
+        let state = Arc::new(Mutex::new(AppState::new("192.0.2.1".to_string())));
+        state.lock().unwrap().scanners.insert(
+            "traceroute".to_string(),
+            ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::scanner::record_outcome("traceroute", 10, Protocol::Ipv4, Instant::now(), outcome, &state);
+        let guard = state.lock().unwrap();
+        render_pane(&TraceroutePane::new(), &guard, 100, 30, false)
+    }
+
+    fn traced(data: TracerouteData) -> Result<ScanResult> {
+        let mut result = TracerouteResult::new();
+        result.ipv4_status = TracerouteStatus::Success(data.total_hops);
+        result.ipv4_result = Some(data);
+        Ok(ScanResult::Traceroute(result))
+    }
+
+    #[test]
+    fn silent_target_renders_target_silent_with_the_last_reply_hop() {
+        let gw = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        let pane = render_traceroute(traced(route(vec![hop(1, gw), hop(2, gw), hop(3, None)], false)));
+        assert!(pane.contains("✗ target silent (last reply: hop 2)"), "{pane}");
+        assert!(!pane.contains("unreached"), "{pane}");
+
+        let pane = render_traceroute(traced(route(vec![hop(1, None)], false)));
+        assert!(pane.contains("✗ target silent (no hop replied)"), "{pane}");
+        assert!(!pane.contains("hop 0"), "{pane}");
+    }
+
+    #[test]
+    fn reached_target_renders_check_reached() {
+        let target = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let pane = render_traceroute(traced(route(vec![hop(1, target)], true)));
+        assert!(pane.contains("✓ reached"), "{pane}");
     }
 
     #[test]

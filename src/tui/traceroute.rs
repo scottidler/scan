@@ -88,7 +88,10 @@ impl Pane for TraceroutePane {
                         if primary_data.destination_reached {
                             Span::styled(" ✓ reached", Style::default().fg(Color::Green))
                         } else {
-                            Span::styled(" ✗ unreached", Style::default().fg(Color::Red))
+                            Span::styled(
+                                format!(" ✗ {}", primary_data.reach_label()),
+                                Style::default().fg(Color::Red),
+                            )
                         },
                     ]));
 

@@ -276,7 +276,7 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 );
             };
             let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
-            let reached = if primary_data.destination_reached { "reached" } else { "unreached" };
+            let reached = primary_data.reach_label();
 
             // Calculate average RTT from last hop
             let last_hop_rtt = primary_data

@@ -744,13 +744,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ipv6_ping_without_aaaa_is_no_address_and_spawns_nothing() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("scan-ping-noaaaa-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("spawned");
         let script = dir.join("fake-ping");
-        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::scan::testing::write_executable_script(
+            &script,
+            &format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        );
 
         let mut target = Target::parse("a-only.example").unwrap();
         target.update_resolved_ips(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]);
@@ -1128,18 +1129,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn dropping_an_in_flight_scan_kills_the_ping_child() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = std::env::temp_dir().join(format!("scan-kill-on-drop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let pid_file = dir.join("pid");
         let program = dir.join("ping");
-        std::fs::write(
+        crate::scan::testing::write_executable_script(
             &program,
-            format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid_file.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid_file.display()),
+        );
 
         let scanner = PingScanner::default().with_program(program.display().to_string());
         let target = Target::parse("127.0.0.1").unwrap();
