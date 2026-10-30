@@ -1,3 +1,4 @@
+pub mod connect;
 pub mod dns;
 pub mod geoip;
 pub mod http;
@@ -39,6 +40,11 @@ impl Family {
             Family::Ipv4 => "IPv4",
             Family::Ipv6 => "IPv6",
         }
+    }
+
+    /// The family `ip` belongs to.
+    pub fn of_ip(ip: std::net::IpAddr) -> Self {
+        if ip.is_ipv4() { Family::Ipv4 } else { Family::Ipv6 }
     }
 
     /// The family a single-family protocol selects; `None` for `Protocol::Both`.
@@ -253,6 +259,12 @@ mod tests {
         let remote = classify_route_error("No route to host (os error 113)", Family::Ipv6).to_string();
         assert_eq!(remote, "host unreachable");
         assert!(!remote.contains("on this host"));
+    }
+
+    #[test]
+    fn family_of_ip_follows_the_address() {
+        assert_eq!(Family::of_ip("192.0.2.1".parse().unwrap()), Family::Ipv4);
+        assert_eq!(Family::of_ip("2001:db8::1".parse().unwrap()), Family::Ipv6);
     }
 
     #[test]

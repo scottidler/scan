@@ -68,8 +68,18 @@ impl Pane for GeoIpPane {
 
         // Get GeoIP results and render them
         if let Some(geoip_state) = state.scanners.get("geoip") {
-            // Update header with current status
-            let (label, label_color) = crate::tui::status_label(&geoip_state, "locating...", "located");
+            // An address with no public location was never looked up, so it is not `located`.
+            let not_geolocatable = match &geoip_state.result {
+                Some(ScanResult::GeoIp(geoip_result)) if !geoip_result.has_any_success() => {
+                    geoip_result.not_geolocatable()
+                }
+                _ => None,
+            };
+            let complete = if not_geolocatable.is_some() { "not geolocatable" } else { "located" };
+            let (label, mut label_color) = crate::tui::status_label(&geoip_state, "locating...", complete);
+            if not_geolocatable.is_some() && matches!(geoip_state.status, crate::types::ScanStatus::Complete) {
+                label_color = Color::Gray;
+            }
             lines[0] = Line::from(vec![
                 Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
                 Span::styled(label, Style::default().fg(label_color)),
@@ -138,6 +148,11 @@ impl Pane for GeoIpPane {
                     lines.push(Line::from(vec![
                         Span::styled("📡 Source: ", Style::default().fg(Color::White)),
                         Span::styled(primary_data.data_source.clone(), Style::default().fg(Color::Gray)),
+                    ]));
+                } else if let Some(not_geolocatable) = not_geolocatable {
+                    lines.push(Line::from(vec![
+                        Span::styled("📍 Location: ", Style::default().fg(Color::White)),
+                        Span::styled(not_geolocatable.to_string(), Style::default().fg(Color::Gray)),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
@@ -273,5 +288,37 @@ mod tests {
             3,
             "📍 Location: Newcastle upon Tyne, Llanfairpwllgwyngyll, United Kingdom of Great Britain and Northern Ireland",
         );
+    }
+
+    #[test]
+    fn loopback_renders_not_geolocatable_in_gray_never_located() {
+        use crate::scan::geoip::{AddressKind, GeoIpResult, GeoIpStatus};
+        let mut result = GeoIpResult::new();
+        result.ipv4_status = GeoIpStatus::NotGeolocatable(AddressKind::Loopback);
+        result.ipv6_status = GeoIpStatus::NotGeolocatable(AddressKind::Loopback);
+        let state = complete_state("geoip", ScanResult::GeoIp(result));
+        let out = crate::tui::testing::render_pane(&GeoIpPane::new(), &state, 80, 12, false);
+        assert!(out.contains("not geolocatable (loopback address)"), "{out}");
+        assert!(!out.contains("located"), "{out}");
+        assert!(!out.contains("failed"), "{out}");
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).expect("TestBackend terminal");
+        terminal
+            .draw(|frame| GeoIpPane::new().render(frame, frame.area(), &state, false))
+            .expect("draw pane");
+        let buffer = terminal.backend().buffer();
+        let row = (0..12)
+            .find(|&y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("not geolocatable (")
+            })
+            .expect("label row");
+        let x = (0..80)
+            .find(|&x| buffer[(x, row)].symbol() == "(")
+            .expect("label start");
+        assert_eq!(buffer[(x, row)].fg, Color::Gray);
     }
 }

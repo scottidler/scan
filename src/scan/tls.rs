@@ -1,3 +1,5 @@
+use super::connect::TcpConnector;
+use super::{Family, classify_route_error, family_failure_summary};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -282,6 +284,19 @@ impl TlsResult {
         }
     }
 
+    /// Why every attempted family failed, e.g. `IPv6: no IPv6 route on this host`. Families with
+    /// no address are left out.
+    pub fn failure_summary(&self, protocol: Protocol) -> String {
+        let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
+            .into_iter()
+            .filter_map(|(family, status)| match status {
+                TlsStatus::Failed(reason) => Some((family, reason.clone())),
+                _ => None,
+            })
+            .collect();
+        family_failure_summary(&failures, protocol)
+    }
+
     pub fn get_primary_result(&self) -> Option<&TlsData> {
         // Prefer IPv4, then IPv6
         if let Some(ipv4_data) = &self.ipv4_result {
@@ -453,6 +468,7 @@ pub struct TlsScanner {
     connection_timeout: Duration,
     handshake_timeout: Duration,
     total_scan_timeout: Duration,
+    connector: TcpConnector,
 }
 
 impl Default for TlsScanner {
@@ -469,7 +485,14 @@ impl TlsScanner {
             connection_timeout: Duration::from_secs(TLS_CONNECTION_TIMEOUT_SECS),
             handshake_timeout: Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
             total_scan_timeout: Duration::from_secs(TLS_TOTAL_SCAN_TIMEOUT_SECS),
+            connector: TcpConnector::system(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_connector(mut self, connector: TcpConnector) -> Self {
+        self.connector = connector;
+        self
     }
 
     async fn tls_protocol(&self, target: &Target, protocol: Protocol) -> Result<TlsData> {
@@ -521,13 +544,15 @@ impl TlsScanner {
         Ok(tls_data)
     }
 
-    fn classify_tls_error(error: &eyre::Error) -> TlsStatus {
+    /// A missing address is `NoAddress`; any other failure is classified by its full cause chain,
+    /// so a missing route on this host reads `no <family> route on this host`.
+    fn classify_tls_error(error: &eyre::Error, family: Family) -> TlsStatus {
         let error_msg = error.to_string();
 
         if error_msg.contains("No") && error_msg.contains("address available") {
             TlsStatus::NoAddress
         } else {
-            TlsStatus::Failed(error_msg)
+            TlsStatus::Failed(classify_route_error(&format!("{error:#}"), family).to_string())
         }
     }
 
@@ -571,7 +596,7 @@ impl TlsScanner {
         let connector = TlsConnector::from(Arc::new(config));
 
         match tokio::time::timeout(self.connection_timeout, async {
-            let socket = tokio::net::TcpStream::connect(addr).await?;
+            let socket = self.connector.connect(addr).await?;
             // Use handshake_timeout for the TLS handshake specifically
             let tls_stream =
                 match tokio::time::timeout(self.handshake_timeout, connector.connect(server_name, socket)).await? {
@@ -966,9 +991,9 @@ impl TlsScanner {
                     phase1_duration.as_millis(),
                     e
                 );
-                result.certificate_errors.push(format!("Connection failed: {}", e));
-                result.scan_time = start_time.elapsed();
-                return Ok(result);
+                // No handshake means nothing to grade: the family fails instead of carrying
+                // `TlsData::new`'s default F.
+                return Err(e);
             }
         };
 
@@ -1115,7 +1140,7 @@ impl Scanner for TlsScanner {
                         result.ipv4_result = Some(tls_data);
                     }
                     Err(e) => {
-                        result.ipv4_status = Self::classify_tls_error(&e);
+                        result.ipv4_status = Self::classify_tls_error(&e, Family::Ipv4);
                     }
                 }
             }
@@ -1127,7 +1152,7 @@ impl Scanner for TlsScanner {
                         result.ipv6_result = Some(tls_data);
                     }
                     Err(e) => {
-                        result.ipv6_status = Self::classify_tls_error(&e);
+                        result.ipv6_status = Self::classify_tls_error(&e, Family::Ipv6);
                     }
                 }
             }
@@ -1141,7 +1166,7 @@ impl Scanner for TlsScanner {
                         result.ipv4_result = Some(tls_data);
                     }
                     Err(e) => {
-                        result.ipv4_status = Self::classify_tls_error(&e);
+                        result.ipv4_status = Self::classify_tls_error(&e, Family::Ipv4);
                         log::debug!("[scan::tls] ipv4_tls_failed: error={}", e);
                     }
                 }
@@ -1153,7 +1178,7 @@ impl Scanner for TlsScanner {
                         result.ipv6_result = Some(tls_data);
                     }
                     Err(e) => {
-                        result.ipv6_status = Self::classify_tls_error(&e);
+                        result.ipv6_status = Self::classify_tls_error(&e, Family::Ipv6);
                         log::debug!("[scan::tls] ipv6_tls_failed: error={}", e);
                     }
                 }
@@ -1173,17 +1198,13 @@ impl Scanner for TlsScanner {
             );
             Ok(ScanResult::Tls(result))
         } else {
-            // All protocols failed
-            let error_msg = format!(
-                "All TLS attempts failed for target: {} ({})",
-                target.display_name(),
-                protocol.as_str()
-            );
+            let error_msg = result.failure_summary(protocol);
             log::error!(
-                "[scan::tls] all_tls_failed: target={} protocol={} duration={}ms",
+                "[scan::tls] all_tls_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
-                result.total_duration.as_millis()
+                result.total_duration.as_millis(),
+                error_msg
             );
             Err(eyre::eyre!(error_msg))
         }
@@ -1308,6 +1329,56 @@ mod tests {
         let scanner = TlsScanner::new();
         assert_eq!(scanner.deadline(), Duration::from_secs(TLS_TOTAL_SCAN_TIMEOUT_SECS));
         assert!(scanner.uses_protocol());
+    }
+
+    /// ENETUNREACH and ECONNREFUSED as Linux numbers them.
+    #[cfg(target_os = "linux")]
+    const ENETUNREACH: i32 = 101;
+    #[cfg(target_os = "linux")]
+    const ECONNREFUSED: i32 = 111;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn enetunreach_is_an_err_never_a_graded_result() {
+        let scanner = TlsScanner::new().with_connector(TcpConnector::failing_with(ENETUNREACH));
+        for (literal, protocol, expected) in [
+            ("192.0.2.1", Protocol::Ipv4, "IPv4: no IPv4 route on this host"),
+            (
+                "2606:4700:4700::1111",
+                Protocol::Ipv6,
+                "IPv6: no IPv6 route on this host",
+            ),
+        ] {
+            let target = Target::parse(literal).unwrap();
+            let ip = target.network_target_for_protocol(protocol).unwrap();
+            assert!(
+                scanner.perform_tls_scan_for_ip(&target, &ip).await.is_err(),
+                "{literal}: a connect error must not produce TlsData"
+            );
+            let error = scanner.scan(&target, protocol).await.unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(!error.to_string().contains("Grade"), "{error}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refused_connect_fails_the_family_with_its_cause() {
+        let scanner = TlsScanner::new().with_connector(TcpConnector::failing_with(ECONNREFUSED));
+        let target = Target::parse("192.0.2.1").unwrap();
+        let error = scanner.scan(&target, Protocol::Ipv4).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "IPv4: TLS handshake failed: Connection refused (os error 111)"
+        );
+    }
+
+    #[test]
+    fn tls_failure_summary_skips_families_without_an_address() {
+        let mut result = TlsResult::new();
+        result.ipv4_status = TlsStatus::Failed("operation timed out".to_string());
+        result.ipv6_status = TlsStatus::NoAddress;
+        assert_eq!(result.failure_summary(Protocol::Both), "IPv4: operation timed out");
     }
 
     #[test]

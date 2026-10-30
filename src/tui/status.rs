@@ -6,15 +6,23 @@ use ratatui::style::Color;
 /// Marker shown while a scanner re-runs and the pane still displays its previous result.
 pub const REFRESHING_LABEL: &str = "↻ refreshing";
 
+/// Marker appended to a failure while the scanner runs its next attempt.
+pub const RETRYING_LABEL: &str = "↻ retrying";
+
 /// Text and color for a pane's `Status:` line.
 ///
-/// A `Running` scanner that already holds a result is a refresh, not a first scan, so the
-/// retained data is marked `↻ refreshing` instead of claiming to be fresh or blank. A `Failed`
-/// scanner names its error, whether or not an older result is still on screen below it.
+/// A `Running` scanner whose last attempt failed keeps naming that failure until the retry
+/// lands, so the reason does not vanish for the length of a scan. Otherwise a `Running` scanner
+/// that already holds a result is a refresh, not a first scan, so the retained data is marked
+/// `↻ refreshing` instead of claiming to be fresh or blank. A `Failed` scanner names its error,
+/// whether or not an older result is still on screen below it.
 pub fn status_label(scan_state: &ScanState, running: &'static str, complete: &'static str) -> (String, Color) {
     match scan_state.status {
-        ScanStatus::Running if scan_state.result.is_some() => (REFRESHING_LABEL.to_string(), Color::Yellow),
-        ScanStatus::Running => (running.to_string(), Color::Yellow),
+        ScanStatus::Running => match (&scan_state.error, &scan_state.result) {
+            (Some(error), _) => (format!("failed: {error:#} · {RETRYING_LABEL}"), Color::Red),
+            (None, Some(_)) => (REFRESHING_LABEL.to_string(), Color::Yellow),
+            (None, None) => (running.to_string(), Color::Yellow),
+        },
         ScanStatus::Complete => (complete.to_string(), Color::Green),
         ScanStatus::Failed => (
             failure_text(scan_state).unwrap_or_else(|| "failed".to_string()),
@@ -88,6 +96,18 @@ mod tests {
         let mut state = scan_state(ScanStatus::Failed, true);
         state.error = Some(eyre::eyre!("connection refused"));
         assert_eq!(status_label(&state, "r", "done").0, "failed: connection refused");
+    }
+
+    #[test]
+    fn running_after_a_failure_keeps_the_reason_while_retrying() {
+        for with_result in [false, true] {
+            let mut state = scan_state(ScanStatus::Running, with_result);
+            state.error = Some(eyre::eyre!("timed out after 30s"));
+            let (label, color) = status_label(&state, "scanning...", "done");
+            assert!(label.contains("failed:"), "{label}");
+            assert_eq!(label, "failed: timed out after 30s · ↻ retrying");
+            assert_eq!(color, Color::Red);
+        }
     }
 
     #[test]

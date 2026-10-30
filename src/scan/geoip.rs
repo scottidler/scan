@@ -1,3 +1,4 @@
+use super::{Family, family_failure_summary};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -7,7 +8,8 @@ use log;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -21,6 +23,9 @@ const MAX_CACHE_SIZE: usize = 1000;
 const CACHE_CLEANUP_THRESHOLD_SECS: u64 = 48 * 60 * 60; // 48 hours
 const MULTI_IP_DELAY_MS: u64 = 100;
 const IP_API_RATE_LIMIT: u32 = 45;
+const IP_API_BASE_URL: &str = "http://ip-api.com";
+const IPINFO_BASE_URL: &str = "https://ipinfo.io";
+const IP_API_FIELDS: &str = "status,country,countryCode,region,regionName,city,lat,lon,timezone,isp,org,as,query";
 
 #[derive(Debug, Clone)]
 pub struct GeoIpScanner {
@@ -49,11 +54,96 @@ pub struct GeoIpData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeoIpStatus {
-    Success,        // GeoIP lookup succeeded
-    Failed(String), // GeoIP lookup failed with error message
-    NoAddress,      // No address available for this protocol
-    NotQueried,     // Query was not attempted
+    Success,                      // GeoIP lookup succeeded
+    Failed(String),               // GeoIP lookup failed with error message
+    NoAddress,                    // No address available for this protocol
+    NotQueried,                   // Query was not attempted
+    NotGeolocatable(AddressKind), // The address has no public location; nothing was asked
 }
+
+/// Why an address has no public location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AddressKind {
+    Loopback,
+    Private,
+    LinkLocal,
+    Documentation,
+    /// RFC 6598 shared address space (carrier-grade NAT), 100.64.0.0/10.
+    SharedCgnat,
+    UniqueLocal,
+    /// ipinfo.io answered `"bogon": true` for an address the local ranges do not cover.
+    Bogon,
+}
+
+impl AddressKind {
+    /// The kind of a non-public address, or `None` for one a GeoIP provider can locate.
+    /// An IPv4-mapped IPv6 address is classified as its IPv4 address.
+    pub fn of(ip: IpAddr) -> Option<Self> {
+        match ip.to_canonical() {
+            IpAddr::V4(v4) => Self::of_v4(v4),
+            IpAddr::V6(v6) => Self::of_v6(v6),
+        }
+    }
+
+    fn of_v4(ip: Ipv4Addr) -> Option<Self> {
+        let [a, b, ..] = ip.octets();
+        if ip.is_loopback() {
+            Some(AddressKind::Loopback)
+        } else if ip.is_private() {
+            Some(AddressKind::Private)
+        } else if ip.is_link_local() {
+            Some(AddressKind::LinkLocal)
+        } else if ip.is_documentation() {
+            Some(AddressKind::Documentation)
+        } else if a == 100 && (b & 0xc0) == 64 {
+            // `Ipv4Addr::is_shared` is unstable.
+            Some(AddressKind::SharedCgnat)
+        } else {
+            None
+        }
+    }
+
+    fn of_v6(ip: Ipv6Addr) -> Option<Self> {
+        let segments = ip.segments();
+        if ip.is_loopback() {
+            Some(AddressKind::Loopback)
+        } else if ip.is_unicast_link_local() {
+            Some(AddressKind::LinkLocal)
+        } else if ip.is_unique_local() {
+            Some(AddressKind::UniqueLocal)
+        } else if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+            // 2001:db8::/32; `Ipv6Addr::is_documentation` is unstable.
+            Some(AddressKind::Documentation)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AddressKind::Loopback => "loopback",
+            AddressKind::Private => "private",
+            AddressKind::LinkLocal => "link-local",
+            AddressKind::Documentation => "documentation",
+            AddressKind::SharedCgnat => "shared CGNAT",
+            AddressKind::UniqueLocal => "unique-local",
+            AddressKind::Bogon => "reserved",
+        }
+    }
+}
+
+/// A lookup that was not made, or was answered `bogon`, because the address has no public
+/// location. Displays as the label the GeoIP pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotGeolocatable(pub AddressKind);
+
+impl fmt::Display for NotGeolocatable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "not geolocatable ({} address)", self.0.as_str())
+    }
+}
+
+impl std::error::Error for NotGeolocatable {}
 
 impl Default for GeoIpResult {
     fn default() -> Self {
@@ -79,6 +169,29 @@ impl GeoIpResult {
 
     pub fn has_any_success(&self) -> bool {
         matches!(self.ipv4_status, GeoIpStatus::Success) || matches!(self.ipv6_status, GeoIpStatus::Success)
+    }
+
+    /// The first family's non-public address kind, when the lookup was skipped or answered bogon.
+    pub fn not_geolocatable(&self) -> Option<NotGeolocatable> {
+        [&self.ipv4_status, &self.ipv6_status]
+            .into_iter()
+            .find_map(|status| match status {
+                GeoIpStatus::NotGeolocatable(kind) => Some(NotGeolocatable(*kind)),
+                _ => None,
+            })
+    }
+
+    /// Why every attempted family failed, e.g. `IPv4: All GeoIP providers failed: ...`. Families
+    /// with no address, or with a non-public address, are left out.
+    pub fn failure_summary(&self, protocol: Protocol) -> String {
+        let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
+            .into_iter()
+            .filter_map(|(family, status)| match status {
+                GeoIpStatus::Failed(reason) => Some((family, reason.clone())),
+                _ => None,
+            })
+            .collect();
+        family_failure_summary(&failures, protocol)
     }
 
     pub fn get_all_locations(&self) -> Vec<&GeoLocation> {
@@ -137,6 +250,8 @@ pub struct NetworkInfo {
 #[derive(Debug)]
 pub struct GeoIpService {
     client: Client,
+    ip_api_base_url: String,
+    ipinfo_base_url: String,
     cache: RwLock<HashMap<IpAddr, CachedGeoData>>,
     rate_limiter: RwLock<RateLimiter>,
 }
@@ -185,6 +300,8 @@ struct IpInfoResponse {
     loc: Option<String>, // "lat,lon" format
     org: Option<String>, // "AS#### Organization Name" format
     timezone: Option<String>,
+    #[serde(default)]
+    bogon: bool,
 }
 
 impl Default for GeoIpScanner {
@@ -204,6 +321,12 @@ impl GeoIpScanner {
 
     pub fn service(&self) -> Arc<GeoIpService> {
         self.service.clone()
+    }
+
+    #[cfg(test)]
+    fn with_service(mut self, service: GeoIpService) -> Self {
+        self.service = Arc::new(service);
+        self
     }
 
     async fn geoip_protocol(&self, target: &Target, protocol: Protocol) -> Result<GeoIpData> {
@@ -342,6 +465,8 @@ impl GeoIpService {
                 .user_agent("scan-tool/1.0")
                 .build()
                 .expect("Failed to create HTTP client"),
+            ip_api_base_url: IP_API_BASE_URL.to_string(),
+            ipinfo_base_url: IPINFO_BASE_URL.to_string(),
             cache: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(RateLimiter {
                 last_request: Instant::now() - Duration::from_secs(RATE_LIMITER_WINDOW_SECS),
@@ -351,7 +476,28 @@ impl GeoIpService {
         }
     }
 
+    /// A service that sends its provider requests to `ip_api_base_url` and `ipinfo_base_url`.
+    #[cfg(test)]
+    fn with_base_urls(ip_api_base_url: String, ipinfo_base_url: String) -> Self {
+        Self {
+            ip_api_base_url,
+            ipinfo_base_url,
+            ..Self::new()
+        }
+    }
+
+    /// Locate `ip`. A non-public address fails with `NotGeolocatable` before any request is made,
+    /// and so does one ipinfo.io answers `bogon`.
     pub async fn lookup_ip(&self, ip: IpAddr) -> Result<(Option<GeoLocation>, Option<NetworkInfo>, String)> {
+        if let Some(kind) = AddressKind::of(ip) {
+            log::debug!(
+                "[scan::geoip] lookup_skipped: ip={} kind={} requests=0",
+                ip,
+                kind.as_str()
+            );
+            return Err(eyre::eyre!(NotGeolocatable(kind)));
+        }
+
         // Check cache first
         {
             let cache = self.cache.read().await;
@@ -381,6 +527,7 @@ impl GeoIpService {
                             .await;
                         Ok((location, network_info, "ipinfo.io".to_string()))
                     }
+                    Err(e) if e.downcast_ref::<NotGeolocatable>().is_some() => Err(e),
                     Err(e) => Err(e.wrap_err("All GeoIP providers failed")),
                 }
             }
@@ -391,10 +538,7 @@ impl GeoIpService {
         // Check rate limit (45 requests per minute)
         self.check_rate_limit(IP_API_RATE_LIMIT).await?;
 
-        let url = format!(
-            "http://ip-api.com/json/{}?fields=status,country,countryCode,region,regionName,city,lat,lon,timezone,isp,org,as,query",
-            ip
-        );
+        let url = format!("{}/json/{}?fields={}", self.ip_api_base_url, ip, IP_API_FIELDS);
 
         let response = self
             .client
@@ -449,7 +593,7 @@ impl GeoIpService {
         // Check rate limit (50,000 requests per month, ~1600 per day, ~67 per hour, ~1 per minute)
         self.check_rate_limit(50).await?;
 
-        let url = format!("https://ipinfo.io/{}/json", ip);
+        let url = format!("{}/{}/json", self.ipinfo_base_url, ip);
 
         let response = self
             .client
@@ -459,6 +603,11 @@ impl GeoIpService {
             .wrap_err("Failed to send request to ipinfo.io")?;
 
         let api_response: IpInfoResponse = response.json().await.wrap_err("Failed to parse ipinfo.io response")?;
+
+        if api_response.bogon {
+            log::debug!("[scan::geoip] ipinfo_bogon: ip={}", ip);
+            return Err(eyre::eyre!(NotGeolocatable(AddressKind::Bogon)));
+        }
 
         let location = if api_response.city.is_some() || api_response.country.is_some() {
             let (lat, lon) = api_response
@@ -619,6 +768,50 @@ fn parse_org_info(org_str: &str) -> (Option<u32>, Option<String>) {
     (None, Some(org_str.to_string()))
 }
 
+/// One family's lookup outcome as its status and data.
+fn family_outcome(target: &Target, family: Family, outcome: Result<GeoIpData>) -> (GeoIpStatus, Option<GeoIpData>) {
+    match outcome {
+        Ok(data) => {
+            log::trace!(
+                "[scan::geoip] geoip_completed: target={} family={} ip={} source={} has_location={} has_network_info={}",
+                target.display_name(),
+                family,
+                data.target_ip,
+                data.data_source,
+                data.location.is_some(),
+                data.network_info.is_some()
+            );
+            (GeoIpStatus::Success, Some(data))
+        }
+        Err(e) => {
+            if let Some(NotGeolocatable(kind)) = e.downcast_ref::<NotGeolocatable>() {
+                log::debug!(
+                    "[scan::geoip] geoip_not_geolocatable: target={} family={} kind={}",
+                    target.display_name(),
+                    family,
+                    kind.as_str()
+                );
+                (GeoIpStatus::NotGeolocatable(*kind), None)
+            } else if e.to_string().contains("address available") {
+                log::warn!(
+                    "[scan::geoip] geoip_no_address: target={} family={}",
+                    target.display_name(),
+                    family
+                );
+                (GeoIpStatus::NoAddress, None)
+            } else {
+                log::error!(
+                    "[scan::geoip] geoip_failed: target={} family={} error={:#}",
+                    target.display_name(),
+                    family,
+                    e
+                );
+                (GeoIpStatus::Failed(format!("{e:#}")), None)
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Scanner for GeoIpScanner {
     async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
@@ -631,134 +824,28 @@ impl Scanner for GeoIpScanner {
         let scan_start = Instant::now();
         let mut result = GeoIpResult::new();
 
-        match protocol {
-            Protocol::Ipv4 => match self.geoip_protocol(target, Protocol::Ipv4).await {
-                Ok(data) => {
-                    result.ipv4_result = Some(data.clone());
-                    result.ipv4_status = GeoIpStatus::Success;
-                    log::trace!(
-                        "[scan::geoip] ipv4_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
-                        target.display_name(),
-                        data.target_ip,
-                        data.data_source,
-                        data.location.is_some(),
-                        data.network_info.is_some()
-                    );
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("address available") {
-                        result.ipv4_status = GeoIpStatus::NoAddress;
-                        log::warn!("[scan::geoip] ipv4_geoip_no_address: target={}", target.display_name());
-                    } else {
-                        result.ipv4_status = GeoIpStatus::Failed(error_str);
-                        log::error!(
-                            "[scan::geoip] ipv4_geoip_failed: target={} error={}",
-                            target.display_name(),
-                            e
-                        );
-                    }
-                }
-            },
-            Protocol::Ipv6 => match self.geoip_protocol(target, Protocol::Ipv6).await {
-                Ok(data) => {
-                    result.ipv6_result = Some(data.clone());
-                    result.ipv6_status = GeoIpStatus::Success;
-                    log::trace!(
-                        "[scan::geoip] ipv6_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
-                        target.display_name(),
-                        data.target_ip,
-                        data.data_source,
-                        data.location.is_some(),
-                        data.network_info.is_some()
-                    );
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("address available") {
-                        result.ipv6_status = GeoIpStatus::NoAddress;
-                        log::warn!("[scan::geoip] ipv6_geoip_no_address: target={}", target.display_name());
-                    } else {
-                        result.ipv6_status = GeoIpStatus::Failed(error_str);
-                        log::error!(
-                            "[scan::geoip] ipv6_geoip_failed: target={} error={}",
-                            target.display_name(),
-                            e
-                        );
-                    }
-                }
-            },
+        let (ipv4, ipv6) = match protocol {
+            Protocol::Ipv4 => (Some(self.geoip_protocol(target, Protocol::Ipv4).await), None),
+            Protocol::Ipv6 => (None, Some(self.geoip_protocol(target, Protocol::Ipv6).await)),
             Protocol::Both => {
-                // Run both IPv4 and IPv6 GeoIP lookups concurrently
-                let (ipv4_result, ipv6_result) = tokio::join!(
+                let (ipv4, ipv6) = tokio::join!(
                     self.geoip_protocol(target, Protocol::Ipv4),
                     self.geoip_protocol(target, Protocol::Ipv6)
                 );
-
-                match ipv4_result {
-                    Ok(data) => {
-                        result.ipv4_result = Some(data.clone());
-                        result.ipv4_status = GeoIpStatus::Success;
-                        log::trace!(
-                            "[scan::geoip] ipv4_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
-                            target.display_name(),
-                            data.target_ip,
-                            data.data_source,
-                            data.location.is_some(),
-                            data.network_info.is_some()
-                        );
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        if error_str.contains("address available") {
-                            result.ipv4_status = GeoIpStatus::NoAddress;
-                            log::warn!("[scan::geoip] ipv4_geoip_no_address: target={}", target.display_name());
-                        } else {
-                            result.ipv4_status = GeoIpStatus::Failed(error_str);
-                            log::error!(
-                                "[scan::geoip] ipv4_geoip_failed: target={} error={}",
-                                target.display_name(),
-                                e
-                            );
-                        }
-                    }
-                }
-
-                match ipv6_result {
-                    Ok(data) => {
-                        result.ipv6_result = Some(data.clone());
-                        result.ipv6_status = GeoIpStatus::Success;
-                        log::trace!(
-                            "[scan::geoip] ipv6_geoip_completed: target={} ip={} source={} has_location={} has_network_info={}",
-                            target.display_name(),
-                            data.target_ip,
-                            data.data_source,
-                            data.location.is_some(),
-                            data.network_info.is_some()
-                        );
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        if error_str.contains("address available") {
-                            result.ipv6_status = GeoIpStatus::NoAddress;
-                            log::warn!("[scan::geoip] ipv6_geoip_no_address: target={}", target.display_name());
-                        } else {
-                            result.ipv6_status = GeoIpStatus::Failed(error_str);
-                            log::error!(
-                                "[scan::geoip] ipv6_geoip_failed: target={} error={}",
-                                target.display_name(),
-                                e
-                            );
-                        }
-                    }
-                }
+                (Some(ipv4), Some(ipv6))
             }
+        };
+        if let Some(outcome) = ipv4 {
+            (result.ipv4_status, result.ipv4_result) = family_outcome(target, Family::Ipv4, outcome);
+        }
+        if let Some(outcome) = ipv6 {
+            (result.ipv6_status, result.ipv6_result) = family_outcome(target, Family::Ipv6, outcome);
         }
 
         result.total_duration = scan_start.elapsed();
 
-        // Return success if any protocol succeeded
-        if result.has_any_success() {
+        // A located family, or an address with no public location to find, is an answer.
+        if result.has_any_success() || result.not_geolocatable().is_some() {
             log::debug!(
                 "[scan::geoip] scan_completed: target={} protocol={} duration={}ms ipv4_status={:?} ipv6_status={:?}",
                 target.display_name(),
@@ -769,10 +856,7 @@ impl Scanner for GeoIpScanner {
             );
             Ok(ScanResult::GeoIp(result))
         } else {
-            let error_msg = format!(
-                "All GeoIP protocols failed: IPv4={:?}, IPv6={:?}",
-                result.ipv4_status, result.ipv6_status
-            );
+            let error_msg = result.failure_summary(protocol);
             log::error!(
                 "[scan::geoip] scan_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
@@ -802,6 +886,103 @@ mod tests {
         let scanner = GeoIpScanner::new();
         assert_eq!(scanner.name(), "geoip");
         assert_eq!(scanner.interval(), Duration::from_secs(10 * 60));
+    }
+
+    use crate::scan::testing::FakeHttp;
+
+    #[test]
+    fn address_kind_classifies_non_public_ranges_and_leaves_public_ones() {
+        let cases = [
+            ("127.0.0.1", Some(AddressKind::Loopback)),
+            ("10.0.0.1", Some(AddressKind::Private)),
+            ("172.16.5.4", Some(AddressKind::Private)),
+            ("192.168.1.1", Some(AddressKind::Private)),
+            ("169.254.1.1", Some(AddressKind::LinkLocal)),
+            ("192.0.2.1", Some(AddressKind::Documentation)),
+            ("198.51.100.7", Some(AddressKind::Documentation)),
+            ("203.0.113.9", Some(AddressKind::Documentation)),
+            ("100.64.0.1", Some(AddressKind::SharedCgnat)),
+            ("100.127.255.254", Some(AddressKind::SharedCgnat)),
+            ("100.128.0.1", None),
+            ("::1", Some(AddressKind::Loopback)),
+            ("fe80::1", Some(AddressKind::LinkLocal)),
+            ("fd00::1", Some(AddressKind::UniqueLocal)),
+            ("2001:db8::1", Some(AddressKind::Documentation)),
+            ("::ffff:10.0.0.1", Some(AddressKind::Private)),
+            ("8.8.8.8", None),
+            ("2606:4700:4700::1111", None),
+        ];
+        for (ip, expected) in cases {
+            assert_eq!(AddressKind::of(ip.parse().unwrap()), expected, "{ip}");
+        }
+    }
+
+    #[test]
+    fn not_geolocatable_names_the_address_kind() {
+        assert_eq!(
+            NotGeolocatable(AddressKind::Loopback).to_string(),
+            "not geolocatable (loopback address)"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_addresses_make_zero_requests_and_are_not_geolocatable() {
+        let fake = FakeHttp::start(vec![]).await;
+        let scanner = GeoIpScanner::new().with_service(GeoIpService::with_base_urls(fake.base_url(), fake.base_url()));
+        for (ip, kind) in [
+            ("127.0.0.1", AddressKind::Loopback),
+            ("10.0.0.1", AddressKind::Private),
+            ("192.0.2.1", AddressKind::Documentation),
+        ] {
+            let target = Target::parse(ip).unwrap();
+            let Ok(ScanResult::GeoIp(result)) = scanner.scan(&target, Protocol::Ipv4).await else {
+                panic!("{ip}: a non-public address is an answer, not a scan failure");
+            };
+            assert!(
+                matches!(result.ipv4_status, GeoIpStatus::NotGeolocatable(k) if k == kind),
+                "{ip}: {:?}",
+                result.ipv4_status
+            );
+            let label = result.not_geolocatable().unwrap().to_string();
+            assert!(label.starts_with("not geolocatable"), "{ip}: {label}");
+        }
+        assert_eq!(fake.total_hits(), 0, "a local address must never reach a provider");
+    }
+
+    #[tokio::test]
+    async fn ipinfo_bogon_is_not_geolocatable() {
+        let ip = "198.18.0.1";
+        let fake = FakeHttp::start(vec![
+            (
+                format!("/json/{ip}?fields={IP_API_FIELDS}").as_str(),
+                200,
+                r#"{"status":"fail","message":"reserved range"}"#.to_string(),
+            ),
+            (
+                format!("/{ip}/json").as_str(),
+                200,
+                format!(r#"{{"ip":"{ip}","bogon":true}}"#),
+            ),
+        ])
+        .await;
+        let service = GeoIpService::with_base_urls(fake.base_url(), fake.base_url());
+        let error = service.lookup_ip(ip.parse().unwrap()).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<NotGeolocatable>(),
+            Some(&NotGeolocatable(AddressKind::Bogon))
+        );
+        assert_eq!(fake.hits(&format!("/{ip}/json")), 1);
+    }
+
+    #[test]
+    fn geoip_failure_summary_leaves_out_unlocatable_families() {
+        let mut result = GeoIpResult::new();
+        result.ipv4_status = GeoIpStatus::Failed("All GeoIP providers failed".to_string());
+        result.ipv6_status = GeoIpStatus::NotGeolocatable(AddressKind::LinkLocal);
+        assert_eq!(
+            result.failure_summary(Protocol::Both),
+            "IPv4: All GeoIP providers failed"
+        );
     }
 
     #[test]

@@ -99,6 +99,16 @@ impl FakeHttp {
     pub fn hits(&self, path: &str) -> usize {
         self.requests.lock().unwrap().iter().filter(|p| *p == path).count()
     }
+
+    /// Requests received so far, on any path.
+    pub fn total_hits(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    /// `http://<addr>`, for a client that appends its own paths.
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
 }
 
 /// The request path, read up to the end of the headers; `None` when the client sends nothing

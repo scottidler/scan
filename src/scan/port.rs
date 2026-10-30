@@ -1,3 +1,5 @@
+use super::connect::TcpConnector;
+use super::{Family, RouteError, classify_route_error, family_failure_summary};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -32,6 +34,31 @@ pub struct PortScanner {
     max_concurrent: usize,
     service_detection: bool,
     scan_mode: ScanMode,
+    connector: TcpConnector,
+}
+
+/// What one port's connect attempt says about the port.
+#[derive(Debug)]
+enum PortProbe {
+    Open(OpenPort),
+    /// The host answered with a refusal (ECONNREFUSED).
+    Closed,
+    /// No answer, or a remote error such as EHOSTUNREACH: something drops or blocks the probe.
+    Filtered,
+    /// This host has no route for the family, so the probe says nothing about the port.
+    NoRoute(Family),
+}
+
+/// Classify a failed connect. Only a refusal proves the port closed; a missing route on this host
+/// is a family failure, never a port verdict.
+fn classify_connect_error(error: &std::io::Error, family: Family) -> PortProbe {
+    if error.kind() == std::io::ErrorKind::ConnectionRefused {
+        return PortProbe::Closed;
+    }
+    match classify_route_error(&error.to_string(), family) {
+        RouteError::NoRoute(family) => PortProbe::NoRoute(family),
+        RouteError::Other(_) => PortProbe::Filtered,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +156,19 @@ impl PortResult {
         ports
     }
 
+    /// Why every attempted family failed, e.g. `IPv6: no IPv6 route on this host`. Families with
+    /// no address are left out.
+    pub fn failure_summary(&self, protocol: Protocol) -> String {
+        let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
+            .into_iter()
+            .filter_map(|(family, status)| match status {
+                PortStatus::Failed(reason) => Some((family, reason.clone())),
+                _ => None,
+            })
+            .collect();
+        family_failure_summary(&failures, protocol)
+    }
+
     pub fn get_primary_result(&self) -> Option<&PortData> {
         // Prefer IPv4, fallback to IPv6
         self.ipv4_result.as_ref().or(self.ipv6_result.as_ref())
@@ -180,7 +220,14 @@ impl PortScanner {
             max_concurrent: MAX_CONCURRENT_SCANS,
             service_detection: true,
             scan_mode: ScanMode::Minimal,
+            connector: TcpConnector::system(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_connector(mut self, connector: TcpConnector) -> Self {
+        self.connector = connector;
+        self
     }
 
     pub fn with_mode(mut self, mode: ScanMode) -> Self {
@@ -270,13 +317,25 @@ impl PortScanner {
         let mut open_ports = Vec::new();
         let mut closed_count = 0;
         let mut filtered_count = 0;
+        let mut no_route = None;
 
-        for result in scan_results {
-            match result {
-                Ok(Some(open_port)) => open_ports.push(open_port),
-                Ok(None) => closed_count += 1,
-                Err(_) => filtered_count += 1,
+        for probe in scan_results {
+            match probe {
+                PortProbe::Open(open_port) => open_ports.push(open_port),
+                PortProbe::Closed => closed_count += 1,
+                PortProbe::Filtered => filtered_count += 1,
+                PortProbe::NoRoute(family) => no_route = Some(family),
             }
+        }
+
+        if let Some(family) = no_route {
+            log::warn!(
+                "[scan::port] no_route: target={} protocol={} family={}",
+                target.display_name(),
+                protocol.as_str(),
+                family
+            );
+            return Err(eyre::eyre!(RouteError::NoRoute(family)));
         }
 
         open_ports.sort_by_key(|p| p.port);
@@ -324,17 +383,17 @@ impl PortScanner {
         }
     }
 
-    async fn scan_port_with_throttle(&self, ip: IpAddr, port: u16) -> Result<Option<OpenPort>> {
+    async fn scan_port_with_throttle(&self, ip: IpAddr, port: u16) -> PortProbe {
         // Add small delay to avoid overwhelming the target
         sleep(Duration::from_millis(PORT_SCAN_THROTTLE_MS)).await;
         self.scan_port(ip, port).await
     }
 
-    async fn scan_port(&self, ip: IpAddr, port: u16) -> Result<Option<OpenPort>> {
+    async fn scan_port(&self, ip: IpAddr, port: u16) -> PortProbe {
         let socket_addr = SocketAddr::new(ip, port);
         let start_time = Instant::now();
 
-        match timeout(self.tcp_timeout, TcpStream::connect(socket_addr)).await {
+        match timeout(self.tcp_timeout, self.connector.connect(socket_addr)).await {
             Ok(Ok(mut stream)) => {
                 let response_time = start_time.elapsed();
 
@@ -344,16 +403,28 @@ impl PortScanner {
                     None
                 };
 
-                Ok(Some(OpenPort {
+                PortProbe::Open(OpenPort {
                     port,
                     transport: Transport::Tcp,
                     state: PortState::Open,
                     service,
                     response_time,
-                }))
+                })
             }
-            Ok(Err(_)) => Ok(None),
-            Err(_) => Err(eyre::eyre!("Port {} timed out", port)),
+            Ok(Err(error)) => {
+                let probe = classify_connect_error(&error, Family::of_ip(ip));
+                log::trace!(
+                    "[scan::port] connect_failed: addr={} error={} probe={:?}",
+                    socket_addr,
+                    error,
+                    probe
+                );
+                probe
+            }
+            Err(_) => {
+                log::trace!("[scan::port] connect_timed_out: addr={}", socket_addr);
+                PortProbe::Filtered
+            }
         }
     }
 
@@ -699,17 +770,13 @@ impl Scanner for PortScanner {
             );
             Ok(ScanResult::Port(result))
         } else {
-            // All protocols failed
-            let error_msg = format!(
-                "All port scan attempts failed for target: {} ({})",
-                target.display_name(),
-                protocol.as_str()
-            );
+            let error_msg = result.failure_summary(protocol);
             log::error!(
-                "[scan::port] all_scans_failed: target={} protocol={} duration={}ms",
+                "[scan::port] all_scans_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
-                result.total_duration.as_millis()
+                result.total_duration.as_millis(),
+                error_msg
             );
             Err(eyre::eyre!(error_msg))
         }
@@ -818,6 +885,72 @@ mod tests {
         let scanner = PortScanner::new();
         let info = scanner.detect_service(&mut stream, 8080).await.unwrap();
         assert!(info.banner.is_some());
+    }
+
+    /// ENETUNREACH as Linux numbers it.
+    #[cfg(target_os = "linux")]
+    const ENETUNREACH: i32 = 101;
+
+    #[test]
+    fn connect_errors_classify_refused_closed_no_route_failed_else_filtered() {
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(matches!(
+            classify_connect_error(&refused, Family::Ipv4),
+            PortProbe::Closed
+        ));
+        let no_route = std::io::Error::other("Network is unreachable (os error 101)");
+        assert!(matches!(
+            classify_connect_error(&no_route, Family::Ipv6),
+            PortProbe::NoRoute(Family::Ipv6)
+        ));
+        let host_unreachable = std::io::Error::other("No route to host (os error 113)");
+        assert!(matches!(
+            classify_connect_error(&host_unreachable, Family::Ipv4),
+            PortProbe::Filtered
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn enetunreach_fails_the_family_and_never_counts_a_closed_port() {
+        let scanner = PortScanner::new()
+            .with_mode(ScanMode::Custom(vec![22, 80, 443]))
+            .with_connector(TcpConnector::failing_with(ENETUNREACH));
+        let target = Target::parse("2606:4700:4700::1111").unwrap();
+
+        let error = scanner.scan_protocol(&target, Protocol::Ipv6).await.unwrap_err();
+        assert_eq!(error.to_string(), "no IPv6 route on this host");
+
+        let error = scanner.scan(&target, Protocol::Ipv6).await.unwrap_err();
+        assert_eq!(error.to_string(), "IPv6: no IPv6 route on this host");
+        assert!(!error.to_string().contains("Closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn refused_connect_counts_a_closed_port() {
+        // Bound, never listening, held for the life of the process: a connect is refused.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        std::mem::forget(socket);
+
+        let scanner = PortScanner::new().with_mode(ScanMode::Custom(vec![port]));
+        let target = Target::parse("127.0.0.1").unwrap();
+        let data = scanner.scan_protocol(&target, Protocol::Ipv4).await.unwrap();
+        assert_eq!(data.closed_ports, 1);
+        assert_eq!(data.filtered_ports, 0);
+        assert!(data.open_ports.is_empty());
+    }
+
+    #[test]
+    fn port_failure_summary_names_each_failed_family() {
+        let mut result = PortResult::new();
+        result.ipv4_status = PortStatus::NoAddress;
+        result.ipv6_status = PortStatus::Failed("no IPv6 route on this host".to_string());
+        assert_eq!(
+            result.failure_summary(Protocol::Both),
+            "IPv6: no IPv6 route on this host"
+        );
     }
 
     #[test]

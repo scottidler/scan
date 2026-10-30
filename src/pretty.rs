@@ -135,8 +135,8 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 );
             };
             if !primary_data.connection_successful {
-                // A connect error sits in certificate_errors (`Connection failed: <cause>`); a handshake
-                // rejected at certificate verification records its cause as a vulnerability instead.
+                // Only a handshake rejected at certificate verification gets here (a connect error is
+                // a scanner error, not a result); its cause is a vulnerability.
                 let reason = primary_data
                     .certificate_errors
                     .first()
@@ -317,6 +317,9 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
         }
 
         ScanResult::GeoIp(geoip) => {
+            if let Some(not_geolocatable) = geoip.not_geolocatable().filter(|_| !geoip.has_any_success()) {
+                return (Outcome::NotApplicable, not_geolocatable.to_string());
+            }
             let Some(primary_data) = geoip.get_primary_result() else {
                 return (
                     Outcome::Failed,
@@ -680,20 +683,26 @@ mod tests {
     }
 
     #[test]
-    fn tls_connection_failure_prints_failure_icon_and_reason() {
-        use crate::scan::tls::{SecurityGrade as TlsSecurityGrade, TlsData, TlsResult, TlsStatus};
-        let mut tls = TlsResult::new();
-        let mut data = TlsData::new("192.0.2.1".to_string());
-        data.certificate_errors
-            .push("Connection failed: connect timed out".to_string());
-        tls.ipv4_result = Some(data);
-        tls.ipv4_status = TlsStatus::Success(TlsSecurityGrade::F);
-        let out = format_scan_state("tls", &state(ScanStatus::Complete, Some(ScanResult::Tls(tls)), None));
+    fn tls_connection_failure_prints_reason_and_no_grade() {
+        let error = eyre::eyre!("IPv4: no IPv4 route on this host");
+        let out = format_scan_state("tls", &state(ScanStatus::Failed, None, Some(error)));
         assert!(
-            out.starts_with("❌ TLS: Connection failed: connect timed out, grade F"),
+            out.starts_with("❌ TLS: Error - IPv4: no IPv4 route on this host"),
             "{out}"
         );
-        assert!(!out.contains('✅'), "{out}");
+        assert!(!out.contains("grade"), "{out}");
+    }
+
+    #[test]
+    fn geoip_for_a_private_address_is_not_applicable_not_failed() {
+        use crate::scan::geoip::{AddressKind, GeoIpResult, GeoIpStatus};
+        let mut geoip = GeoIpResult::new();
+        geoip.ipv4_status = GeoIpStatus::NotGeolocatable(AddressKind::Private);
+        let out = format_scan_state(
+            "geoip",
+            &state(ScanStatus::Complete, Some(ScanResult::GeoIp(geoip)), None),
+        );
+        assert!(out.starts_with("⚫ GEOIP: not geolocatable (private address)"), "{out}");
     }
 
     #[test]
