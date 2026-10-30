@@ -1,7 +1,7 @@
 use crate::scan::Family;
 use crate::scan::ping::{PingResult, PingStatus};
 use crate::target::Protocol;
-use crate::tui::pane::{Pane, create_block};
+use crate::tui::pane::{Detail, Pane, create_block};
 use crate::tui::sparkline::{Sample, SparklineData, average_us, bars_newest_first, scale_max_us, span};
 use crate::types::{AppState, ScanResult};
 use log;
@@ -457,6 +457,50 @@ impl Default for ConnectivityPane {
     }
 }
 
+/// The overall status row: the smoothed connectivity verdict, with the latest ping scan's failure
+/// beside it or in its place.
+fn status_line(state: &AppState, ipv4_state: &ConnectivityState, ipv6_state: &ConnectivityState) -> Line<'static> {
+    let (status_text, status_color) = overall_status(ipv4_state, ipv6_state);
+    log::trace!(
+        "[tui::connectivity] stable_states: ipv4={:?} ipv6={:?} text={}",
+        ipv4_state,
+        ipv6_state,
+        status_text
+    );
+    let mut status_text = status_text.to_string();
+    let mut status_color = status_color;
+    // The latest ping scan's error (deadline hit). The smoothed label stays, since it reflects
+    // the last samples; the error rides next to it. With no samples yet it replaces
+    // `checking connectivity`, which would otherwise never change.
+    let mut scan_failure = state
+        .scanners
+        .get("ping")
+        .and_then(|ping_state| crate::tui::failure_text(&ping_state));
+    if status_text == "checking connectivity"
+        && let Some(failure) = scan_failure.take()
+    {
+        status_text = failure;
+        status_color = Color::Red;
+    } else if status_text == "no ping reply"
+        && let Some(ping_state) = state.scanners.get("ping")
+        && let Some(ScanResult::Ping(ping)) = &ping_state.result
+        && let Some(reason) = ping.failure_reason()
+        && reason != NO_REPLY_LABEL
+    {
+        status_text = format!("no ping reply: {reason}");
+    }
+
+    // Status line
+    let mut status_spans = vec![
+        Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+        Span::styled(status_text, Style::default().fg(status_color)),
+    ];
+    if let Some(failure) = scan_failure {
+        status_spans.push(Span::styled(format!(", {failure}"), Style::default().fg(Color::Red)));
+    }
+    Line::from(status_spans)
+}
+
 impl Pane for ConnectivityPane {
     /// Take in the protocol selection and every ping result not yet seen: the scanner's history
     /// first, then its current result, so results published between two ticks are all counted.
@@ -481,6 +525,23 @@ impl Pane for ConnectivityPane {
         }
     }
 
+    /// The status row. The family rows are sparklines, drawn only by `render`.
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
+        log::trace!("[tui::connectivity] content: width={} detail={:?}", width, detail);
+        let ingested = self.snapshot();
+        let line = status_line(
+            state,
+            &ingested.family(Family::Ipv4).state,
+            &ingested.family(Family::Ipv6).state,
+        );
+        vec![crate::tui::text::owned(crate::tui::text::fit_line(line, width))]
+    }
+
+    /// Draws sparklines, not rows, so the layout never scrolls it.
+    fn scrolls(&self) -> bool {
+        false
+    }
+
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         log::trace!(
             "[tui::connectivity] render: area={}x{} focused={}",
@@ -497,60 +558,15 @@ impl Pane for ConnectivityPane {
         // Render the block first
         block.render(area, frame.buffer_mut());
 
-        // Prepare content lines
-        let mut lines = Vec::new();
-
         let ingested = self.snapshot();
         let ipv4_state = ingested.family(Family::Ipv4).state.clone();
         let ipv6_state = ingested.family(Family::Ipv6).state.clone();
-        let (status_text, status_color) = overall_status(&ipv4_state, &ipv6_state);
-        log::trace!(
-            "[tui::connectivity] stable_states: ipv4={:?} ipv6={:?} text={}",
-            ipv4_state,
-            ipv6_state,
-            status_text
-        );
-        let mut status_text = status_text.to_string();
-        let mut status_color = status_color;
-        // The latest ping scan's error (deadline hit). The smoothed label stays, since it reflects
-        // the last samples; the error rides next to it. With no samples yet it replaces
-        // `checking connectivity`, which would otherwise never change.
-        let mut scan_failure = state
-            .scanners
-            .get("ping")
-            .and_then(|ping_state| crate::tui::failure_text(&ping_state));
-        if status_text == "checking connectivity"
-            && let Some(failure) = scan_failure.take()
-        {
-            status_text = failure;
-            status_color = Color::Red;
-        } else if status_text == "no ping reply"
-            && let Some(ping_state) = state.scanners.get("ping")
-            && let Some(ScanResult::Ping(ping)) = &ping_state.result
-            && let Some(reason) = ping.failure_reason()
-            && reason != NO_REPLY_LABEL
-        {
-            status_text = format!("no ping reply: {reason}");
-        }
-
-        // Status line
-        let mut status_spans = vec![
-            Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled(status_text, Style::default().fg(status_color)),
-        ];
-        if let Some(failure) = scan_failure {
-            status_spans.push(Span::styled(format!(", {failure}"), Style::default().fg(Color::Red)));
-        }
-        lines.push(Line::from(status_spans));
 
         let rows = connectivity_rows(inner_area);
         // The status gets one row, so a long failure reason is fit to it rather than wrapped.
         let status_width = rows.status().width;
-        let lines: Vec<Line<'_>> = lines
-            .into_iter()
-            .map(|line| crate::tui::text::fit_line(line, status_width))
-            .collect();
-        Paragraph::new(lines)
+        let status = crate::tui::text::fit_line(status_line(state, &ipv4_state, &ipv6_state), status_width);
+        Paragraph::new(status)
             .alignment(Alignment::Left)
             .render(rows.status(), frame.buffer_mut());
 

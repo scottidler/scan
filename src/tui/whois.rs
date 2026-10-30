@@ -1,13 +1,10 @@
 use crate::scan::whois::DataSource;
-use crate::tui::pane::{Pane, create_block};
+use crate::tui::pane::{Detail, Pane};
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    Frame,
-    layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget, Wrap},
 };
 use std::any::Any;
 
@@ -39,21 +36,8 @@ impl Default for WhoisPane {
 }
 
 impl Pane for WhoisPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!(
-            "[tui::whois] render: area={}x{} focused={}",
-            area.width,
-            area.height,
-            focused
-        );
-
-        let block = create_block(self.title, focused);
-
-        // Calculate content area (inside the border)
-        let inner_area = block.inner(area);
-
-        // Render the block first
-        block.render(area, frame.buffer_mut());
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
+        log::trace!("[tui::whois] content: width={} detail={:?}", width, detail);
 
         // Prepare content lines
         let mut lines = Vec::new();
@@ -275,11 +259,7 @@ impl Pane for WhoisPane {
 
         // Identifiers are fit to the width; the status header and reason rows wrap so their cause
         // stays readable.
-        let lines = crate::tui::text::fit_lines_except(lines, inner_area.width, &wrapped);
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: false });
-        paragraph.render(inner_area, frame.buffer_mut());
+        crate::tui::text::to_rows(lines, width, detail, &wrapped)
     }
 
     fn title(&self) -> &'static str {

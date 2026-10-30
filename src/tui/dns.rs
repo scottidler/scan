@@ -1,12 +1,9 @@
-use crate::tui::pane::{Pane, create_block};
+use crate::tui::pane::{Detail, Pane};
 use crate::types::AppState;
 use log;
 use ratatui::{
-    Frame,
-    layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 use std::any::Any;
 
@@ -27,13 +24,11 @@ const MAX_SRV_RECORDS_DISPLAYED: usize = 1000;
 const MAX_PTR_RECORDS_DISPLAYED: usize = 1000;
 const MIN_DNS_PANE_WIDTH: u16 = 25;
 const MIN_DNS_PANE_HEIGHT: u16 = 10;
-const SCROLL_STEP: u16 = 1;
 
 /// DNS pane displays domain name system resolution information
 pub struct DnsPane {
     title: &'static str,
     id: &'static str,
-    scroll_offset: u16,
 }
 
 impl DnsPane {
@@ -42,51 +37,10 @@ impl DnsPane {
         Self {
             title: "dns",
             id: "dns",
-            scroll_offset: 0,
         }
     }
 
-    pub fn scroll_up(&mut self) {
-        let old_offset = self.scroll_offset;
-        self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_STEP);
-        log::debug!(
-            "[tui::dns] scroll_up: old_offset={} new_offset={}",
-            old_offset,
-            self.scroll_offset
-        );
-    }
-
-    pub fn scroll_down_smart(&mut self, state: &AppState, visible_height: u16) {
-        // Use the SINGLE SOURCE OF TRUTH for content calculation
-        let lines = self.build_content_lines(state);
-        let actual_lines = lines.len() as u16;
-
-        let old_offset = self.scroll_offset;
-        if actual_lines > visible_height {
-            let max_scroll = actual_lines.saturating_sub(visible_height);
-            if self.scroll_offset < max_scroll {
-                self.scroll_offset += SCROLL_STEP;
-            }
-        }
-
-        log::debug!(
-            "[tui::dns] scroll_down_smart: old_offset={} new_offset={} actual_lines={} visible_height={} max_scroll={}",
-            old_offset,
-            self.scroll_offset,
-            actual_lines,
-            visible_height,
-            actual_lines.saturating_sub(visible_height)
-        );
-    }
-
-    pub fn reset_scroll(&mut self) {
-        let old_offset = self.scroll_offset;
-        self.scroll_offset = 0;
-        log::debug!("[tui::dns] reset_scroll: old_offset={}", old_offset);
-    }
-
-    /// Build the actual content lines - SINGLE SOURCE OF TRUTH
-    /// This method is used by both scroll calculation and rendering
+    /// The pane's logical lines, before they are laid out as rows by `content`.
     fn build_content_lines(&self, state: &AppState) -> Vec<Line<'_>> {
         log::trace!("[tui::dns] build_content_lines: building DNS resolution content");
 
@@ -482,59 +436,9 @@ impl Default for DnsPane {
 }
 
 impl Pane for DnsPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!(
-            "[tui::dns] render: area={}x{} focused={} scroll_offset={}",
-            area.width,
-            area.height,
-            focused,
-            self.scroll_offset
-        );
-
-        let block = create_block(self.title, focused);
-
-        // Calculate content area (inside the border)
-        let inner_area = block.inner(area);
-
-        // Render the block first
-        block.render(area, frame.buffer_mut());
-
-        // Use the SINGLE SOURCE OF TRUTH for content
-        let lines = self.build_content_lines(state);
-
-        // Apply scrolling
-        let total_lines = lines.len() as u16;
-        let visible_area_height = inner_area.height;
-        let max_scroll_offset = if total_lines > visible_area_height {
-            total_lines.saturating_sub(visible_area_height)
-        } else {
-            0
-        };
-        let safe_scroll_offset = self.scroll_offset.min(max_scroll_offset);
-
-        log::trace!(
-            "[tui::dns] scroll_calculation: total_lines={} visible_height={} max_scroll={} safe_scroll={}",
-            total_lines,
-            visible_area_height,
-            max_scroll_offset,
-            safe_scroll_offset
-        );
-
-        // Apply scroll offset - skip lines from the beginning
-        // Scrolling is by logical line, so every line is fit to one row rather than wrapped.
-        let visible_lines: Vec<Line<'_>> = if safe_scroll_offset < total_lines {
-            lines.into_iter().skip(safe_scroll_offset as usize).collect()
-        } else {
-            lines
-        }
-        .into_iter()
-        .map(|line| crate::tui::text::fit_line(line, inner_area.width))
-        .collect();
-
-        log::trace!("[tui::dns] render_content: visible_lines={}", visible_lines.len());
-
-        let paragraph = Paragraph::new(visible_lines).alignment(Alignment::Left);
-        paragraph.render(inner_area, frame.buffer_mut());
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
+        log::trace!("[tui::dns] content: width={} detail={:?}", width, detail);
+        crate::tui::text::to_rows(self.build_content_lines(state), width, detail, &[])
     }
 
     fn title(&self) -> &'static str {

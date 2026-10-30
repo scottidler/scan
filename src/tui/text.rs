@@ -1,5 +1,6 @@
 //! Fitting pane lines to the width they are drawn in.
 
+use crate::tui::pane::Detail;
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -63,13 +64,108 @@ pub fn fit_line(line: Line<'_>, width: u16) -> Line<'_> {
     }
 }
 
-/// `lines` for a wrapping `Paragraph` of `width`: every line is fit to `width` except those at the
-/// indices in `wrapped`, the failure and status-reason lines, which are left whole to wrap.
-pub fn fit_lines_except<'a>(lines: Vec<Line<'a>>, width: u16, wrapped: &[usize]) -> Vec<Line<'a>> {
+/// `line` broken into rows of at most `width` display cells, one `Line` per screen row.
+///
+/// Rows break after the last space that fits; a word longer than a row is broken between
+/// graphemes, and a wide glyph that would straddle the edge starts the next row. Every span keeps
+/// its style and every row keeps the line's style and alignment. An empty line is one empty row;
+/// width 0 yields one empty row, since nothing can be drawn.
+pub fn wrap_line(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let Line {
+        style,
+        alignment,
+        spans,
+    } = line;
+    let row = |cells: &[(String, Style)]| Line {
+        style,
+        alignment,
+        spans: merge_cells(cells),
+    };
+    if width == 0 {
+        return vec![row(&[])];
+    }
+    let cells: Vec<(String, Style)> = spans
+        .iter()
+        .flat_map(|span| {
+            span.styled_graphemes(Style::default())
+                .map(|grapheme| (grapheme.symbol.to_string(), grapheme.style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut current: Vec<(String, Style)> = Vec::new();
+    let mut used = 0;
+    // Index in `current` just past the last space, where the row may break.
+    let mut break_at: Option<usize> = None;
+    for cell in cells {
+        let cell_width = Span::raw(cell.0.as_str()).width();
+        if used + cell_width > width && !current.is_empty() {
+            let carried = match break_at {
+                Some(at) if at < current.len() => current.split_off(at),
+                _ => Vec::new(),
+            };
+            rows.push(row(&current));
+            used = carried
+                .iter()
+                .map(|(symbol, _)| Span::raw(symbol.as_str()).width())
+                .sum();
+            current = carried;
+            break_at = None;
+        }
+        let is_space = cell.0 == " ";
+        current.push(cell);
+        used += cell_width;
+        if is_space {
+            break_at = Some(current.len());
+        }
+    }
+    rows.push(row(&current));
+    rows
+}
+
+/// Adjacent graphemes of one style joined back into a single span.
+fn merge_cells(cells: &[(String, Style)]) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (symbol, style) in cells {
+        match spans.last_mut() {
+            Some(last) if last.style == *style => last.content.to_mut().push_str(symbol),
+            _ => spans.push(Span::styled(symbol.clone(), *style)),
+        }
+    }
+    spans
+}
+
+/// `line` with its text owned, so it outlives the state it was built from.
+pub fn owned(line: Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), span.style))
+            .collect(),
+    }
+}
+
+/// `lines` laid out as screen rows of `width` for `detail`: one `Line` per row.
+///
+/// Normal detail fits every line to one row with `fit_line`, except those at the indices in
+/// `wrapped` (failure and status-reason lines), which wrap so their cause stays readable. Zoomed
+/// detail wraps every line, so a long TXT record, URL or certificate name is shown whole.
+pub fn to_rows(lines: Vec<Line<'_>>, width: u16, detail: Detail, wrapped: &[usize]) -> Vec<Line<'static>> {
     lines
         .into_iter()
         .enumerate()
-        .map(|(index, line)| if wrapped.contains(&index) { line } else { fit_line(line, width) })
+        .flat_map(|(index, line)| {
+            if detail == Detail::Zoomed || wrapped.contains(&index) {
+                wrap_line(line, width)
+            } else {
+                vec![owned(fit_line(line, width))]
+            }
+        })
         .collect()
 }
 
@@ -156,10 +252,69 @@ mod tests {
     }
 
     #[test]
-    fn fit_lines_except_leaves_wrapped_rows_whole() {
+    fn to_rows_fits_normal_lines_and_wraps_the_listed_ones() {
         let lines = vec![two_spans(), two_spans()];
-        let fitted = fit_lines_except(lines, 5, &[1]);
-        assert_eq!(text(&fitted[0]), "Doma…");
-        assert_eq!(text(&fitted[1]), "Domain: example.com");
+        let rows = to_rows(lines, 10, Detail::Normal, &[1]);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts, ["Domain: e…", "Domain: ", "example.co", "m"]);
+    }
+
+    #[test]
+    fn to_rows_wraps_every_line_when_zoomed() {
+        let rows = to_rows(vec![two_spans()], 10, Detail::Zoomed, &[]);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts, ["Domain: ", "example.co", "m"]);
+    }
+
+    #[test]
+    fn wrap_line_breaks_after_the_last_space_that_fits() {
+        let rows = wrap_line(Line::from("failed: connection refused by peer"), 12);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts, ["failed: ", "connection ", "refused by ", "peer"]);
+        assert!(rows.iter().all(|row| row.width() <= 12), "{rows:?}");
+    }
+
+    #[test]
+    fn wrap_line_keeps_each_span_style_across_rows() {
+        let rows = wrap_line(two_spans(), 10);
+        assert_eq!(
+            rows[0].spans,
+            [Span::styled("Domain: ", Style::default().fg(Color::White))]
+        );
+        assert_eq!(
+            rows[1].spans,
+            [Span::styled("example.co", Style::default().fg(Color::Cyan))]
+        );
+        assert_eq!(rows[2].spans, [Span::styled("m", Style::default().fg(Color::Cyan))]);
+    }
+
+    #[test]
+    fn wrap_line_that_fits_is_one_row() {
+        let rows = wrap_line(two_spans(), 80);
+        assert_eq!(rows, vec![two_spans()]);
+    }
+
+    #[test]
+    fn wrap_line_moves_a_straddling_wide_glyph_to_the_next_row() {
+        let rows = wrap_line(Line::from("ab🦀cd"), 3);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts, ["ab", "🦀c", "d"]);
+    }
+
+    #[test]
+    fn wrap_line_of_empty_line_or_zero_width_is_one_empty_row() {
+        assert_eq!(wrap_line(Line::from(""), 10).len(), 1);
+        let rows = wrap_line(two_spans(), 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].width(), 0);
+    }
+
+    #[test]
+    fn wrap_line_keeps_line_style_and_alignment_on_every_row() {
+        let line = two_spans().style(Style::default().fg(Color::Red)).centered();
+        for row in wrap_line(line, 10) {
+            assert_eq!(row.style, Style::default().fg(Color::Red));
+            assert_eq!(row.alignment, Some(ratatui::layout::Alignment::Center));
+        }
     }
 }

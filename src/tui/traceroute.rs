@@ -1,13 +1,9 @@
-use crate::tui::pane::{Pane, create_block};
-use crate::tui::scrollable::ScrollablePane;
+use crate::tui::pane::{Detail, Pane};
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    Frame,
-    layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 use std::any::Any;
 
@@ -20,7 +16,6 @@ const MIN_TRACEROUTE_PANE_HEIGHT: u16 = 20;
 pub struct TraceroutePane {
     title: &'static str,
     id: &'static str,
-    scroll_offset: u16,
 }
 
 impl TraceroutePane {
@@ -29,7 +24,6 @@ impl TraceroutePane {
         Self {
             title: "traceroute",
             id: "traceroute",
-            scroll_offset: 0,
         }
     }
 }
@@ -41,21 +35,8 @@ impl Default for TraceroutePane {
 }
 
 impl Pane for TraceroutePane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!(
-            "[tui::traceroute] render: area={}x{} focused={}",
-            area.width,
-            area.height,
-            focused
-        );
-
-        let block = create_block(self.title, focused);
-
-        // Calculate content area (inside the border)
-        let inner_area = block.inner(area);
-
-        // Render the block first
-        block.render(area, frame.buffer_mut());
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
+        log::trace!("[tui::traceroute] content: width={} detail={:?}", width, detail);
 
         // Prepare content lines
         let mut lines = Vec::new();
@@ -177,18 +158,7 @@ impl Pane for TraceroutePane {
             ]));
         }
 
-        // Apply scrolling to lines
-        let visible_height = inner_area.height;
-        // Scrolling is by logical line, so every line is fit to one row rather than wrapped.
-        let visible_lines: Vec<Line<'_>> = self
-            .apply_scroll_to_lines(lines, visible_height)
-            .into_iter()
-            .map(|line| crate::tui::text::fit_line(line, inner_area.width))
-            .collect();
-
-        // Create and render the paragraph
-        let paragraph = Paragraph::new(visible_lines).alignment(Alignment::Left);
-        paragraph.render(inner_area, frame.buffer_mut());
+        crate::tui::text::to_rows(lines, width, detail, &[])
     }
 
     fn title(&self) -> &'static str {
@@ -209,55 +179,6 @@ impl Pane for TraceroutePane {
 
     fn is_focusable(&self) -> bool {
         true
-    }
-}
-
-impl ScrollablePane for TraceroutePane {
-    fn scroll_offset(&self) -> u16 {
-        self.scroll_offset
-    }
-
-    fn set_scroll_offset(&mut self, offset: u16) {
-        self.scroll_offset = offset;
-    }
-
-    fn calculate_content_lines(&self, state: &AppState) -> u16 {
-        // Calculate total lines that would be rendered for traceroute content
-        let mut line_count = 0u16;
-
-        // Header line
-        line_count += 1;
-        // Empty line
-        line_count += 1;
-
-        if let Some(traceroute_state) = state.scanners.get("traceroute") {
-            if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
-                // Protocol status section (3 lines: header + IPv4 + IPv6)
-                line_count += 3;
-                // Empty line
-                line_count += 1;
-
-                if let Some(primary_data) = traceroute_result.get_primary_result() {
-                    // Route header line
-                    line_count += 1;
-                    // Each hop line
-                    line_count += primary_data.hops.len() as u16;
-                } else {
-                    // Failed status line
-                    line_count += 1;
-                }
-                // Duration line
-                line_count += 1;
-            } else {
-                // Status lines when no data
-                line_count += 2;
-            }
-        } else {
-            // No scanner available lines
-            line_count += 1;
-        }
-
-        line_count
     }
 }
 

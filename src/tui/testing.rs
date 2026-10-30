@@ -1,6 +1,5 @@
 //! Test-only helper that renders a pane into a `TestBackend` buffer.
 
-use crate::tui::layout::PaneLayout;
 use crate::tui::pane::Pane;
 use crate::types::AppState;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, text::Span};
@@ -64,7 +63,7 @@ pub const NARROW_TERMINALS: [(u16, u16); 2] = [(80, 24), (108, 40)];
 /// Width and height of the dashboard cell at `row`, `col` in a `cols` x `rows` terminal, as
 /// `PaneLayout` splits it.
 pub fn dashboard_pane_size(row: usize, col: usize, cols: u16, rows: u16) -> (u16, u16) {
-    let grid = PaneLayout::default_dashboard().create_grid_layout_public(Rect::new(0, 0, cols, rows));
+    let grid = crate::tui::layout::grid_layout(Rect::new(0, 0, cols, rows));
     let cell = grid[row][col];
     (cell.width, cell.height)
 }

@@ -5,7 +5,6 @@ pub mod http;
 pub mod layout;
 pub mod pane;
 pub mod ports;
-pub mod scrollable;
 pub mod security;
 pub mod sparkline;
 pub mod status;
@@ -21,9 +20,8 @@ pub use dns::DnsPane;
 pub use geoip::GeoIpPane;
 pub use http::HttpPane;
 pub use layout::PaneLayout;
-pub use pane::{Pane, PaneConfig, PanePosition};
+pub use pane::{Detail, Pane, PaneConfig, PanePosition};
 pub use ports::PortsPane;
-pub use scrollable::ScrollablePane;
 pub use security::SecurityPane;
 pub use sparkline::SparklineData;
 pub use status::{failure_text, status_label};
@@ -216,17 +214,10 @@ impl TuiApp {
                     KeyCode::Char('p') => {
                         switch_protocol(&state, protocol_tx);
                     }
-                    // Handle scrolling and navigation for focused pane
+                    // Scrolling and navigation for the focused pane
                     _ => {
-                        // We need to calculate pane areas for proper scroll bounds
-                        // This is a bit of a hack, but we'll create a temporary frame to get areas
-                        let size = terminal.size()?;
-                        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                        let grid_areas = self.layout.create_grid_layout_public(area);
-
-                        // Let the layout handle pane-specific events
                         let state_guard = state.lock().unwrap();
-                        let handled = self.layout.handle_key_event(key, &state_guard, &grid_areas);
+                        let handled = self.layout.handle_key_event(key, &state_guard);
                         if handled {
                             log::trace!("[tui] key_handled_by_pane: key={:?}", key.code);
                         } else {

@@ -1,13 +1,10 @@
 use crate::scan::dns::QueryStatus;
-use crate::tui::pane::{Pane, create_block};
+use crate::tui::pane::{Detail, Pane};
 use crate::types::{AppState, ScanStatus};
 use log;
 use ratatui::{
-    Frame,
-    layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 use std::any::Any;
 use std::net::IpAddr;
@@ -110,7 +107,7 @@ impl TargetPane {
         }
     }
 
-    /// One-line stand-in for the scanner list, e.g. `6/8 ✅ 1 🔄 1 ❌`.
+    /// The scanner counts on the Status row, e.g. `6/8 ✅ 1 🔄 1 ❌`.
     fn collapsed_summary(total: usize, running: usize, complete: usize, failed: usize) -> String {
         let mut summary = format!("{}/{} ✅", complete, total);
         if running > 0 {
@@ -223,33 +220,35 @@ impl Default for TargetPane {
 }
 
 impl Pane for TargetPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+    /// The target, both addresses and the scanner summary come first, so a short dashboard cell
+    /// shows them; the protocol hint and one row per scanner follow, reached by scrolling.
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!(
-            "[tui::target] render: area={}x{} focused={} target={}",
-            area.width,
-            area.height,
-            focused,
+            "[tui::target] content: width={} detail={:?} target={}",
+            width,
+            detail,
             state.target
         );
 
-        let block = create_block(self.title, focused);
-
-        // Calculate content area (inside the border)
-        let inner_area = block.inner(area);
-
-        // Render the block first
-        block.render(area, frame.buffer_mut());
-
-        // Prepare content lines
         let mut lines = Vec::new();
 
-        // Target information
         lines.push(Line::from(vec![
             Span::styled("🎯 ", Style::default().fg(Color::Cyan)),
-            Span::styled(&state.target, Style::default().fg(Color::White)),
+            Span::styled(state.target.clone(), Style::default().fg(Color::White)),
         ]));
 
-        // Protocol information
+        lines.push(Self::address_line(state, AddressFamily::V4));
+        lines.push(Self::address_line(state, AddressFamily::V6));
+
+        let (total, running, complete, failed) = Self::calculate_stats(state);
+        lines.push(Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(Color::White)),
+            Span::styled(
+                Self::collapsed_summary(total, running, complete, failed),
+                Self::summary_color(running, failed),
+            ),
+        ]));
+
         lines.push(Line::from(vec![
             Span::styled("🔗 ", Style::default().fg(Color::Magenta)),
             Span::styled("Protocol: ", Style::default().fg(Color::White)),
@@ -259,47 +258,17 @@ impl Pane for TargetPane {
             ),
         ]));
 
-        lines.push(Self::address_line(state, AddressFamily::V4));
-        lines.push(Self::address_line(state, AddressFamily::V6));
+        for key in Self::ordered_scanner_keys(state) {
+            if let Some(scanner) = state.scanners.get(&key) {
+                let (icon, color) = Self::status_icon_and_color(&scanner.status);
+                let elapsed = scanner.last_updated.elapsed();
 
-        let (total, running, complete, failed) = Self::calculate_stats(state);
-        let rows = inner_area.height as usize;
-        let ordered = Self::ordered_scanner_keys(state);
-
-        // Spacer + Status line + one row per scanner must all fit, otherwise show the
-        // one-line summary: a clipped list would silently hide scanners.
-        let full_list_rows = lines.len() + 2 + ordered.len();
-        if full_list_rows <= rows {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("Status: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{}/{} scanners", complete, total),
-                    Self::summary_color(running, failed),
-                ),
-            ]));
-
-            for key in &ordered {
-                if let Some(scanner) = state.scanners.get(key) {
-                    let (icon, color) = Self::status_icon_and_color(&scanner.status);
-                    let elapsed = scanner.last_updated.elapsed();
-
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{} ", icon), Style::default().fg(color)),
-                        Span::styled(format!("{}: ", key.to_uppercase()), Style::default().fg(Color::White)),
-                        Span::styled(Self::format_elapsed(elapsed), Style::default().fg(Color::Gray)),
-                    ]));
-                }
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} ", icon), Style::default().fg(color)),
+                    Span::styled(format!("{}: ", key.to_uppercase()), Style::default().fg(Color::White)),
+                    Span::styled(Self::format_elapsed(elapsed), Style::default().fg(Color::Gray)),
+                ]));
             }
-        } else {
-            // The summary outranks the protocol hint when rows are scarce.
-            if lines.len() + 1 > rows && lines.len() > 2 {
-                lines.remove(1);
-            }
-            lines.push(Line::from(Span::styled(
-                Self::collapsed_summary(total, running, complete, failed),
-                Self::summary_color(running, failed),
-            )));
         }
 
         log::trace!(
@@ -309,13 +278,7 @@ impl Pane for TargetPane {
         );
 
         // No line here carries a failure reason, so every one is fit to a single row.
-        let lines: Vec<Line<'_>> = lines
-            .into_iter()
-            .map(|line| crate::tui::text::fit_line(line, inner_area.width))
-            .collect();
-        let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
-
-        paragraph.render(inner_area, frame.buffer_mut());
+        crate::tui::text::to_rows(lines, width, detail, &[])
     }
 
     fn title(&self) -> &'static str {
@@ -466,19 +429,26 @@ mod tests {
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "order wrong:\n{}", out);
     }
 
+    /// Target, two addresses, Status, Protocol, then one row per scanner.
+    const TARGET_ROWS_WITH_EVERY_SCANNER: u16 = 5 + SCANNER_DISPLAY_ORDER.len() as u16;
+
     #[test]
-    fn test_short_pane_collapses_never_clips_subset() {
+    fn short_pane_shows_the_summary_and_marks_the_hidden_scanners() {
         use crate::tui::testing::render_pane;
         let state = state_with_scanners(&SCANNER_DISPLAY_ORDER, ScanStatus::Complete);
         // 6 rows is the 25% top row of a 24-row terminal; inner height is 4.
         for height in [6u16, 8, 10, 12] {
             let out = render_pane(&TargetPane::new(), &state, 40, height, false);
-            assert!(out.contains("8/8 ✅"), "no summary at height {}:\n{}", height, out);
             assert!(
-                !SCANNER_DISPLAY_ORDER
-                    .iter()
-                    .any(|n| out.contains(&format!("{}:", n.to_uppercase()))),
-                "partial scanner list at height {}:\n{}",
+                out.contains("Status: 8/8 ✅"),
+                "no summary at height {}:\n{}",
+                height,
+                out
+            );
+            let hidden = TARGET_ROWS_WITH_EVERY_SCANNER - (height - 2);
+            assert!(
+                out.contains(&format!("↓ {hidden} more")),
+                "hidden scanners not marked at height {}:\n{}",
                 height,
                 out
             );
@@ -486,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tall_pane_shows_every_scanner_and_no_summary() {
+    fn tall_pane_shows_every_scanner_the_summary_and_no_marker() {
         use crate::tui::testing::render_pane;
         let state = state_with_scanners(&SCANNER_DISPLAY_ORDER, ScanStatus::Complete);
         let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
@@ -498,7 +468,8 @@ mod tests {
                 out
             );
         }
-        assert!(!out.contains("8/8 ✅"));
+        assert!(out.contains("Status: 8/8 ✅"), "{out}");
+        assert!(!out.contains('↓'), "{out}");
     }
 
     #[test]

@@ -1,12 +1,9 @@
-use crate::tui::pane::{Pane, create_block};
+use crate::tui::pane::{Detail, Pane};
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    Frame,
-    layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget, Wrap},
 };
 use std::any::Any;
 
@@ -46,21 +43,8 @@ impl Default for HttpPane {
 }
 
 impl Pane for HttpPane {
-    fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
-        log::trace!(
-            "[tui::http] render: area={}x{} focused={}",
-            area.width,
-            area.height,
-            focused
-        );
-
-        let block = create_block(self.title, focused);
-
-        // Calculate content area (inside the border)
-        let inner_area = block.inner(area);
-
-        // Render the block first
-        block.render(area, frame.buffer_mut());
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
+        log::trace!("[tui::http] content: width={} detail={:?}", width, detail);
 
         // Prepare content lines
         let mut lines = Vec::new();
@@ -170,9 +154,9 @@ impl Pane for HttpPane {
                             ),
                         ]));
 
-                        // One row when it fits: the pane does not scroll, so a second row per
-                        // redirect pushes issue names off the bottom. A redirect too wide for one
-                        // row gets a row per URL, so a long source URL cannot push its target off.
+                        // One row when it fits, so a second row per redirect does not push the issue
+                        // names below the fold. A redirect too wide for one row gets a row per URL,
+                        // so a long source URL cannot push its target off.
                         for redirect in &primary_data.redirect_chain {
                             let code = Span::styled(
                                 format!("  {} ", redirect.status_code),
@@ -186,7 +170,7 @@ impl Pane for HttpPane {
                                 Span::styled(" → ", Style::default().fg(Color::Magenta)),
                                 to.clone(),
                             ]);
-                            if one_row.width() <= usize::from(inner_area.width) {
+                            if one_row.width() <= usize::from(width) {
                                 lines.push(one_row);
                             } else {
                                 lines.push(Line::from(vec![code, from]));
@@ -267,11 +251,7 @@ impl Pane for HttpPane {
 
         // Identifiers are fit to the width; the status header and the HTTPS failure reason wrap so
         // their cause stays readable.
-        let lines = crate::tui::text::fit_lines_except(lines, inner_area.width, &wrapped);
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: false });
-        paragraph.render(inner_area, frame.buffer_mut());
+        crate::tui::text::to_rows(lines, width, detail, &wrapped)
     }
 
     fn title(&self) -> &'static str {
@@ -498,7 +478,7 @@ mod tests {
     }
 
     /// Audit round 1: a redirect that fits the pane takes one row, so at 200x55 the redirect rows
-    /// do not push issue names off the bottom of the pane, which does not scroll.
+    /// do not push issue names below the fold.
     #[test]
     fn redirects_that_fit_take_one_row_and_every_issue_name_stays_visible() {
         type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, usize);

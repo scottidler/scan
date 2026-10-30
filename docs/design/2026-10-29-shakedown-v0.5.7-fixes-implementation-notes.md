@@ -124,3 +124,37 @@ Evidence, each new test run with its fix undone, then sources restored and `otto
 - None.
 
 Evidence: each new test was run with its fix undone, and each failed. The undone fixes: `ticker.reset_after` removed (the paused-time test then saw the second scan at 60s), the 10s..60s clamp removed, DMARC read from apex TXT instead of the `_dmarc.` answer, the organizational fallback name dropped, the `expired, refreshing` branch and the `(cached)` suffix removed, PTR-first disabled, `is_reverse_only` forced false, the CNAME failure line removed, and the old DKIM text restored. Sources were then restored and `otto ci` re-run green. CNAME/CAA collection has no hermetic test (no resolver fake). A live `scan --no-tui www.tatari.tv` run logged `cname_status=Success(1) caa_status=Success(4)`, `dmarc_found: host=www.tatari.tv answered_by=_dmarc.tatari.tv`, and `next_scan: scanner=dns delay=10000ms (from result)`.
+
+## Phase 6: Generic content, scroll and overflow
+
+### Design decisions
+- `Detail::{Normal, Zoomed}` and the `Pane` methods live in `src/tui/pane.rs`. `content(state, width, detail) -> Vec<Line<'static>>` is required. `render` has a default that draws the content rows at offset 0, and `render_detail` defaults to `render`. A new `scrolls()` defaults to true. Connectivity returns false and overrides `render` (sparklines). Why: the layout needs a signal for which panes it scrolls, and that pane is the only exemption.
+- `draw_rows(pane, frame, area, state, focused, detail, offset) -> u16` (`src/tui/pane.rs`) is the one renderer. It draws the block, calls `content` at the inner width, clamps the offset through `RowView::new(total, visible, offset)`, writes `RowView::marker()` (`↓ N more`, `↑ N`, or `↑ N ↓ M more`) right-aligned on the bottom border, and draws the visible slice without wrapping. It returns the clamped offset.
+- `PaneLayout` keeps `scroll: HashMap<(&'static str, Detail), u16>` and the last rendered frame `area`. `render(&mut self, ..)` stores each clamped offset back after drawing, so a resize or shorter content re-clamps on the next frame. `handle_key_event(key, state)` sizes the focused pane with the same rect function, `pane_rect(grid_rows, grid_cols, config, area)` over the free `grid_layout(area)`, and clamps there too. Up therefore steps back from the real end even after extra Downs with no frame drawn in between. `PaneLayout::detail()` returns `Normal` until Phase 8 adds `zoomed`.
+- `src/tui/text.rs`: `wrap_line(line, width)` wraps word by word, breaking after the last space that fits. A word longer than a row breaks between graphemes, and a wide glyph that would straddle the edge starts the next row. Span styles, line style and alignment are kept. `to_rows(lines, width, detail, wrapped)` replaces `fit_lines_except`. Normal fits each line with `fit_line` except the `wrapped` indices (status and reason lines), which go through `wrap_line`. Zoomed wraps every line. `owned()` turns a borrowed line into `Line<'static>`.
+- Each pane's `render` became `content`. WHOIS, HTTP, Ports and GeoIP keep their `wrapped` index lists. DNS, Security and Traceroute pass `&[]`, so they fit every line as before. HTTP's one-row redirect check now uses `width`.
+- Connectivity: the status row moved into the free function `status_line(state, ipv4, ipv6)`. `content` returns that one row, and `render` calls the same function with its single snapshot.
+- Deleted: `src/tui/scrollable.rs` (`ScrollablePane`, `calculate_content_lines`), the DNS and Security `scroll_offset`/`scroll_up`/`scroll_down_smart`/`reset_scroll`, `SecurityPane::get_actual_line_count`, Traceroute's `scroll_offset`, the downcast key routing and `pane_areas[2][2]` in `layout.rs`, `BORDER_HEIGHT_OFFSET`/`FALLBACK_VISIBLE_LINES`, `create_grid_layout_public`, and the `terminal.size()` rebuild in `mod.rs`.
+
+### Deviations
+- Target content no longer depends on height, because `content` gets no height. The old render collapsed the scanner list to a one-line summary when the list did not fit. The new order is target, IPv4, IPv6, `Status: <summary>` (the old collapsed summary, e.g. `8/8 ✅ 1 🔄`), the protocol hint, then one row per scanner. Hidden rows are marked `↓ N more`. At 80x24 (4 inner rows) the same four facts show as before. The protocol hint moved below Status, and the blank spacer row is gone. Two old tests pinned the height-based collapse: `test_short_pane_collapses_never_clips_subset` became `short_pane_shows_the_summary_and_marks_the_hidden_scanners`, and `test_tall_pane_shows_every_scanner_and_no_summary` became `tall_pane_shows_every_scanner_the_summary_and_no_marker`.
+- `Pane::scrolls()` is not in the doc's API. It is how the layout tells a row pane from Connectivity. The doc's `render_detail` defaulting to `render` is kept as written.
+- `Pane::render` now has a default (draw rows at offset 0), so the eight row panes no longer implement it. `testing::render_pane` goes through it, so every existing pane test now also sees the marker.
+- The layout's scroll map is read by `PaneLayout::scroll_offset(id, detail)` (public, used by the tests), and the rect by `PaneLayout::pane_area(id, area)`. The doc names neither.
+
+### Tradeoffs
+- Clamping at key time and again at render vs only at render: either one alone fixes item 10 while a frame is drawn after every key. Doing both keeps the stored offset true even when several keys arrive between frames, and a test covers that case (`up_after_scrolling_to_the_end_changes_the_view_on_the_first_press` presses Down rows+5 times with no frame drawn).
+- Key handling rebuilds the focused pane's content to learn its row count, vs caching the count from the last render: the rebuild costs one `content` call per key. A cached count could go stale if the scanner state changed between the frame and the key.
+- The marker sits right-aligned on the bottom border, vs a content row: it costs no content row, so `content().len()` stays the true row count.
+
+### Open questions
+- None.
+
+Evidence: each new test was run with its fix undone, and each failed. Sources were then restored and `otto ci` re-run green.
+- Marker removed from `draw_rows`: `every_scrolling_pane_marks_the_rows_it_does_not_show` and the inverted Target short-pane test fail.
+- `to_rows` fits the `wrapped` lines instead of wrapping them (row count = logical lines): `whois_wrapped_domain_row_counts_every_row_it_takes`, the marker test, the scroll-to-end test, the Up test, `to_rows_fits_normal_lines_and_wraps_the_listed_ones`, and two existing wrap tests fail.
+- Down clamped one row short: the marker test, `scrolling_to_the_end_reveals_the_last_built_row_in_every_scrolling_pane` and the re-clamp test fail.
+- Render keeps the unclamped offset (no write-back): `a_resize_or_shorter_content_reclamps_the_offset` fails.
+- Item 10 as before (no write-back, unclamped Up/Down): `up_after_scrolling_to_the_end_changes_the_view_on_the_first_press` and the re-clamp test fail.
+
+The parametrized tests cover `SCROLLING_PANES` (every pane but Connectivity). `scroll_tests_cover_every_pane_but_connectivity` checks that this list matches the layout's panes and that only Connectivity returns `scrolls() == false`.
