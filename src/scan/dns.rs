@@ -18,9 +18,12 @@ use std::time::{Duration, Instant};
 const DNS_SCAN_INTERVAL_SECS: u64 = 60;
 const DNS_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_DNS_TTL: u32 = 300;
-/// Bounds on the TTL-driven re-query: the floor keeps tiny TTLs from hammering the resolver, the
-/// ceiling keeps the old once-a-minute refresh for long TTLs.
-const DNS_REQUERY_FLOOR: Duration = Duration::from_secs(10);
+/// Bounds on the TTL-driven re-query: the floor keeps tiny TTLs from hammering the local stub, the
+/// ceiling keeps the old once-a-minute refresh for long TTLs. The floor stays short because one
+/// re-query refreshes every type: a type whose stub entry was in its last second comes back with
+/// TTL 0, and a 10s floor left it reading `expired` for 10s (be.tatari.tv, v0.5.9). The stub
+/// caches by TTL, so a short floor adds no upstream queries.
+const DNS_REQUERY_FLOOR: Duration = Duration::from_secs(2);
 const DNS_REQUERY_CEILING: Duration = Duration::from_secs(60);
 /// The re-query lands this long after the earliest record expires. The stub reports TTLs in whole
 /// seconds, so a query at exactly `queried_at + ttl` still hits the cache entry's last second and
@@ -990,7 +993,7 @@ impl Scanner for DnsScanner {
         "dns"
     }
 
-    /// Re-query 1s after the first cached record expires (10s..60s), so the answer carries a fresh TTL.
+    /// Re-query 1s after the first cached record expires (2s..60s), so the answer carries a fresh TTL.
     fn next_delay(&self, result: &ScanResult) -> Option<Duration> {
         let ScanResult::Dns(dns) = result else {
             return None;
@@ -1238,11 +1241,11 @@ mod tests {
     }
 
     /// Item 1: the re-query lands 1s after the earliest expiry, so the stub's cache entry is gone
-    /// and the answer carries a fresh TTL; clamped to 10s..60s.
+    /// and the answer carries a fresh TTL; clamped to 2s..60s.
     #[test]
-    fn requery_delay_is_one_second_past_the_earliest_expiry_clamped_to_10s_60s() {
+    fn requery_delay_is_one_second_past_the_earliest_expiry_clamped_to_2s_60s() {
         let now = Instant::now();
-        for (ttl, expected) in [(4, 10), (30, 31), (300, 60)] {
+        for (ttl, expected) in [(0, 2), (4, 5), (30, 31), (300, 60)] {
             let mut result = DnsResult::new();
             result.A.push(expiring_in(ttl, now));
             assert_eq!(
@@ -1269,11 +1272,26 @@ mod tests {
             queried_at: now,
         });
         assert_eq!(result.requery_delay(now), Some(Duration::from_secs(26)));
-        // 20s later the TXT record has 5s left: the floor holds.
+        // 20s later the TXT record has 5s left.
         assert_eq!(
             result.requery_delay(now + Duration::from_secs(20)),
-            Some(Duration::from_secs(10))
+            Some(Duration::from_secs(6))
         );
+    }
+
+    /// AC3: a re-query refreshed TXT, but A came back in its stub entry's last second (TTL 0).
+    /// The next re-query lands 2s later, not after a 10s floor that left A `expired`.
+    #[test]
+    fn a_type_returned_with_ttl_zero_is_requeried_within_two_seconds() {
+        let now = Instant::now();
+        let mut result = DnsResult::new();
+        result.TXT.push(DnsRecord {
+            value: "v=spf1 -all".to_string(),
+            ttl_original: 300,
+            queried_at: now,
+        });
+        result.A.push(expiring_in(0, now));
+        assert_eq!(result.requery_delay(now), Some(Duration::from_secs(2)));
     }
 
     #[test]

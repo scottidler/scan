@@ -1041,3 +1041,18 @@ neverssl.com stays in `HOSTS`. In 4 pairs the two sides were never up at the sam
 
 ### Open questions
 - XSS-Protect and Permissions rows still color the target's own header (no Observatory test for either); `partial (some contact fields visible)` wording. Both left for Scott, not release blockers.
+
+## Post-release: AC3 and AC5 failed on installed v0.5.9
+
+### Design decisions
+- AC3 (`src/scan/dns.rs`, `DNS_REQUERY_FLOOR` 10s -> 2s). Installed v0.5.9 on ripr, be.tatari.tv: longest `TTL: expired` run 5. Cause, sampled every 2s: one re-query refreshes every type, timed to the earliest expiry + 1s; at t=47 TXT refreshed while another type's stub entry was in its last second and came back TTL 0; the 10s floor held the next re-query to t=57. Scott chose "A: lower the floor to 2s" (the stub caches by TTL, so upstream load is unchanged). Test `a_type_returned_with_ttl_zero_is_requeried_within_two_seconds` fails with the floor at 10s. After: longest run 1.
+- AC5 (`src/main.rs`, `cap_malloc_arenas`, `mallopt(M_ARENA_MAX, 2)` before the runtime starts; `#[tokio::main]` replaced by a hand-built multi-thread runtime; `libc` added). Installed v0.5.9: 660s->900s +1416 KB. Same build, RSS every 60s for 900s: default 40000 -> 54476 KB, `MALLOC_ARENA_MAX=1` 36544 -> 37516 KB (+200 KB 660->900), so the growth is glibc arenas, not retained data. Scott chose "A: cap arenas at startup". After (2s floor + cap): 37176 KB at 60s, 40040 at 660s, 40044 at 900s (+4 KB).
+
+### Deviations
+- The DNS floor (doc: "Clamp stays 10s..60s") is now 2s..60s, by Scott's choice after AC3 failed.
+
+### Tradeoffs
+- Arena cap vs. cutting allocation churn per source (parse the suffix list once per refresh, measure HTTP's transients): the cap covers whatever allocates next; per-source fixes regress with each new scanner.
+
+### Open questions
+- No unit test can observe allocator arenas; the 900s RSS series is the evidence.
