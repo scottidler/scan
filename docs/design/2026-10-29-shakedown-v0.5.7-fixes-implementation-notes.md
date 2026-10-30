@@ -265,3 +265,13 @@ Live, release build of this commit, 200x55: AC5 `google.com` Enter shows `DMARC:
 ### Open questions
 - Should `ACCENT` be Magenta or something else on Scott's palette?
 - Should open ports 1-5 stay neutral LABEL?
+
+## Orchestrator: acceptance criteria before release
+
+Run on ripr (no IPv6 default route, so AC2's precondition holds) against `target/release/scan` built from `a26b32c` (`scan v0.5.7-8-ga26b32c`), 2026-10-29, with the doc's tui-test procedure. Exit codes, in criterion order:
+- AC1: 0, 0. Pass.
+- AC2: 0, 0, 0. Pass.
+- AC3 (80x24): 0, 0. Pass.
+- AC4 (`shift+tab`, Enter, Escape): 0, 0, 0. Pass.
+- AC5: 0. Pass.
+- AC6: `--fg 1` 1, `--fg 2` 0; `192.0.2.1` `no echo reply --fg 9` 0. Pass.
