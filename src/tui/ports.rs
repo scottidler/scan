@@ -104,15 +104,6 @@ impl Pane for PortsPane {
 
                         let mut result_lines = Vec::new();
 
-                        // A refresh keeps the previous result on screen; the header says `↻ refreshing`,
-                        // so there is no progress to report and no `completed` to claim.
-                        if !matches!(status, crate::types::ScanStatus::Running) {
-                            result_lines.push(Line::from(vec![
-                                Span::styled("📊 Scanned: ", Style::default().fg(theme::LABEL)),
-                                Span::styled("completed", Style::default().fg(theme::GOOD)),
-                            ]));
-                        }
-
                         // Open ports count with color coding
                         let port_color = if open_count == 0 {
                             theme::GOOD
@@ -124,8 +115,10 @@ impl Pane for PortsPane {
 
                         result_lines.push(Line::from(vec![
                             Span::styled("🟢 Open: ", Style::default().fg(theme::LABEL)),
-                            Span::styled(open_count.to_string(), Style::default().fg(port_color)),
-                            Span::styled(" ports", Style::default().fg(theme::LABEL)),
+                            Span::styled(
+                                crate::tui::text::plural(open_count, "port"),
+                                Style::default().fg(port_color),
+                            ),
                         ]));
 
                         // Show open ports from all protocols (clean display)
@@ -442,5 +435,82 @@ mod tests {
         let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
         assert!(!normal.contains(&format!("{last}/tcp")), "{normal}");
         assert!(normal.contains("... and 2 more"), "{normal}");
+    }
+
+    fn ports_state(status: crate::types::ScanStatus) -> AppState {
+        use crate::scan::port::{PortData, PortResult, PortStatus, ScanMode};
+        let mut result = PortResult::new();
+        result.ipv4_status = PortStatus::Success(0);
+        result.ipv4_result = Some(PortData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            open_ports: vec![],
+            closed_ports: 6,
+            filtered_ports: 0,
+            scan_duration: std::time::Duration::from_millis(50),
+            scan_mode: ScanMode::Minimal,
+        });
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "port".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Port(result)),
+                error: None,
+                status,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
+    /// Item 12: the pane is as tall while refreshing as after the scan; item 11: one status row.
+    #[test]
+    fn ports_renders_the_same_rows_refreshing_and_complete_with_one_status_row() {
+        use crate::tui::testing::content_rows;
+        let pane = PortsPane::new();
+        let complete = content_rows(
+            &pane,
+            &ports_state(crate::types::ScanStatus::Complete),
+            60,
+            Detail::Normal,
+        );
+        let refreshing = content_rows(
+            &pane,
+            &ports_state(crate::types::ScanStatus::Running),
+            60,
+            Detail::Normal,
+        );
+        assert_eq!(complete.len(), refreshing.len(), "{complete:#?}\n{refreshing:#?}");
+        for rows in [&complete, &refreshing] {
+            assert_eq!(rows.iter().filter(|r| r.contains("Status:")).count(), 1, "{rows:#?}");
+            assert!(!rows.iter().any(|r| r.contains("Scanned:")), "{rows:#?}");
+        }
+    }
+
+    /// Item 9: a count of one open port reads `1 port`.
+    #[test]
+    fn one_open_port_reads_in_the_singular() {
+        use crate::scan::port::{OpenPort, PortData, PortResult, PortState, PortStatus, ScanMode, Transport};
+        let mut result = PortResult::new();
+        result.ipv4_status = PortStatus::Success(1);
+        result.ipv4_result = Some(PortData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            open_ports: vec![OpenPort {
+                port: 80,
+                transport: Transport::Tcp,
+                state: PortState::Open,
+                service: None,
+                response_time: std::time::Duration::from_millis(5),
+            }],
+            closed_ports: 0,
+            filtered_ports: 0,
+            scan_duration: std::time::Duration::from_millis(50),
+            scan_mode: ScanMode::Minimal,
+        });
+        let state = ports_state(crate::types::ScanStatus::Complete);
+        state.scanners.get_mut("port").expect("port").result = Some(ScanResult::Port(result));
+        let rows = crate::tui::testing::content_rows(&PortsPane::new(), &state, 60, Detail::Normal).join("\n");
+        assert!(rows.contains("Open: 1 port"), "{rows}");
+        assert!(!rows.contains("1 ports"), "{rows}");
     }
 }

@@ -1,4 +1,5 @@
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::text::plural;
 use crate::tui::theme;
 use crate::types::AppState;
 use log;
@@ -95,22 +96,15 @@ impl DnsPane {
             lines.extend(ptr_lines(&dns_result, detail, refreshing));
         }
 
-        // A records
-        let (a_color, a_status_text) = status_display(&dns_result.A_status);
-        lines.push(Line::from(vec![
-            Span::styled("A: ", Style::default().fg(theme::LABEL)),
-            Span::styled(a_status_text, Style::default().fg(a_color)),
-        ]));
-
-        if !dns_result.A.is_empty() {
-            let ttl = ttl_span(dns_result.A[0].ttl_remaining(), refreshing);
-
-            lines.push(Line::from(vec![
-                Span::styled("  TTL: ", Style::default().fg(theme::LABEL)),
-                ttl,
-            ]));
-
-            // Show A records
+        // A and AAAA: an IP target has no forward records to query, so it lists neither.
+        if !reverse_only {
+            // A records
+            lines.push(status_header(
+                "A",
+                &dns_result.A_status,
+                dns_result.A.first().map(|r| r.ttl_remaining()),
+                refreshing,
+            ));
             for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
                 lines.push(record_line(
                     vec![Span::styled(
@@ -122,23 +116,14 @@ impl DnsPane {
                     refreshing,
                 ));
             }
-        }
 
-        // AAAA records (IPv6)
-        let (aaaa_color, aaaa_status_text) = status_display(&dns_result.AAAA_status);
-        lines.push(Line::from(vec![
-            Span::styled("AAAA: ", Style::default().fg(theme::LABEL)),
-            Span::styled(aaaa_status_text, Style::default().fg(aaaa_color)),
-        ]));
-
-        if !dns_result.AAAA.is_empty() {
-            let ttl = ttl_span(dns_result.AAAA[0].ttl_remaining(), refreshing);
-
-            lines.push(Line::from(vec![
-                Span::styled("  TTL: ", Style::default().fg(theme::LABEL)),
-                ttl,
-            ]));
-
+            // AAAA records (IPv6)
+            lines.push(status_header(
+                "AAAA",
+                &dns_result.AAAA_status,
+                dns_result.AAAA.first().map(|r| r.ttl_remaining()),
+                refreshing,
+            ));
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
                 lines.push(record_line(
                     vec![Span::styled(
@@ -159,8 +144,11 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("CNAME: ", Style::default().fg(theme::LABEL)),
-                Span::styled(dns_result.CNAME.len().to_string(), Style::default().fg(theme::GOOD)),
-                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
+                Span::styled(
+                    plural(dns_result.CNAME.len(), "record"),
+                    Style::default().fg(theme::GOOD),
+                ),
+                Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -180,8 +168,8 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("NS: ", Style::default().fg(theme::LABEL)),
-                Span::styled(dns_result.NS.len().to_string(), Style::default().fg(theme::GOOD)),
-                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
+                Span::styled(plural(dns_result.NS.len(), "record"), Style::default().fg(theme::GOOD)),
+                Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -201,8 +189,8 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("TXT: ", Style::default().fg(theme::LABEL)),
-                Span::styled(dns_result.TXT.len().to_string(), Style::default().fg(theme::GOOD)),
-                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
+                Span::styled(plural(dns_result.TXT.len(), "record"), Style::default().fg(theme::GOOD)),
+                Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -271,8 +259,8 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("MX: ", Style::default().fg(theme::LABEL)),
-                Span::styled(dns_result.MX.len().to_string(), Style::default().fg(theme::GOOD)),
-                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
+                Span::styled(plural(dns_result.MX.len(), "record"), Style::default().fg(theme::GOOD)),
+                Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -340,8 +328,11 @@ impl DnsPane {
 
             lines.push(Line::from(vec![
                 Span::styled("SRV: ", Style::default().fg(theme::LABEL)),
-                Span::styled(dns_result.SRV.len().to_string(), Style::default().fg(theme::GOOD)),
-                Span::styled(" services, TTL: ", Style::default().fg(theme::LABEL)),
+                Span::styled(
+                    plural(dns_result.SRV.len(), "service"),
+                    Style::default().fg(theme::GOOD),
+                ),
+                Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -397,11 +388,31 @@ impl DnsPane {
 fn status_display(status: &crate::scan::dns::QueryStatus) -> (Color, String) {
     match status {
         crate::scan::dns::QueryStatus::NotQueried => (theme::MUTED, "not queried".to_string()),
-        crate::scan::dns::QueryStatus::Success(count) => (theme::GOOD, format!("{} records", count)),
+        crate::scan::dns::QueryStatus::Success(count) => (theme::GOOD, plural(*count, "record")),
         crate::scan::dns::QueryStatus::NoRecords => (theme::WARN, "No Records".to_string()),
         crate::scan::dns::QueryStatus::Failed(_error) => (theme::BAD, "Failed".to_string()),
         crate::scan::dns::QueryStatus::Timeout => (theme::BAD, "Timeout".to_string()),
     }
+}
+
+/// `<label>: <status>`, with `, TTL: <ttl>` inline when the set has records: the one header shape
+/// every section uses.
+fn status_header(
+    label: &'static str,
+    status: &crate::scan::dns::QueryStatus,
+    first_ttl: Option<u32>,
+    refreshing: bool,
+) -> Line<'static> {
+    let (color, text) = status_display(status);
+    let mut spans = vec![
+        Span::styled(format!("{label}: "), Style::default().fg(theme::LABEL)),
+        Span::styled(text, Style::default().fg(color)),
+    ];
+    if let Some(ttl) = first_ttl {
+        spans.push(Span::styled(", TTL: ", Style::default().fg(theme::LABEL)));
+        spans.push(ttl_span(ttl, refreshing));
+    }
+    Line::from(spans)
 }
 
 /// A record's remaining TTL as the stub resolver reported it: `<n>s (cached)`, since that is the
@@ -635,7 +646,7 @@ mod tests {
         )];
         result.CAA_status = QueryStatus::Success(1);
         let out = render_dns(result, "www.tatari.tv");
-        assert!(out.contains("CNAME: 1 records, TTL: "), "{out}");
+        assert!(out.contains("CNAME: 1 record, TTL: "), "{out}");
         assert!(out.contains("cname.vercel-dns.com."), "{out}");
         assert!(out.contains("CAA: 1 cert auth, TTL: "), "{out}");
         assert!(out.contains("issue letsencrypt.org"), "{out}");
@@ -664,7 +675,7 @@ mod tests {
             .iter()
             .position(|r| r.contains(':') && !r.contains("Status"))
             .unwrap();
-        assert!(rows[first_record_row].starts_with("PTR: 1 records"), "{out}");
+        assert!(rows[first_record_row].starts_with("PTR: 1 record"), "{out}");
         assert_eq!(rows[first_record_row + 1], "one.one.one.one.", "{out}");
     }
 
@@ -702,8 +713,8 @@ mod tests {
         result.PTR = vec![DnsRecord::new("host.example.".to_string(), 300)];
         result.PTR_status = QueryStatus::Success(1);
         let out = render_dns(result, "example.com");
-        let a = out.find("A: 1 records").unwrap();
-        let ptr = out.find("PTR: 1 records").unwrap();
+        let a = out.find("A: 1 record").unwrap();
+        let ptr = out.find("PTR: 1 record").unwrap();
         assert!(a < ptr, "{out}");
     }
 
@@ -816,6 +827,7 @@ mod tests {
             DnsRecord::new("192.0.2.2".parse().expect("ip"), 1200),
         ];
         result.A_status = QueryStatus::Success(2);
+        result.MX_status = QueryStatus::NoRecords;
         result.SOA = vec![DnsRecord::new(
             SoaRecord {
                 primary_ns: "ns1.example.com".to_string(),
@@ -845,5 +857,55 @@ mod tests {
         let normal = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Normal).join("\n");
         assert!(!normal.contains("1200s"), "{normal}");
         assert!(!normal.contains("Refresh:"), "{normal}");
+    }
+
+    /// Item 9: a count of one reads in the singular.
+    #[test]
+    fn a_count_of_one_reads_in_the_singular() {
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::NoRecords;
+        result.A = vec![DnsRecord::new("192.0.2.1".parse().unwrap(), 300)];
+        result.A_status = QueryStatus::Success(1);
+        result.NS = vec![DnsRecord::new("ns1.example.com.".to_string(), 300)];
+        result.TXT = vec![DnsRecord::new("v=spf1 -all".to_string(), 300)];
+        let out = render_dns(result, "example.com");
+        assert!(out.contains("A: 1 record, TTL: "), "{out}");
+        assert!(out.contains("NS: 1 record, TTL: "), "{out}");
+        assert!(out.contains("TXT: 1 record, TTL: "), "{out}");
+        assert!(!out.contains("1 records"), "{out}");
+    }
+
+    /// Item 10: A and AAAA put the TTL on the header row like every other section.
+    #[test]
+    fn every_section_header_carries_its_ttl_inline() {
+        let mut result = DnsResult::new();
+        result.A = vec![DnsRecord::new("192.0.2.1".parse().unwrap(), 300)];
+        result.A_status = QueryStatus::Success(1);
+        result.AAAA = vec![DnsRecord::new("2001:db8::1".parse().unwrap(), 300)];
+        result.AAAA_status = QueryStatus::Success(1);
+        result.MX = vec![mx(10, "mail.example.com.")];
+        result.MX_status = QueryStatus::Success(1);
+        let out = render_dns(result, "example.com");
+        let rows = rows(&out);
+        for label in ["A: ", "AAAA: ", "MX: "] {
+            let header = rows.iter().find(|r| r.starts_with(label)).expect(label);
+            assert!(header.contains(", TTL: 300s (cached)"), "{header}\n{out}");
+        }
+        assert!(
+            !rows.iter().any(|r| r.starts_with("TTL: ")),
+            "a TTL row of its own:\n{out}"
+        );
+    }
+
+    /// Item 10: an IP target has no forward records, so it lists no A or AAAA row.
+    #[test]
+    fn ip_target_renders_no_a_or_aaaa_row() {
+        let mut result = DnsResult::new();
+        result.PTR = vec![DnsRecord::new("one.one.one.one.".to_string(), 300)];
+        result.PTR_status = QueryStatus::Success(1);
+        let out = render_dns(result, "1.1.1.1");
+        assert!(!out.contains("A:"), "{out}");
+        assert!(!out.contains("AAAA:"), "{out}");
+        assert!(!out.contains("not queried"), "{out}");
     }
 }

@@ -416,7 +416,7 @@ mod tests {
 
         let scan_state = state.scanners.get("traceroute").expect("traceroute state");
         let summary = crate::pretty::format_scan_state("traceroute", &scan_state);
-        assert!(summary.contains("2 timeouts"), "{summary}");
+        assert!(summary.contains("2 no reply"), "{summary}");
     }
 
     /// www.tatari.tv from the shakedown: hops 1-2 answer, 3-9 are silent, 10 answers, 11 is the target.

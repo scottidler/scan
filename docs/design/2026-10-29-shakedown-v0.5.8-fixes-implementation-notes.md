@@ -449,3 +449,41 @@ Each fix undone in turn (scripted string mutation of the working tree, `cargo te
 
 - `PrivacyLevel::Partial`'s label is `partial (some contact fields visible)`. AC4 only requires `Privacy: ` present and not `open`; Scott may want different wording.
 - With the DNS fallback gone, a domain whose `resolved_ips` is empty would read `none` on both rows. `main` fails before the TUI when resolution errors, so this is not reachable today; noted in case a later phase re-resolves on protocol change.
+
+## Phase 3: Cosmetic fixes
+### Design decisions
+- Protocol joins the Status row as `Status: <counts> · IPv4+IPv6 (p)` and the `Protocol:` row is deleted: `src/tui/target.rs:content`. 12 content rows at 200x55 (4 + 8 scanners), so `↓ 1 more` is gone.
+- `plural(n, noun)` returns `"<n> <noun>"` with an `s` unless n is 1: `src/tui/text.rs`. Used for DNS `status_display`, CNAME/NS/TXT/MX/SRV headers, Security SAN, WHOIS risks, Ports `Open:` and the `--no-tui` WHOIS `risks` suffix. The count is part of the string, so call sites no longer format the number separately.
+- One `status_header(label, status, first_ttl, refreshing)` builds the A and AAAA headers with TTL inline (`, TTL: <ttl>`), the shape PTR and the other sections already had: `src/tui/dns.rs`.
+- A and AAAA are skipped when `is_reverse_only()` (IP target): `src/tui/dns.rs:build_dns_result_lines`.
+- Ports: the `Scanned:` row is deleted outright, so row count no longer depends on scan status (items 11 and 12 share one fix): `src/tui/ports.rs`.
+- Security: the `🔗 Status: failed` row in the first-scan-failed branch is deleted; the header's `Status: failed: <error>` stands alone: `src/tui/security.rs`. The `connection_successful == false` row inside a completed result is a different fact and stays.
+- `pretty.rs` reads `, N no reply`, matching the TUI traceroute pane's wording: `src/pretty.rs`.
+
+### Deviations
+- The two protocol-row tests (`protocol_line_is_fit_with_ellipsis_at_108_columns`, `protocol_line_that_fits_is_unchanged`) were replaced by `target_at_200x55_shows_every_row_and_the_protocol_on_the_status_row`: they pinned the deleted `Protocol:` row. Truncation of a long row is still covered by `fit_line` and `long_target_is_fit_with_ellipsis_in_narrow_terminals`.
+- `layout.rs` `dns_fixture` and one DNS test fixture now set `MX_status = NoRecords`. With A/AAAA hidden for IP targets, a fixture without a queried MX reads as an IP target and lost its rows; real name targets always query MX.
+- `Open: N ports` in the Ports pane and the `--no-tui` WHOIS `N risks` were also routed through `plural` (the doc says "every count"); not named in the defect table.
+
+### Tradeoffs
+- `plural` appends `s` only vs an irregular-noun table: every noun used is regular; a table is speculative.
+- Delete `Scanned:` vs keep it in both states: it duplicated the Status row, so deleting fixes items 11 and 12 together.
+
+### Bite proofs
+Each fix undone in turn (scripted string mutation, `cargo test --lib <filter>`, restore):
+
+| Fix undone | Failing tests |
+|---|---|
+| 8: protocol dropped from Status row | `target_at_200x55_shows_every_row_and_the_protocol_on_the_status_row` |
+| 8: `Protocol:` row restored | `target_at_200x55_shows_every_row_and_the_protocol_on_the_status_row`, `short_pane_shows_the_summary_and_marks_the_hidden_scanners` |
+| 9: `plural` always adds `s` | `plural_adds_an_s_unless_the_count_is_one`, `a_count_of_one_reads_in_the_singular`, `san_count_of_one_reads_domain`, `one_risk_indicator_reads_in_the_singular`, `one_open_port_reads_in_the_singular`, `cname_and_caa_render_their_sections` |
+| 9: WHOIS `indicators` unpluralized | `one_risk_indicator_reads_in_the_singular` |
+| 10: A/AAAA header without inline TTL | `every_section_header_carries_its_ttl_inline`, `a_count_of_one_reads_in_the_singular` |
+| 10: A/AAAA shown for an IP target | `ip_target_renders_no_a_or_aaaa_row` |
+| 11: `Scanned:` row restored | `ports_renders_the_same_rows_refreshing_and_complete_with_one_status_row`, `refreshing_ports_pane_shows_no_progress` |
+| 11: Security `🔗 Status: failed` restored | `failed_tls_scan_renders_one_status_row` |
+| 12: `Scanned:` dropped only while refreshing (old behavior) | `ports_renders_the_same_rows_refreshing_and_complete_with_one_status_row` |
+| 13: `no reply` back to `timeouts` | `tui_and_no_tui_report_the_same_silent_hop_count` (assertion inverted from `2 timeouts` to `2 no reply`) |
+
+### Open questions
+- `--no-tui` reads `, 2 no reply`; Scott may prefer `, 2 hops no reply`.

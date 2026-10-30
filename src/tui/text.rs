@@ -6,6 +6,11 @@ use ratatui::{
     text::{Line, Span},
 };
 
+/// `<n> <noun>`, the noun pluralized with an `s` unless `n` is 1: `1 record`, `0 records`.
+pub fn plural(n: usize, noun: &str) -> String {
+    if n == 1 { format!("{n} {noun}") } else { format!("{n} {noun}s") }
+}
+
 /// Marks a line cut short by `fit_line`.
 pub const ELLIPSIS: &str = "…";
 
@@ -326,5 +331,14 @@ mod tests {
             assert_eq!(row.style, Style::default().fg(Color::LightRed));
             assert_eq!(row.alignment, Some(ratatui::layout::Alignment::Center));
         }
+    }
+
+    /// Item 9: one helper formats every count.
+    #[test]
+    fn plural_adds_an_s_unless_the_count_is_one() {
+        assert_eq!(plural(0, "record"), "0 records");
+        assert_eq!(plural(1, "record"), "1 record");
+        assert_eq!(plural(2, "domain"), "2 domains");
+        assert_eq!(plural(1, "indicator"), "1 indicator");
     }
 }

@@ -693,6 +693,8 @@ mod tests {
                 .push(DnsRecord::new(format!("192.0.2.{n}").parse().expect("ip"), 300));
         }
         dns.A_status = QueryStatus::Success(usize::from(records));
+        // MX is queried for every name target; without it the fixture reads as an IP target.
+        dns.MX_status = QueryStatus::NoRecords;
         dns
     }
 

@@ -365,7 +365,10 @@ impl SecurityPane {
                 if san_count > 0 {
                     lines.push(Line::from(vec![
                         Span::styled("  SAN: ", Style::default().fg(theme::LABEL)),
-                        Span::styled(format!("{} domains", san_count), Style::default().fg(theme::GOOD)),
+                        Span::styled(
+                            crate::tui::text::plural(san_count, "domain"),
+                            Style::default().fg(theme::GOOD),
+                        ),
                     ]));
                 }
             }
@@ -400,18 +403,8 @@ impl SecurityPane {
                 ]));
             }
         } else if tls_failed {
-            // The first scan failed: the header carries the reason, nothing is still pending.
-            // With no target address there was nothing to fail, so the muted header stands alone.
-            let no_address = state
-                .scanners
-                .get("tls")
-                .is_some_and(|tls_state| crate::tui::no_address(&tls_state).is_some());
-            if !no_address {
-                lines.push(Line::from(vec![
-                    Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
-                    Span::styled("failed", Style::default().fg(theme::BAD)),
-                ]));
-            }
+            // The first scan failed: the header's `Status:` row carries the reason and is the only
+            // status row; a second `🔗 Status:` row would say the same thing again.
         } else if state.scanners.contains_key("tls") {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![
@@ -1944,5 +1937,49 @@ mod tests {
         assert!(zoomed.contains(&last), "{zoomed}");
         let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
         assert!(!normal.contains(&last), "{normal}");
+    }
+
+    /// Item 9: a one-name certificate reads `1 domain`.
+    #[test]
+    fn san_count_of_one_reads_domain() {
+        let state = AppState::new("example.com".to_string());
+        let mut tls_result = TlsResult::new();
+        let mut data = crate::scan::tls::fixtures::expired_handshake_result();
+        data.certificate_chain[0].san_domains = vec!["example.com".to_string()];
+        tls_result.ipv4_status = TlsStatus::Success(data.security_grade.clone());
+        tls_result.ipv4_result = Some(data);
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: Some(ScanResult::Tls(tls_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(out.contains("SAN: 1 domain"), "{out}");
+        assert!(!out.contains("1 domains"), "{out}");
+    }
+
+    /// Item 11: a failed TLS scan says so once, in the header; no second `🔗 Status:` row.
+    #[test]
+    fn failed_tls_scan_renders_one_status_row() {
+        let state = AppState::new("dead.example".to_string());
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: None,
+                error: Some(eyre::eyre!("connection refused")),
+                status: ScanStatus::Failed,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 20, false);
+        assert!(out.contains("Status: failed: connection refused"), "{out}");
+        assert_eq!(out.matches("Status:").count(), 1, "{out}");
+        assert!(!out.contains("🔗"), "{out}");
     }
 }

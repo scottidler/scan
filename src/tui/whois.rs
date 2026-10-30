@@ -270,10 +270,9 @@ impl Pane for WhoisPane {
                     lines.push(Line::from(vec![
                         Span::styled("❗ Risks: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
-                            whois_result.risk_indicators.len().to_string(),
+                            crate::tui::text::plural(whois_result.risk_indicators.len(), "indicator"),
                             Style::default().fg(theme::BAD),
                         ),
-                        Span::styled(" indicators", Style::default().fg(theme::BAD)),
                     ]));
 
                     // Show each risk indicator
@@ -602,5 +601,17 @@ mod tests {
         }
         let normal = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Normal).join("\n");
         assert!(!normal.contains("DNSSEC"), "{normal}");
+    }
+
+    /// Item 9: one risk indicator reads `1 indicator`.
+    #[test]
+    fn one_risk_indicator_reads_in_the_singular() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, RiskIndicator, WhoisResult};
+        let mut result = WhoisResult::not_applicable("example.com".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.risk_indicators = vec![RiskIndicator::WeakDnssec];
+        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), 80, 30, false);
+        assert!(out.contains("Risks: 1 indicator"), "{out}");
+        assert!(!out.contains("1 indicators"), "{out}");
     }
 }

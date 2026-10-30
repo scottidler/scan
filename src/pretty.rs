@@ -247,7 +247,11 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 .unwrap_or("unknown registrar");
 
             let risk_count = whois.risk_indicators.len();
-            let risk_str = if risk_count > 0 { format!(", {} risks", risk_count) } else { String::new() };
+            let risk_str = if risk_count > 0 {
+                format!(", {}", crate::tui::text::plural(risk_count, "risk"))
+            } else {
+                String::new()
+            };
 
             (
                 Outcome::Ok,
@@ -286,11 +290,11 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 .map(|rtt| format!("{}ms", rtt.as_millis()))
                 .unwrap_or_else(|| "timeout".to_string());
 
-            // Count timeouts
+            // Hops that never answered
             let timeout_hops = primary_data.silent_hops();
 
             let timeout_str = if timeout_hops > 0 {
-                format!(", {} timeouts", timeout_hops)
+                format!(", {} no reply", timeout_hops)
             } else {
                 String::new()
             };

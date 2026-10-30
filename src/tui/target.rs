@@ -199,7 +199,7 @@ impl Default for TargetPane {
 
 impl Pane for TargetPane {
     /// The target, both addresses and the scanner summary come first, so a short dashboard cell
-    /// shows them; the protocol hint and one row per scanner follow, reached by scrolling.
+    /// shows them; the protocol rides the Status row and one row per scanner follows, reached by scrolling.
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!(
             "[tui::target] content: width={} detail={:?} target={}",
@@ -222,17 +222,12 @@ impl Pane for TargetPane {
         lines.push(Line::from(vec![
             Span::styled("Status: ", Style::default().fg(theme::LABEL)),
             Span::styled(
-                Self::collapsed_summary(&counts),
+                format!(
+                    "{} · {} (p)",
+                    Self::collapsed_summary(&counts),
+                    state.protocol_display()
+                ),
                 Self::summary_color(counts.running, counts.failed),
-            ),
-        ]));
-
-        lines.push(Line::from(vec![
-            Span::styled("🔗 ", Style::default().fg(theme::ACCENT)),
-            Span::styled("Protocol: ", Style::default().fg(theme::LABEL)),
-            Span::styled(
-                format!("{} (Press 'p' to cycle)", state.protocol_display()),
-                Style::default().fg(theme::VALUE),
             ),
         ]));
 
@@ -440,8 +435,8 @@ mod tests {
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "order wrong:\n{}", out);
     }
 
-    /// Target, two addresses, Status, Protocol, then one row per scanner.
-    const TARGET_ROWS_WITH_EVERY_SCANNER: u16 = 5 + SCANNER_DISPLAY_ORDER.len() as u16;
+    /// Target, two addresses, Status (which carries the protocol), then one row per scanner.
+    const TARGET_ROWS_WITH_EVERY_SCANNER: u16 = 4 + SCANNER_DISPLAY_ORDER.len() as u16;
 
     #[test]
     fn short_pane_shows_the_summary_and_marks_the_hidden_scanners() {
@@ -642,26 +637,19 @@ mod tests {
         );
     }
 
-    fn protocol_source(state: &AppState) -> String {
-        format!("🔗 Protocol: {} (Press 'p' to cycle)", state.protocol_display())
-    }
-
+    /// Item 8: at the 200x55 dashboard the Target cell has 12 inner rows; the protocol hint used to
+    /// take a 13th row and hid one scanner behind `↓ 1 more`.
     #[test]
-    fn protocol_line_is_fit_with_ellipsis_at_108_columns() {
-        // Scott's ~108-column screenshot cut this to `Protocol: IPv4+IPv6 (Pre`.
-        let state = AppState::new("www.tatari.tv".to_string());
-        let (width, height) = crate::tui::testing::dashboard_pane_size(0, 0, 108, 40);
-        let expected = crate::tui::testing::expected_clip(&protocol_source(&state), width - 2);
-        let out = crate::tui::testing::render_pane(&TargetPane::new(), &state, width, height, false);
-        assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
-    }
-
-    #[test]
-    fn protocol_line_that_fits_is_unchanged() {
-        let state = AppState::new("www.tatari.tv".to_string());
+    fn target_at_200x55_shows_every_row_and_the_protocol_on_the_status_row() {
+        let state = state_with_scanners(&SCANNER_DISPLAY_ORDER, ScanStatus::Running);
         let (width, height) = crate::tui::testing::dashboard_pane_size(0, 0, 200, 55);
         let out = crate::tui::testing::render_pane(&TargetPane::new(), &state, width, height, false);
-        assert!(out.contains(&protocol_source(&state)), "protocol line changed:\n{out}");
+        assert!(!out.contains('↓'), "a row is hidden:\n{out}");
         assert!(!out.contains('…'), "nothing here is too long:\n{out}");
+        assert!(out.contains("Status: 0/8 ✅ 8 🔄 · IPv4+IPv6 (p)"), "{out}");
+        assert!(!out.contains("Protocol:"), "the protocol row is gone:\n{out}");
+        for n in SCANNER_DISPLAY_ORDER {
+            assert!(out.contains(&format!("{}:", n.to_uppercase())), "{n} missing:\n{out}");
+        }
     }
 }
