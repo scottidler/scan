@@ -103,6 +103,18 @@ impl TracerouteData {
             .max()
     }
 
+    /// The hop that answered from the target's own address, when the destination was reached.
+    pub fn destination_hop(&self) -> Option<&TracerouteHop> {
+        if !self.destination_reached {
+            return None;
+        }
+        self.hops.iter().rev().find(|hop| {
+            hop.responses
+                .iter()
+                .any(|r| !r.timeout && r.ip_address == Some(self.target_ip))
+        })
+    }
+
     /// How many hops had no probe answered. The one count the TUI and `--no-tui` share.
     pub fn silent_hops(&self) -> usize {
         self.hops.iter().filter(|hop| hop.is_silent()).count()
@@ -1287,5 +1299,44 @@ exit 0"#;
         let no_timeout_line = " 7  192.168.1.1  5.0 ms  6.0 ms  7.0 ms";
         let success_hop = scanner.parse_hop_line(no_timeout_line).unwrap().unwrap();
         assert_eq!(success_hop.packet_loss, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod destination_hop_tests {
+    use super::*;
+
+    fn data(reached: bool) -> TracerouteData {
+        let answer = |n: u8, ip: &str| TracerouteHop {
+            hop_number: n,
+            responses: vec![HopResponse {
+                ip_address: Some(ip.parse().expect("ip")),
+                rtt: Some(Duration::from_millis(1)),
+                timeout: false,
+            }],
+            best_rtt: None,
+            avg_rtt: None,
+            worst_rtt: None,
+            packet_loss: 0.0,
+        };
+        TracerouteData {
+            hops: vec![answer(1, "10.0.0.1"), answer(2, "192.0.2.9")],
+            destination_reached: reached,
+            total_hops: 2,
+            max_hops: 30,
+            target_ip: "192.0.2.9".parse().expect("ip"),
+            scan_duration: Duration::from_millis(5),
+            ipv6: false,
+        }
+    }
+
+    #[test]
+    fn destination_hop_is_the_hop_that_answered_from_the_target() {
+        assert_eq!(data(true).destination_hop().map(|hop| hop.hop_number), Some(2));
+    }
+
+    #[test]
+    fn no_destination_hop_when_the_target_was_not_reached() {
+        assert!(data(false).destination_hop().is_none());
     }
 }

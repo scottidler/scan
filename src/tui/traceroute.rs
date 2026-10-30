@@ -1,3 +1,4 @@
+use crate::scan::traceroute::{TracerouteData, TracerouteHop};
 use crate::tui::pane::{Detail, Pane};
 use crate::types::{AppState, ScanResult};
 use log;
@@ -7,8 +8,8 @@ use ratatui::{
 };
 use std::any::Any;
 
-const LOCAL_ISP_HOP_THRESHOLD: u8 = 3;
-const MID_NETWORK_HOP_THRESHOLD: u8 = 10;
+/// LABEL in the design doc; Phase 2 moves it to the theme.
+const HOP_NUMBER_COLOR: Color = Color::White;
 const MIN_TRACEROUTE_PANE_WIDTH: u16 = 35;
 const MIN_TRACEROUTE_PANE_HEIGHT: u16 = 20;
 
@@ -34,6 +35,70 @@ impl Default for TraceroutePane {
     }
 }
 
+/// The hop's first answer as `(ip, rtt)` text, `*` for what the answer did not carry.
+fn first_answer(hop: &TracerouteHop) -> Option<(String, String)> {
+    let response = hop.responses.iter().find(|r| !r.timeout)?;
+    let ip = response.ip_address.map_or_else(|| "*".to_string(), |ip| ip.to_string());
+    let rtt = response
+        .rtt
+        .map_or_else(|| "*".to_string(), |rtt| format!("{}ms", rtt.as_millis()));
+    Some((ip, rtt))
+}
+
+/// `→ <target ip> (<rtt>)`, or `(no reply)` when the target never answered.
+fn destination_line(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> Line<'static> {
+    let note = match destination_hop.and_then(first_answer) {
+        Some((_, rtt)) => format!(" ({rtt})"),
+        None if data.destination_reached => String::new(),
+        None => " (no reply)".to_string(),
+    };
+    Line::from(vec![
+        Span::styled("→ ", Style::default().fg(Color::Gray)),
+        Span::styled(data.target_ip.to_string(), Style::default().fg(Color::Cyan)),
+        Span::styled(note, Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// One row per answering hop, and one per run of silent hops: `3-9: no reply (7 hops)`, or
+/// `3: no reply` for a run of one. The destination hop is left out; it has its own row.
+fn hop_lines(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> Vec<Line<'static>> {
+    let route: Vec<&TracerouteHop> = data
+        .hops
+        .iter()
+        .filter(|hop| destination_hop.is_none_or(|dest| dest.hop_number != hop.hop_number))
+        .collect();
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < route.len() {
+        let hop = route[index];
+        if hop.is_silent() {
+            let run = route[index..].iter().take_while(|h| h.is_silent()).count();
+            let last = route[index + run - 1].hop_number;
+            let text = match run {
+                1 => format!("{}: no reply", hop.hop_number),
+                _ => format!("{}-{}: no reply ({} hops)", hop.hop_number, last, run),
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {text}"),
+                Style::default().fg(Color::Gray),
+            )));
+            index += run;
+            continue;
+        }
+        let (ip, rtt) = first_answer(hop).unwrap_or_else(|| ("*".to_string(), "*".to_string()));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:2}: ", hop.hop_number),
+                Style::default().fg(HOP_NUMBER_COLOR),
+            ),
+            Span::styled(ip, Style::default().fg(Color::Cyan)),
+            Span::styled(format!(" ({rtt})"), Style::default().fg(Color::Gray)),
+        ]));
+        index += 1;
+    }
+    lines
+}
+
 impl Pane for TraceroutePane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::traceroute] content: width={} detail={:?}", width, detail);
@@ -46,9 +111,6 @@ impl Pane for TraceroutePane {
             Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
             Span::styled("tracing...", Style::default().fg(Color::Gray)),
         ]));
-
-        // Empty line for spacing
-        lines.push(Line::from(""));
 
         // Get traceroute results and render them
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
@@ -65,7 +127,7 @@ impl Pane for TraceroutePane {
                     let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
 
                     lines.push(Line::from(vec![
-                        Span::styled(format!("📍 {} Route:", protocol), Style::default().fg(Color::White)),
+                        Span::styled(format!("📍 {}", protocol), Style::default().fg(Color::White)),
                         if primary_data.destination_reached {
                             Span::styled(" ✓ reached", Style::default().fg(Color::Green))
                         } else {
@@ -76,43 +138,10 @@ impl Pane for TraceroutePane {
                         },
                     ]));
 
-                    // Show all hops
-                    for hop in &primary_data.hops {
-                        // Get first responding IP and best RTT
-                        let (ip_display, rtt_display, hop_color) = if let Some(response) =
-                            hop.responses.iter().find(|r| !r.timeout)
-                            && !hop.is_silent()
-                        {
-                            let ip_str = response
-                                .ip_address
-                                .as_ref()
-                                .map(|ip| ip.to_string())
-                                .unwrap_or_else(|| "*".to_string());
-                            let rtt_str = response
-                                .rtt
-                                .as_ref()
-                                .map(|rtt| format!("{}ms", rtt.as_millis()))
-                                .unwrap_or_else(|| "*".to_string());
-                            (ip_str, rtt_str, Color::Cyan)
-                        } else {
-                            ("*".to_string(), "timeout".to_string(), Color::Gray)
-                        };
-
-                        // Color code hop number based on position
-                        let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
-                            Color::Green // Local/ISP hops
-                        } else if hop.hop_number <= MID_NETWORK_HOP_THRESHOLD {
-                            Color::Yellow // Mid-network
-                        } else {
-                            Color::Red // Far hops
-                        };
-
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(hop_num_color)),
-                            Span::styled(ip_display, Style::default().fg(hop_color)),
-                            Span::styled(format!(" ({})", rtt_display), Style::default().fg(Color::Gray)),
-                        ]));
-                    }
+                    // The destination has its own row; the route above it is the other hops.
+                    let destination_hop = primary_data.destination_hop();
+                    lines.push(destination_line(primary_data, destination_hop));
+                    lines.extend(hop_lines(primary_data, destination_hop));
                 } else {
                     lines.push(Line::from(vec![
                         Span::styled("📍 Status: ", Style::default().fg(Color::White)),
@@ -248,7 +277,7 @@ mod tests {
             &traced_state(ipv6_route(hop, true)),
             2,
             1,
-            &format!("   1: {hop} (5ms)"),
+            &format!("→ {hop} (5ms)"),
         );
     }
 
@@ -305,11 +334,137 @@ mod tests {
 
         let state = traced_state(data);
         let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, 60, 20, false);
-        let tui_silent = out.lines().filter(|row| row.contains("timeout")).count();
-        assert_eq!(tui_silent, 2, "{out}");
+        assert!(out.contains("2: no reply"), "{out}");
+        assert!(out.contains("4: no reply"), "{out}");
+        assert!(!out.contains("3: no reply"), "{out}");
 
         let scan_state = state.scanners.get("traceroute").expect("traceroute state");
         let summary = crate::pretty::format_scan_state("traceroute", &scan_state);
         assert!(summary.contains("2 timeouts"), "{summary}");
+    }
+
+    /// www.tatari.tv from the shakedown: hops 1-2 answer, 3-9 are silent, 10 answers, 11 is the target.
+    fn tatari_route() -> crate::scan::traceroute::TracerouteData {
+        use crate::scan::traceroute::{HopResponse, TracerouteHop};
+        use std::time::Duration;
+        let answer = |number: u8, ip: &str, ms: u64| TracerouteHop {
+            hop_number: number,
+            responses: vec![HopResponse {
+                ip_address: Some(ip.parse().expect("ip")),
+                rtt: Some(Duration::from_millis(ms)),
+                timeout: false,
+            }],
+            best_rtt: None,
+            avg_rtt: None,
+            worst_rtt: None,
+            packet_loss: 0.0,
+        };
+        let mut hops = vec![answer(1, "192.168.1.1", 1), answer(2, "10.0.0.1", 2)];
+        hops.extend((3..=9).map(|n| hop(n, &[false, false, false], 1.0)));
+        hops.push(answer(10, "63.140.62.5", 3));
+        hops.push(answer(11, "216.150.16.193", 3));
+        let mut data = ipv6_route("2001:db8::1", true);
+        data.target_ip = "216.150.16.193".parse().expect("ip");
+        data.ipv6 = false;
+        data.total_hops = 11;
+        data.hops = hops;
+        data
+    }
+
+    fn tatari_pane(width: u16, height: u16) -> String {
+        let mut result = crate::scan::traceroute::TracerouteResult::new();
+        result.ipv4_result = Some(tatari_route());
+        result.total_duration = std::time::Duration::from_millis(3200);
+        let state = AppState::new("www.tatari.tv".to_string());
+        state.scanners.insert(
+            "traceroute".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Traceroute(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        crate::tui::testing::render_pane(&TraceroutePane::new(), &state, width, height, false)
+    }
+
+    #[test]
+    fn tatari_route_fits_the_80x24_dashboard_with_destination_and_duration() {
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let out = tatari_pane(width, height);
+        assert!(out.contains("📍 IPv4 ✓ reached"), "{out}");
+        assert!(out.contains("→ 216.150.16.193 (3ms)"), "{out}");
+        assert!(out.contains("3-9: no reply (7 hops)"), "{out}");
+        assert!(out.contains("Duration: 3200ms"), "{out}");
+        assert!(!out.contains("more"), "nothing is hidden at 80x24:\n{out}");
+        let last_row = out.lines().rev().nth(1).expect("row above the border");
+        assert!(last_row.contains("Duration"), "Duration is the last row:\n{out}");
+    }
+
+    #[test]
+    fn no_hop_row_says_timeout() {
+        let out = tatari_pane(60, 30);
+        assert!(!out.contains("timeout"), "{out}");
+        let single = traced_state(route_with_silent_hops());
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &single, 60, 20, false);
+        assert!(!out.contains("timeout"), "{out}");
+    }
+
+    #[test]
+    fn a_single_silent_hop_reads_without_a_count() {
+        let out = crate::tui::testing::render_pane(
+            &TraceroutePane::new(),
+            &traced_state(route_with_silent_hops()),
+            60,
+            20,
+            false,
+        );
+        assert!(out.contains("2: no reply\n") || out.contains("2: no reply "), "{out}");
+        assert!(!out.contains("(1 hops)"), "{out}");
+    }
+
+    #[test]
+    fn a_silent_target_keeps_its_label_and_a_no_reply_destination_row() {
+        let mut data = tatari_route();
+        data.destination_reached = false;
+        data.hops.truncate(10);
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &traced_state(data), 60, 20, false);
+        assert!(out.contains("✗ target silent (last reply: hop 10)"), "{out}");
+        assert!(out.contains("→ 216.150.16.193 (no reply)"), "{out}");
+    }
+
+    #[test]
+    fn hop_numbers_use_the_label_color_never_the_bad_color() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("terminal");
+        let mut result = crate::scan::traceroute::TracerouteResult::new();
+        let mut data = tatari_route();
+        data.hops.truncate(2);
+        for n in 11..=14 {
+            data.hops.push(hop(n, &[true], 0.0));
+        }
+        result.ipv4_result = Some(data);
+        let state = AppState::new("www.tatari.tv".to_string());
+        state.scanners.insert(
+            "traceroute".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Traceroute(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let pane = TraceroutePane::new();
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        for number in ["12:", "14:", "1:"] {
+            let color = crate::tui::testing::fg_of(&buffer, number);
+            assert_eq!(color, Color::White, "hop {number}");
+            assert_ne!(color, Color::Red, "hop {number}");
+        }
     }
 }

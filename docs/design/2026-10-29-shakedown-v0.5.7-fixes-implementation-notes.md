@@ -158,3 +158,26 @@ Evidence: each new test was run with its fix undone, and each failed. Sources we
 - Item 10 as before (no write-back, unclamped Up/Down): `up_after_scrolling_to_the_end_changes_the_view_on_the_first_press` and the re-clamp test fail.
 
 The parametrized tests cover `SCROLLING_PANES` (every pane but Connectivity). `scroll_tests_cover_every_pane_but_connectivity` checks that this list matches the layout's panes and that only Connectivity returns `scrolls() == false`.
+
+## Phase 7: Traceroute layout
+
+### Design decisions
+- The destination has its own row: `📍 IPv4 ✓ reached` (or `✗ target silent (last reply: hop N)`), then `→ <target ip> (<rtt>)` — `src/tui/traceroute.rs` `destination_line`. The `Route:` word is gone from the header. A reached target whose answering hop cannot be found reads `→ <ip>` with no parentheses; a silent target reads `→ <ip> (no reply)`.
+- `TracerouteData::destination_hop()` (`src/scan/traceroute.rs`) is the last hop with a non-timeout answer from `target_ip`, and only when `destination_reached`. That hop is left out of the hop list so the target is not printed twice.
+- `hop_lines` collapses a run of silent hops (`TracerouteHop::is_silent`) to `3-9: no reply (7 hops)`, a run of one to `3: no reply`. No hop row carries the word `timeout`. Silent rows are Gray.
+- Hop numbers use `HOP_NUMBER_COLOR = Color::White` (the doc's LABEL value). The local/mid/far green/yellow/red thresholds are deleted. Phase 2 should replace the constant with `theme::LABEL`.
+- Duration is the last content row, not pinned. The blank spacer row under Status is dropped (as Phase 6 did for Target). At 80x24 the pane has 8 inner rows, and the tatari fixture takes exactly 8: Status, 📍, →, hops 1, 2, `3-9`, 10, Duration. The test asserts no `↓ N more` marker and that Duration is the row above the bottom border. A longer route scrolls with the Phase 6 offsets; Duration is reached at the end of the scroll, and Zoom (Phase 8) shows every row.
+
+### Deviations
+- The doc says Duration stays the last row; it does not say how it interacts with scroll. Decision above: last content row, with no pinned footer, since a footer would need new layout machinery that `content()` does not have. The 80x24 criterion holds only because the spacer row was dropped and the destination hop leaves the list; a tatari-like route with more than four answering hops would scroll Duration out of the 80x24 view (marked `↓ N more`).
+- `tui_and_no_tui_report_the_same_silent_hop_count` counted `timeout` rows; it now asserts `2: no reply` and `4: no reply` rows (and no `3:`), still checking `silent_hops() == 2` and the `--no-tui` summary.
+- `long_ipv6_hop_is_fit_with_ellipsis_in_narrow_terminals` now clips the destination row (`→ <ip> (5ms)`) since its fixture hop is the target and moves to that row.
+
+### Tradeoffs
+- Drop the spacer row vs pin Duration: dropping costs one blank row and no new mechanism; pinning would be robust for long routes but needs a footer concept in `Pane`.
+- Match the destination hop by IP against `target_ip` vs treat the last hop as the destination when reached: matching never hides a hop that is not the target.
+
+### Open questions
+- None.
+
+Evidence: each new test was run with its fix undone, and each failed. Collapse disabled: `tatari_route_fits_the_80x24_dashboard_with_destination_and_duration`, `a_single_silent_hop_reads_without_a_count`, `tui_and_no_tui_report_the_same_silent_hop_count`. Destination row and hop removal disabled: the tatari fit test, `a_silent_target_keeps_its_label_and_a_no_reply_destination_row`, the long-IPv6 clip test. Red hop numbers and `timeout` text restored: `hop_numbers_use_the_label_color_never_the_bad_color`, `no_hop_row_says_timeout`, and two others. Sources restored, then `otto ci` green.
