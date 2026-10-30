@@ -1056,3 +1056,19 @@ neverssl.com stays in `HOSTS`. In 4 pairs the two sides were never up at the sam
 
 ### Open questions
 - No unit test can observe allocator arenas; the 900s RSS series is the evidence.
+
+## Post-release: the three open questions (Scott: "do all three")
+
+### Design decisions
+- XSS-Protect and Permissions rows are `MUTED` whether the header is present or missing: `src/tui/security.rs`. Observatory has no test for either, so a `GOOD`/`WARN` color was a verdict nobody graded, beside rows that carry Observatory's. `1; mode=block` read `GOOD`, against MDN's advice to send `0` or omit the header. Test: `xss_protect_and_permissions_rows_are_muted_present_or_missing`, which fails on the old colors.
+- `PrivacyLevel::Partial` keeps `partial (some contact fields visible)`: it matches `open (contacts visible)`, the level then what shows.
+- `THIRD-PARTY-NOTICES` at the repo root carries the full license texts of htmlparser2 12.0.0 and structured-headers 2.1.1 (MIT), tough-cookie 5.1.2 (BSD-3-Clause) and entities 8.1.0 (BSD-2-Clause), fetched from each package at that version on unpkg, plus the CC BY 4.0 attribution for the WHATWG entity table. `README.md`'s License section points to it.
+
+### Deviations
+- None.
+
+### Tradeoffs
+- CC BY 4.0 gets attribution, the license URL and the change note, not the full legal code: that is what the license's section 3(a) asks for.
+
+### Open questions
+- The release tarballs carry only the `scan` binary (v0.5.10 linux-amd64: `tar tzf` lists `scan`). The BSD licenses ask a binary redistribution to reproduce the notice "in the documentation and/or other materials". The archive contents come from the shared `tatari-tv/github-actions-public` `rust-cli-release.yml@v2.0.0` workflow, not this repo.

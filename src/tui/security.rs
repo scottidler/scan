@@ -440,13 +440,10 @@ impl SecurityPane {
                 x_content.as_deref(),
             ));
 
-            // X-XSS-Protection: Observatory has no test for it, so the row is the target's header.
+            // X-XSS-Protection: Observatory has no test for it, so the row is the target's header, ungraded.
             lines.push(Line::from(vec![
                 Span::styled("  XSS-Protect: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    xss_protect.clone(),
-                    Style::default().fg(if xss_protect != "missing" { theme::GOOD } else { theme::WARN }),
-                ),
+                Span::styled(xss_protect.clone(), Style::default().fg(theme::MUTED)),
             ]));
 
             lines.push(observatory_row(
@@ -456,13 +453,10 @@ impl SecurityPane {
                 referrer_policy.as_deref(),
             ));
 
-            // Permissions-Policy: Observatory has no test for it, so the row is the target's header.
+            // Permissions-Policy: Observatory has no test for it, so the row is the target's header, ungraded.
             lines.push(Line::from(vec![
                 Span::styled("  Permissions: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    permissions_policy.clone(),
-                    Style::default().fg(if permissions_policy != "missing" { theme::GOOD } else { theme::WARN }),
-                ),
+                Span::styled(permissions_policy.clone(), Style::default().fg(theme::MUTED)),
             ]));
 
             // CSP: Observatory's result for the graded host; the policy below is the target's own.
@@ -1683,6 +1677,34 @@ mod tests {
             !zoomed.contains("Missing") && !zoomed.contains("Vulnerabilities"),
             "{zoomed}"
         );
+    }
+
+    /// Observatory has no test for X-XSS-Protection or Permissions-Policy, so those rows carry no
+    /// verdict: present or missing, the target's header reads `MUTED`, never `GOOD` or `WARN`.
+    #[test]
+    fn xss_protect_and_permissions_rows_are_muted_present_or_missing() {
+        let pane = SecurityPane::new();
+        let missing = http_state_with_policies(ObservatoryOutcome::Graded(google_com_result()));
+        let out = crate::tui::testing::render_pane(&pane, &missing, 120, 80, false);
+        assert!(
+            out.contains("XSS-Protect: missing") && out.contains("Permissions: missing"),
+            "{out}"
+        );
+        let buffer = crate::tui::testing::render_buffer(&pane, &missing, 120, 80, false);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "missing"), theme::MUTED);
+
+        let present = http_state_with_policies(ObservatoryOutcome::Graded(google_com_result()));
+        if let Some(mut scan) = present.scanners.get_mut("http")
+            && let Some(ScanResult::Http(http)) = scan.result.as_mut()
+            && let Some(data) = http.ipv4_result.as_mut()
+        {
+            data.security_headers.x_xss_protection = Some("1; mode=block".to_string());
+            data.security_headers.permissions_policy = Some("geolocation=()".to_string());
+        }
+        let buffer = crate::tui::testing::render_buffer(&pane, &present, 120, 80, false);
+        for value in ["1; mode=block", "geolocation=()"] {
+            assert_eq!(crate::tui::testing::fg_of(&buffer, value), theme::MUTED, "{value}");
+        }
     }
 
     /// With no grade there is no verdict: the rows show what the target sent, uncolored.
