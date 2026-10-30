@@ -1,9 +1,10 @@
-//! Fetched data files the scanners cache on disk: the public suffix list (WHOIS and DNS) and the
-//! IANA RDAP bootstrap (WHOIS). Both change faster than the code, so they are fetched, not compiled
-//! in.
+//! Fetched data files the scanners cache on disk: the public suffix list (WHOIS and DNS), the
+//! IANA RDAP bootstrap (WHOIS) and the Chromium HSTS preload list (HTTP). They change faster than
+//! the code, so they are fetched, not compiled in.
 
 use reqwest::Client;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -51,6 +52,16 @@ impl CachedSource<'_> {
         deadline: tokio::time::Instant,
         parse: impl Fn(&str) -> eyre::Result<T>,
     ) -> eyre::Result<T> {
+        self.load_aged(deadline, parse).await.map(|(value, _)| value)
+    }
+
+    /// [`load`](Self::load), with the age of what it returned: the cache file's age, or zero for
+    /// a fresh fetch.
+    pub async fn load_aged<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        parse: impl Fn(&str) -> eyre::Result<T>,
+    ) -> eyre::Result<(T, Duration)> {
         log::debug!(
             "[scan::cache] load: file={} url={} cache_dir={:?}",
             self.file_name,
@@ -66,18 +77,13 @@ impl CachedSource<'_> {
                     self.file_name,
                     age.as_secs()
                 );
-                return Ok(value);
+                return Ok((value, age));
             }
             other => other,
         };
 
-        let fetched = self.bounded_fetch(deadline).await.map_err(|failure| failure.error);
-        let refresh_error = match fetched.and_then(|text| parse(&text).map(|value| (text, value))) {
-            Ok((text, value)) => {
-                self.write_cache(&text).await;
-                log::debug!("[scan::cache] fetched: file={} bytes={}", self.file_name, text.len());
-                return Ok(value);
-            }
+        let refresh_error = match self.refresh(deadline, &parse).await {
+            Ok(value) => return Ok((value, Duration::ZERO)),
             Err(e) => e,
         };
 
@@ -89,7 +95,7 @@ impl CachedSource<'_> {
                     age.as_secs(),
                     refresh_error
                 );
-                Ok(value)
+                Ok((value, age))
             }
             None => {
                 log::warn!(
@@ -100,6 +106,20 @@ impl CachedSource<'_> {
                 Err(refresh_error)
             }
         }
+    }
+
+    /// A fetch within `deadline`, parsed, and written to the cache only when it parses. Reads no
+    /// cache: the caller already holds a copy.
+    pub async fn refresh<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        parse: impl Fn(&str) -> eyre::Result<T>,
+    ) -> eyre::Result<T> {
+        let fetched = self.bounded_fetch(deadline).await.map_err(|failure| failure.error)?;
+        let value = parse(&fetched)?;
+        self.write_cache(&fetched).await;
+        log::debug!("[scan::cache] fetched: file={} bytes={}", self.file_name, fetched.len());
+        Ok(value)
     }
 
     fn cache_path(&self) -> Option<PathBuf> {
@@ -257,6 +277,84 @@ impl CachedSource<'_> {
                 e
             );
         }
+    }
+}
+
+/// A parsed cached file held in memory, re-read only when its copy has aged past
+/// [`CACHE_MAX_AGE`]: for a file too large to parse on every scan. A failed refresh keeps the copy
+/// in memory and the next call tries again.
+#[derive(Debug)]
+pub struct Refreshing<T> {
+    held: tokio::sync::Mutex<Option<Held<T>>>,
+}
+
+#[derive(Debug)]
+struct Held<T> {
+    value: Arc<T>,
+    /// When the copy reaches `CACHE_MAX_AGE`.
+    due: tokio::time::Instant,
+}
+
+impl<T> Default for Refreshing<T> {
+    fn default() -> Self {
+        Self {
+            held: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl<T> Refreshing<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The copy in memory while it is younger than `CACHE_MAX_AGE`. Past that, a refresh is
+    /// attempted (a [`CachedSource::load`] when nothing is held yet); a failed refresh returns the
+    /// copy in memory, of any age. `Err` only when nothing was ever loaded.
+    pub async fn get(
+        &self,
+        source: &CachedSource<'_>,
+        deadline: tokio::time::Instant,
+        parse: impl Fn(&str) -> eyre::Result<T>,
+    ) -> eyre::Result<Arc<T>> {
+        let mut held = self.held.lock().await;
+        let now = tokio::time::Instant::now();
+        match held.as_ref() {
+            Some(copy) if now < copy.due => {
+                log::debug!("[scan::cache] refreshing_hit: file={}", source.file_name);
+                return Ok(copy.value.clone());
+            }
+            Some(copy) => match source.refresh(deadline, &parse).await {
+                Ok(value) => {
+                    log::debug!("[scan::cache] refreshing_refreshed: file={}", source.file_name);
+                    *held = Some(Held {
+                        value: Arc::new(value),
+                        due: now + CACHE_MAX_AGE,
+                    });
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[scan::cache] refreshing_failed_keeping_copy: file={} error={:#}",
+                        source.file_name,
+                        e
+                    );
+                    return Ok(copy.value.clone());
+                }
+            },
+            None => {
+                let (value, age) = source.load_aged(deadline, &parse).await?;
+                log::debug!(
+                    "[scan::cache] refreshing_loaded: file={} age={}s",
+                    source.file_name,
+                    age.as_secs()
+                );
+                *held = Some(Held {
+                    value: Arc::new(value),
+                    due: now + CACHE_MAX_AGE.saturating_sub(age),
+                });
+            }
+        }
+        Ok(held.as_ref().expect("held was just set").value.clone())
     }
 }
 
@@ -576,6 +674,90 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A parse that counts its calls.
+    fn counting(calls: &AtomicU64) -> impl Fn(&str) -> eyre::Result<String> + '_ {
+        move |text| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            parse_nonempty(text)
+        }
+    }
+
+    /// The copy is parsed once and served from memory while fresh.
+    #[tokio::test]
+    async fn refreshing_parses_once_while_fresh() {
+        let fake = FakeHttp::start(vec![("/data", 200, "ok:one".to_string())]).await;
+        let dir = temp_dir("refreshing-fresh");
+        let client = Client::builder().no_proxy().build().unwrap();
+        let url = fake.url("/data");
+        let held = Refreshing::new();
+        let calls = AtomicU64::new(0);
+
+        let first = held
+            .get(&source(&client, &url, &dir), deadline(), counting(&calls))
+            .await
+            .unwrap();
+        let second = held
+            .get(&source(&client, &url, &dir), deadline(), counting(&calls))
+            .await
+            .unwrap();
+
+        assert_eq!(*first, "ok:one");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.hits("/data"), 1);
+    }
+
+    /// A copy past 24h: each call attempts a refresh, a failed one keeps the copy in memory with
+    /// no re-read of the disk, and a successful one replaces it, after which it is fresh again.
+    #[tokio::test]
+    async fn refreshing_retries_a_stale_copy_and_keeps_it_on_failure() {
+        let fake = FakeHttp::start(vec![("/down", 500, String::new()), ("/up", 200, "ok:new".to_string())]).await;
+        let dir = temp_dir("refreshing-stale");
+        std::fs::write(dir.join("data.txt"), "ok:old").unwrap();
+        set_age(&dir.join("data.txt"), CACHE_MAX_AGE + Duration::from_secs(3600));
+        let client = Client::builder().no_proxy().build().unwrap();
+        let (down, up) = (fake.url("/down"), fake.url("/up"));
+        let held = Refreshing::new();
+        let calls = AtomicU64::new(0);
+
+        let first = held
+            .get(&source(&client, &down, &dir), deadline(), counting(&calls))
+            .await
+            .unwrap();
+        let second = held
+            .get(&source(&client, &down, &dir), deadline(), counting(&calls))
+            .await
+            .unwrap();
+        assert_eq!((first.as_str(), second.as_str()), ("ok:old", "ok:old"));
+        assert_eq!(fake.hits("/down"), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the stale copy is parsed once");
+
+        let third = held
+            .get(&source(&client, &up, &dir), deadline(), counting(&calls))
+            .await
+            .unwrap();
+        assert_eq!(*third, "ok:new");
+        let fourth = held
+            .get(&source(&client, &down, &dir), deadline(), counting(&calls))
+            .await
+            .unwrap();
+        assert_eq!(*fourth, "ok:new");
+        assert_eq!(fake.hits("/down"), 2, "a fresh copy makes no fetch");
+    }
+
+    #[tokio::test]
+    async fn refreshing_with_no_copy_and_no_fetch_is_an_error() {
+        let url = dead_http_url().await;
+        let dir = temp_dir("refreshing-none");
+        let client = Client::builder().no_proxy().build().unwrap();
+        let held: Refreshing<String> = Refreshing::new();
+        assert!(
+            held.get(&source(&client, &url, &dir), deadline(), parse_nonempty)
+                .await
+                .is_err()
         );
     }
 }

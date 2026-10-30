@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// Derived from mdn/mdn-http-observatory at commit 2776308 (analyzeScan in src/scanner/index.js,
+// Derived from mdn/mdn-http-observatory at commit 2776308 (scan and analyzeScan in src/scanner/index.js,
 // src/constants.js, onlyIfWorse in src/analyzer/utils.js).
 
 //! A port of MDN HTTP Observatory's analyzers and grader: the 12 tests run over one
@@ -25,6 +25,7 @@ pub mod js;
 pub mod redirection;
 pub mod referrer;
 pub mod retriever;
+pub mod session;
 pub mod sri;
 pub mod structured;
 pub mod types;
@@ -33,7 +34,7 @@ pub mod xfo;
 
 pub use grade::GradeLetter;
 pub use hsts::HstsPreload;
-pub use retriever::Retrieval;
+pub use retriever::{Retrieval, Retriever};
 pub use sri::RegistrableDomain;
 pub use types::Expectation;
 
@@ -110,6 +111,32 @@ fn test_result(name: &'static str, result: Expectation, pass: bool) -> TestResul
         score_modifier: grade::score_modifier(result),
         pass,
     }
+}
+
+/// The public suffix lists a scan reads: the ICANN section alone (`tldts` defaults, the SRI test)
+/// and ICANN plus private (tough-cookie's jar rules).
+#[derive(Clone, Copy)]
+pub struct SuffixLists<'a> {
+    pub icann: &'a (dyn RegistrableDomain + Sync),
+    pub all: &'a (dyn RegistrableDomain + Sync),
+}
+
+/// `scan(site)`: retrieve, then [`analyze`].
+pub async fn observe(
+    retriever: &Retriever,
+    host: &str,
+    preload: &HstsPreload,
+    lists: SuffixLists<'_>,
+) -> Result<ObservatoryResult, AnalyzeError> {
+    log::debug!("[observatory] observe: host={}", host);
+    let retrieval = retriever.retrieve(host, lists.all).await?;
+    let result = analyze(&retrieval, preload, lists.icann);
+    log::debug!(
+        "[observatory] observe: host={} outcome={:?}",
+        host,
+        result.as_ref().map(|r| (r.score, r.grade))
+    );
+    result
 }
 
 /// `analyzeScan`: the status gate, the 12 tests, the score and the grade.

@@ -9,8 +9,10 @@
 //! `Secure`, `HttpOnly` and `SameSite`; the worst finding wins.
 
 mod cookie;
+mod jar;
 
 pub use cookie::{Cookie, SameSite};
+pub use jar::{CookieJar, parse_date};
 
 use super::headers::{SET_COOKIE, get_http_headers};
 use super::hsts::{HstsPreload, strict_transport_security_test};

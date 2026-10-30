@@ -648,3 +648,100 @@ observatory`, restore), with the tests it broke:
   the full MIT/BSD license texts (e.g. a `THIRD-PARTY-NOTICES` file)?
 - `README.md` gained a License section (the repo's README was two lines); Scott may want different
   wording.
+
+## Phase 5: Retriever and HSTS preload
+
+`src/scan/observatory/session.rs` (session.js), `session/transport.rs` (the HTTP layer under it),
+`cookies/jar.rs` (tough-cookie's store rules), the retriever in `retriever.rs` (retriever.js),
+`observe` in `observatory.rs`, the Chromium list and `PreloadSource` in `hsts.rs`, `Refreshing<T>`
+in `src/scan/cache.rs`, and `FakeHttp`/`TestCa` in `src/scan/testing.rs`. Every derived file
+carries the MPL-2.0 header. Nothing is wired into `HttpScanner` or the TUI (Phase 6).
+
+Read end to end before writing: `retriever.js`, `session.js`, `url.js`, `utils.js`,
+`scanner/index.js`, `retrieve-hsts.js`, `analyzer/hsts.js`, and from `node_modules` tough-cookie
+5.1.2 (`cookieJar.js`, `memstore.js`, `permuteDomain.js`, `getPublicSuffix.js`, `domainMatch.js`,
+`canonicalDomain.js`, `defaultPath.js`, `pathMatch.js`, `parseDate.js`), http-cookie-agent 8.0.0's
+cookie glue and axios 1.20.0's http adapter (decompression, `stripBOM`).
+
+Live check (temporary `#[ignore]` test, not committed; Phase 6 owns the live test), 2026-10-30,
+from talos: `observe` with `Retriever::standard()`, the cached public suffix list and Chromium's list
+fetched the same hour (10614168 bytes, sha256 `d132107c...2486c`, parses in 27 ms): google.com C- 45,
+github.com A+ 115, www.tatari.tv B 75, example.com F 10, mozilla.org B+ 80, all 12 results and
+modifiers equal to Phase 0b's API table for each host.
+
+Success criteria (all tests, `cargo test --lib`, 758 passing):
+
+| Criterion | Test(s) | Result |
+|---|---|---|
+| Eight redirection results via FakeHttp | `retriever::tests::network::redirection_{to_https,all_redirects_preloaded,not_needed_no_http,off_host_from_http,not_to_https_on_initial_redirection,not_to_https,missing}`, `untrusted_certificate_grades_unverified_and_the_jar_survives_the_retry` (invalid-cert) | pass |
+| Two STS headers -> `hsts-header-invalid` | `two_sts_headers_grade_hsts_header_invalid` | pass |
+| Untrusted cert -> `verified=false`, jar survives the retry | `untrusted_certificate_grades_unverified_and_the_jar_survives_the_retry` | pass |
+| robots.txt cookie only on the fallback path | `robots_cookie_reaches_the_jar_only_on_the_fallback_path` | pass |
+| 500 -> unexpected status | `a_500_is_an_unexpected_status` (`Err(AnalyzeError::UnexpectedStatusCode(500))`) | pass, data level |
+| Five preload fixtures | `preload_fixtures_grade_through_the_chromium_list` (Chromium-format JSON through `parse_chromium`, full retrieval per host) | pass |
+| No cache + dead URL: same result and score as a list lacking the host, `preload_available=false` | `an_unavailable_list_scores_as_a_list_lacking_the_host`, `no_cache_and_a_dead_url_is_the_unavailable_list` | pass, data level; the `· preload list unavailable` grade-line text is Phase 6 display |
+| Stalled https session hits its 10s cap, scan returns within 35s, paused time | `retriever::tests::budget::a_stalled_https_session_hits_its_cap_and_the_scan_still_returns` (returns graded at exactly 28 s), `session::tests::slow_hops_end_at_the_session_cap` (10 s) | pass; the target observation half is Phase 6 |
+
+### Design decisions
+- A transport port, `session::Transport` (`send(OutgoingRequest) -> IncomingResponse`), with `ReqwestTransport` as the production implementation: `session.rs:run`, `session/transport.rs`. Redirects, cookies, the certificate retry and both timeouts live in the session logic, as they do in session.js on top of Node's agents. The same logic runs over loopback sockets in the FakeHttp tests and over a scripted transport in the paused-time tests.
+- `ReqwestTransport` builds two clients from `TransportOptions` (`built_in_roots`, `extra_roots` DER, `resolve`, `env_proxy`): `Policy::none`, `http1_only`, no pool reuse, one verifying and one with `danger_accept_invalid_certs` (`rejectUnauthorized` true/false). That builder is where a test CA is injected. `env_proxy` defaults on because axios honors `HTTP_PROXY`/`HTTPS_PROXY`; tests turn it off.
+- Request shape exactly as Phase 0b recorded: session hops send Observatory's UA, `Accept`, `Accept-Encoding: gzip, compress, deflate, br`, `Connection: close` and the jar's `Cookie`; robots.txt and the preflight send `Connection: keep-alive` and their own `Accept`/`Origin`/`Access-Control-Request-Method`: `session.rs:follow`, `SessionRun::auxiliary`. reqwest's `brotli` and `deflate` features were enabled (`cargo add`) so bodies decode as axios's do; reqwest decodes on the response's `Content-Encoding` whatever request header was set.
+- Certificate errors are any rustls `InvalidCertificate` in the error chain: `transport.rs:certificate_error`. hyper-util wraps an `io::Error` (Other) around tokio-rustls's `io::Error` (InvalidData) around the rustls error, and `io::Error::source()` skips what it wraps, so the walk descends through `get_ref` (found by logging the chain when the first version missed it).
+- The retry (`session.rs:init`) clears the history, keeps the jar and the redirect count, flips to the non-verifying client, and stays under the original 10 s session deadline (the axios `signal` is copied into the retry's instance). The auxiliary client then switches too (`Aux::Fallback`): non-verifying, the jar on https requests only (the fallback client sets `httpsAgent` alone), its own 10 s deadline from the retry, and a 2xx answer pushed onto the session's history by the interceptor the retry attaches. So on the fallback path robots.txt joins `httpsRedirects` and the preflight goes to robots.txt (`redirectHistory.at(-1)`); `robots_cookie_reaches_the_jar_only_on_the_fallback_path` pins both.
+- Auxiliary requests follow redirects the follow-redirects way (any 3xx with a `Location`, at most 10, a 303 turns OPTIONS into GET) and keep axios's default `validateStatus`: a non-2xx final answer is `None`, which is how a 405 preflight becomes `cors = null` (Phase 0b).
+- A missing `Location` resolves as `undefined` (`new URL(undefined, base)`), an unusable one fails the session, and after 10 followed redirects the 11th redirect answer is the session's response: `session.rs:follow`.
+- Response headers are joined the Node way (`session.rs:node_headers`): `set-cookie` always a list, Node's 18 first-wins names keep the first value, `cookie` joins with `"; "`, everything else with `", "`. Header values are latin1 both ways (`transport.rs:latin1_decode`/`latin1_encode`), as Node reads and writes them. Bodies are lossy UTF-8 with a leading BOM stripped (`decode_body`).
+- `CookieJar` (`cookies/jar.rs`) mirrors tough-cookie as http-cookie-agent drives it (`setCookieSync(.., { ignoreError: true })`, `getCookiesSync` for the header): public-suffix rejection with RFC 6761 special-use names allowed, `domainMatch`, `hostOnly`, `defaultPath`, `__Secure-`/`__Host-` prefixes, replacement in place by (domain, path, key), expired cookies stored. Read from the source and not in Phase 0c: `getCookies` removes an expired cookie from the store when a later request's lookup matches it, so an expired cookie set on a redirect hop is gone from the jar if a later hop's request matches it. The port does the same (`cookie_header`), with `parseDate` ported for the expiry check.
+- tough-cookie's `getPublicSuffix` calls tldts `getDomain` with the private section on; the SRI test's tldts call is ICANN only. `observe` takes `SuffixLists { icann, all }` and the retriever passes `all` to the jars: `observatory.rs:observe`.
+- `is_html` copies `headers["content-type"]?.split(";", 1)[0]` against `HTML_TYPES` with no trim or lowercasing: `retriever.rs:is_html`.
+- `Retriever::with_ports` mirrors upstream's `httpPort`/`httpsPort` options; the tests use it to reach fakes on ephemeral ports, with every test name resolved to 127.0.0.1 through `TransportOptions::resolve`.
+- `parse_chromium` (`hsts.rs`) is `retrieveAndStoreHsts`'s parse: `//` to end of line stripped everywhere (inside strings too, which breaks such a file as upstream's regex does), names trimmed and lowercased, a later duplicate winning, `mode == "force-https"`, `!!include_subdomains`. The cached file is Chromium's raw JSON; the parsed list is held in memory.
+- `PreloadSource` (`hsts.rs`) owns the copy for its lifetime through `cache.rs:Refreshing<T>`: the first `get` loads through `CachedSource::load_aged` (cache if fresh, else fetch, else a stale cache); after that the in-memory copy is served until it reaches 24 h, then each `get` attempts `CachedSource::refresh` (fetch only, no disk re-read) and keeps the copy on failure. With no copy at all, `get` returns `HstsPreload::unavailable()`, so a missing list is never an empty one.
+- `FakeHttp` gained `FakeRoute` (method, `Host`, path, status, repeated headers, bytes body, `stall`), a request log with headers (`FakeRequest`), `start_tls` with a `TestCa`-issued `ServerIdentity` (openssl-built CA and SAN leaf, tokio-rustls acceptor), and `port()`. It now stops when dropped instead of after 5 s without a request, so a slow test never loses its server; every existing caller keeps the server bound for the test's life.
+
+### Deviations
+- `observe(retriever, host, preload, lists) -> Result<ObservatoryResult, AnalyzeError>` instead of the doc's `observe(host, pin, preload) -> ObservatoryResult`. Same effect, correct seam: `pin` was dropped by the 2026-10-30 no-per-family decision; there is no result for a site that is down or answers an unexpected status (`analyze` already returns `Result`, Phase 4); the retriever carries the client builder the doc asks the test CA to go through; the jar needs the suffix lists.
+- Timeouts: axios's `timeout` (9 s) is Node's socket idle timeout, the port's is 9 s total per request, which is what the doc's budget says. They differ only for a server that keeps trickling bytes past 9 s; the 10 s session cap bounds both.
+- The stall criterion runs over a scripted transport, not FakeHttp: with paused time tokio advances the clock whenever the runtime is idle, including while a socket read is pending, so a loopback fake would race the clock. FakeHttp covers the socket paths with the clock running. The 35 s inner budget and the "target observation" half belong to `HttpScanner` (Phase 6); this phase shows the Observatory part returns at 28 s, the doc's worst case.
+- "500 gives `Failed(unexpected status)`" and "the grade line shows `preload list unavailable`" are asserted at the data level (`AnalyzeError::UnexpectedStatusCode(500)`, `preload_available == false`); `ObservatoryOutcome` and the grade line are Phase 6.
+- Bodies: reqwest decodes `gzip`, `deflate` and `br` only. axios also decodes `x-gzip`, `compress`, `x-compress` and (where Node has it) `zstd`; such a body stays encoded here. axios's `forcedJSONParsing` turns a JSON-parseable body into an object, the port keeps the text; it matters only for a JSON-parseable body served as `text/html`.
+- reqwest's decoder drops `Content-Length` from a decoded response, where axios keeps it, and reorders names after removing `Content-Encoding`. No analyzer reads either.
+- Enabling reqwest's `brotli`/`deflate` also changes the existing `HttpScanner` client's automatic `Accept-Encoding` (now `gzip, br, deflate`). Its request is replaced in Phase 6.
+- The `Cookie` header orders by path length then creation, one value per key; tough-cookie's own order also depends on its store's object-key order. Only what servers receive can differ; nothing is graded on it.
+- `canonicalDomain`'s IPv6 handling is approximated by an `Ipv6Addr` parse (brackets stripped).
+
+### Tradeoffs
+- A transport trait vs reqwest's `cookie_store` and redirect policy: reqwest cannot express the retry's "same jar, cleared history, new client" or the aux client's jar-on-https-only, and the trait makes the budget testable in paused time.
+- Generic `Refreshing<T>` in `cache.rs` vs a preload-only holder: the rule (parse once per refresh, keep the copy on failure) is about the cache, not HSTS, and the suffix list re-parse Phase 0 flagged could use it.
+- Bite proofs ran as scripted string mutations of the working tree with `cargo test --lib`, then restored. Every undo below broke at least one test:
+
+| Fix undone | Failing tests |
+|---|---|
+| certificate walk without `get_ref` descent | `transport::invalid_certificate_inside_an_io_error_is_a_certificate_error`, `robots_cookie_reaches_the_jar_only_on_the_fallback_path`, `untrusted_certificate_grades_unverified_and_the_jar_survives_the_retry` |
+| retry resets the jar | `untrusted_certificate_grades_unverified_and_the_jar_survives_the_retry` |
+| retry keeps the history | `untrusted_certificate_grades_unverified_and_the_jar_survives_the_retry` |
+| normal-path aux client uses the jar | `robots_cookie_reaches_the_jar_only_on_the_fallback_path` |
+| aux answers recorded on the normal path | `auxiliary_follows_redirects_and_rejects_non_2xx`, `robots_cookie_reaches_the_jar_only_on_the_fallback_path` |
+| preflight to the start URL, not the history's last hop | `robots_cookie_reaches_the_jar_only_on_the_fallback_path` |
+| duplicate headers: last wins | `duplicate_headers_join_the_node_way`, `two_sts_headers_grade_hsts_header_invalid` |
+| no 10 s session cap | `slow_hops_end_at_the_session_cap`, `a_stalled_https_session_hits_its_cap_and_the_scan_still_returns` |
+| no 9 s request timeout | `a_silent_request_ends_at_the_request_timeout` |
+| missing `Location` ends the chain | `a_redirect_without_location_goes_to_undefined` |
+| redirect limit off by one | `ten_redirects_are_followed_and_the_eleventh_is_the_response` |
+| redirects never followed | 11 tests, incl. `redirection_to_https`, `redirection_off_host_from_http`, `redirection_not_to_https_on_initial_redirection`, `redirection_not_to_https` |
+| non-2xx aux answer kept | `auxiliary_follows_redirects_and_rejects_non_2xx`, `a_non_2xx_preflight_is_no_cors_response`, `robots_cookie_reaches_the_jar_only_on_the_fallback_path` |
+| brotli decoding off | `a_brotli_body_is_decoded_and_its_meta_tags_read` |
+| preload names not trimmed/lowercased | `chromium_list_parses_with_comments_names_trimmed_and_lowercased`, `duplicates_take_the_last_entry_and_flags_follow_js_truthiness`, `preload_fixtures_grade_through_the_chromium_list` |
+| `mode` ignored | `chromium_list_parses_with_comments_names_trimmed_and_lowercased`, `preload_fixtures_grade_through_the_chromium_list` |
+| no comment stripping | `a_double_slash_inside_a_string_breaks_the_parse_as_upstream`, `chromium_list_parses_with_comments_names_trimmed_and_lowercased`, `preload_fixtures_grade_through_the_chromium_list`, `the_list_is_fetched_cached_and_parsed_once` |
+| no list -> empty list | `no_cache_and_a_dead_url_is_the_unavailable_list`, `an_unavailable_list_scores_as_a_list_lacking_the_host` |
+| failed refresh drops the copy | `refreshing_retries_a_stale_copy_and_keeps_it_on_failure` |
+| stale copy never refreshed | `refreshing_retries_a_stale_copy_and_keeps_it_on_failure` |
+| expired matches kept on lookup | `cookie_header_matches_and_drops_expired_matches` |
+| cross-domain cookie accepted | `cross_domain_cookies_are_rejected_and_parent_domains_kept` |
+| HTML type check lowercases | `html_type_is_the_exact_mime_before_the_first_semicolon` |
+| BOM kept | `body_is_lossy_utf8_without_a_bom` |
+
+### Open questions
+- Phase 6 must hand the jar an ICANN-plus-private suffix list (`publicsuffix::List`); `psl.rs` parses the ICANN section only (`IcannList`). Both can come from the one cached file.
+- The expired-cookie removal on a later matching request is ported from tough-cookie's source; Phase 0c's crafted server only measured cookies set on the last hop. A cross-hop check against the local CLI would confirm it.
