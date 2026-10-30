@@ -35,6 +35,78 @@ impl Default for WhoisPane {
     }
 }
 
+/// `<label>: <value>`, indented under a zoomed section.
+fn field_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
+        Span::styled(value, Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// A contact's fields, one row each; `redacted` when the registry withholds them.
+fn contact_lines(role: &str, contact: &crate::scan::whois::ContactInfo) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("👤 {role}{}", if contact.is_redacted { " (redacted)" } else { "" }),
+        Style::default().fg(Color::Cyan),
+    ))];
+    let fields = [
+        ("Name", &contact.name),
+        ("Organization", &contact.organization),
+        ("Email", &contact.email),
+        ("Phone", &contact.phone),
+        ("Address", &contact.address),
+    ];
+    for (label, value) in fields {
+        if let Some(value) = value {
+            lines.push(field_line(label, value.clone()));
+        }
+    }
+    lines
+}
+
+/// Zoomed only, after everything the grid shows: last update, DNSSEC, age, the registrar's
+/// details, and every contact.
+fn zoomed_lines(result: &crate::scan::whois::WhoisResult) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("")];
+    if let Some(updated) = &result.last_updated {
+        lines.push(field_line("Last updated", updated.format("%Y-%m-%d").to_string()));
+    }
+    lines.push(field_line(
+        "DNSSEC",
+        match result.dnssec {
+            Some(true) => "signed".to_string(),
+            Some(false) => "unsigned".to_string(),
+            None => "unknown".to_string(),
+        },
+    ));
+    if let Some(age) = result.domain_age_days {
+        lines.push(field_line("Age", format!("{age} days")));
+    }
+    if let Some(registrar) = &result.registrar {
+        if let Some(iana_id) = registrar.iana_id {
+            lines.push(field_line("Registrar IANA ID", iana_id.to_string()));
+        }
+        if let Some(url) = &registrar.url {
+            lines.push(field_line("Registrar URL", url.clone()));
+        }
+        if let Some(abuse) = &registrar.abuse_contact {
+            lines.extend(contact_lines("Registrar abuse", abuse));
+        }
+    }
+    let contacts = [
+        ("Registrant", &result.registrant),
+        ("Admin", &result.admin_contact),
+        ("Tech", &result.tech_contact),
+        ("Abuse", &result.abuse_contact),
+    ];
+    for (role, contact) in contacts {
+        if let Some(contact) = contact {
+            lines.extend(contact_lines(role, contact));
+        }
+    }
+    lines
+}
+
 impl Pane for WhoisPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::whois] content: width={} detail={:?}", width, detail);
@@ -215,6 +287,10 @@ impl Pane for WhoisPane {
                             Span::styled(risk_text, Style::default().fg(Color::Red)),
                         ]));
                     }
+                }
+
+                if detail == Detail::Zoomed {
+                    lines.extend(zoomed_lines(whois_result));
                 }
             } else {
                 // No WHOIS data available yet - check scanner status
@@ -423,5 +499,58 @@ mod tests {
         let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), 80, 30, false);
         assert!(out.contains("Privacy: organization only"), "{out}");
         assert!(!out.contains("Corporate"), "enum name leaked:\n{out}");
+    }
+
+    #[test]
+    fn zoomed_content_shows_every_field_and_contact() {
+        use crate::scan::whois::{ContactInfo, DataSource, NotApplicableReason, RegistrarInfo, WhoisResult};
+        use crate::tui::pane::Detail;
+        let mut result = WhoisResult::not_applicable("example.com".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.dnssec = Some(true);
+        result.last_updated = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+                .expect("date")
+                .into(),
+        );
+        result.registrar = Some(RegistrarInfo {
+            name: "Example Registrar".to_string(),
+            iana_id: Some(292),
+            abuse_contact: None,
+            url: Some("https://registrar.example".to_string()),
+        });
+        result.tech_contact = Some(ContactInfo {
+            name: None,
+            organization: Some("Example Org".to_string()),
+            email: Some("tech@example.com".to_string()),
+            phone: None,
+            address: None,
+            is_redacted: false,
+        });
+        result.registrant = Some(ContactInfo {
+            name: None,
+            organization: None,
+            email: None,
+            phone: None,
+            address: None,
+            is_redacted: true,
+        });
+        let state = state_with_whois(result);
+        let pane = WhoisPane::new();
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Zoomed).join("\n");
+        for expected in [
+            "Last updated: 2026-01-02",
+            "DNSSEC: signed",
+            "Registrar IANA ID: 292",
+            "Registrar URL: https://registrar.example",
+            "Registrant (redacted)",
+            "Tech",
+            "Organization: Example Org",
+            "Email: tech@example.com",
+        ] {
+            assert!(zoomed.contains(expected), "{expected}:\n{zoomed}");
+        }
+        let normal = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Normal).join("\n");
+        assert!(!normal.contains("DNSSEC"), "{normal}");
     }
 }

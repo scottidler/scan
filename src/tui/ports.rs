@@ -36,6 +36,28 @@ impl Default for PortsPane {
     }
 }
 
+/// Zoomed only, under an open port: the service version and banner it answered with, and its
+/// connect time.
+fn service_detail_lines(open_port: &crate::scan::port::OpenPort) -> Vec<Line<'static>> {
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("      {label}: "), Style::default().fg(Color::White)),
+            Span::styled(value, Style::default().fg(Color::Gray)),
+        ])
+    };
+    let mut lines = Vec::new();
+    if let Some(service) = &open_port.service {
+        if let Some(version) = &service.version {
+            lines.push(field("Version", version.clone()));
+        }
+        if let Some(banner) = &service.banner {
+            lines.push(field("Banner", banner.clone()));
+        }
+    }
+    lines.push(field("Connect", format!("{}ms", open_port.response_time.as_millis())));
+    lines
+}
+
 impl Pane for PortsPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::ports] content: width={} detail={:?}", width, detail);
@@ -107,12 +129,14 @@ impl Pane for PortsPane {
 
                         // Show open ports from all protocols (clean display)
                         let all_open_ports = port_result.get_all_open_ports();
+                        // The grid shows the first few; zoom shows every open port.
+                        let displayed_ports = if detail == Detail::Zoomed { usize::MAX } else { MAX_DISPLAYED_PORTS };
                         let mut ports_shown = 0;
                         // `ports_shown` gates an early break (display cap), not just an
                         // index, so `.enumerate()` would not preserve the loop semantics.
                         #[allow(clippy::explicit_counter_loop)]
                         for open_port in all_open_ports.iter() {
-                            if ports_shown >= MAX_DISPLAYED_PORTS {
+                            if ports_shown >= displayed_ports {
                                 break;
                             }
 
@@ -137,14 +161,17 @@ impl Pane for PortsPane {
                                 Span::styled(service_name, Style::default().fg(Color::Yellow)),
                                 Span::styled(")", Style::default().fg(Color::Gray)),
                             ]));
+                            if detail == Detail::Zoomed {
+                                result_lines.extend(service_detail_lines(open_port));
+                            }
                             ports_shown += 1;
                         }
 
-                        if all_open_ports.len() > MAX_DISPLAYED_PORTS {
+                        if all_open_ports.len() > displayed_ports {
                             result_lines.push(Line::from(vec![
                                 Span::styled("   ", Style::default()),
                                 Span::styled(
-                                    format!("... and {} more", all_open_ports.len() - MAX_DISPLAYED_PORTS),
+                                    format!("... and {} more", all_open_ports.len() - displayed_ports),
                                     Style::default().fg(Color::Gray),
                                 ),
                             ]));
@@ -360,5 +387,59 @@ mod tests {
         assert!(out.contains("refreshing"), "{out}");
         assert!(!out.contains("Progress:"), "{out}");
         assert!(!out.contains("Scanned: completed"), "{out}");
+    }
+
+    #[test]
+    fn zoomed_content_shows_every_open_port_with_version_and_banner() {
+        use crate::scan::port::{
+            OpenPort, PortData, PortResult, PortState, PortStatus, ScanMode, ServiceInfo, Transport,
+        };
+        use crate::tui::pane::Detail;
+        let count = MAX_DISPLAYED_PORTS + 2;
+        let open_ports: Vec<OpenPort> = (0..count)
+            .map(|n| OpenPort {
+                port: 8000 + n as u16,
+                transport: Transport::Tcp,
+                state: PortState::Open,
+                service: Some(ServiceInfo {
+                    name: "http".to_string(),
+                    version: Some(format!("nginx/1.{n}")),
+                    banner: Some(format!("banner {n}")),
+                    confidence: 1.0,
+                }),
+                response_time: std::time::Duration::from_millis(5),
+            })
+            .collect();
+        let mut result = PortResult::new();
+        result.ipv4_status = PortStatus::Success(count);
+        result.ipv4_result = Some(PortData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            open_ports,
+            closed_ports: 0,
+            filtered_ports: 0,
+            scan_duration: std::time::Duration::from_millis(50),
+            scan_mode: ScanMode::Quick,
+        });
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "port".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Port(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let pane = PortsPane::new();
+        let last = 8000 + count as u16 - 1;
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed).join("\n");
+        assert!(zoomed.contains(&format!("{last}/tcp")), "{zoomed}");
+        assert!(zoomed.contains(&format!("Version: nginx/1.{}", count - 1)), "{zoomed}");
+        assert!(zoomed.contains(&format!("Banner: banner {}", count - 1)), "{zoomed}");
+        assert!(!zoomed.contains("more"), "{zoomed}");
+        let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
+        assert!(!normal.contains(&format!("{last}/tcp")), "{normal}");
+        assert!(normal.contains("... and 2 more"), "{normal}");
     }
 }

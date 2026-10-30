@@ -49,6 +49,11 @@ impl SparklineData {
         self.samples.back().map(|(_, micros)| *micros)
     }
 
+    /// Every kept sample, oldest first.
+    pub fn all(&self) -> Vec<Sample> {
+        self.samples.iter().copied().collect()
+    }
+
     /// The newest `width` samples, oldest first.
     pub fn visible(&self, width: usize) -> Vec<Sample> {
         let skip = self.samples.len().saturating_sub(width);
@@ -63,6 +68,31 @@ pub fn average_us(samples: &[Sample]) -> Option<u64> {
         return None;
     }
     Some(replies.iter().sum::<u64>() / replies.len() as u64)
+}
+
+/// Percent of `samples` that got no reply, rounded; `None` with no samples.
+pub fn loss_percent(samples: &[Sample]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let lost = samples.iter().filter(|(_, micros)| micros.is_none()).count() as u64;
+    Some((lost * 100 + samples.len() as u64 / 2) / samples.len() as u64)
+}
+
+/// Mean absolute difference, in µs, between the round trips of consecutive cycles that both got a
+/// reply; `None` when no two consecutive cycles did.
+pub fn jitter_us(samples: &[Sample]) -> Option<u64> {
+    let deltas: Vec<u64> = samples
+        .windows(2)
+        .filter_map(|pair| match (pair[0].1, pair[1].1) {
+            (Some(a), Some(b)) => Some(a.abs_diff(b)),
+            _ => None,
+        })
+        .collect();
+    if deltas.is_empty() {
+        return None;
+    }
+    Some(deltas.iter().sum::<u64>() / deltas.len() as u64)
 }
 
 /// The smallest scale step at or above the largest successful sample, in µs. 1ms when none succeeded.
@@ -238,5 +268,36 @@ mod tests {
             Some('▁'),
             "older sample not left of newest: {drawn:?}"
         );
+    }
+
+    #[test]
+    fn loss_percent_counts_failed_cycles() {
+        assert_eq!(loss_percent(&[]), None);
+        assert_eq!(loss_percent(&samples(&[Some(1), None, Some(1), Some(1)])), Some(25));
+        assert_eq!(loss_percent(&samples(&[None, None])), Some(100));
+        assert_eq!(loss_percent(&samples(&[Some(1), None, None])), Some(67));
+    }
+
+    #[test]
+    fn jitter_averages_consecutive_reply_differences_and_skips_failures() {
+        assert_eq!(jitter_us(&samples(&[Some(1000)])), None);
+        assert_eq!(jitter_us(&samples(&[Some(1000), None, Some(5000)])), None);
+        // 1000 -> 3000 -> 2000: differences 2000 and 1000.
+        assert_eq!(jitter_us(&samples(&[Some(1000), Some(3000), Some(2000)])), Some(1500));
+        assert_eq!(
+            jitter_us(&samples(&[Some(1000), Some(3000), None, Some(9000)])),
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn all_returns_every_kept_sample_oldest_first() {
+        let mut data = SparklineData::new(3);
+        let start = Instant::now();
+        for ms in 1..=4u64 {
+            data.add_sample(start + Duration::from_secs(ms), Some(Duration::from_millis(ms)));
+        }
+        let micros: Vec<Option<u64>> = data.all().iter().map(|(_, micros)| *micros).collect();
+        assert_eq!(micros, vec![Some(2000), Some(3000), Some(4000)]);
     }
 }

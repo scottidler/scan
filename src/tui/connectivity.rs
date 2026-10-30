@@ -2,7 +2,9 @@ use crate::scan::Family;
 use crate::scan::ping::{PingResult, PingStatus};
 use crate::target::Protocol;
 use crate::tui::pane::{Detail, Pane, create_block};
-use crate::tui::sparkline::{Sample, SparklineData, average_us, bars_newest_first, scale_max_us, span};
+use crate::tui::sparkline::{
+    Sample, SparklineData, average_us, bars_newest_first, jitter_us, loss_percent, scale_max_us, span,
+};
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
@@ -145,6 +147,13 @@ fn latest_text(latest: Option<Option<u64>>) -> String {
         Some(None) => "✗".to_string(),
         None => "---".to_string(),
     }
+}
+
+/// `loss N% · jitter Xms` over `samples`, `---` for what they cannot tell.
+fn loss_and_jitter(samples: &[Sample]) -> String {
+    let loss = loss_percent(samples).map_or_else(|| "---".to_string(), |percent| format!("{percent}%"));
+    let jitter = jitter_us(samples).map_or_else(|| "---".to_string(), format_latency);
+    format!("loss {loss} · jitter {jitter}")
 }
 
 /// One family's state and history, snapshotted for a render.
@@ -543,11 +552,18 @@ impl Pane for ConnectivityPane {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
+        self.render_detail(frame, area, state, focused, Detail::Normal);
+    }
+
+    /// Zoomed, the graphs take the full frame and each family's title adds loss and jitter over
+    /// every kept sample, not just the visible ones.
+    fn render_detail(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool, detail: Detail) {
         log::trace!(
-            "[tui::connectivity] render: area={}x{} focused={}",
+            "[tui::connectivity] render_detail: area={}x{} focused={} detail={:?}",
             area.width,
             area.height,
-            focused
+            focused,
+            detail
         );
 
         let block = create_block(self.title, focused);
@@ -608,6 +624,12 @@ impl Pane for ConnectivityPane {
                         Span::styled(format!("{} ", view.family), Style::default().fg(Color::White)),
                         Span::styled(state_text, Style::default().fg(view.title_color())),
                     ];
+                    if detail == Detail::Zoomed {
+                        spans.push(Span::styled(
+                            format!(" │ {}", loss_and_jitter(&view.data.all())),
+                            Style::default().fg(Color::Gray),
+                        ));
+                    }
                     if !visible.is_empty() {
                         let has_reply = visible.iter().any(|(_, micros)| micros.is_some());
                         let scale = if has_reply {
@@ -1164,5 +1186,48 @@ mod tests {
         let out = render_cycles(&pane, &pings, width, height);
         assert!(out.contains("scale 0-"), "title lost its scale:\n{out}");
         assert!(!out.contains('…'), "title clipped at 200 columns:\n{out}");
+    }
+
+    #[test]
+    fn zoomed_render_adds_loss_and_jitter_over_every_sample() {
+        let pane = ConnectivityPane::new();
+        let start = Instant::now();
+        // Four cycles: 10ms, 14ms, a failure, 12ms. Loss 25%; jitter |14-10| = 4ms.
+        let statuses = [
+            PingStatus::Success(Duration::from_millis(10)),
+            PingStatus::Success(Duration::from_millis(14)),
+            PingStatus::Failed(PingFailure::NoReply),
+            PingStatus::Success(Duration::from_millis(12)),
+        ];
+        let mut state = AppState::new("example.com".to_string());
+        for (n, status) in statuses.into_iter().enumerate() {
+            let mut ping = PingResult::new();
+            ping.ipv4_status = status;
+            ping.ipv6_status = PingStatus::NoAddress;
+            ping.queried_at = start + Duration::from_secs(n as u64);
+            state = state_with_ping(ping);
+            pane.ingest(&state);
+        }
+        let draw = |detail: Detail| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).expect("terminal");
+            terminal
+                .draw(|frame| pane.render_detail(frame, frame.area(), &state, true, detail))
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..120)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let zoomed = draw(Detail::Zoomed);
+        assert!(zoomed.contains("loss 25% · jitter 4ms"), "{zoomed}");
+        // IPv6 has no address, so no samples: nothing to measure.
+        assert!(zoomed.contains("loss --- · jitter ---"), "{zoomed}");
+        let normal = draw(Detail::Normal);
+        assert!(!normal.contains("loss"), "{normal}");
     }
 }

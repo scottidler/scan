@@ -33,8 +33,10 @@ impl SecurityPane {
     }
 
     /// The pane's logical lines, before they are laid out as rows by `content`.
-    fn build_content_lines(&self, state: &AppState) -> Vec<Line<'_>> {
+    fn build_content_lines(&self, state: &AppState, detail: Detail) -> Vec<Line<'_>> {
         log::trace!("[tui::security] build_content_lines: building security analysis content");
+        // The grid caps each list to keep the pane short; zoom shows every entry.
+        let cap = |grid_cap: usize| if detail == Detail::Zoomed { usize::MAX } else { grid_cap };
 
         let mut lines = Vec::new();
 
@@ -130,7 +132,7 @@ impl SecurityPane {
                                 csp.header_value.clone(),
                                 csp.issues
                                     .iter()
-                                    .take(MAX_CSP_ISSUES_DISPLAYED)
+                                    .take(cap(MAX_CSP_ISSUES_DISPLAYED))
                                     .map(|issue| match issue {
                                         crate::scan::http::CspIssue::UnsafeInline(directive) => {
                                             format!("unsafe-inline in {}", directive)
@@ -156,7 +158,7 @@ impl SecurityPane {
                                 cors.access_control_allow_credentials,
                                 cors.issues
                                     .iter()
-                                    .take(MAX_CORS_ISSUES_DISPLAYED)
+                                    .take(cap(MAX_CORS_ISSUES_DISPLAYED))
                                     .map(|issue| match issue {
                                         crate::scan::http::CorsIssue::WildcardOrigin => "wildcard origin".to_string(),
                                         crate::scan::http::CorsIssue::WildcardMethods => "wildcard methods".to_string(),
@@ -171,7 +173,7 @@ impl SecurityPane {
                         http_result
                             .get_all_vulnerabilities()
                             .iter()
-                            .take(MAX_HTTP_VULNERABILITIES_DISPLAYED)
+                            .take(cap(MAX_HTTP_VULNERABILITIES_DISPLAYED))
                             .map(|vuln| match vuln {
                                 crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
                                 crate::scan::http::HttpVulnerability::MissingXFrameOptions => {
@@ -234,7 +236,7 @@ impl SecurityPane {
                         .iter()
                         .map(|vuln| vuln.description())
                         .chain(primary_data.certificate_errors.iter().cloned())
-                        .take(MAX_TLS_VULNERABILITIES_DISPLAYED)
+                        .take(cap(MAX_TLS_VULNERABILITIES_DISPLAYED))
                         .collect::<Vec<_>>()
                 })
             } else {
@@ -570,12 +572,14 @@ impl SecurityPane {
                     ]));
                 }
 
+                let methods = if detail == Detail::Zoomed && !access_control_allow_methods.is_empty() {
+                    access_control_allow_methods.join(", ")
+                } else {
+                    format!("{}", access_control_allow_methods.len())
+                };
                 lines.push(Line::from(vec![
                     Span::styled("    Methods: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{}", access_control_allow_methods.len()),
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled(methods, Style::default().fg(Color::Gray)),
                 ]));
 
                 lines.push(Line::from(vec![
@@ -687,8 +691,82 @@ impl SecurityPane {
             }
         }
 
+        if detail == Detail::Zoomed {
+            lines.extend(zoomed_tls_lines(state));
+        }
+
         lines
     }
+}
+
+/// Zoomed only, after everything the grid shows: the negotiated family's supported TLS versions
+/// and its full certificate chain.
+fn zoomed_tls_lines(state: &AppState) -> Vec<Line<'static>> {
+    let Some(tls_state) = state.scanners.get("tls") else {
+        return Vec::new();
+    };
+    let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() else {
+        return Vec::new();
+    };
+    let Some(data) = tls_result.get_primary_result() else {
+        return Vec::new();
+    };
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("    {label}: "), Style::default().fg(Color::White)),
+            Span::styled(value, Style::default().fg(Color::Gray)),
+        ])
+    };
+    let mut lines = vec![Line::from("")];
+    let versions: Vec<&str> = data.supported_versions.iter().map(|version| version.as_str()).collect();
+    lines.push(Line::from(vec![
+        Span::styled("🔐 Supported Versions: ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            if versions.is_empty() {
+                "none recorded".to_string()
+            } else {
+                versions.join(", ")
+            },
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("📜 Certificate Chain: ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("{} certificates", data.certificate_chain.len()),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+    for (index, cert) in data.certificate_chain.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  [{index}] "), Style::default().fg(Color::White)),
+            Span::styled(common_name_display(&cert.subject), Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(field("Subject", cert.subject.clone()));
+        lines.push(field("Issuer", cert.issuer.clone()));
+        lines.push(field("Serial", cert.serial_number.clone()));
+        lines.push(field(
+            "Valid",
+            format!(
+                "{} to {}",
+                cert.not_before.format("%Y-%m-%d"),
+                cert.not_after.format("%Y-%m-%d")
+            ),
+        ));
+        lines.push(field("Signature", cert.signature_algorithm.clone()));
+        lines.push(field(
+            "Key",
+            match cert.key_size {
+                Some(size) => format!("{} {}bit", cert.public_key_algorithm, size),
+                None => cert.public_key_algorithm.clone(),
+            },
+        ));
+        if !cert.san_domains.is_empty() {
+            lines.push(field("SAN", cert.san_domains.join(", ")));
+        }
+    }
+    lines
 }
 
 impl Default for SecurityPane {
@@ -700,7 +778,7 @@ impl Default for SecurityPane {
 impl Pane for SecurityPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::security] content: width={} detail={:?}", width, detail);
-        crate::tui::text::to_rows(self.build_content_lines(state), width, detail, &[])
+        crate::tui::text::to_rows(self.build_content_lines(state, detail), width, detail, &[])
     }
 
     fn title(&self) -> &'static str {
@@ -1793,5 +1871,74 @@ mod tests {
             2,
             &format!("🔑 Cipher: {cipher}"),
         );
+    }
+
+    #[test]
+    fn zoomed_content_lists_the_certificate_chain_and_dmarc_in_full() {
+        let state = state_with_cert("CN=www.example.com, O=Example", "CN=Example Issuing CA, O=Example");
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.certificate_chain[0].serial_number = "0a:1b:2c".to_string();
+            data.certificate_chain[0].san_domains = vec!["www.example.com".to_string(), "example.com".to_string()];
+            data.supported_versions = vec![TlsVersion::V1_2, TlsVersion::V1_3];
+        }
+        let dmarc = "v=DMARC1; p=reject; rua=mailto:mailauth-reports@example.com; ruf=mailto:forensics@example.com";
+        let mut dns_result = DnsResult::new();
+        dns_result.email_security = Some(EmailSecurityAnalysis {
+            spf_record: Some("v=spf1 include:_spf.example.com ~all".to_string()),
+            dmarc_record: Some(dmarc.to_string()),
+            has_mx: true,
+            mx_count: 1,
+        });
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: Some(ScanResult::Dns(dns_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let pane = SecurityPane::new();
+        let rows = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Zoomed);
+        let text = rows.join("\n");
+        for expected in [
+            "Certificate Chain: 1 certificates",
+            "Serial: 0a:1b:2c",
+            "Subject: CN=www.example.com, O=Example",
+            "Signature: SHA256withRSA",
+            "SAN: www.example.com, example.com",
+            "Supported Versions: TLSv1.2, TLSv1.3",
+            "DMARC: configured",
+        ] {
+            assert!(text.contains(expected), "{expected}:\n{text}");
+        }
+        assert!(rows.concat().contains(dmarc), "DMARC text not whole:\n{text}");
+
+        let normal = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Normal).join("\n");
+        assert!(!normal.contains("Certificate Chain"), "{normal}");
+        assert!(!normal.contains("0a:1b:2c"), "{normal}");
+    }
+
+    #[test]
+    fn zoomed_content_lists_every_tls_issue_past_the_grid_cap() {
+        let state = state_with_tls(ScanStatus::Complete);
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.certificate_errors = (1..=MAX_TLS_VULNERABILITIES_DISPLAYED + 2)
+                .map(|n| format!("certificate problem {n}"))
+                .collect();
+        }
+        let pane = SecurityPane::new();
+        let last = format!("certificate problem {}", MAX_TLS_VULNERABILITIES_DISPLAYED + 2);
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed).join("\n");
+        assert!(zoomed.contains(&last), "{zoomed}");
+        let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
+        assert!(!normal.contains(&last), "{normal}");
     }
 }

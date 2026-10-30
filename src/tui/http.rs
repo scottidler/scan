@@ -42,6 +42,78 @@ impl Default for HttpPane {
     }
 }
 
+/// `<label>: <value>`, indented, with `missing` in place of a header that was not sent.
+fn header_line(label: &str, value: Option<&str>) -> Line<'static> {
+    let (text, color) = match value {
+        Some(value) => (value.to_string(), Color::Gray),
+        None => ("missing".to_string(), Color::Yellow),
+    };
+    Line::from(vec![
+        Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
+        Span::styled(text, Style::default().fg(color)),
+    ])
+}
+
+/// Zoomed only, after everything the grid shows: the request, every security header with its
+/// value, the CSP and CORS policies, and the caching headers.
+fn zoomed_lines(data: &crate::scan::http::HttpData) -> Vec<Line<'static>> {
+    let section = |title: &str| Line::from(Span::styled(title.to_string(), Style::default().fg(Color::Cyan)));
+    let headers = &data.security_headers;
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("🔗 URL: ", Style::default().fg(Color::White)),
+            Span::styled(data.url.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("🎯 IP: ", Style::default().fg(Color::White)),
+            Span::styled(data.target_ip.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        section("Security Headers"),
+        header_line(
+            "Strict-Transport-Security",
+            headers.strict_transport_security.as_deref(),
+        ),
+        header_line("X-Frame-Options", headers.x_frame_options.as_deref()),
+        header_line("X-Content-Type-Options", headers.x_content_type_options.as_deref()),
+        header_line("X-XSS-Protection", headers.x_xss_protection.as_deref()),
+        header_line("Referrer-Policy", headers.referrer_policy.as_deref()),
+        header_line("Permissions-Policy", headers.permissions_policy.as_deref()),
+        header_line(
+            "Content-Security-Policy",
+            data.csp.as_ref().map(|csp| csp.header_value.as_str()),
+        ),
+    ];
+    if let Some(cors) = &data.cors {
+        lines.push(Line::from(""));
+        lines.push(section("CORS"));
+        lines.push(header_line("Allow-Origin", cors.access_control_allow_origin.as_deref()));
+        let methods = cors.access_control_allow_methods.join(", ");
+        lines.push(header_line(
+            "Allow-Methods",
+            (!methods.is_empty()).then_some(methods.as_str()),
+        ));
+        let allowed = cors.access_control_allow_headers.join(", ");
+        lines.push(header_line(
+            "Allow-Headers",
+            (!allowed.is_empty()).then_some(allowed.as_str()),
+        ));
+        lines.push(header_line(
+            "Allow-Credentials",
+            Some(if cors.access_control_allow_credentials { "true" } else { "false" }),
+        ));
+    }
+    let caching = &data.caching;
+    lines.push(Line::from(""));
+    lines.push(section("Caching"));
+    lines.push(header_line("Cache-Control", caching.cache_control.as_deref()));
+    lines.push(header_line("Expires", caching.expires.as_deref()));
+    lines.push(header_line("ETag", caching.etag.as_deref()));
+    lines.push(header_line("Last-Modified", caching.last_modified.as_deref()));
+    lines
+}
+
 impl Pane for HttpPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::http] content: width={} detail={:?}", width, detail);
@@ -209,6 +281,10 @@ impl Pane for HttpPane {
                                 Span::styled(vuln_text, Style::default().fg(Color::Red)),
                             ]));
                         }
+                    }
+
+                    if detail == Detail::Zoomed {
+                        lines.extend(zoomed_lines(primary_data));
                     }
                 } else {
                     // HTTP scan failed for all protocols
@@ -537,5 +613,47 @@ mod tests {
         );
         let expected = crate::tui::testing::expected_clip(&format!("    → {to}"), LIVE_PANE_WIDTH - 2);
         assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
+    }
+
+    #[test]
+    fn zoomed_content_shows_header_values_policies_and_caching() {
+        use crate::scan::http::{CorsPolicy, CorsSecurityLevel, CspPolicy, CspStrength};
+        use crate::tui::pane::Detail;
+        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        data.security_headers.strict_transport_security = Some("max-age=31536000; includeSubDomains".to_string());
+        data.csp = Some(CspPolicy {
+            header_value: "default-src 'self'; script-src 'self' https://cdn.example.com".to_string(),
+            directives: Default::default(),
+            issues: vec![],
+            strength: CspStrength::Strong,
+        });
+        data.cors = Some(CorsPolicy {
+            access_control_allow_origin: Some("https://app.example.com".to_string()),
+            access_control_allow_methods: vec!["GET".to_string(), "POST".to_string()],
+            access_control_allow_headers: vec![],
+            access_control_allow_credentials: false,
+            issues: vec![],
+            security_level: CorsSecurityLevel::Secure,
+        });
+        data.caching.cache_control = Some("private, max-age=0".to_string());
+        let state = state_with_http(data);
+        let pane = HttpPane::new();
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Zoomed).join("\n");
+        for expected in [
+            "URL: https://example.com/",
+            "IP: 192.0.2.1",
+            "Strict-Transport-Security: max-age=31536000; includeSubDomains",
+            "X-Frame-Options: missing",
+            "Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.example.com",
+            "Allow-Origin: https://app.example.com",
+            "Allow-Methods: GET, POST",
+            "Allow-Headers: missing",
+            "Cache-Control: private, max-age=0",
+            "ETag: missing",
+        ] {
+            assert!(zoomed.contains(expected), "{expected}:\n{zoomed}");
+        }
+        let normal = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Normal).join("\n");
+        assert!(!normal.contains("Cache-Control"), "{normal}");
     }
 }

@@ -41,7 +41,7 @@ impl DnsPane {
     }
 
     /// The pane's logical lines, before they are laid out as rows by `content`.
-    fn build_content_lines(&self, state: &AppState) -> Vec<Line<'_>> {
+    fn build_content_lines(&self, state: &AppState, detail: Detail) -> Vec<Line<'_>> {
         log::trace!("[tui::dns] build_content_lines: building DNS resolution content");
 
         let mut lines = Vec::new();
@@ -66,7 +66,7 @@ impl DnsPane {
         // Get DNS results and add them
         let dns_lines = if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
-                Self::build_dns_result_lines(dns_result.clone())
+                Self::build_dns_result_lines(dns_result.clone(), detail)
             } else if matches!(dns_state.status, crate::types::ScanStatus::Failed) {
                 // The header carries the reason; nothing is still resolving.
                 Vec::new()
@@ -81,13 +81,13 @@ impl DnsPane {
         lines
     }
 
-    fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
+    fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult, detail: Detail) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
         // An IP target has only reverse DNS, so PTR leads.
         let reverse_only = dns_result.is_reverse_only();
         if reverse_only {
-            lines.extend(ptr_lines(&dns_result));
+            lines.extend(ptr_lines(&dns_result, detail));
         }
 
         // A records
@@ -107,10 +107,11 @@ impl DnsPane {
 
             // Show A records
             for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(record.value.to_string(), Style::default().fg(Color::Cyan)),
-                ]));
+                lines.push(record_line(
+                    vec![Span::styled(record.value.to_string(), Style::default().fg(Color::Cyan))],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -130,12 +131,11 @@ impl DnsPane {
             ]));
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
-                let ipv6_str = record.value.to_string();
-
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(ipv6_str, Style::default().fg(Color::Cyan)),
-                ]));
+                lines.push(record_line(
+                    vec![Span::styled(record.value.to_string(), Style::default().fg(Color::Cyan))],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -152,10 +152,11 @@ impl DnsPane {
             ]));
 
             for record in dns_result.CNAME.iter().take(MAX_CNAME_RECORDS_DISPLAYED) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(record.value.clone(), Style::default().fg(Color::Magenta)),
-                ]));
+                lines.push(record_line(
+                    vec![Span::styled(record.value.clone(), Style::default().fg(Color::Magenta))],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -171,10 +172,11 @@ impl DnsPane {
             ]));
 
             for record in dns_result.NS.iter().take(MAX_NS_RECORDS_DISPLAYED) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(record.value.clone(), Style::default().fg(Color::Blue)),
-                ]));
+                lines.push(record_line(
+                    vec![Span::styled(record.value.clone(), Style::default().fg(Color::Blue))],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -191,7 +193,10 @@ impl DnsPane {
 
             for record in dns_result.TXT.iter().take(MAX_TXT_RECORDS_DISPLAYED) {
                 let value = record.value.clone();
-                let display_value = if value.starts_with("google-site-verification") {
+                // The grid abbreviates verification tokens; zoom shows every record whole.
+                let display_value = if detail == Detail::Zoomed {
+                    value
+                } else if value.starts_with("google-site-verification") {
                     "google-site-verification=...".to_string()
                 } else if value.starts_with("MS=") {
                     format!(
@@ -205,10 +210,11 @@ impl DnsPane {
                     value
                 };
 
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(display_value, Style::default().fg(Color::Yellow)),
-                ]));
+                lines.push(record_line(
+                    vec![Span::styled(display_value, Style::default().fg(Color::Yellow))],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -225,13 +231,14 @@ impl DnsPane {
             ]));
 
             for record in dns_result.CAA.iter().take(MAX_CAA_RECORDS_DISPLAYED) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
+                lines.push(record_line(
+                    vec![Span::styled(
                         format!("{} {}", record.value.tag, record.value.value),
                         Style::default().fg(Color::Green),
-                    ),
-                ]));
+                    )],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -261,16 +268,19 @@ impl DnsPane {
                     Color::Red
                 };
 
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(record.value.exchange.clone(), Style::default().fg(Color::Magenta)),
-                    Span::styled(" (pri: ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!("{}", record.value.priority),
-                        Style::default().fg(priority_color),
-                    ),
-                    Span::styled(")", Style::default().fg(Color::Gray)),
-                ]));
+                lines.push(record_line(
+                    vec![
+                        Span::styled(record.value.exchange.clone(), Style::default().fg(Color::Magenta)),
+                        Span::styled(" (pri: ", Style::default().fg(Color::Gray)),
+                        Span::styled(
+                            format!("{}", record.value.priority),
+                            Style::default().fg(priority_color),
+                        ),
+                        Span::styled(")", Style::default().fg(Color::Gray)),
+                    ],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
@@ -299,6 +309,21 @@ impl DnsPane {
                         Style::default().fg(Color::Gray),
                     ),
                 ]));
+                if detail == Detail::Zoomed {
+                    let fields = [
+                        ("Email", soa.value.responsible_email.clone()),
+                        ("Refresh", format!("{}s", soa.value.refresh)),
+                        ("Retry", format!("{}s", soa.value.retry)),
+                        ("Expire", format!("{}s", soa.value.expire)),
+                        ("Minimum TTL", format!("{}s", soa.value.minimum_ttl)),
+                    ];
+                    for (label, value) in fields {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
+                            Span::styled(value, Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                }
             }
         }
 
@@ -314,21 +339,22 @@ impl DnsPane {
             ]));
 
             for record in dns_result.SRV.iter().take(MAX_SRV_RECORDS_DISPLAYED) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
+                lines.push(record_line(
+                    vec![Span::styled(
                         format!(
                             "{}:{} (p:{}, w:{})",
                             record.value.target, record.value.port, record.value.priority, record.value.weight
                         ),
                         Style::default().fg(Color::Blue),
-                    ),
-                ]));
+                    )],
+                    record.ttl_remaining(),
+                    detail,
+                ));
             }
         }
 
         if !reverse_only {
-            lines.extend(ptr_lines(&dns_result));
+            lines.extend(ptr_lines(&dns_result, detail));
         }
 
         lines
@@ -403,8 +429,20 @@ fn failed_query_line(label: &'static str, status: &crate::scan::dns::QueryStatus
     ]))
 }
 
+/// One record's row, indented under its section header. Zoomed, it ends with the record's own TTL,
+/// since records of one set can expire apart.
+fn record_line(value: Vec<Span<'static>>, ttl: u32, detail: Detail) -> Line<'static> {
+    let mut spans = vec![Span::styled("  ", Style::default())];
+    spans.extend(value);
+    if detail == Detail::Zoomed {
+        spans.push(Span::styled("  TTL: ", Style::default().fg(Color::White)));
+        spans.push(ttl_span(ttl));
+    }
+    Line::from(spans)
+}
+
 /// The `PTR:` section: reverse DNS for the target's addresses.
-fn ptr_lines(dns_result: &crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
+fn ptr_lines(dns_result: &crate::scan::dns::DnsResult, detail: Detail) -> Vec<Line<'static>> {
     let (color, text) = status_display(&dns_result.PTR_status);
     let mut header = vec![
         Span::styled("PTR: ", Style::default().fg(Color::White)),
@@ -416,10 +454,11 @@ fn ptr_lines(dns_result: &crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
     }
     let mut lines = vec![Line::from(header)];
     for record in dns_result.PTR.iter().take(MAX_PTR_RECORDS_DISPLAYED) {
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(record.value.clone(), Style::default().fg(Color::Cyan)),
-        ]));
+        lines.push(record_line(
+            vec![Span::styled(record.value.clone(), Style::default().fg(Color::Cyan))],
+            record.ttl_remaining(),
+            detail,
+        ));
     }
     lines
 }
@@ -438,7 +477,7 @@ impl Default for DnsPane {
 impl Pane for DnsPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::dns] content: width={} detail={:?}", width, detail);
-        crate::tui::text::to_rows(self.build_content_lines(state), width, detail, &[])
+        crate::tui::text::to_rows(self.build_content_lines(state, detail), width, detail, &[])
     }
 
     fn title(&self) -> &'static str {
@@ -674,5 +713,90 @@ mod tests {
         assert!(out.contains("mail.example.com (pri: 0)"), "{out}");
         let lone_dot_with_peer = render_mx(vec![mx(0, "."), mx(10, "mail.example.com")]);
         assert!(!lone_dot_with_peer.contains("null MX"), "{lone_dot_with_peer}");
+    }
+
+    fn txt_state(records: &[&str]) -> AppState {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+        let mut result = DnsResult::new();
+        result.TXT = records
+            .iter()
+            .map(|value| DnsRecord::new(value.to_string(), 3600))
+            .collect();
+        result.TXT_status = QueryStatus::Success(records.len());
+        complete_state("dns", crate::types::ScanResult::Dns(result))
+    }
+
+    #[test]
+    fn zoomed_content_shows_a_300_char_txt_record_in_full_wrapped() {
+        let mut txt = "v=spf1".to_string();
+        let mut n = 0;
+        while txt.len() < 290 {
+            txt.push_str(&format!(" include:_spf{n}.mail.example.com"));
+            n += 1;
+        }
+        let txt: String = format!("{txt} -all").chars().take(300).collect();
+        assert_eq!(txt.chars().count(), 300);
+        let verification = "google-site-verification=0123456789abcdefABCDEF";
+        let state = txt_state(&[&txt, verification]);
+        let pane = DnsPane::new();
+
+        let rows = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed);
+        assert!(rows.iter().all(|row| row.chars().count() <= 80), "{rows:#?}");
+        let start = rows
+            .iter()
+            .position(|row| row.starts_with("  v=spf1"))
+            .expect("TXT row");
+        let joined: String = rows[start..].concat();
+        assert!(joined.contains(&txt), "TXT not shown whole:\n{rows:#?}");
+        let tail: String = txt.chars().skip(280).collect();
+        assert!(!rows[start].contains(&tail), "TXT did not wrap: {rows:#?}");
+        assert!(
+            rows.concat().contains(verification),
+            "verification token abbreviated in zoom"
+        );
+
+        let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).concat();
+        assert!(!normal.contains(&txt), "the grid fits the record to one row");
+        assert!(!normal.contains(verification));
+    }
+
+    #[test]
+    fn zoomed_content_gives_each_record_its_ttl_and_every_soa_field() {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus, SoaRecord};
+        let mut result = DnsResult::new();
+        result.A = vec![
+            DnsRecord::new("192.0.2.1".parse().expect("ip"), 300),
+            DnsRecord::new("192.0.2.2".parse().expect("ip"), 1200),
+        ];
+        result.A_status = QueryStatus::Success(2);
+        result.SOA = vec![DnsRecord::new(
+            SoaRecord {
+                primary_ns: "ns1.example.com".to_string(),
+                responsible_email: "hostmaster.example.com".to_string(),
+                serial: 2026102901,
+                refresh: 7200,
+                retry: 3600,
+                expire: 1209600,
+                minimum_ttl: 300,
+            },
+            3600,
+        )];
+        let state = complete_state("dns", crate::types::ScanResult::Dns(result));
+        let pane = DnsPane::new();
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Zoomed).join("\n");
+        assert!(zoomed.contains("192.0.2.1  TTL: 300s (cached)"), "{zoomed}");
+        assert!(zoomed.contains("192.0.2.2  TTL: 1200s (cached)"), "{zoomed}");
+        for field in [
+            "Email: hostmaster.example.com",
+            "Refresh: 7200s",
+            "Retry: 3600s",
+            "Expire: 1209600s",
+            "Minimum TTL: 300s",
+        ] {
+            assert!(zoomed.contains(field), "{field}: {zoomed}");
+        }
+        let normal = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Normal).join("\n");
+        assert!(!normal.contains("1200s"), "{normal}");
+        assert!(!normal.contains("Refresh:"), "{normal}");
     }
 }

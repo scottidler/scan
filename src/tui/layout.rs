@@ -5,6 +5,9 @@ use log;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    text::Line,
+    widgets::{Paragraph, Widget},
 };
 use std::collections::HashMap;
 
@@ -14,6 +17,10 @@ const TOP_ROW_HEIGHT_PERCENT: u16 = 25;
 const MIDDLE_ROW_HEIGHT_PERCENT: u16 = 35;
 const BOTTOM_ROW_HEIGHT_PERCENT: u16 = 40;
 const SCROLL_STEP: u16 = 1;
+/// Rows under the zoomed pane for the key footer.
+const ZOOM_FOOTER_ROWS: u16 = 1;
+/// The keys that act while a pane is zoomed.
+pub const ZOOM_FOOTER: &str = "Esc back · ←/→ pane · ↑/↓ scroll";
 // Row 0 widths (2 columns)
 const TARGET_PANE_WIDTH_PERCENT: u16 = 30;
 const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 70;
@@ -45,6 +52,8 @@ pub struct PaneLayout {
     scroll: HashMap<(&'static str, Detail), u16>,
     /// The frame area last rendered, so key handling sizes panes exactly as they were drawn.
     area: Rect,
+    /// The focused pane fills the frame at `Detail::Zoomed` instead of the grid being drawn.
+    zoomed: bool,
 }
 
 impl PaneLayout {
@@ -59,6 +68,7 @@ impl PaneLayout {
             grid_cols,
             scroll: HashMap::new(),
             area: Rect::default(),
+            zoomed: false,
         }
     }
 
@@ -85,14 +95,51 @@ impl PaneLayout {
         log::trace!("[tui::layout] pane_added: total_panes={}", self.panes.len());
     }
 
-    /// Set the focused pane by ID
+    /// Set the focused pane by ID. While zoomed, the zoom moves to that pane, starting at its
+    /// first row.
     pub fn set_focus(&mut self, pane_id: Option<String>) {
         log::debug!(
-            "[tui::layout] set_focus: old_focus={:?} new_focus={:?}",
+            "[tui::layout] set_focus: old_focus={:?} new_focus={:?} zoomed={}",
             self.focused_pane,
-            pane_id
+            pane_id,
+            self.zoomed
         );
         self.focused_pane = pane_id;
+        if self.zoomed {
+            self.reset_zoom_offset();
+        }
+    }
+
+    /// Whether the focused pane is drawn zoomed to the full frame.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// Zoom the focused pane to the full frame, from its first row. Returns false, and stays in
+    /// the grid, when no pane has focus.
+    pub fn zoom(&mut self) -> bool {
+        if self.focused_pane.is_none() {
+            log::debug!("[tui::layout] zoom_ignored: no focused pane");
+            return false;
+        }
+        self.zoomed = true;
+        self.reset_zoom_offset();
+        log::debug!("[tui::layout] zoomed: pane={:?}", self.focused_pane);
+        true
+    }
+
+    /// Return to the grid. Grid scroll offsets are untouched by zoom.
+    pub fn unzoom(&mut self) {
+        log::debug!("[tui::layout] unzoomed: pane={:?}", self.focused_pane);
+        self.zoomed = false;
+    }
+
+    /// Forget the focused pane's zoomed offset, so its zoom starts at row 0.
+    fn reset_zoom_offset(&mut self) {
+        if let Some(focused) = self.focused_pane.as_deref() {
+            self.scroll
+                .retain(|(id, detail), _| !(*id == focused && *detail == Detail::Zoomed));
+        }
     }
 
     /// Get the currently focused pane ID
@@ -117,9 +164,9 @@ impl PaneLayout {
         }
     }
 
-    /// The detail panes are drawn at. Always Normal until zoom exists.
+    /// The detail panes are drawn at: Zoomed while a pane fills the frame, Normal in the grid.
     fn detail(&self) -> Detail {
-        Detail::Normal
+        if self.zoomed { Detail::Zoomed } else { Detail::Normal }
     }
 
     /// The first row shown for `pane_id` at `detail`.
@@ -143,6 +190,16 @@ impl PaneLayout {
             self.focused_pane
         );
         self.area = area;
+        if self.zoomed {
+            if self.render_zoomed(frame, area, state) {
+                return;
+            }
+            log::warn!(
+                "[tui::layout] zoom_dropped: focused pane {:?} cannot be drawn",
+                self.focused_pane
+            );
+            self.zoomed = false;
+        }
         let detail = self.detail();
 
         let mut rendered_count = 0;
@@ -183,24 +240,15 @@ impl PaneLayout {
                 pane_area.height,
                 is_focused
             );
-
-            if pane.scrolls() {
-                let key = (pane_id, detail);
-                let offset = self.scroll.get(&key).copied().unwrap_or(0);
-                let clamped = draw_rows(pane.as_ref(), frame, pane_area, state, is_focused, detail, offset);
-                if clamped != offset {
-                    log::debug!(
-                        "[tui::layout] scroll_clamped: pane={} detail={:?} offset={} clamped={}",
-                        pane_id,
-                        detail,
-                        offset,
-                        clamped
-                    );
-                }
-                self.scroll.insert(key, clamped);
-            } else {
-                pane.render_detail(frame, pane_area, state, is_focused, detail);
-            }
+            draw_pane(
+                pane.as_ref(),
+                &mut self.scroll,
+                frame,
+                pane_area,
+                state,
+                is_focused,
+                detail,
+            );
             rendered_count += 1;
         }
 
@@ -211,10 +259,55 @@ impl PaneLayout {
         );
     }
 
-    /// The rect of `pane_id` when the frame is `area`, as `render` places it.
-    pub fn pane_area(&self, pane_id: &str, area: Rect) -> Option<Rect> {
+    /// Draw only the focused pane, zoomed over the frame above the key footer. Returns false when
+    /// there is no focused pane to draw.
+    fn render_zoomed(&mut self, frame: &mut Frame, area: Rect, state: &AppState) -> bool {
+        let Some(focused) = self.focused_pane.as_deref() else {
+            return false;
+        };
+        let Some(pane) = self.panes.iter().find(|pane| pane.id() == focused) else {
+            return false;
+        };
+        let pane_area = zoom_rect(area);
+        log::trace!(
+            "[tui::layout] rendering_zoomed: pane_id={} area={}x{}",
+            focused,
+            pane_area.width,
+            pane_area.height
+        );
+        draw_pane(
+            pane.as_ref(),
+            &mut self.scroll,
+            frame,
+            pane_area,
+            state,
+            true,
+            Detail::Zoomed,
+        );
+        if let Some(footer) = footer_rect(area) {
+            Paragraph::new(crate::tui::text::fit_line(
+                // MUTED: Gray until the theme lands (Phase 2).
+                Line::styled(ZOOM_FOOTER, Style::default().fg(Color::Gray)),
+                footer.width,
+            ))
+            .render(footer, frame.buffer_mut());
+        }
+        true
+    }
+
+    /// The rect of `pane_id` when the frame is `area`, as `render` places it: the zoom rect for the
+    /// zoomed pane, nothing for the others while zoomed, its grid cell otherwise.
+    fn rect_of(&self, pane_id: &str, area: Rect) -> Option<Rect> {
+        if self.zoomed {
+            return (self.focused_pane.as_deref() == Some(pane_id)).then(|| zoom_rect(area));
+        }
         let config = self.config.get(pane_id)?;
         pane_rect(self.grid_rows, self.grid_cols, config, area)
+    }
+
+    /// The rect of `pane_id` when the frame is `area`, as `render` places it.
+    pub fn pane_area(&self, pane_id: &str, area: Rect) -> Option<Rect> {
+        self.rect_of(pane_id, area)
     }
 
     /// Get all pane IDs in the layout
@@ -335,11 +428,7 @@ impl PaneLayout {
             log::trace!("[tui::layout] pane_does_not_scroll: pane={}", focused_id);
             return false;
         }
-        let Some(rect) = self
-            .config
-            .get(focused_id)
-            .and_then(|config| pane_rect(self.grid_rows, self.grid_cols, config, self.area))
-        else {
+        let Some(rect) = self.rect_of(focused_id, self.area) else {
             log::warn!("[tui::layout] focused_pane_has_no_rect: pane_id={}", focused_id);
             return false;
         };
@@ -374,6 +463,53 @@ impl PaneLayout {
         self.scroll.insert((pane_id, detail), new_offset);
         true
     }
+}
+
+/// Draw `pane` at `rect` for `detail`. A scrolling pane is drawn at its kept offset and the offset
+/// clamped against its rows this frame is kept, so a resize or shorter content re-clamps.
+fn draw_pane(
+    pane: &dyn Pane,
+    scroll: &mut HashMap<(&'static str, Detail), u16>,
+    frame: &mut Frame,
+    rect: Rect,
+    state: &AppState,
+    focused: bool,
+    detail: Detail,
+) {
+    if !pane.scrolls() {
+        pane.render_detail(frame, rect, state, focused, detail);
+        return;
+    }
+    let key = (pane.id(), detail);
+    let offset = scroll.get(&key).copied().unwrap_or(0);
+    let clamped = draw_rows(pane, frame, rect, state, focused, detail, offset);
+    if clamped != offset {
+        log::debug!(
+            "[tui::layout] scroll_clamped: pane={} detail={:?} offset={} clamped={}",
+            key.0,
+            detail,
+            offset,
+            clamped
+        );
+    }
+    scroll.insert(key, clamped);
+}
+
+/// The zoomed pane's rect: the whole frame but the key footer.
+fn zoom_rect(area: Rect) -> Rect {
+    Rect {
+        height: area.height.saturating_sub(ZOOM_FOOTER_ROWS),
+        ..area
+    }
+}
+
+/// The key footer's row under the zoomed pane, or `None` when the frame has no room for it.
+fn footer_rect(area: Rect) -> Option<Rect> {
+    (area.height > ZOOM_FOOTER_ROWS).then(|| Rect {
+        y: area.y + area.height - ZOOM_FOOTER_ROWS,
+        height: ZOOM_FOOTER_ROWS,
+        ..area
+    })
 }
 
 /// The dashboard grid over `area`: one rect per cell, row by row, with custom proportions.
@@ -853,13 +989,223 @@ mod tests {
         assert!(!press(&mut layout, &state, KeyCode::Down));
     }
 
+    use crate::target::Protocol;
+    use crate::tui::TuiApp;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::watch;
+
+    const PANE_TITLES: [&str; 9] = [
+        "TARGET",
+        "CONNECTIVITY",
+        "WHOIS",
+        "HTTP",
+        "PORTS",
+        "GEOIP",
+        "DNS",
+        "TRACEROUTE",
+        "SECURITY",
+    ];
+
+    /// The app with `focus`, over `state`, with a protocol channel nobody listens on.
+    fn app_on(focus: &str) -> (TuiApp, watch::Sender<Protocol>) {
+        let mut app = TuiApp::new().expect("app");
+        app.layout.set_focus(Some(focus.to_string()));
+        (app, watch::channel(Protocol::Both).0)
+    }
+
+    fn key(app: &mut TuiApp, state: &Arc<Mutex<AppState>>, tx: &watch::Sender<Protocol>, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), state, tx);
+    }
+
+    /// Draw the whole app as the event loop does; the frame as text rows.
+    fn frame_text(app: &mut TuiApp, state: &Arc<Mutex<AppState>>, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| app.ui(frame, state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| row_text(&buffer, y, 0, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The pane titles drawn on a top border in `text`.
+    fn titles(text: &str) -> Vec<&'static str> {
+        PANE_TITLES
+            .into_iter()
+            .filter(|title| text.contains(&format!("┌{title}")))
+            .collect()
+    }
+
+    fn shared(state: AppState) -> Arc<Mutex<AppState>> {
+        Arc::new(Mutex::new(state))
+    }
+
+    fn zoomed_rows(id: &str, state: &AppState, width: u16) -> usize {
+        let layout = crate::tui::create_default_layout();
+        pane(&layout, id).content(state, width - 2, Detail::Zoomed).len()
+    }
+
     #[test]
-    fn grid_and_zoomed_offsets_are_kept_apart() {
+    fn zoom_draws_exactly_one_pane_title_and_the_key_footer() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        let grid = frame_text(&mut app, &state, 80, 24);
+        assert_eq!(titles(&grid).len(), 9, "the grid draws every pane:\n{grid}");
+
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        let zoomed = frame_text(&mut app, &state, 80, 24);
+        assert_eq!(titles(&zoomed), vec!["SECURITY"], "{zoomed}");
+        let footer = zoomed.lines().last().expect("footer row");
+        assert!(footer.starts_with(ZOOM_FOOTER), "footer: `{footer}`");
+    }
+
+    #[test]
+    fn right_while_zoomed_shows_the_next_pane_from_its_first_row() {
         let state = overflowing_state();
-        let mut layout = focused_layout("dns");
-        draw(&mut layout, &state, 80, 24);
-        press(&mut layout, &state, KeyCode::Down);
-        assert_eq!(layout.scroll_offset("dns", Detail::Normal), 1);
-        assert_eq!(layout.scroll_offset("dns", Detail::Zoomed), 0);
+        state.scanners.insert(
+            "traceroute".to_string(),
+            scan_state(
+                Some(ScanResult::Traceroute(traceroute_fixture(30))),
+                None,
+                ScanStatus::Complete,
+            ),
+        );
+        assert!(
+            zoomed_rows("traceroute", &state, 80) > 22,
+            "fixture must overflow the zoom"
+        );
+        let state = shared(state);
+        let (mut app, tx) = app_on("traceroute");
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        frame_text(&mut app, &state, 80, 24);
+        for _ in 0..3 {
+            key(&mut app, &state, &tx, KeyCode::Down);
+        }
+        assert_eq!(app.layout.scroll_offset("traceroute", Detail::Zoomed), 3);
+
+        // Away and back: the traceroute zoom starts over at its first row.
+        key(&mut app, &state, &tx, KeyCode::Left);
+        assert_eq!(app.layout.focused_pane().map(String::as_str), Some("dns"));
+        key(&mut app, &state, &tx, KeyCode::Right);
+        let text = frame_text(&mut app, &state, 80, 24);
+        assert!(app.layout.is_zoomed());
+        assert_eq!(titles(&text), vec!["TRACEROUTE"], "{text}");
+        assert_eq!(app.layout.scroll_offset("traceroute", Detail::Zoomed), 0);
+        let first_row = text.lines().nth(1).expect("first content row");
+        assert!(first_row.contains("Status:"), "not at row 0: `{first_row}`");
+    }
+
+    #[test]
+    fn a_resize_while_zoomed_stays_zoomed_and_reclamps() {
+        let state = overflowing_state();
+        state.scanners.insert(
+            "dns".to_string(),
+            scan_state(Some(ScanResult::Dns(dns_fixture(40))), None, ScanStatus::Complete),
+        );
+        let rows = zoomed_rows("dns", &state, 80) as u16;
+        let state = shared(state);
+        let (mut app, tx) = app_on("dns");
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        frame_text(&mut app, &state, 80, 24);
+        for _ in 0..rows {
+            key(&mut app, &state, &tx, KeyCode::Down);
+        }
+        frame_text(&mut app, &state, 80, 24);
+        // 24 rows: one footer row and two border rows leave 21.
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), rows - 21);
+
+        let text = frame_text(&mut app, &state, 80, 40);
+        assert!(app.layout.is_zoomed(), "a resize left zoom");
+        assert_eq!(titles(&text), vec!["DNS"], "{text}");
+        assert!(rows > 37, "fixture must still overflow at 80x40");
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), rows - 37);
+    }
+
+    #[test]
+    fn esc_while_zoomed_leaves_zoom_and_does_not_quit() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        assert!(app.layout.is_zoomed());
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        assert!(!app.layout.is_zoomed(), "Esc did not leave zoom");
+        assert!(!app.should_quit(), "Esc quit from zoom");
+        assert_eq!(titles(&frame_text(&mut app, &state, 80, 24)).len(), 9);
+    }
+
+    #[test]
+    fn esc_while_not_zoomed_quits_and_q_quits_from_zoom() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        assert!(app.should_quit(), "Esc in the grid did not quit");
+
+        let (mut app, tx) = app_on("security");
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        key(&mut app, &state, &tx, KeyCode::Char('q'));
+        assert!(app.should_quit(), "q in zoom did not quit");
+    }
+
+    #[test]
+    fn grid_and_zoomed_offsets_of_one_pane_are_independent() {
+        let state = overflowing_state();
+        state.scanners.insert(
+            "dns".to_string(),
+            scan_state(Some(ScanResult::Dns(dns_fixture(40))), None, ScanStatus::Complete),
+        );
+        let state = shared(state);
+        let (mut app, tx) = app_on("dns");
+        frame_text(&mut app, &state, 80, 24);
+        key(&mut app, &state, &tx, KeyCode::Down);
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Normal), 1);
+
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        frame_text(&mut app, &state, 80, 24);
+        assert_eq!(
+            app.layout.scroll_offset("dns", Detail::Zoomed),
+            0,
+            "zoom starts at row 0"
+        );
+        for _ in 0..3 {
+            key(&mut app, &state, &tx, KeyCode::Down);
+        }
+        frame_text(&mut app, &state, 80, 24);
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), 3);
+        assert_eq!(
+            app.layout.scroll_offset("dns", Detail::Normal),
+            1,
+            "zoom moved the grid offset"
+        );
+
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        frame_text(&mut app, &state, 80, 24);
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Normal), 1);
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        assert_eq!(
+            app.layout.scroll_offset("dns", Detail::Zoomed),
+            0,
+            "re-entering zoom resets it"
+        );
+    }
+
+    #[test]
+    fn enter_with_no_focused_pane_stays_in_the_grid() {
+        let mut layout = crate::tui::create_default_layout();
+        assert!(!layout.zoom());
+        assert!(!layout.is_zoomed());
+    }
+
+    #[test]
+    fn zoomed_connectivity_takes_no_scroll_keys() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("connectivity");
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        let text = frame_text(&mut app, &state, 80, 24);
+        assert_eq!(titles(&text), vec!["CONNECTIVITY"], "{text}");
+        let guard = state.lock().unwrap();
+        assert!(
+            !app.layout
+                .handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &guard)
+        );
     }
 }

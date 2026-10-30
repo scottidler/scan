@@ -32,6 +32,82 @@ impl Default for GeoIpPane {
     }
 }
 
+/// `<label>: <value>`, indented under a zoomed family.
+fn field_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
+        Span::styled(value, Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// Why a family has no lookup data, and its color: a failure is a fault, the rest are not.
+fn status_text(status: &crate::scan::geoip::GeoIpStatus) -> (String, Color) {
+    use crate::scan::geoip::{GeoIpStatus, NotGeolocatable};
+    match status {
+        GeoIpStatus::Success => ("located".to_string(), Color::Green),
+        GeoIpStatus::Failed(reason) => (format!("failed: {reason}"), Color::Red),
+        GeoIpStatus::NoAddress => ("no address".to_string(), Color::Gray),
+        GeoIpStatus::NotQueried => ("not queried".to_string(), Color::Gray),
+        GeoIpStatus::NotGeolocatable(kind) => (NotGeolocatable(*kind).to_string(), Color::Gray),
+    }
+}
+
+/// Zoomed only: every field of each family's lookup, or why the family has none.
+fn zoomed_lines(result: &crate::scan::geoip::GeoIpResult) -> Vec<Line<'static>> {
+    let families = [
+        ("IPv4", &result.ipv4_result, &result.ipv4_status),
+        ("IPv6", &result.ipv6_result, &result.ipv6_status),
+    ];
+    let mut lines = Vec::new();
+    for (name, data, status) in families {
+        lines.push(Line::from(""));
+        let Some(data) = data else {
+            let (text, color) = status_text(status);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
+                Span::styled(text, Style::default().fg(color)),
+            ]));
+            continue;
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
+            Span::styled(data.target_ip.to_string(), Style::default().fg(Color::Cyan)),
+        ]));
+        if let Some(location) = &data.location {
+            lines.push(field_line("City", location.city.clone()));
+            lines.push(field_line(
+                "Region",
+                format!("{} ({})", location.region, location.region_code),
+            ));
+            lines.push(field_line(
+                "Country",
+                format!("{} ({})", location.country, location.country_code),
+            ));
+            lines.push(field_line(
+                "Coords",
+                format!("{:.4}, {:.4}", location.latitude, location.longitude),
+            ));
+            lines.push(field_line("Timezone", location.timezone.clone()));
+        }
+        if let Some(network) = &data.network_info {
+            lines.push(field_line("ISP", network.isp.clone()));
+            lines.push(field_line("Organization", network.organization.clone()));
+            if let Some(asn) = network.asn {
+                lines.push(field_line("ASN", format!("AS{asn}")));
+            }
+            if let Some(asn_name) = &network.asn_name {
+                lines.push(field_line("AS name", asn_name.clone()));
+            }
+            if let Some(range) = &network.network_range {
+                lines.push(field_line("Network", range.clone()));
+            }
+        }
+        lines.push(field_line("Source", data.data_source.clone()));
+        lines.push(field_line("Lookup", format!("{}ms", data.scan_duration.as_millis())));
+    }
+    lines
+}
+
 impl Pane for GeoIpPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::geoip] content: width={} detail={:?}", width, detail);
@@ -133,6 +209,10 @@ impl Pane for GeoIpPane {
                         Span::styled("📡 Source: ", Style::default().fg(Color::White)),
                         Span::styled(primary_data.data_source.clone(), Style::default().fg(Color::Gray)),
                     ]));
+
+                    if detail == Detail::Zoomed {
+                        lines.extend(zoomed_lines(geoip_result));
+                    }
                 } else if let Some(not_geolocatable) = not_geolocatable {
                     lines.push(Line::from(vec![
                         Span::styled("📍 Location: ", Style::default().fg(Color::White)),
@@ -300,5 +380,51 @@ mod tests {
             .find(|&x| buffer[(x, row)].symbol() == "(")
             .expect("label start");
         assert_eq!(buffer[(x, row)].fg, Color::Gray);
+    }
+
+    #[test]
+    fn zoomed_content_shows_every_field_of_each_family() {
+        use crate::scan::geoip::{AddressKind, GeoIpData, GeoIpResult, GeoIpStatus, GeoLocation, NetworkInfo};
+        use crate::tui::pane::Detail;
+        let mut result = GeoIpResult::new();
+        result.ipv4_status = GeoIpStatus::Success;
+        result.ipv4_result = Some(GeoIpData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            location: Some(GeoLocation {
+                country: "United States".to_string(),
+                country_code: "US".to_string(),
+                region: "Oregon".to_string(),
+                region_code: "OR".to_string(),
+                city: "Portland".to_string(),
+                latitude: 45.5,
+                longitude: -122.6,
+                timezone: "America/Los_Angeles".to_string(),
+            }),
+            network_info: Some(NetworkInfo {
+                isp: "Example ISP".to_string(),
+                organization: "Example ISP".to_string(),
+                asn: Some(64500),
+                asn_name: Some("EXAMPLE-AS".to_string()),
+                network_range: Some("192.0.2.0/24".to_string()),
+            }),
+            scan_duration: std::time::Duration::from_millis(20),
+            data_source: "ip-api.com".to_string(),
+        });
+        result.ipv6_status = GeoIpStatus::NotGeolocatable(AddressKind::Documentation);
+        let state = complete_state("geoip", ScanResult::GeoIp(result));
+        let pane = GeoIpPane::new();
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Zoomed).join("\n");
+        for expected in [
+            "IPv4: 192.0.2.1",
+            "Region: Oregon (OR)",
+            "Country: United States (US)",
+            "Network: 192.0.2.0/24",
+            "AS name: EXAMPLE-AS",
+            "IPv6: not geolocatable (documentation address)",
+        ] {
+            assert!(zoomed.contains(expected), "{expected}:\n{zoomed}");
+        }
+        let normal = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Normal).join("\n");
+        assert!(!normal.contains("192.0.2.0/24"), "{normal}");
     }
 }

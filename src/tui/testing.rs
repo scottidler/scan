@@ -1,6 +1,6 @@
 //! Test-only helper that renders a pane into a `TestBackend` buffer.
 
-use crate::tui::pane::Pane;
+use crate::tui::pane::{Detail, Pane};
 use crate::types::AppState;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, text::Span};
 
@@ -14,6 +14,14 @@ pub fn render_buffer(pane: &dyn Pane, state: &AppState, width: u16, height: u16,
         })
         .expect("draw pane");
     terminal.backend().buffer().clone()
+}
+
+/// `pane`'s content rows at `width` cells for `detail`, as plain text.
+pub fn content_rows(pane: &dyn Pane, state: &AppState, width: u16, detail: Detail) -> Vec<String> {
+    pane.content(state, width, detail)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+        .collect()
 }
 
 /// Row `y` of `buffer` as text, with the x of the cell each byte offset starts at. The

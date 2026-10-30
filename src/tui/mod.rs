@@ -190,41 +190,7 @@ impl TuiApp {
                 .unwrap_or_else(|| Duration::from_secs(FALLBACK_TIMEOUT_SECS));
 
             if let Some(key) = next_key(timeout)? {
-                log::debug!("[tui] key_event: key={:?} modifiers={:?}", key.code, key.modifiers);
-
-                match key.code {
-                    // Quit on 'q' or Escape key
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        log::debug!("[tui] quit_requested: key={:?}", key.code);
-                        self.should_quit = true;
-                    }
-                    // Quit on Ctrl+C
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        log::debug!("[tui] quit_requested: ctrl_c");
-                        self.should_quit = true;
-                    }
-                    KeyCode::Tab | KeyCode::Right => {
-                        // Cycle forward through focusable panes
-                        self.focus_next_pane();
-                    }
-                    KeyCode::BackTab | KeyCode::Left => {
-                        // Cycle backward through focusable panes
-                        self.focus_prev_pane();
-                    }
-                    KeyCode::Char('p') => {
-                        switch_protocol(&state, protocol_tx);
-                    }
-                    // Scrolling and navigation for the focused pane
-                    _ => {
-                        let state_guard = state.lock().unwrap();
-                        let handled = self.layout.handle_key_event(key, &state_guard);
-                        if handled {
-                            log::trace!("[tui] key_handled_by_pane: key={:?}", key.code);
-                        } else {
-                            log::trace!("[tui] key_unhandled: key={:?}", key.code);
-                        }
-                    }
-                }
+                self.handle_key(key, &state, protocol_tx);
             }
 
             // Check if we should quit
@@ -244,6 +210,52 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    /// Act on one key press. Esc leaves zoom, and quits only from the grid; `q` and Ctrl-C always
+    /// quit. Enter zooms the focused pane; Tab/Right and BackTab/Left move focus, which carries the
+    /// zoom with it.
+    fn handle_key(
+        &mut self,
+        key: event::KeyEvent,
+        state: &Arc<Mutex<AppState>>,
+        protocol_tx: &watch::Sender<Protocol>,
+    ) {
+        log::debug!(
+            "[tui] key_event: key={:?} modifiers={:?} zoomed={}",
+            key.code,
+            key.modifiers,
+            self.layout.is_zoomed()
+        );
+        match key.code {
+            KeyCode::Char('q') => {
+                log::debug!("[tui] quit_requested: key={:?}", key.code);
+                self.should_quit = true;
+            }
+            KeyCode::Esc if self.layout.is_zoomed() => self.layout.unzoom(),
+            KeyCode::Esc => {
+                log::debug!("[tui] quit_requested: key={:?}", key.code);
+                self.should_quit = true;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                log::debug!("[tui] quit_requested: ctrl_c");
+                self.should_quit = true;
+            }
+            KeyCode::Enter => {
+                self.layout.zoom();
+            }
+            KeyCode::Tab | KeyCode::Right => self.focus_next_pane(),
+            KeyCode::BackTab | KeyCode::Left => self.focus_prev_pane(),
+            KeyCode::Char('p') => {
+                switch_protocol(state, protocol_tx);
+            }
+            // Scrolling for the focused pane
+            _ => {
+                let state_guard = state.lock().unwrap();
+                let handled = self.layout.handle_key_event(key, &state_guard);
+                log::trace!("[tui] key_handled_by_pane: key={:?} handled={}", key.code, handled);
+            }
+        }
     }
 
     /// The per-tick step that feeds every pane new scanner data, separate from drawing so a pane

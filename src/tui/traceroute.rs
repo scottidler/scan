@@ -1,4 +1,4 @@
-use crate::scan::traceroute::{TracerouteData, TracerouteHop};
+use crate::scan::traceroute::{TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus};
 use crate::tui::pane::{Detail, Pane};
 use crate::types::{AppState, ScanResult};
 use log;
@@ -99,6 +99,85 @@ fn hop_lines(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> 
     lines
 }
 
+/// `IPv4 ✓ reached` / `IPv4 ✗ target silent (...)`, the family's route header.
+fn reach_line(data: &TracerouteData) -> Line<'static> {
+    let protocol = if data.ipv6 { "IPv6" } else { "IPv4" };
+    Line::from(vec![
+        Span::styled(format!("📍 {}", protocol), Style::default().fg(Color::White)),
+        if data.destination_reached {
+            Span::styled(" ✓ reached", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(format!(" ✗ {}", data.reach_label()), Style::default().fg(Color::Red))
+        },
+    ])
+}
+
+/// Zoomed, every hop has a row, the destination included and silent hops uncollapsed: each
+/// probe's IP and RTT (`*` for a probe with no answer) and the hop's loss.
+fn every_hop_lines(data: &TracerouteData) -> Vec<Line<'static>> {
+    data.hops
+        .iter()
+        .map(|hop| {
+            let probes: Vec<String> = hop
+                .responses
+                .iter()
+                .map(|response| match (response.timeout, response.ip_address, response.rtt) {
+                    (true, _, _) => "*".to_string(),
+                    (false, ip, rtt) => format!(
+                        "{} {}",
+                        ip.map_or_else(|| "*".to_string(), |ip| ip.to_string()),
+                        rtt.map_or_else(|| "*".to_string(), |rtt| format!("{}ms", rtt.as_millis()))
+                    ),
+                })
+                .collect();
+            let lost = hop.responses.iter().filter(|response| response.timeout).count();
+            let probes_sent = hop.responses.len();
+            // Rounded, as Connectivity's loss is: one answer in three reads 67%.
+            let loss = (lost * 100 + probes_sent / 2)
+                .checked_div(probes_sent)
+                .map_or_else(|| "---".to_string(), |percent| format!("{percent}%"));
+            let probe_color = if hop.is_silent() { Color::Gray } else { Color::Cyan };
+            Line::from(vec![
+                Span::styled(
+                    format!("  {:2}: ", hop.hop_number),
+                    Style::default().fg(HOP_NUMBER_COLOR),
+                ),
+                Span::styled(probes.join(" · "), Style::default().fg(probe_color)),
+                Span::styled(format!("  loss {loss}"), Style::default().fg(Color::Gray)),
+            ])
+        })
+        .collect()
+}
+
+/// Zoomed: each family's route in full, or why the family has none.
+fn zoomed_route_lines(result: &TracerouteResult) -> Vec<Line<'static>> {
+    let families = [
+        ("IPv4", &result.ipv4_result, &result.ipv4_status),
+        ("IPv6", &result.ipv6_result, &result.ipv6_status),
+    ];
+    let mut lines = Vec::new();
+    for (name, data, status) in families {
+        match data {
+            Some(data) => {
+                lines.push(reach_line(data));
+                lines.push(destination_line(data, data.destination_hop()));
+                lines.extend(every_hop_lines(data));
+            }
+            None => {
+                let color = match status {
+                    TracerouteStatus::Failed(_) => Color::Red,
+                    _ => Color::Gray,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("📍 {name}: "), Style::default().fg(Color::White)),
+                    Span::styled(status.to_string(), Style::default().fg(color)),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
 impl Pane for TraceroutePane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::traceroute] content: width={} detail={:?}", width, detail);
@@ -122,23 +201,12 @@ impl Pane for TraceroutePane {
             ]);
 
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
-                // Show traceroute data for the primary result with protocol-specific route header
-                if let Some(primary_data) = traceroute_result.get_primary_result() {
-                    let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
-
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("📍 {}", protocol), Style::default().fg(Color::White)),
-                        if primary_data.destination_reached {
-                            Span::styled(" ✓ reached", Style::default().fg(Color::Green))
-                        } else {
-                            Span::styled(
-                                format!(" ✗ {}", primary_data.reach_label()),
-                                Style::default().fg(Color::Red),
-                            )
-                        },
-                    ]));
-
-                    // The destination has its own row; the route above it is the other hops.
+                if detail == Detail::Zoomed {
+                    lines.extend(zoomed_route_lines(traceroute_result));
+                } else if let Some(primary_data) = traceroute_result.get_primary_result() {
+                    // The primary family only; the destination has its own row, the route above
+                    // it is the other hops.
+                    lines.push(reach_line(primary_data));
                     let destination_hop = primary_data.destination_hop();
                     lines.push(destination_line(primary_data, destination_hop));
                     lines.extend(hop_lines(primary_data, destination_hop));
@@ -466,5 +534,64 @@ mod tests {
             assert_eq!(color, Color::White, "hop {number}");
             assert_ne!(color, Color::Red, "hop {number}");
         }
+    }
+
+    #[test]
+    fn zoomed_content_shows_every_probe_rtt_for_a_hop() {
+        use crate::scan::traceroute::{HopResponse, TracerouteResult, TracerouteStatus};
+        use std::time::Duration;
+        let probe = |ms: u64| HopResponse {
+            ip_address: Some("192.0.2.1".parse().expect("ip")),
+            rtt: Some(Duration::from_millis(ms)),
+            timeout: false,
+        };
+        let mut data = tatari_route();
+        data.hops[0].responses = vec![probe(5), probe(7), probe(9)];
+        let mut result = TracerouteResult::new();
+        result.ipv4_status = TracerouteStatus::Success(11);
+        result.ipv4_result = Some(data);
+        result.ipv6_status = TracerouteStatus::NoAddress;
+        let state = AppState::new("www.tatari.tv".to_string());
+        state.scanners.insert(
+            "traceroute".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Traceroute(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let pane = TraceroutePane::new();
+        let rows = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Zoomed);
+        let text = rows.join("\n");
+        assert!(
+            text.contains(" 1: 192.0.2.1 5ms · 192.0.2.1 7ms · 192.0.2.1 9ms  loss 0%"),
+            "{text}"
+        );
+        // Silent hops are not collapsed, and the destination hop is listed too.
+        for number in 3..=9 {
+            assert!(
+                text.contains(&format!("{number:2}: * · * · *  loss 100%")),
+                "hop {number}: {text}"
+            );
+        }
+        assert!(text.contains("11: 216.150.16.193 3ms"), "{text}");
+        assert!(text.contains(" 2: 10.0.0.1 2ms  loss 0%"), "{text}");
+        assert!(text.contains("📍 IPv6: no address"), "{text}");
+        assert!(text.contains("Duration:"), "{text}");
+
+        let normal = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Normal).join("\n");
+        assert!(
+            !normal.contains("7ms"),
+            "the grid shows only the first answer:\n{normal}"
+        );
+    }
+
+    #[test]
+    fn zoomed_hop_loss_is_rounded_like_connectivity() {
+        let state = traced_state(route_with_silent_hops());
+        let text = crate::tui::testing::content_rows(&TraceroutePane::new(), &state, 120, Detail::Zoomed).join("\n");
+        assert!(text.contains(" 3: 192.0.2.1 5ms · * · *  loss 67%"), "{text}");
     }
 }

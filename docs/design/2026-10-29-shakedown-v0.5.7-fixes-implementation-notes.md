@@ -181,3 +181,55 @@ The parametrized tests cover `SCROLLING_PANES` (every pane but Connectivity). `s
 - None.
 
 Evidence: each new test was run with its fix undone, and each failed. Collapse disabled: `tatari_route_fits_the_80x24_dashboard_with_destination_and_duration`, `a_single_silent_hop_reads_without_a_count`, `tui_and_no_tui_report_the_same_silent_hop_count`. Destination row and hop removal disabled: the tatari fit test, `a_silent_target_keeps_its_label_and_a_no_reply_destination_row`, the long-IPv6 clip test. Red hop numbers and `timeout` text restored: `hop_numbers_use_the_label_color_never_the_bad_color`, `no_hop_row_says_timeout`, and two others. Sources restored, then `otto ci` green.
+
+## Phase 8: Zoom
+
+### Design decisions
+- `PaneLayout.zoomed: bool` drives zoom, and `detail()` returns `Zoomed` while it is set. `zoom()` (Enter) needs a focused pane, sets `zoomed`, and drops that pane's `(id, Zoomed)` offset, so every zoom starts at row 0. `unzoom()` (Esc) clears `zoomed` and leaves every grid offset alone. `set_focus` drops the newly focused pane's zoomed offset while zoomed, so Tab/Right and BackTab/Left move the zoom to a pane that starts at row 0. File: `src/tui/layout.rs`. Why `set_focus`: it is the one place focus changes, so no key path can skip the reset.
+- One rect function: `PaneLayout::rect_of(id, area)` returns `zoom_rect(area)` (the frame minus a one-row footer) for the zoomed pane, `None` for the other panes while zoomed, and the grid cell otherwise. `render`, `handle_key_event` and the public `pane_area` all call it, so key-time clamping uses the zoomed rect.
+- `render` draws only the focused pane at `Detail::Zoomed` (`render_zoomed`), plus the `ZOOM_FOOTER` row `Esc back · ←/→ pane · ↑/↓ scroll`. If the focused pane cannot be found, zoom is dropped with a WARN and the grid is drawn, so the screen is never blank. The per-pane draw and offset write-back moved into a free `draw_pane(pane, &mut scroll, ..)` that both paths share, so a resize while zoomed re-clamps through the same write-back as the grid.
+- Key handling moved out of the event loop into `TuiApp::handle_key` (`src/tui/mod.rs`), so tests can drive keys. `q` and Ctrl-C always quit. Esc leaves zoom when zoomed and quits otherwise. Enter calls `layout.zoom()`. Everything else is as before.
+- Per-pane zoom content, from already-collected data only. Each pane branches on `detail` inside `content`:
+  - Traceroute (`zoomed_route_lines`): both families. Each family shows its header and destination row, then every hop with no collapsing and the destination hop included: each probe's `ip rtt` or `*`, and the hop's loss computed from its probes. A family with no data reads `📍 IPv6: <status>`. Duration closes the pane.
+  - DNS: `record_line` adds each record's own `TTL:` when zoomed. TXT verification tokens (`google-site-verification`, `MS=`) are abbreviated only in the grid. SOA adds Email, Refresh, Retry, Expire and Minimum TTL.
+  - Security: the list caps (CSP issues, CORS issues, HTTP and TLS vulnerabilities) lift when zoomed, and CORS methods are listed by name. `zoomed_tls_lines` then appends supported versions and the full certificate chain: subject, issuer, serial, validity, signature, key and SANs for each certificate. Email security (SPF, and DMARC with its full text) was already in the pane and now wraps whole.
+  - HTTP (`zoomed_lines`): URL, pinned IP, every security header with its value (`missing` when absent), the CSP header, CORS allow-origin/methods/headers/credentials, and the four caching headers. The redirect chain and vulnerabilities were already listed in full.
+  - WHOIS (`zoomed_lines`): last updated, DNSSEC, age, registrar IANA ID and URL, the registrar's abuse contact, and the registrant, admin, tech and abuse contacts (`(redacted)` when withheld).
+  - Ports: no 5-port cap; under each port, `service_detail_lines` adds version, banner and connect time.
+  - GeoIP (`zoomed_lines`): each family's IP, city, region and country with codes, coordinates, timezone, ISP, organization, ASN, AS name, network range, source and lookup time, or the family's status.
+  - Target: unchanged.
+- Connectivity overrides `render_detail`, and `render` now delegates to it at `Normal`. Zoomed, the graphs fill the frame (taller sparklines), and each family title adds `loss N% · jitter Xms` over every kept sample (`SparklineData::all`, up to 200), not only the visible ones. `loss_percent` rounds. `jitter_us` is the mean absolute difference between consecutive cycles that both got a reply, and a failed cycle breaks the pair. Both live in `src/tui/sparkline.rs`.
+- Traceroute hop loss rounds the same way (`1 answer in 3` reads `67%`), so the two loss figures agree.
+- Test helper `testing::content_rows(pane, state, width, detail)`.
+- New color literals for Phase 2 to migrate: the zoom footer (Gray, MUTED); the zoomed field labels/values in `http.rs` (`header_line`, White/Gray, `missing` Yellow), `whois.rs` (`field_line`, `contact_lines` Cyan header), `geoip.rs` (`field_line`, `status_text`: Green/Red/Gray), `ports.rs` (`service_detail_lines`), `security.rs` (`zoomed_tls_lines`) and `traceroute.rs` (`every_hop_lines` Cyan/Gray, the zoomed family-status line Red/Gray); the Connectivity loss/jitter span (Gray).
+
+### Deviations
+- The doc puts the full certificate chain under Security's certificate details. It is appended after Email Security instead, so zoom keeps the grid's section order and `DMARC: configured` stays on the first screen at 200x55 (AC5). Verified on a release build against google.com: the chain starts below DMARC.
+- `PaneLayout::pane_area` now returns the zoom rect for the zoomed pane and `None` for the other panes while zoomed. It used to always return the grid cell. All existing callers run unzoomed.
+- `Pane::render` on Connectivity now delegates to `render_detail(.., Normal)`. The doc has `render_detail` default to `render`; that default is unchanged, and only the override direction is reversed for the one pane that overrides it.
+- HTTP zoom shows no per-family status line: `HttpStatus` has no `Display`, and adding one is outside this phase. The primary result's fields are shown.
+- AC4 as written (`tui-test ... key press BackTab`) cannot pass with this tui-test: its verbose log shows `WRITE BackTab` (the literal text) while Enter logs `WRITE \r`. `key press shift+tab` writes `\e[Z` and AC4 then passes on a release build of this commit (SECURITY hidden, TRACEROUTE shown, Escape back to the grid with SECURITY). Phase 8's code is correct; the AC's key name needs changing.
+
+### Tradeoffs
+- Resetting the zoom offset on every focus change vs keeping a per-pane zoom offset across visits: the doc asks for 0 on Left/Right. One rule (zooming into a pane starts at its top) is easier to predict than a remembered position.
+- Zoom extras appended after the grid content vs reordered for zoom: appending keeps the order a user already knows from the grid, at the cost of the most detailed data sitting lowest.
+- Jitter as the mean consecutive difference vs RFC 3550's smoothed estimator: the mean over a fixed window is reproducible from the samples shown and is testable exactly. The smoothed estimator weights recent samples, which the window already does.
+- Footer only while zoomed vs always: the grid has no footer today. Adding one would take a row from every 80x24 pane and break the Phase 7 fit.
+
+### Open questions
+- AC4's key name: change `key press BackTab` to `key press shift+tab` in the doc's Acceptance Criteria? The command as written types the text `BackTab`.
+
+Evidence: each new test was run with its fix undone, and each failed. Sources were then restored byte-for-byte and `otto ci` re-run green. The undone fixes:
+- render ignores `zoomed`: `zoom_draws_exactly_one_pane_title_and_the_key_footer` fails.
+- no zoom-offset reset in `set_focus`: `right_while_zoomed_shows_the_next_pane_from_its_first_row` fails.
+- no zoomed offset write-back: `a_resize_while_zoomed_stays_zoomed_and_reclamps` fails.
+- Esc always quits: `esc_while_zoomed_leaves_zoom_and_does_not_quit` fails. Esc never quits: `esc_while_not_zoomed_quits_and_q_quits_from_zoom` fails.
+- `detail()` always Normal: `grid_and_zoomed_offsets_of_one_pane_are_independent` fails.
+- traceroute zoom branch off: `zoomed_content_shows_every_probe_rtt_for_a_hop` fails. Floor instead of round: `zoomed_hop_loss_is_rounded_like_connectivity` fails.
+- `to_rows` fitting at Zoomed, and TXT abbreviated at every detail: `zoomed_content_shows_a_300_char_txt_record_in_full_wrapped` fails for each.
+- per-record TTL off: `zoomed_content_gives_each_record_its_ttl_and_every_soa_field` fails.
+- Security chain off: `zoomed_content_lists_the_certificate_chain_and_dmarc_in_full` fails. Caps kept: `zoomed_content_lists_every_tls_issue_past_the_grid_cap` fails.
+- HTTP, WHOIS, GeoIP and Ports zoom off: their `zoomed_content_*` tests fail.
+- Connectivity loss/jitter off: `zoomed_render_adds_loss_and_jitter_over_every_sample` fails.
+
+Live, release build of this commit, 200x55: AC5 `google.com` Enter shows `DMARC: configured`. The same text was not visible in the grid within 45s, so the check is meaningful. AC4 passes with `shift+tab` as above, and a second Escape exits 0.
