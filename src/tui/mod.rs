@@ -162,6 +162,8 @@ impl TuiApp {
         let start_time = Instant::now();
 
         loop {
+            self.ingest(&state);
+
             // Draw the UI
             let draw_start = Instant::now();
             terminal.draw(|f| self.ui(f, &state))?;
@@ -251,6 +253,13 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    /// The per-tick step that feeds every pane new scanner data, separate from drawing so a pane
+    /// that is not drawn (zoom on another pane) still loses no scan results.
+    fn ingest(&self, state: &Arc<Mutex<AppState>>) {
+        let state_guard = state.lock().unwrap();
+        self.layout.ingest(&state_guard);
     }
 
     /// Draw the UI
@@ -436,6 +445,72 @@ mod tests {
         // Test that KeyModifiers is properly imported and accessible
         let ctrl_modifier = KeyModifiers::CONTROL;
         assert_eq!(ctrl_modifier, KeyModifiers::CONTROL);
+    }
+
+    use crate::scan::ping::{PingResult, PingStatus};
+    use crate::types::{ScanResult, ScanState, ScanStatus};
+    use std::collections::VecDeque;
+
+    /// Publish one ping result the way the scanner loop does.
+    fn publish_ping(state: &Arc<Mutex<AppState>>, cycle: u64) {
+        {
+            let guard = state.lock().unwrap();
+            guard.scanners.entry("ping".to_string()).or_insert_with(|| ScanState {
+                result: None,
+                error: None,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: VecDeque::new(),
+            });
+        }
+        let mut ping = PingResult::new();
+        ping.ipv4_status = PingStatus::Success(Duration::from_millis(10 + cycle));
+        ping.ipv6_status = PingStatus::Success(Duration::from_millis(20 + cycle));
+        ping.queried_at = Instant::now() + Duration::from_secs(cycle);
+        crate::scanner::record_outcome(
+            "ping",
+            10,
+            Protocol::Both,
+            Instant::now(),
+            Ok(ScanResult::Ping(ping)),
+            state,
+        );
+    }
+
+    fn connectivity_samples(app: &mut TuiApp) -> (usize, usize) {
+        app.layout
+            .pane_mut("connectivity")
+            .expect("connectivity pane")
+            .as_any_mut()
+            .downcast_mut::<ConnectivityPane>()
+            .expect("ConnectivityPane")
+            .sample_counts()
+    }
+
+    #[test]
+    fn ping_results_published_while_connectivity_is_not_drawn_are_all_sampled() {
+        const N: usize = 7;
+        let mut app = TuiApp::new().expect("app");
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        for cycle in 0..N {
+            publish_ping(&state, cycle as u64);
+            app.ingest(&state);
+        }
+        assert_eq!(connectivity_samples(&mut app), (N, N), "no frame was drawn");
+    }
+
+    #[test]
+    fn ping_results_published_between_two_ticks_are_all_sampled() {
+        const N: usize = 4;
+        let mut app = TuiApp::new().expect("app");
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        app.ingest(&state);
+        for cycle in 0..N {
+            publish_ping(&state, cycle as u64);
+        }
+        app.ingest(&state);
+        app.ingest(&state);
+        assert_eq!(connectivity_samples(&mut app), (N, N));
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -95,6 +95,23 @@ impl PaneLayout {
         self.focused_pane.as_ref()
     }
 
+    /// Let every pane take in new scanner data, whether or not it is drawn this frame.
+    pub fn ingest(&self, state: &AppState) {
+        log::trace!("[tui::layout] ingest: panes={}", self.panes.len());
+        for pane in &self.panes {
+            pane.ingest(state);
+        }
+    }
+
+    /// The pane with `id`, for tests that inspect a pane's own state.
+    #[cfg(test)]
+    pub(crate) fn pane_mut(&mut self, id: &str) -> Option<&mut dyn Pane> {
+        match self.panes.iter_mut().find(|pane| pane.id() == id) {
+            Some(pane) => Some(pane.as_mut()),
+            None => None,
+        }
+    }
+
     /// Render all panes in the layout
     pub fn render(&self, frame: &mut Frame, area: Rect, state: &AppState) {
         log::trace!(

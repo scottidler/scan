@@ -1,5 +1,6 @@
 use crate::scan::Family;
-use crate::scan::ping::PingStatus;
+use crate::scan::ping::{PingResult, PingStatus};
+use crate::target::Protocol;
 use crate::tui::pane::{Pane, create_block};
 use crate::tui::sparkline::{Sample, SparklineData, average_us, bars_newest_first, scale_max_us, span};
 use crate::types::{AppState, ScanResult};
@@ -59,12 +60,21 @@ fn family_state_text(
     checking_text: &str,
 ) -> String {
     match (&view.state, form) {
+        (ConnectivityState::NoAddress, _) => format!("no {} address", view.family.as_str()),
+        (ConnectivityState::Disabled, _) => DISABLED_LABEL.to_string(),
         (ConnectivityState::Disconnected, _) => family_failure_label(state, view.family),
         (ConnectivityState::Checking, StateForm::Full) => checking_text.to_string(),
         (_, StateForm::Full) => view.latency_text(visible),
         (_, StateForm::Compact) => latest_text(view.data.latest()),
     }
 }
+
+/// Shown for a family the protocol selection turned off; `p` turns it back on.
+const DISABLED_LABEL: &str = "disabled (p)";
+/// Ping results kept per family to judge its state.
+const STATE_WINDOW: usize = 10;
+/// How many of the newest results decide the state.
+const STATE_RECENT: usize = 5;
 
 /// Drawn, in red, for a ping cycle that got no reply.
 const FAILED_SAMPLE_SYMBOL: &str = "░";
@@ -142,7 +152,6 @@ struct FamilyView {
     family: Family,
     short: &'static str,
     state: ConnectivityState,
-    connected: bool,
     data: SparklineData,
 }
 
@@ -161,11 +170,16 @@ impl FamilyView {
     }
 
     fn title_color(&self) -> Color {
-        if self.connected { Color::Green } else { Color::Red }
+        match self.state {
+            ConnectivityState::Connected => Color::Green,
+            // MUTED: neither is a fault. Phase 2 moves this to the theme.
+            ConnectivityState::NoAddress | ConnectivityState::Disabled => Color::Gray,
+            _ => Color::Red,
+        }
     }
 
     fn graph_color(&self, visible: &[Sample]) -> Color {
-        if !self.connected {
+        if self.state != ConnectivityState::Connected {
             return Color::Red;
         }
         match average_us(visible) {
@@ -194,89 +208,209 @@ enum ConnectivityState {
     Connected,
     Disconnected,
     Intermittent,
+    /// The target has no address in this family: nothing to ping, not a failure.
+    NoAddress,
+    /// The protocol selection leaves this family out.
+    Disabled,
 }
 
+/// The overall status line for the two families' states. A family with no address, or left out by
+/// the protocol selection, never makes the status a warning.
+fn overall_status(ipv4: &ConnectivityState, ipv6: &ConnectivityState) -> (&'static str, Color) {
+    use ConnectivityState::*;
+    match (ipv4, ipv6) {
+        (NoAddress | Disabled, NoAddress | Disabled) => ("no address", Color::Gray),
+        (live, NoAddress | Disabled) => single_family_status(live, "ipv4", "ipv4 intermittent"),
+        (NoAddress | Disabled, live) => single_family_status(live, "ipv6", "ipv6 intermittent"),
+        (Connected, Connected) => ("dual-stack", Color::Green),
+        (Connected, Disconnected) => ("ipv4 only", Color::Yellow),
+        (Disconnected, Connected) => ("ipv6 only", Color::Yellow),
+        (Connected, Intermittent) => ("ipv4 stable, ipv6 intermittent", Color::Yellow),
+        (Intermittent, Connected) => ("ipv4 intermittent, ipv6 stable", Color::Yellow),
+        (Intermittent, Intermittent) => ("intermittent connectivity", Color::Yellow),
+        (Intermittent, Disconnected) => ("ipv4 intermittent", Color::Yellow),
+        (Disconnected, Intermittent) => ("ipv6 intermittent", Color::Yellow),
+        (Disconnected, Disconnected) | (Disconnected, Checking) | (Checking, Disconnected) => {
+            ("no ping reply", Color::Red)
+        }
+        (Checking, _) | (_, Checking) => ("checking connectivity", Color::Gray),
+    }
+}
+
+/// The status when only one family can be pinged.
+fn single_family_status(
+    state: &ConnectivityState,
+    connected_text: &'static str,
+    intermittent_text: &'static str,
+) -> (&'static str, Color) {
+    match state {
+        ConnectivityState::Connected => (connected_text, Color::Green),
+        ConnectivityState::Intermittent => (intermittent_text, Color::Yellow),
+        ConnectivityState::Disconnected => ("no ping reply", Color::Red),
+        _ => ("checking connectivity", Color::Gray),
+    }
+}
+
+/// One family's recent ping results, the state they add up to, and its sparkline samples.
 #[derive(Debug, Clone)]
-struct ConnectivityHistory {
-    ipv4_results: VecDeque<(Instant, bool)>, // (timestamp, success)
-    ipv6_results: VecDeque<(Instant, bool)>,
-    ipv4_state: ConnectivityState,
-    ipv6_state: ConnectivityState,
-    last_state_change: Instant,
+struct FamilyHistory {
+    results: VecDeque<bool>,
+    state: ConnectivityState,
+    samples: SparklineData,
 }
 
-impl ConnectivityHistory {
+impl FamilyHistory {
     fn new() -> Self {
         Self {
-            ipv4_results: VecDeque::new(),
-            ipv6_results: VecDeque::new(),
-            ipv4_state: ConnectivityState::Checking,
-            ipv6_state: ConnectivityState::Checking,
-            last_state_change: Instant::now(),
+            results: VecDeque::new(),
+            state: ConnectivityState::Checking,
+            samples: SparklineData::new(SPARKLINE_CAPACITY),
         }
     }
 
-    fn add_result(&mut self, ipv4_success: Option<bool>, ipv6_success: Option<bool>) {
-        let now = Instant::now();
-
-        // Keep last 10 results for each protocol
-        const MAX_HISTORY: usize = 10;
-
-        if let Some(success) = ipv4_success {
-            self.ipv4_results.push_back((now, success));
-            while self.ipv4_results.len() > MAX_HISTORY {
-                self.ipv4_results.pop_front();
+    /// Record one ping cycle's `status` for this family. `NoAddress` sets the state directly: it is
+    /// not a ping attempt, so it never counts as a failure. A disabled family records nothing.
+    fn observe(&mut self, at: Instant, status: &PingStatus) {
+        if self.state == ConnectivityState::Disabled {
+            return;
+        }
+        match status {
+            PingStatus::Success(latency) => {
+                self.push_result(true);
+                self.samples.add_sample(at, Some(*latency));
             }
-            self.update_ipv4_state();
-        }
-
-        if let Some(success) = ipv6_success {
-            self.ipv6_results.push_back((now, success));
-            while self.ipv6_results.len() > MAX_HISTORY {
-                self.ipv6_results.pop_front();
+            PingStatus::Failed(_) | PingStatus::ToolMissing(_) => {
+                self.push_result(false);
+                self.samples.add_sample(at, None);
             }
-            self.update_ipv6_state();
+            PingStatus::NoAddress => {
+                self.results.clear();
+                self.state = ConnectivityState::NoAddress;
+            }
+            PingStatus::NotQueried => {}
         }
     }
 
-    fn update_ipv4_state(&mut self) {
-        let new_state = self.calculate_state(&self.ipv4_results);
-        if new_state != self.ipv4_state {
-            self.ipv4_state = new_state;
-            self.last_state_change = Instant::now();
+    fn push_result(&mut self, success: bool) {
+        self.results.push_back(success);
+        while self.results.len() > STATE_WINDOW {
+            self.results.pop_front();
+        }
+        self.state = state_of(&self.results);
+    }
+
+    /// Drop everything recorded: the family is off until the protocol selection includes it again.
+    fn disable(&mut self) {
+        *self = Self::new();
+        self.state = ConnectivityState::Disabled;
+    }
+
+    /// Start a disabled family over at `Checking`; an enabled family is left as it is.
+    fn enable(&mut self) {
+        if self.state == ConnectivityState::Disabled {
+            *self = Self::new();
+        }
+    }
+}
+
+/// The state the newest results add up to.
+fn state_of(results: &VecDeque<bool>) -> ConnectivityState {
+    let recent: Vec<bool> = results.iter().rev().take(STATE_RECENT).copied().collect();
+    let success_count = recent.iter().filter(|&&success| success).count();
+    let failure_count = recent.len() - success_count;
+    match (success_count, failure_count) {
+        (s, 0) if s >= 2 => ConnectivityState::Connected,
+        (0, f) if f >= 3 => ConnectivityState::Disconnected,
+        (s, f) if s > 0 && f > 0 => ConnectivityState::Intermittent,
+        _ => ConnectivityState::Checking,
+    }
+}
+
+/// Everything Connectivity has taken in from the ping scanner, updated by `ingest` once per TUI
+/// tick whether or not the pane is drawn.
+#[derive(Debug, Clone)]
+struct Ingested {
+    /// IPv4, then IPv6.
+    families: [FamilyHistory; 2],
+    /// `queried_at` of the newest ping result taken in, so none is counted twice.
+    last_ping_at: Option<Instant>,
+    /// The protocol selection last seen, so a change disables the family it leaves out.
+    protocol: Option<Protocol>,
+}
+
+impl Ingested {
+    fn new() -> Self {
+        Self {
+            families: [FamilyHistory::new(), FamilyHistory::new()],
+            last_ping_at: None,
+            protocol: None,
         }
     }
 
-    fn update_ipv6_state(&mut self) {
-        let new_state = self.calculate_state(&self.ipv6_results);
-        if new_state != self.ipv6_state {
-            self.ipv6_state = new_state;
-            self.last_state_change = Instant::now();
-        }
+    fn family(&self, family: Family) -> &FamilyHistory {
+        &self.families[family_index(family)]
     }
 
-    fn calculate_state(&self, results: &VecDeque<(Instant, bool)>) -> ConnectivityState {
-        if results.is_empty() {
-            return ConnectivityState::Checking;
+    /// On a protocol change, clear and disable each family the selection leaves out, and restart
+    /// each one it brings back.
+    fn follow_protocol(&mut self, protocol: Protocol) {
+        if self.protocol == Some(protocol) {
+            return;
         }
-
-        let recent_count = results.len().min(5); // Look at last 5 results
-        let recent_results: Vec<bool> = results
-            .iter()
-            .rev()
-            .take(recent_count)
-            .map(|(_, success)| *success)
-            .collect();
-
-        let success_count = recent_results.iter().filter(|&&s| s).count();
-        let failure_count = recent_results.len() - success_count;
-
-        match (success_count, failure_count) {
-            (s, 0) if s >= 2 => ConnectivityState::Connected, // All recent pings successful
-            (0, f) if f >= 3 => ConnectivityState::Disconnected, // Multiple recent failures
-            (s, f) if s > 0 && f > 0 => ConnectivityState::Intermittent, // Mixed results
-            _ => ConnectivityState::Checking,                 // Not enough data
+        for family in [Family::Ipv4, Family::Ipv6] {
+            let history = &mut self.families[family_index(family)];
+            if protocol_includes(protocol, family) {
+                history.enable();
+            } else {
+                history.disable();
+            }
         }
+        log::debug!(
+            "[tui::connectivity] protocol_followed: old={:?} new={} ipv4={:?} ipv6={:?}",
+            self.protocol.map(|p| p.as_str()),
+            protocol.as_str(),
+            self.families[0].state,
+            self.families[1].state
+        );
+        self.protocol = Some(protocol);
+    }
+
+    /// Take in one ping result, unless it is not newer than the last one taken in.
+    fn take_ping(&mut self, ping: &PingResult) {
+        if self.last_ping_at.is_some_and(|last| last >= ping.queried_at) {
+            log::trace!(
+                "[tui::connectivity] skipping_old_data: last={:?} current={:?}",
+                self.last_ping_at,
+                ping.queried_at
+            );
+            return;
+        }
+        self.last_ping_at = Some(ping.queried_at);
+        self.families[0].observe(ping.queried_at, &ping.ipv4_status);
+        self.families[1].observe(ping.queried_at, &ping.ipv6_status);
+        log::debug!(
+            "[tui::connectivity] ping_taken: ipv4={:?} ipv4_state={:?} ipv4_samples={} ipv6={:?} ipv6_state={:?} ipv6_samples={}",
+            ping.ipv4_status,
+            self.families[0].state,
+            self.families[0].samples.len(),
+            ping.ipv6_status,
+            self.families[1].state,
+            self.families[1].samples.len()
+        );
+    }
+}
+
+fn family_index(family: Family) -> usize {
+    match family {
+        Family::Ipv4 => 0,
+        Family::Ipv6 => 1,
+    }
+}
+
+fn protocol_includes(protocol: Protocol, family: Family) -> bool {
+    match family {
+        Family::Ipv4 => protocol.includes_ipv4(),
+        Family::Ipv6 => protocol.includes_ipv6(),
     }
 }
 
@@ -284,10 +418,7 @@ impl ConnectivityHistory {
 pub struct ConnectivityPane {
     title: &'static str,
     id: &'static str,
-    ipv4_sparkline: Mutex<SparklineData>,
-    ipv6_sparkline: Mutex<SparklineData>,
-    last_ping_timestamp: Mutex<Option<std::time::Instant>>,
-    connectivity_history: Mutex<ConnectivityHistory>,
+    ingested: Mutex<Ingested>,
 }
 
 impl ConnectivityPane {
@@ -297,99 +428,26 @@ impl ConnectivityPane {
         Self {
             title: "connectivity",
             id: "connectivity",
-            ipv4_sparkline: Mutex::new(SparklineData::new(SPARKLINE_CAPACITY)),
-            ipv6_sparkline: Mutex::new(SparklineData::new(SPARKLINE_CAPACITY)),
-            last_ping_timestamp: Mutex::new(None),
-            connectivity_history: Mutex::new(ConnectivityHistory::new()),
+            ingested: Mutex::new(Ingested::new()),
         }
     }
 
-    fn update_sparklines(&self, ping_result: &crate::scan::ping::PingResult) {
-        // Check if this is new data
-        let is_new_data = if let Ok(mut last_timestamp) = self.last_ping_timestamp.lock() {
-            let current_timestamp = ping_result.queried_at;
-            match *last_timestamp {
-                Some(last) if last >= current_timestamp => {
-                    // This is old data, don't update sparklines
-                    log::trace!(
-                        "[tui::connectivity] skipping_old_data: last={:?} current={:?}",
-                        last,
-                        current_timestamp
-                    );
-                    return;
-                }
-                _ => {
-                    // This is new data, update timestamp and continue
-                    log::debug!("[tui::connectivity] new_ping_data: timestamp={:?}", current_timestamp);
-                    *last_timestamp = Some(current_timestamp);
-                    true
-                }
-            }
-        } else {
-            log::warn!("[tui::connectivity] failed_to_lock_timestamp");
-            false
-        };
-
-        if !is_new_data {
-            return;
-        }
-
-        let ipv4_success = ping_result.ipv4_status.is_success();
-        let ipv6_success = ping_result.ipv6_status.is_success();
-        let ipv4_attempted = ping_result.ipv4_status.was_attempted();
-        let ipv6_attempted = ping_result.ipv6_status.was_attempted();
-
-        log::debug!(
-            "[tui::connectivity] updating_sparklines: ipv4_success={} ipv6_success={}",
-            ipv4_success,
-            ipv6_success
-        );
-
-        // Update connectivity history - treat any attempt as a result to track
-        if let Ok(mut history) = self.connectivity_history.lock() {
-            let ipv4_result = if ipv4_attempted { Some(ipv4_success) } else { None };
-            let ipv6_result = if ipv6_attempted { Some(ipv6_success) } else { None };
-
-            history.add_result(ipv4_result, ipv6_result);
-            log::debug!(
-                "[tui::connectivity] connectivity_history_updated: ipv4_attempted={} ipv4_success={} ipv4_state={:?} ipv6_attempted={} ipv6_success={} ipv6_state={:?}",
-                ipv4_attempted,
-                ipv4_success,
-                history.ipv4_state,
-                ipv6_attempted,
-                ipv6_success,
-                history.ipv6_state
-            );
-        } else {
-            log::warn!("[tui::connectivity] failed_to_lock_connectivity_history");
-        }
-
-        let at = ping_result.queried_at;
-        for (family, status, sparkline) in [
-            (Family::Ipv4, &ping_result.ipv4_status, &self.ipv4_sparkline),
-            (Family::Ipv6, &ping_result.ipv6_status, &self.ipv6_sparkline),
-        ] {
-            let sample = match status {
-                PingStatus::Success(latency) => Some(Some(*latency)),
-                PingStatus::Failed(_) | PingStatus::ToolMissing(_) => Some(None),
-                PingStatus::NoAddress | PingStatus::NotQueried => None,
-            };
-            let Some(latency) = sample else {
-                log::debug!("[tui::connectivity] no_sample: family={:?} status={:?}", family, status);
-                continue;
-            };
-            if let Ok(mut sparkline) = sparkline.lock() {
-                sparkline.add_sample(at, latency);
-                log::debug!(
-                    "[tui::connectivity] sparkline_updated: family={:?} latency={:?} points={}",
-                    family,
-                    latency,
-                    sparkline.len()
-                );
-            } else {
-                log::warn!("[tui::connectivity] failed_to_lock_sparkline: family={:?}", family);
+    /// A copy of what has been taken in, for one render.
+    fn snapshot(&self) -> Ingested {
+        match self.ingested.lock() {
+            Ok(ingested) => ingested.clone(),
+            Err(_) => {
+                log::warn!("[tui::connectivity] ingested_lock_failed");
+                Ingested::new()
             }
         }
+    }
+
+    /// IPv4 and IPv6 sparkline sample counts.
+    #[cfg(test)]
+    pub(crate) fn sample_counts(&self) -> (usize, usize) {
+        let ingested = self.snapshot();
+        (ingested.families[0].samples.len(), ingested.families[1].samples.len())
     }
 }
 
@@ -400,6 +458,29 @@ impl Default for ConnectivityPane {
 }
 
 impl Pane for ConnectivityPane {
+    /// Take in the protocol selection and every ping result not yet seen: the scanner's history
+    /// first, then its current result, so results published between two ticks are all counted.
+    fn ingest(&self, state: &AppState) {
+        let Ok(mut ingested) = self.ingested.lock() else {
+            log::warn!("[tui::connectivity] ingested_lock_failed");
+            return;
+        };
+        ingested.follow_protocol(state.protocol);
+        let Some(ping_state) = state.scanners.get("ping") else {
+            return;
+        };
+        let results = ping_state
+            .history
+            .iter()
+            .map(|entry| &entry.result)
+            .chain(ping_state.result.as_ref());
+        for result in results {
+            if let ScanResult::Ping(ping) = result {
+                ingested.take_ping(ping);
+            }
+        }
+    }
+
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool) {
         log::trace!(
             "[tui::connectivity] render: area={}x{} focused={}",
@@ -419,50 +500,16 @@ impl Pane for ConnectivityPane {
         // Prepare content lines
         let mut lines = Vec::new();
 
-        // Get stable connectivity states to prevent flashing
-        let (has_ipv4, has_ipv6, status_text, status_color) = if let Ok(history) = self.connectivity_history.lock() {
-            let ipv4_connected = matches!(history.ipv4_state, ConnectivityState::Connected);
-            let ipv6_connected = matches!(history.ipv6_state, ConnectivityState::Connected);
-
-            let (text, color) = match (&history.ipv4_state, &history.ipv6_state) {
-                (ConnectivityState::Connected, ConnectivityState::Connected) => ("dual-stack", Color::Green),
-                (ConnectivityState::Connected, ConnectivityState::Disconnected) => ("ipv4 only", Color::Yellow),
-                (ConnectivityState::Disconnected, ConnectivityState::Connected) => ("ipv6 only", Color::Yellow),
-                (ConnectivityState::Connected, ConnectivityState::Intermittent) => {
-                    ("ipv4 stable, ipv6 intermittent", Color::Yellow)
-                }
-                (ConnectivityState::Intermittent, ConnectivityState::Connected) => {
-                    ("ipv4 intermittent, ipv6 stable", Color::Yellow)
-                }
-                (ConnectivityState::Intermittent, ConnectivityState::Intermittent) => {
-                    ("intermittent connectivity", Color::Yellow)
-                }
-                (ConnectivityState::Intermittent, ConnectivityState::Disconnected) => {
-                    ("ipv4 intermittent", Color::Yellow)
-                }
-                (ConnectivityState::Disconnected, ConnectivityState::Intermittent) => {
-                    ("ipv6 intermittent", Color::Yellow)
-                }
-                (ConnectivityState::Disconnected, ConnectivityState::Disconnected)
-                | (ConnectivityState::Disconnected, ConnectivityState::Checking)
-                | (ConnectivityState::Checking, ConnectivityState::Disconnected) => ("no ping reply", Color::Red),
-                (ConnectivityState::Checking, _) | (_, ConnectivityState::Checking) => {
-                    ("checking connectivity", Color::Gray)
-                }
-            };
-
-            log::trace!(
-                "[tui::connectivity] stable_states: ipv4={:?} ipv6={:?} text={}",
-                history.ipv4_state,
-                history.ipv6_state,
-                text
-            );
-
-            (ipv4_connected, ipv6_connected, text, color)
-        } else {
-            log::warn!("[tui::connectivity] failed_to_lock_connectivity_history");
-            (false, false, "checking", Color::Gray)
-        };
+        let ingested = self.snapshot();
+        let ipv4_state = ingested.family(Family::Ipv4).state.clone();
+        let ipv6_state = ingested.family(Family::Ipv6).state.clone();
+        let (status_text, status_color) = overall_status(&ipv4_state, &ipv6_state);
+        log::trace!(
+            "[tui::connectivity] stable_states: ipv4={:?} ipv6={:?} text={}",
+            ipv4_state,
+            ipv6_state,
+            status_text
+        );
         let mut status_text = status_text.to_string();
         let mut status_color = status_color;
         // The latest ping scan's error (deadline hit). The smoothed label stays, since it reflects
@@ -484,14 +531,6 @@ impl Pane for ConnectivityPane {
             && reason != NO_REPLY_LABEL
         {
             status_text = format!("no ping reply: {reason}");
-        }
-
-        // Update sparklines if we have ping results
-        if let Some(ping_state) = state.scanners.get("ping")
-            && let Some(ScanResult::Ping(ping)) = &ping_state.result
-        {
-            log::trace!("[tui::connectivity] updating_sparklines_from_render");
-            self.update_sparklines(ping);
         }
 
         // Status line
@@ -526,31 +565,18 @@ impl Pane for ConnectivityPane {
             "checking"
         };
 
-        let (ipv4_state, ipv6_state) = match self.connectivity_history.lock() {
-            Ok(history) => (history.ipv4_state.clone(), history.ipv6_state.clone()),
-            Err(_) => (ConnectivityState::Checking, ConnectivityState::Checking),
-        };
-        let snapshot = |sparkline: &Mutex<SparklineData>| match sparkline.lock() {
-            Ok(data) => data.clone(),
-            Err(_) => {
-                log::warn!("[tui::connectivity] sparkline_lock_failed");
-                SparklineData::new(0)
-            }
-        };
         let families = [
             FamilyView {
                 family: Family::Ipv4,
                 short: "v4",
                 state: ipv4_state,
-                connected: has_ipv4,
-                data: snapshot(&self.ipv4_sparkline),
+                data: ingested.family(Family::Ipv4).samples.clone(),
             },
             FamilyView {
                 family: Family::Ipv6,
                 short: "v6",
                 state: ipv6_state,
-                connected: has_ipv6,
-                data: snapshot(&self.ipv6_sparkline),
+                data: ingested.family(Family::Ipv6).samples.clone(),
             },
         ];
 
@@ -671,26 +697,46 @@ mod tests {
         ok.ipv4_status = PingStatus::Success(Duration::from_micros(500));
         ok.ipv6_status = PingStatus::NoAddress;
         ok.queried_at = start;
-        pane.update_sparklines(&ok);
+        pane.ingest(&state_with_ping(ok));
         let mut failed = failed_ping_with(PingFailure::NoReply);
         failed.queried_at = start + Duration::from_secs(1);
-        pane.update_sparklines(&failed);
+        pane.ingest(&state_with_ping(failed));
 
-        let ipv4 = pane.ipv4_sparkline.lock().expect("ipv4 sparkline");
+        let ingested = pane.snapshot();
+        let ipv4 = &ingested.family(Family::Ipv4).samples;
         let values: Vec<Option<u64>> = ipv4.visible(10).iter().map(|(_, micros)| *micros).collect();
         assert_eq!(values, vec![Some(500), None]);
-        let ipv6 = pane.ipv6_sparkline.lock().expect("ipv6 sparkline");
+        let ipv6 = &ingested.family(Family::Ipv6).samples;
         assert_eq!(ipv6.len(), 1, "NoAddress is not a ping cycle; the failure is");
     }
 
-    /// Render `pane` once per ping from `pings`, each 1s after the last; returns the final render.
-    fn render_cycles(pane: &ConnectivityPane, pings: &[PingResult], width: u16, height: u16) -> String {
+    /// One TUI tick: ingest `state`, then draw the pane.
+    fn tick(pane: &ConnectivityPane, state: &AppState, width: u16, height: u16) -> String {
+        pane.ingest(state);
+        render_pane(pane, state, width, height, false)
+    }
+
+    /// One tick per ping from `pings`, each 1s after the last, under `protocol`.
+    fn states_for(pings: &[PingResult], protocol: Protocol) -> Vec<AppState> {
         let start = Instant::now();
+        pings
+            .iter()
+            .enumerate()
+            .map(|(cycle, ping)| {
+                let mut ping = ping.clone();
+                ping.queried_at = start + Duration::from_secs(cycle as u64);
+                let mut state = state_with_ping(ping);
+                state.protocol = protocol;
+                state
+            })
+            .collect()
+    }
+
+    /// Tick `pane` once per ping from `pings`, each 1s after the last; returns the final render.
+    fn render_cycles(pane: &ConnectivityPane, pings: &[PingResult], width: u16, height: u16) -> String {
         let mut out = String::new();
-        for (cycle, ping) in pings.iter().enumerate() {
-            let mut ping = ping.clone();
-            ping.queried_at = start + Duration::from_secs(cycle as u64);
-            out = render_pane(pane, &state_with_ping(ping), width, height, false);
+        for state in states_for(pings, Protocol::Both) {
+            out = tick(pane, &state, width, height);
         }
         out
     }
@@ -860,7 +906,7 @@ mod tests {
         let pane = ConnectivityPane::new();
         let mut out = String::new();
         for _ in 0..5 {
-            out = render_pane(&pane, &state_with_ping(ping()), 100, 20, false);
+            out = tick(&pane, &state_with_ping(ping()), 100, 20);
         }
         out
     }
@@ -913,7 +959,7 @@ mod tests {
         let mut out = String::new();
         for _ in 0..5 {
             let state = state_with_ping(failed_ping("ping binary missing"));
-            out = render_pane(&pane, &state, 100, 20, false);
+            out = tick(&pane, &state, 100, 20);
         }
         assert!(out.contains("no ping reply"), "{out}");
         assert!(out.contains("ping binary missing"), "{out}");
@@ -925,7 +971,7 @@ mod tests {
         let pane = ConnectivityPane::new();
         let mut out = String::new();
         for _ in 0..2 {
-            out = render_pane(&pane, &state_with_ping(failed_ping("x")), 100, 20, false);
+            out = tick(&pane, &state_with_ping(failed_ping("x")), 100, 20);
         }
         assert!(out.contains("checking"), "{out}");
     }
@@ -943,14 +989,14 @@ mod tests {
             ping
         };
         for sample in 1..=5 {
-            render_pane(&pane, &state_with_ping(ok(sample)), 100, 20, false);
+            tick(&pane, &state_with_ping(ok(sample)), 100, 20);
         }
         let state = state_with_ping(ok(5));
         if let Some(mut ping_state) = state.scanners.get_mut("ping") {
             ping_state.status = ScanStatus::Failed;
             ping_state.error = Some(eyre::eyre!("timed out after 30s"));
         }
-        let out = render_pane(&pane, &state, 100, 20, false);
+        let out = tick(&pane, &state, 100, 20);
         assert!(out.contains("dual-stack"), "smoothed label dropped:\n{out}");
         assert!(
             out.contains("failed: timed out after 30s"),
@@ -979,6 +1025,119 @@ mod tests {
             1,
             &format!("🌐 Status: failed: {reason}"),
         );
+    }
+
+    fn no_address_ping(family: Family) -> PingResult {
+        let mut ping = ok_ping(12, 14);
+        match family {
+            Family::Ipv4 => ping.ipv4_status = PingStatus::NoAddress,
+            Family::Ipv6 => ping.ipv6_status = PingStatus::NoAddress,
+        }
+        ping
+    }
+
+    /// Five cycles in `pane`, then the final frame as a styled buffer.
+    fn five_cycles_buffer(pings: &[PingResult], width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let pane = ConnectivityPane::new();
+        let states = states_for(pings, Protocol::Both);
+        for state in &states {
+            pane.ingest(state);
+        }
+        crate::tui::testing::render_buffer(&pane, states.last().unwrap(), width, height, false)
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn five_no_aaaa_cycles_read_no_ipv6_address_muted_and_status_ipv4() {
+        use crate::tui::testing::fg_of;
+        let pings = vec![no_address_ping(Family::Ipv6); 5];
+        for (mode, height) in [("full", 20), ("compact", 6)] {
+            let buffer = five_cycles_buffer(&pings, 100, height);
+            let out = buffer_text(&buffer);
+            assert!(out.contains("no IPv6 address"), "{mode}:\n{out}");
+            assert_eq!(fg_of(&buffer, "no IPv6 address"), Color::Gray, "{mode}: not MUTED");
+            assert!(out.contains("Status: ipv4 "), "{mode}:\n{out}");
+            assert_eq!(fg_of(&buffer, "ipv4 "), Color::Green, "{mode}: status not GOOD");
+            for wrong in ["no ping reply", "ipv4 only", "no echo reply"] {
+                assert!(!out.contains(wrong), "{mode}: shows `{wrong}`:\n{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn five_no_a_cycles_read_no_ipv4_address_and_status_ipv6() {
+        let buffer = five_cycles_buffer(&vec![no_address_ping(Family::Ipv4); 5], 100, 20);
+        let out = buffer_text(&buffer);
+        assert!(out.contains("no IPv4 address"), "{out}");
+        assert!(out.contains("Status: ipv6 "), "{out}");
+        assert!(!out.contains("ipv6 only"), "{out}");
+    }
+
+    #[test]
+    fn no_address_never_makes_the_status_a_warning() {
+        use ConnectivityState::*;
+        assert_eq!(overall_status(&Connected, &NoAddress), ("ipv4", Color::Green));
+        assert_eq!(overall_status(&NoAddress, &Connected), ("ipv6", Color::Green));
+        assert_eq!(overall_status(&Connected, &Disabled), ("ipv4", Color::Green));
+        assert_eq!(overall_status(&Disconnected, &NoAddress), ("no ping reply", Color::Red));
+        assert_eq!(overall_status(&Checking, &NoAddress).1, Color::Gray);
+        assert_eq!(overall_status(&Connected, &Disconnected), ("ipv4 only", Color::Yellow));
+    }
+
+    /// Rows of the IPv6 graph in a full-mode render: those after the `IPv6` title row.
+    fn rows_after<'a>(out: &'a str, title: &str) -> Vec<&'a str> {
+        out.lines().skip_while(|row| !row.contains(title)).skip(1).collect()
+    }
+
+    #[test]
+    fn disabling_a_family_clears_its_samples_and_draws_no_bars() {
+        use crate::tui::testing::{fg_of, render_buffer};
+        let pane = ConnectivityPane::new();
+        let states = states_for(&vec![ok_ping(12, 14); 5], Protocol::Both);
+        for state in &states {
+            pane.ingest(state);
+        }
+        assert_eq!(pane.sample_counts(), (5, 5));
+
+        // `p`: IPv4 only. The next ping result has no IPv6 status.
+        let mut v4_only = ok_ping(12, 14);
+        v4_only.ipv6_status = PingStatus::NotQueried;
+        let mut next = states_for(&vec![v4_only; 6], Protocol::Ipv4);
+        let state = next.pop().unwrap();
+        pane.ingest(&state);
+        assert_eq!(pane.sample_counts(), (6, 0), "IPv6 samples kept after disabling it");
+
+        let buffer = render_buffer(&pane, &state, 100, 20, false);
+        let out = buffer_text(&buffer);
+        assert!(out.contains("IPv6 disabled (p)"), "{out}");
+        assert_eq!(fg_of(&buffer, "disabled (p)"), Color::Gray, "not MUTED");
+        assert!(
+            rows_after(&out, "IPv6 disabled").iter().all(|row| !has_bar_glyph(row)),
+            "disabled family drew bars:\n{out}"
+        );
+        assert!(has_bar_glyph(&out), "IPv4 lost its bars:\n{out}");
+        assert!(out.contains("Status: ipv4 "), "{out}");
+
+        let compact = render_pane(&pane, &state, 56, 6, false);
+        assert!(compact.contains("v6 disabled (p)"), "{compact}");
+        assert!(!has_bar_glyph(row_containing(&compact, "v6 disabled")), "{compact}");
+
+        // `p` twice more: back to both families, IPv6 starts over.
+        let mut both = state_with_ping(ok_ping(12, 14));
+        both.protocol = Protocol::Both;
+        pane.ingest(&both);
+        let out = render_pane(&pane, &both, 100, 20, false);
+        assert!(!out.contains("disabled"), "{out}");
     }
 
     #[test]

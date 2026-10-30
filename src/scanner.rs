@@ -57,6 +57,9 @@ pub trait Scanner {
 
         let mut ticker = tokio::time::interval(self.interval());
         let mut scan_count = 0u64;
+        // The protocol of the last scan started, so a change is seen at scan start whichever
+        // `select!` branch woke the loop.
+        let mut last_protocol: Option<Protocol> = None;
 
         loop {
             tokio::select! {
@@ -86,6 +89,13 @@ pub trait Scanner {
                     scan_count,
                     protocol.as_str()
                 );
+                if self.uses_protocol()
+                    && let Some(previous) = last_protocol
+                    && previous != protocol
+                {
+                    clear_for_protocol_change(self.name(), previous, protocol, &state);
+                }
+                last_protocol = Some(protocol);
                 mark_running(self.name(), &state);
 
                 let deadline = self.deadline();
@@ -131,6 +141,23 @@ pub trait Scanner {
             }
         }
     }
+}
+
+/// Drop a scanner's result, error and history from `previous`: they describe the old protocol, not
+/// the one about to be scanned.
+fn clear_for_protocol_change(name: &str, previous: Protocol, protocol: Protocol, state: &Arc<Mutex<AppState>>) {
+    let state_guard = state.lock().unwrap();
+    if let Some(mut scan_state) = state_guard.scanners.get_mut(name) {
+        scan_state.result = None;
+        scan_state.error = None;
+        scan_state.history.clear();
+    }
+    log::debug!(
+        "[scanner] protocol_reset: scanner={} old_protocol={} new_protocol={} - result, error and history cleared",
+        name,
+        previous.as_str(),
+        protocol.as_str()
+    );
 }
 
 /// Flip the scanner's state to Running in place: the previous result, error and history stay visible.
@@ -402,8 +429,18 @@ mod tests {
         assert_eq!(guard.scanners.get("stub").unwrap().history.len(), 2);
     }
 
-    /// A scan observed by a test: which protocol it was asked for and when (tokio clock) it started.
-    type Call = (Protocol, tokio::time::Instant);
+    /// A scan observed by a test: which protocol it was asked for, when (tokio clock) it started,
+    /// and whether the scanner's state still held a result, error or history as it started.
+    type Call = (Protocol, tokio::time::Instant, bool);
+
+    /// Whether `name`'s state holds anything from an earlier scan.
+    fn retains_state(state: &Arc<Mutex<AppState>>, name: &str) -> bool {
+        let guard = state.lock().unwrap();
+        guard
+            .scanners
+            .get(name)
+            .is_some_and(|s| s.result.is_some() || s.error.is_some() || !s.history.is_empty())
+    }
 
     /// Stub for the protocol and deadline tests. `scan()` reports each call, then sleeps `scan_time`
     /// (or never returns when `None`).
@@ -411,6 +448,7 @@ mod tests {
         calls: tokio::sync::mpsc::UnboundedSender<Call>,
         scan_time: Option<Duration>,
         uses_protocol: bool,
+        state: Arc<Mutex<AppState>>,
     }
 
     #[async_trait]
@@ -425,7 +463,10 @@ mod tests {
             self.uses_protocol
         }
         async fn scan(&self, _target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error> {
-            self.calls.send((protocol, tokio::time::Instant::now())).unwrap();
+            let retained = retains_state(&self.state, "stub");
+            self.calls
+                .send((protocol, tokio::time::Instant::now(), retained))
+                .unwrap();
             match self.scan_time {
                 Some(scan_time) => tokio::time::sleep(scan_time).await,
                 None => std::future::pending::<()>().await,
@@ -449,6 +490,7 @@ mod tests {
             calls: calls_tx,
             scan_time,
             uses_protocol,
+            state: state.clone(),
         };
         let target = Target::parse("example.com").unwrap();
         let handle = {
@@ -466,11 +508,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn protocol_change_mid_scan_restarts_scan_with_new_protocol_immediately() {
         let mut h = spawn_protocol_stub(Some(Duration::from_secs(60)), true);
-        let (first_protocol, first_at) = h.calls.recv().await.unwrap();
+        let (first_protocol, first_at, _) = h.calls.recv().await.unwrap();
         assert_eq!(first_protocol, Protocol::Both);
 
         h.tx.send(Protocol::Ipv4).unwrap();
-        let (second_protocol, second_at) = h.calls.recv().await.unwrap();
+        let (second_protocol, second_at, _) = h.calls.recv().await.unwrap();
 
         assert_eq!(second_protocol, Protocol::Ipv4);
         assert_eq!(second_at, first_at, "rescan started without the clock advancing");
@@ -491,11 +533,11 @@ mod tests {
 
         let changed_at = tokio::time::Instant::now();
         h.tx.send(Protocol::Ipv6).unwrap();
-        let (protocol, at) = h.calls.recv().await.unwrap();
+        let (protocol, at, _) = h.calls.recv().await.unwrap();
         assert_eq!(protocol, Protocol::Ipv6);
         assert_eq!(at, changed_at);
 
-        let (_, next_tick_at) = h.calls.recv().await.unwrap();
+        let (_, next_tick_at, _) = h.calls.recv().await.unwrap();
         assert_eq!(
             next_tick_at - changed_at,
             Duration::from_secs(3600),
@@ -539,9 +581,119 @@ mod tests {
         h.calls.recv().await.unwrap();
         drop(h.tx);
 
-        let (protocol, _) = h.calls.recv().await.unwrap();
+        let (protocol, _, _) = h.calls.recv().await.unwrap();
         assert_eq!(protocol, Protocol::Both, "next tick still scans with the last protocol");
         assert!(!h.handle.is_finished());
+        h.handle.abort();
+    }
+
+    /// Let the spawned scanner run until it blocks on its next wake-up.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_change_while_idle_clears_the_result_before_the_next_scan() {
+        let mut h = spawn_protocol_stub(Some(Duration::ZERO), true);
+        let (_, _, retained) = h.calls.recv().await.unwrap();
+        assert!(!retained);
+        settle().await;
+        assert!(retains_state(&h.state, "stub"), "first scan recorded nothing");
+
+        h.tx.send(Protocol::Ipv4).unwrap();
+        let (protocol, _, retained) = h.calls.recv().await.unwrap();
+        assert_eq!(protocol, Protocol::Ipv4);
+        assert!(
+            !retained,
+            "the IPv4+IPv6 result, error or history survived into the IPv4 scan"
+        );
+        h.handle.abort();
+    }
+
+    /// Scans once slowly, past its 1s interval, and sends a protocol change as that scan finishes:
+    /// when the loop returns to its idle `select!`, the overdue tick and the change are both ready.
+    /// Later scans are instant.
+    struct RaceStub {
+        calls: tokio::sync::mpsc::UnboundedSender<Call>,
+        protocol_tx: watch::Sender<Protocol>,
+        state: Arc<Mutex<AppState>>,
+        count: AtomicUsize,
+    }
+
+    const RACE_INTERVAL: Duration = Duration::from_millis(1000);
+    const RACE_FIRST_SCAN: Duration = Duration::from_millis(1500);
+
+    #[async_trait]
+    impl Scanner for RaceStub {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn interval(&self) -> Duration {
+            RACE_INTERVAL
+        }
+        async fn scan(&self, _target: &Target, protocol: Protocol) -> Result<ScanResult, eyre::Error> {
+            let retained = retains_state(&self.state, "stub");
+            self.calls
+                .send((protocol, tokio::time::Instant::now(), retained))
+                .unwrap();
+            if self.count.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(RACE_FIRST_SCAN).await;
+                self.protocol_tx.send(Protocol::Ipv6).unwrap();
+            }
+            Ok(ScanResult::Ping(PingResult::new()))
+        }
+    }
+
+    /// Tick and protocol change ready in the same poll. `select!` picks a branch at random, so the
+    /// scenario runs `TRIALS` times and must see the tick branch win at least once. The winner shows
+    /// in the third scan's start: the tick branch keeps the schedule (2 x interval), the change
+    /// branch restarts it from the change (first scan + interval).
+    #[tokio::test(start_paused = true)]
+    async fn protocol_change_ready_with_the_tick_clears_the_result_whichever_branch_wins() {
+        const TRIALS: usize = 64;
+        let mut tick_wins = 0;
+        for trial in 0..TRIALS {
+            let (calls_tx, mut calls) = tokio::sync::mpsc::unbounded_channel();
+            let (protocol_tx, rx) = watch::channel(Protocol::Both);
+            let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+            let scanner = RaceStub {
+                calls: calls_tx,
+                protocol_tx,
+                state: state.clone(),
+                count: AtomicUsize::new(0),
+            };
+            let target = Target::parse("example.com").unwrap();
+            let handle = tokio::spawn(async move { scanner.run(target, rx, state).await });
+
+            let (first, started, _) = calls.recv().await.unwrap();
+            assert_eq!(first, Protocol::Both);
+            let (second, _, retained) = calls.recv().await.unwrap();
+            assert_eq!(second, Protocol::Ipv6, "trial {trial}");
+            assert!(!retained, "trial {trial}: old-protocol state present at the new scan");
+
+            let (_, third_at, _) = calls.recv().await.unwrap();
+            if third_at - started == 2 * RACE_INTERVAL {
+                tick_wins += 1;
+            } else {
+                assert_eq!(third_at - started, RACE_FIRST_SCAN + RACE_INTERVAL, "trial {trial}");
+            }
+            handle.abort();
+        }
+        assert!(tick_wins > 0, "the tick branch never won in {TRIALS} trials");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_agnostic_scanner_keeps_its_result_across_a_change() {
+        let mut h = spawn_protocol_stub(Some(Duration::ZERO), false);
+        h.calls.recv().await.unwrap();
+        settle().await;
+
+        h.tx.send(Protocol::Ipv4).unwrap();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        let (_, _, retained) = h.calls.recv().await.unwrap();
+        assert!(retained, "WHOIS-like scanner lost its result on a protocol change");
         h.handle.abort();
     }
 

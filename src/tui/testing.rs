@@ -3,11 +3,10 @@
 use crate::tui::layout::PaneLayout;
 use crate::tui::pane::Pane;
 use crate::types::AppState;
-use ratatui::{Terminal, backend::TestBackend, layout::Rect, text::Span};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, text::Span};
 
-/// Render `pane` at `width` x `height` and return the buffer as newline-joined text rows.
-/// The continuation cell after a double-width glyph is dropped, as a terminal shows it.
-pub fn render_pane(pane: &dyn Pane, state: &AppState, width: u16, height: u16, focused: bool) -> String {
+/// Render `pane` at `width` x `height` into a buffer that keeps each cell's style.
+pub fn render_buffer(pane: &dyn Pane, state: &AppState, width: u16, height: u16, focused: bool) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("TestBackend terminal");
     terminal
         .draw(|frame| {
@@ -15,20 +14,47 @@ pub fn render_pane(pane: &dyn Pane, state: &AppState, width: u16, height: u16, f
             pane.render(frame, area, state, focused);
         })
         .expect("draw pane");
-    let buffer = terminal.backend().buffer();
+    terminal.backend().buffer().clone()
+}
+
+/// Row `y` of `buffer` as text, with the x of the cell each byte offset starts at. The
+/// continuation cell after a double-width glyph is dropped, as a terminal shows it.
+fn buffer_row(buffer: &Buffer, y: u16) -> (String, Vec<(usize, u16)>) {
+    let mut row = String::new();
+    let mut starts = Vec::new();
+    let mut x = 0;
+    while x < buffer.area.width {
+        let symbol = buffer[(x, y)].symbol();
+        starts.push((row.len(), x));
+        row.push_str(symbol);
+        x += Span::raw(symbol).width().max(1) as u16;
+    }
+    (row, starts)
+}
+
+/// Render `pane` at `width` x `height` and return the buffer as newline-joined text rows.
+pub fn render_pane(pane: &dyn Pane, state: &AppState, width: u16, height: u16, focused: bool) -> String {
+    let buffer = render_buffer(pane, state, width, height, focused);
     (0..height)
-        .map(|y| {
-            let mut row = String::new();
-            let mut x = 0;
-            while x < width {
-                let symbol = buffer[(x, y)].symbol();
-                row.push_str(symbol);
-                x += Span::raw(symbol).width().max(1) as u16;
-            }
-            row
-        })
+        .map(|y| buffer_row(&buffer, y).0)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The foreground color of the first cell of the first occurrence of `needle` in `buffer`.
+pub fn fg_of(buffer: &Buffer, needle: &str) -> Color {
+    for y in 0..buffer.area.height {
+        let (row, starts) = buffer_row(buffer, y);
+        if let Some(offset) = row.find(needle) {
+            let x = starts
+                .iter()
+                .find(|(start, _)| *start == offset)
+                .map(|(_, x)| *x)
+                .expect("needle starts on a cell boundary");
+            return buffer[(x, y)].fg;
+        }
+    }
+    panic!("{needle:?} not rendered");
 }
 
 /// The narrow terminals the clipping fixtures render at: Scott's 80x24 and his ~108-column

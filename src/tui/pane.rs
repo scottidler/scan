@@ -18,6 +18,10 @@ pub trait Pane {
     /// Render the pane content to the given area
     fn render(&self, frame: &mut Frame, area: Rect, state: &AppState, focused: bool);
 
+    /// Take in new scanner data. Called once per TUI tick for every pane, drawn or not, so a pane
+    /// that keeps its own history across scans records it here, never in `render`.
+    fn ingest(&self, _state: &AppState) {}
+
     /// Get the pane's title for display
     fn title(&self) -> &'static str;
 

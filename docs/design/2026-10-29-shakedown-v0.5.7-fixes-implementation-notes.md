@@ -56,3 +56,40 @@ Evidence: each new test was run with its fix mutated away and failed (scale titl
 - None.
 
 Evidence: each new test was run with its fix undone and failed (status_label retrying, Ports NoRoute counted closed, TLS connect error returned as graded `Ok`, GeoIP local classification removed (the fake server then saw requests), ipinfo `bogon` ignored, GeoIP pane label and header, `--no-tui` NotApplicable); sources were then restored and `otto ci` re-run green.
+
+## Phase 4: Protocol and no-address state
+
+### Design decisions
+- Protocol reset at scan start: `Scanner::run` keeps `last_protocol: Option<Protocol>` local to the loop. Each scan start compares it to the protocol `borrow_and_update()` returned, and for a `uses_protocol()` scanner a difference calls `clear_for_protocol_change` (result, error and history cleared, debug log) before `mark_running`. File: `src/scanner.rs`. Why: the check runs at scan start, so it does not matter which `select!` branch woke the loop, and it also covers a scan cancelled mid-flight and restarted. WHOIS (`uses_protocol() == false`) never resets. An ordinary refresh still keeps its result.
+- Connectivity state is per family (`FamilyHistory`: results window, state, sparkline samples). `PingStatus::NoAddress` sets `ConnectivityState::NoAddress` directly and clears the results window, and is never counted as an attempt; `was_attempted` is no longer read by Connectivity. `Disabled` is the protocol-off state. File: `src/tui/connectivity.rs`.
+- `overall_status(ipv4, ipv6)` is pulled out of `render`. A family that is `NoAddress` or `Disabled` drops out, and the other family alone sets the status: Connected `ipv4`/`ipv6` (Green), Intermittent, Disconnected `no ping reply`, Checking. With both families absent the status is `no address` (Gray).
+- Family-state text, shared by full and compact rows, gains `no IPv6 address` / `no IPv4 address` and `disabled (p)`. Both draw in Gray, and the title color is now derived from the state rather than a `connected` bool.
+- Ingestion is out of `render`. `Pane::ingest(&self, &AppState)` is a default no-op hook, `PaneLayout::ingest` calls it on every pane, and `TuiApp::run_with_keys` calls `TuiApp::ingest` at the top of every loop iteration, before drawing. `ConnectivityPane::ingest` follows the protocol selection, then takes in the ping scanner's `history` and then its `result`, deduplicated by `queried_at`. Why history: a result published between two ticks is still counted, up to ping's history depth of 10.
+- On a protocol change, `Ingested::follow_protocol` clears and disables each family the selection leaves out. A family that comes back starts over at `Checking`. A disabled family ignores any status a result carries for it.
+- The pane's four mutexes (two sparklines, last timestamp, history) are now one `Mutex<Ingested>`, snapshotted once per render. The never-read `last_state_change` field is gone.
+- Test helpers: `testing::render_buffer` and `testing::fg_of` (styled-buffer color lookup), `PaneLayout::pane_mut` (cfg(test)), and `ConnectivityPane::sample_counts` (cfg(test)).
+
+### Deviations
+- MUTED is `Color::Gray` and GOOD is `Color::Green`, because Phase 2 (`theme.rs`) has not run. The literals sit in `FamilyView::title_color`, `overall_status` and `single_family_status`; Phase 2 migrates them.
+- The doc says "a per-tick `TuiApp` step". It is implemented as a `Pane::ingest` hook driven by `TuiApp::ingest` through `PaneLayout::ingest`. Same effect, correct seam: the layout owns the panes, and a later pane can keep history the same way.
+- The doc names only `(Connected, NoAddress)`. `Disabled` is treated the same in the status matrix (`(Connected, Disabled)` reads `ipv4`, Green), and both families absent reads `no address` (Gray). The doc does not specify either case.
+- Race test staging: `tokio::time::advance` cannot make both branches ready in one poll, because the `send` wakes the scanner before the driver fires the tick. The test therefore uses a `RaceStub` whose first scan overruns its 1s interval and sends the protocol change as it finishes, so the overdue tick and the change are ready together. `select!` picks at random, so the test runs 64 trials and asserts the tick branch won at least once. The winner is read from the third scan's start time: 2 x interval when the tick won, first scan + interval when the change won.
+
+### Tradeoffs
+- Reading the ping history in `ingest` vs only the current result: history makes the sample count independent of tick timing (up to 10 results between ticks). The cost is walking at most 10 entries per tick.
+- Repeated randomized trials vs `biased;` on the production `select!`: `biased;` would make the test deterministic but would change production branch order only for a test. Trials leave production untouched. The tick-won assertion can miss with probability 2^-64. The reset assertion never flakes, because the fix resets on either branch.
+- Clearing the results window on `NoAddress` vs keeping it: a family that later gets an address starts at `Checking`, not at a stale verdict.
+
+### Open questions
+- None.
+
+Evidence, each new test run with its fix undone, then sources restored and `otto ci` re-run green:
+- No reset at all: the idle-change test and the both-ready test fail.
+- Reset done only in the idle protocol-change branch: only the both-ready test fails, at its `retained` assertion, so the tick branch did win.
+- `uses_protocol()` gate removed: the WHOIS-like test fails.
+- `PaneLayout::ingest` made a no-op (no ingestion without a render): both sample-count tests fail.
+- Ingesting only `result`: the between-ticks test fails.
+- `NoAddress` counted as a failed attempt: both five-cycle no-address tests fail.
+- Status matrix warning for a missing family: the matrix test and both five-cycle tests fail.
+- Disabling without clearing samples: the disabled-family test fails.
+- `NoAddress`/`Disabled` titles in red: the MUTED color assertions fail.
