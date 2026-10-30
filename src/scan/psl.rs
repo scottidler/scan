@@ -2,7 +2,7 @@
 //! DMARC's organizational fallback looks). Fetched and cached through `scan::cache`.
 
 use crate::scan::cache::{CachedSource, FETCH_TIMEOUT, default_cache_dir};
-use publicsuffix::{IcannList, Psl};
+use publicsuffix::{IcannList, List, Psl};
 use reqwest::Client;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -36,6 +36,17 @@ impl SuffixList {
         }
     }
 
+    /// The cached file this list is read from.
+    pub fn cached_source(&self) -> CachedSource<'_> {
+        CachedSource {
+            client: &self.client,
+            url: &self.url,
+            cache_dir: self.cache_dir.as_deref(),
+            file_name: PSL_CACHE_FILE,
+            fetch_timeout: self.fetch_timeout,
+        }
+    }
+
     /// The registrable domain of `host` under the ICANN section of the public suffix list:
     /// `www.tatari.tv` -> `tatari.tv`. `Ok(None)` when the host has none (`localhost`, a bare
     /// public suffix, a name `idna` rejects). `Err` when the suffix list is unavailable.
@@ -48,15 +59,7 @@ impl SuffixList {
                 return Ok(None);
             }
         };
-        let list = CachedSource {
-            client: &self.client,
-            url: &self.url,
-            cache_dir: self.cache_dir.as_deref(),
-            file_name: PSL_CACHE_FILE,
-            fetch_timeout: self.fetch_timeout,
-        }
-        .load(deadline, parse_suffix_list)
-        .await?;
+        let list = self.cached_source().load(deadline, parse_suffix_list).await?;
         let domain = list
             .domain(ascii.as_bytes())
             .map(|d| String::from_utf8_lossy(d.as_bytes()).into_owned());
@@ -82,6 +85,22 @@ fn parse_suffix_list(text: &str) -> eyre::Result<IcannList> {
     }
     text.parse::<IcannList>()
         .map_err(|e| eyre::eyre!("public suffix list does not parse: {}", e))
+}
+
+/// Both readings of the one public suffix file: the ICANN section alone (what `tldts` reads by
+/// default, the SRI test) and ICANN plus PRIVATE (what tough-cookie's jar rules read).
+pub struct Suffixes {
+    pub icann: IcannList,
+    pub all: List,
+}
+
+/// Both lists from one file, under the same corruption check as [`parse_suffix_list`].
+pub fn parse_suffixes(text: &str) -> eyre::Result<Suffixes> {
+    let icann = parse_suffix_list(text)?;
+    let all = text
+        .parse::<List>()
+        .map_err(|e| eyre::eyre!("public suffix list does not parse: {}", e))?;
+    Ok(Suffixes { icann, all })
 }
 
 /// ICANN section plus a PRIVATE entry, so a test can tell which section was read.
@@ -142,6 +161,22 @@ mod tests {
     fn suffix_list_without_an_icann_section_is_corrupt() {
         assert!(parse_suffix_list("<html>captive portal</html>").is_err());
         assert!(parse_suffix_list(PSL_FIXTURE).is_ok());
+    }
+
+    /// One file, two readings: `github.io` is a suffix only when the PRIVATE section counts, so
+    /// the jar's list and the SRI test's list disagree on `foo.github.io` as they should.
+    #[test]
+    fn suffixes_read_the_one_file_with_and_without_the_private_section() {
+        let suffixes = parse_suffixes(PSL_FIXTURE).unwrap();
+        assert_eq!(
+            suffixes.icann.domain(b"foo.github.io").map(|d| d.as_bytes().to_vec()),
+            Some(b"github.io".to_vec())
+        );
+        assert_eq!(
+            suffixes.all.domain(b"foo.github.io").map(|d| d.as_bytes().to_vec()),
+            Some(b"foo.github.io".to_vec())
+        );
+        assert!(parse_suffixes("<html>captive portal</html>").is_err());
     }
 
     /// PRIVATE rules alone parse in the crate, which counts rules of either section, and an empty

@@ -22,6 +22,8 @@ mod helpers;
 pub mod hsts;
 pub mod html;
 pub mod js;
+#[cfg(test)]
+mod live;
 pub mod redirection;
 pub mod referrer;
 pub mod retriever;
@@ -65,6 +67,70 @@ pub struct ObservatoryResult {
     pub verified: bool,
     /// The HSTS preload list was available; without it every host reads as not preloaded.
     pub preload_available: bool,
+}
+
+/// What a scan's Observatory run came to, independent of the target observation beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservatoryOutcome {
+    Graded(ObservatoryResult),
+    /// Observatory refuses the host (an IP address, a name with no dot): no grade, never F.
+    NotApplicable(String),
+    /// No grade: site down, an unexpected status, a deadline, or a list the run needed.
+    Failed(String),
+}
+
+/// The grade line's note when the HSTS preload list could not be loaded.
+pub const PRELOAD_UNAVAILABLE_NOTE: &str = "preload list unavailable";
+
+impl ObservatoryOutcome {
+    /// The outcome of `observe`: an [`AnalyzeError`] is a failure, worded as it displays.
+    pub fn from_analysis(analysis: Result<ObservatoryResult, AnalyzeError>) -> Self {
+        match analysis {
+            Ok(result) => ObservatoryOutcome::Graded(result),
+            Err(error) => ObservatoryOutcome::Failed(error.to_string()),
+        }
+    }
+
+    /// The grade line after its `Grade: ` label, without the preload note: `C- (45) · google.com`,
+    /// `n/a (IP address)`, `none (site down)`.
+    pub fn grade_summary(&self) -> String {
+        match self {
+            ObservatoryOutcome::Graded(result) => format!("{} ({}) · {}", result.grade, result.score, result.host),
+            ObservatoryOutcome::NotApplicable(reason) => format!("n/a ({reason})"),
+            ObservatoryOutcome::Failed(reason) => format!("none ({reason})"),
+        }
+    }
+
+    /// A graded run whose HSTS preload list was missing: every host read as not preloaded.
+    pub fn preload_unavailable(&self) -> bool {
+        matches!(self, ObservatoryOutcome::Graded(result) if !result.preload_available)
+    }
+
+    /// [`grade_summary`](Self::grade_summary) plus ` · preload list unavailable` when the list was
+    /// missing.
+    pub fn grade_text(&self) -> String {
+        let mut text = self.grade_summary();
+        if self.preload_unavailable() {
+            text.push_str(&format!(" · {PRELOAD_UNAVAILABLE_NOTE}"));
+        }
+        text
+    }
+}
+
+/// The host Observatory grades for a target host, or the reason it refuses it, as the API's
+/// `validHostname` does (`src/api/v2/utils.js`): a trailing dot is dropped, an IP address and a
+/// name with no dot get no grade. The API's TLD-list check is not ported: a name under an
+/// unknown TLD is retrieved and reads as a site that is down.
+pub fn eligible_host(host: &str) -> Result<String, String> {
+    let host = host.trim().trim_end_matches('.');
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
+        return Err("IP address".to_string());
+    }
+    if host.is_empty() || !host.contains('.') {
+        return Err("not a public hostname".to_string());
+    }
+    Ok(host.to_string())
 }
 
 /// Why a retrieval gets no grade.
@@ -218,7 +284,7 @@ pub fn analyze(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::scan::observatory::cookies::{Cookie, SameSite};
     use crate::scan::observatory::headers::{HeaderValue, Headers};
@@ -315,6 +381,17 @@ mod tests {
             meta: parse_http_equiv(&body),
             auto_body: Some(body),
         }
+    }
+
+    /// google.com as the API graded it (`C-` 45), for the panes' fixtures.
+    pub(crate) fn google_com_result() -> ObservatoryResult {
+        let fixture: Value = serde_json::from_str(GOOGLE).unwrap();
+        analyze(
+            &google_retrieval(&fixture),
+            &HstsPreload::from_entries(Vec::new()),
+            &suffixes(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -447,6 +524,46 @@ mod tests {
         assert_eq!(with_list.score, without.score);
         assert_eq!(with_list.tests, without.tests);
         assert!(!without.preload_available);
+    }
+
+    #[test]
+    fn grade_text_names_the_grade_score_and_host() {
+        let graded = ObservatoryOutcome::Graded(google_com_result());
+        assert_eq!(graded.grade_text(), "C- (45) · google.com");
+        let mut no_list = google_com_result();
+        no_list.preload_available = false;
+        assert_eq!(
+            ObservatoryOutcome::Graded(no_list).grade_text(),
+            "C- (45) · google.com · preload list unavailable"
+        );
+        assert_eq!(
+            ObservatoryOutcome::NotApplicable("IP address".into()).grade_text(),
+            "n/a (IP address)"
+        );
+        assert_eq!(
+            ObservatoryOutcome::from_analysis(Err(AnalyzeError::SiteIsDown)).grade_text(),
+            "none (site down)"
+        );
+        assert_eq!(
+            ObservatoryOutcome::from_analysis(Err(AnalyzeError::UnexpectedStatusCode(500))).grade_text(),
+            "none (HTTP 500)"
+        );
+    }
+
+    #[test]
+    fn eligible_host_refuses_ips_and_dotless_names() {
+        assert_eq!(eligible_host("google.com").as_deref(), Ok("google.com"));
+        assert_eq!(eligible_host("www.tatari.tv.").as_deref(), Ok("www.tatari.tv"));
+        for ip in ["127.0.0.1", "2606:4700:4700::1111", "[2606:4700:4700::1111]"] {
+            assert_eq!(eligible_host(ip), Err("IP address".to_string()), "{ip}");
+        }
+        for name in ["localhost", "intranet", ""] {
+            assert_eq!(
+                eligible_host(name),
+                Err("not a public hostname".to_string()),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

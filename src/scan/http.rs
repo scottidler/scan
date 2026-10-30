@@ -1,3 +1,8 @@
+use super::cache::Refreshing;
+use super::observatory::{
+    HstsPreload, ObservatoryOutcome, Retriever, SuffixLists, eligible_host, hsts::PreloadSource, observe,
+};
+use super::psl::{SuffixList, Suffixes, parse_suffixes};
 use super::{Family, classify_route_error, family_failure};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target, TargetType};
@@ -14,32 +19,22 @@ const HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 const HTTP_REDIRECT_LIMIT: usize = 10;
 const ASSUMED_REDIRECT_STATUS: u16 = 301;
 const HTTP_SCAN_INTERVAL_SECS: u64 = 60;
-const INITIAL_SECURITY_SCORE: i32 = 100;
-const HSTS_MISSING_PENALTY: i32 = 15;
-const FRAME_OPTIONS_MISSING_PENALTY: i32 = 10;
-const CONTENT_TYPE_OPTIONS_MISSING_PENALTY: i32 = 5;
-const XSS_PROTECTION_MISSING_PENALTY: i32 = 5;
-const CSP_MISSING_PENALTY: i32 = 20;
-const CSP_WEAK_PENALTY: i32 = 15;
-const CSP_MODERATE_PENALTY: i32 = 5;
-const CORS_DANGEROUS_PENALTY: i32 = 25;
-const CORS_WEAK_PENALTY: i32 = 10;
-const CORS_MODERATE_PENALTY: i32 = 5;
-const INFORMATION_DISCLOSURE_PENALTY: i32 = 5;
-const GRADE_A_PLUS_MIN: i32 = 90;
-const GRADE_A_MIN: i32 = 80;
-const GRADE_B_MIN: i32 = 70;
-const GRADE_C_MIN: i32 = 60;
-const GRADE_D_MIN: i32 = 50;
-const CSP_STRONG_MIN_DIRECTIVES: usize = 5;
-const CSP_MODERATE_MIN_DIRECTIVES: usize = 3;
-const CSP_MODERATE_MAX_ISSUES: usize = 2;
-const CORS_WEAK_MIN_ISSUES: usize = 2;
-const CORS_MODERATE_ISSUES: usize = 1;
+/// The runner's deadline for one HTTP scan; the inner budget sits under it so a scan that runs
+/// long still returns what finished.
+const HTTP_SCAN_DEADLINE: Duration = Duration::from_secs(40);
+const HTTP_SCAN_BUDGET: Duration = Duration::from_secs(35);
 
-#[derive(Debug, Clone)]
+/// Probes the target as given and grades its host as MDN HTTP Observatory does, concurrently.
 pub struct HttpScanner {
     timeout: Duration,
+    /// Inner budget for one scan, under the runner's deadline.
+    budget: Duration,
+    retriever: Retriever,
+    /// The Chromium preload list, owned for the scanner's life and refreshed after 24h.
+    preload: PreloadSource,
+    suffix_source: SuffixList,
+    /// Both readings of the public suffix file, parsed once per refresh.
+    suffixes: Refreshing<Suffixes>,
 }
 
 impl Default for HttpScanner {
@@ -109,8 +104,26 @@ fn root_cause(error: &eyre::Error) -> String {
 impl HttpScanner {
     pub fn new() -> Self {
         log::debug!("[scan::http] new: timeout={}s", HTTP_CLIENT_TIMEOUT_SECS);
+        let fetch_client = Client::builder()
+            .user_agent("scan/1.0")
+            .build()
+            .expect("Failed to create HTTP client");
+        Self::with_observatory(
+            Retriever::standard().expect("Failed to create Observatory retriever"),
+            PreloadSource::new(fetch_client.clone()),
+            SuffixList::new(fetch_client),
+        )
+    }
+
+    /// A scanner whose Observatory run uses `retriever` and reads its lists from the given sources.
+    pub fn with_observatory(retriever: Retriever, preload: PreloadSource, suffix_source: SuffixList) -> Self {
         Self {
             timeout: Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS),
+            budget: HTTP_SCAN_BUDGET,
+            retriever,
+            preload,
+            suffix_source,
+            suffixes: Refreshing::new(),
         }
     }
 
@@ -182,7 +195,7 @@ impl HttpScanner {
     }
 
     /// Request `plan.primary` pinned to `ip`; on failure, try the plain-HTTP fallback (if any)
-    /// and keep the HTTPS failure reason on the result, graded F.
+    /// and keep the HTTPS failure reason on the result.
     async fn scan_plan(&self, plan: &RequestPlan, ip: IpAddr) -> eyre::Result<HttpData> {
         log::debug!("[scan::http] scan_plan: primary={} ip={}", plan.primary, ip);
 
@@ -209,7 +222,6 @@ impl HttpScanner {
                 match self.perform_scan(&client, fallback, ip).await {
                     Ok(mut result) => {
                         result.https_failure = Some(reason);
-                        result.security_grade = SecurityGrade::F;
                         result
                     }
                     Err(http_error) => {
@@ -230,11 +242,10 @@ impl HttpScanner {
         result.scan_duration = scan_start.elapsed();
 
         log::debug!(
-            "[scan::http] scan_completed: url={} status={} duration={}ms grade={:?} https_failure={:?}",
+            "[scan::http] scan_completed: url={} status={} duration={}ms https_failure={:?}",
             result.url,
             result.status_code,
             result.scan_duration.as_millis(),
-            result.security_grade,
             result.https_failure
         );
 
@@ -299,15 +310,13 @@ impl HttpScanner {
         let cors = self.analyze_cors(&headers);
         let caching = self.analyze_caching(&headers);
 
-        let vulnerabilities = self.assess_vulnerabilities(&security_headers, &csp, &cors);
-        let security_grade = self.calculate_security_grade(&security_headers, &csp, &cors, &vulnerabilities);
+        let vulnerabilities = self.assess_vulnerabilities(&security_headers, &csp);
 
         let security_duration = security_start.elapsed();
         log::trace!(
-            "[scan::http] security_analysis_completed: url={} duration={}μs grade={:?} vulnerabilities={}",
+            "[scan::http] security_analysis_completed: url={} duration={}μs vulnerabilities={}",
             url,
             security_duration.as_micros(),
-            security_grade,
             vulnerabilities.len()
         );
 
@@ -323,18 +332,16 @@ impl HttpScanner {
             cors,
             caching,
             vulnerabilities,
-            security_grade,
             scan_duration: start_time.elapsed(),
             target_ip: ip.to_string(),
             https_failure: None,
         };
 
         log::debug!(
-            "[scan::http] scan_result: url={} status={} content_length={} security_grade={:?}",
+            "[scan::http] scan_result: url={} status={} content_length={}",
             result.url,
             result.status_code,
-            result.content_length,
-            result.security_grade
+            result.content_length
         );
 
         Ok(result)
@@ -391,13 +398,11 @@ impl HttpScanner {
 
         let directives = self.parse_csp_directives(csp_header);
         let issues = self.analyze_csp_issues(&directives);
-        let strength = self.calculate_csp_strength(&directives, &issues);
 
         Some(CspPolicy {
             header_value: csp_header.to_string(),
             directives,
             issues,
-            strength,
         })
     }
 
@@ -447,23 +452,6 @@ impl HttpScanner {
         issues
     }
 
-    fn calculate_csp_strength(&self, directives: &HashMap<String, Vec<String>>, issues: &[CspIssue]) -> CspStrength {
-        let directive_count = directives.len();
-        let issue_count = issues.len();
-
-        if directive_count == 0 {
-            return CspStrength::None;
-        }
-
-        if issue_count == 0 && directive_count >= CSP_STRONG_MIN_DIRECTIVES {
-            CspStrength::Strong
-        } else if issue_count <= CSP_MODERATE_MAX_ISSUES && directive_count >= CSP_MODERATE_MIN_DIRECTIVES {
-            CspStrength::Moderate
-        } else {
-            CspStrength::Weak
-        }
-    }
-
     fn analyze_cors(&self, headers: &reqwest::header::HeaderMap) -> Option<CorsPolicy> {
         let access_control_allow_origin = headers
             .get("access-control-allow-origin")
@@ -507,15 +495,12 @@ impl HttpScanner {
             access_control_allow_credentials,
         );
 
-        let security_level = self.calculate_cors_security(&access_control_allow_origin, &issues);
-
         Some(CorsPolicy {
             access_control_allow_origin,
             access_control_allow_methods,
             access_control_allow_headers,
             access_control_allow_credentials,
             issues,
-            security_level,
         })
     }
 
@@ -549,20 +534,6 @@ impl HttpScanner {
         issues
     }
 
-    fn calculate_cors_security(&self, _origin: &Option<String>, issues: &[CorsIssue]) -> CorsSecurityLevel {
-        if issues.iter().any(|i| matches!(i, CorsIssue::WildcardWithCredentials)) {
-            return CorsSecurityLevel::Dangerous;
-        }
-
-        if issues.len() >= CORS_WEAK_MIN_ISSUES {
-            CorsSecurityLevel::Weak
-        } else if issues.len() == CORS_MODERATE_ISSUES {
-            CorsSecurityLevel::Moderate
-        } else {
-            CorsSecurityLevel::Secure
-        }
-    }
-
     fn analyze_caching(&self, headers: &reqwest::header::HeaderMap) -> CachingPolicy {
         CachingPolicy {
             cache_control: headers
@@ -581,11 +552,12 @@ impl HttpScanner {
         }
     }
 
+    /// The headers the target's own response did not send. What is wrong with the ones it did
+    /// send is Observatory's to say, in the grade's 12 tests.
     fn assess_vulnerabilities(
         &self,
         security_headers: &SecurityHeaders,
         csp: &Option<CspPolicy>,
-        cors: &Option<CorsPolicy>,
     ) -> Vec<HttpVulnerability> {
         let mut vulnerabilities = Vec::new();
 
@@ -600,106 +572,161 @@ impl HttpScanner {
             vulnerabilities.push(HttpVulnerability::MissingXContentTypeOptions);
         }
 
-        // CSP issues
         if csp.is_none() {
             vulnerabilities.push(HttpVulnerability::MissingCsp);
-        } else if let Some(csp_policy) = csp
-            && matches!(csp_policy.strength, CspStrength::Weak | CspStrength::None)
-        {
-            vulnerabilities.push(HttpVulnerability::WeakCsp);
-        }
-
-        // CORS issues
-        if let Some(cors_policy) = cors
-            && matches!(cors_policy.security_level, CorsSecurityLevel::Dangerous)
-        {
-            vulnerabilities.push(HttpVulnerability::InsecureCors);
         }
 
         vulnerabilities
     }
+}
 
-    fn calculate_security_grade(
+/// What the target observation found per family, before it is joined with the grade.
+struct Observation {
+    ipv4: (HttpStatus, Option<HttpData>),
+    ipv6: (HttpStatus, Option<HttpData>),
+}
+
+impl HttpScanner {
+    /// One family's observation of the target, cut off at `budget_end` with a timeout.
+    async fn observe_family(
         &self,
-        security_headers: &SecurityHeaders,
-        csp: &Option<CspPolicy>,
-        cors: &Option<CorsPolicy>,
-        vulnerabilities: &[HttpVulnerability],
-    ) -> SecurityGrade {
-        let score = self.calculate_security_score(security_headers, csp, cors, vulnerabilities);
-        let grade = match score {
-            s if s >= GRADE_A_PLUS_MIN => SecurityGrade::APlus,
-            s if s >= GRADE_A_MIN => SecurityGrade::A,
-            s if s >= GRADE_B_MIN => SecurityGrade::B,
-            s if s >= GRADE_C_MIN => SecurityGrade::C,
-            s if s >= GRADE_D_MIN => SecurityGrade::D,
-            _ => SecurityGrade::F,
-        };
-        log::debug!(
-            "[scan::http] calculate_security_grade: score={} grade={:?}",
-            score,
-            grade
-        );
-        grade
+        target: &Target,
+        protocol: Protocol,
+        family: Family,
+        budget_end: tokio::time::Instant,
+    ) -> (HttpStatus, Option<HttpData>) {
+        match tokio::time::timeout_at(budget_end, self.http_protocol(target, protocol)).await {
+            Ok(Ok(data)) => (HttpStatus::Success, Some(data)),
+            Ok(Err(error)) => {
+                log::debug!(
+                    "[scan::http] observe_family_failed: family={} error={}",
+                    family,
+                    root_cause(&error)
+                );
+                (Self::classify_http_error(&error, family), None)
+            }
+            Err(_) => {
+                log::debug!("[scan::http] observe_family_budget_spent: family={}", family);
+                let error = eyre::eyre!("operation timed out");
+                (Self::classify_http_error(&error, family), None)
+            }
+        }
     }
 
-    /// Each finding is penalized once. Header, CSP and CORS findings are scored from the
-    /// policies themselves; a vulnerability that restates one of them adds nothing.
-    fn calculate_security_score(
+    /// The URL as given, per family, the selected families concurrently.
+    async fn observe_target(
         &self,
-        security_headers: &SecurityHeaders,
-        csp: &Option<CspPolicy>,
-        cors: &Option<CorsPolicy>,
-        vulnerabilities: &[HttpVulnerability],
-    ) -> i32 {
-        let mut score = INITIAL_SECURITY_SCORE;
-
-        if security_headers.strict_transport_security.is_none() {
-            score -= HSTS_MISSING_PENALTY;
-        }
-        if security_headers.x_frame_options.is_none() {
-            score -= FRAME_OPTIONS_MISSING_PENALTY;
-        }
-        if security_headers.x_content_type_options.is_none() {
-            score -= CONTENT_TYPE_OPTIONS_MISSING_PENALTY;
-        }
-        if security_headers.x_xss_protection.is_none() {
-            score -= XSS_PROTECTION_MISSING_PENALTY;
-        }
-
-        match csp {
-            None => score -= CSP_MISSING_PENALTY,
-            Some(csp_policy) => match csp_policy.strength {
-                CspStrength::None => score -= CSP_MISSING_PENALTY,
-                CspStrength::Weak => score -= CSP_WEAK_PENALTY,
-                CspStrength::Moderate => score -= CSP_MODERATE_PENALTY,
-                CspStrength::Strong => {}
+        target: &Target,
+        protocol: Protocol,
+        budget_end: tokio::time::Instant,
+    ) -> Observation {
+        let skipped = || (HttpStatus::NotQueried, None);
+        match protocol {
+            Protocol::Ipv4 => Observation {
+                ipv4: self
+                    .observe_family(target, Protocol::Ipv4, Family::Ipv4, budget_end)
+                    .await,
+                ipv6: skipped(),
             },
-        }
-
-        if let Some(cors_policy) = cors {
-            match cors_policy.security_level {
-                CorsSecurityLevel::Dangerous => score -= CORS_DANGEROUS_PENALTY,
-                CorsSecurityLevel::Weak => score -= CORS_WEAK_PENALTY,
-                CorsSecurityLevel::Moderate => score -= CORS_MODERATE_PENALTY,
-                CorsSecurityLevel::Secure => {}
+            Protocol::Ipv6 => Observation {
+                ipv4: skipped(),
+                ipv6: self
+                    .observe_family(target, Protocol::Ipv6, Family::Ipv6, budget_end)
+                    .await,
+            },
+            Protocol::Both => {
+                let (ipv4, ipv6) = tokio::join!(
+                    self.observe_family(target, Protocol::Ipv4, Family::Ipv4, budget_end),
+                    self.observe_family(target, Protocol::Ipv6, Family::Ipv6, budget_end),
+                );
+                Observation { ipv4, ipv6 }
             }
         }
-
-        for vulnerability in vulnerabilities {
-            match vulnerability {
-                HttpVulnerability::MissingHsts
-                | HttpVulnerability::MissingXFrameOptions
-                | HttpVulnerability::MissingXContentTypeOptions
-                | HttpVulnerability::MissingCsp
-                | HttpVulnerability::WeakCsp
-                | HttpVulnerability::InsecureCors => {}
-                HttpVulnerability::InformationDisclosure => score -= INFORMATION_DISCLOSURE_PENALTY,
-            }
-        }
-
-        score
     }
+
+    /// Both readings of the public suffix file, held in memory between scans.
+    async fn suffix_lists(&self, deadline: tokio::time::Instant) -> eyre::Result<std::sync::Arc<Suffixes>> {
+        self.suffixes
+            .get(&self.suffix_source.cached_source(), deadline, parse_suffixes)
+            .await
+    }
+
+    /// The Observatory run for `host`: the lists it needs, then `observe`.
+    pub async fn grade_host(&self, host: &str, deadline: tokio::time::Instant) -> ObservatoryOutcome {
+        log::debug!("[scan::http] grade_host: host={}", host);
+        let (preload, suffixes) = tokio::join!(self.preload.get(deadline), self.suffix_lists(deadline));
+        let suffixes = match suffixes {
+            Ok(suffixes) => suffixes,
+            Err(error) => {
+                log::debug!(
+                    "[scan::http] grade_host_no_suffix_list: host={} error={:#}",
+                    host,
+                    error
+                );
+                return ObservatoryOutcome::Failed(format!("public suffix list unavailable: {}", root_cause(&error)));
+            }
+        };
+        let lists = SuffixLists {
+            icann: &suffixes.icann,
+            all: &suffixes.all,
+        };
+        let preload: &HstsPreload = &preload;
+        ObservatoryOutcome::from_analysis(observe(&self.retriever, host, preload, lists).await)
+    }
+
+    /// The target's graded host, cut off at `budget_end`; no grade for a host Observatory refuses.
+    async fn grade_target(&self, target: &Target, budget_end: tokio::time::Instant) -> ObservatoryOutcome {
+        let host = match observatory_host(target) {
+            Ok(host) => host,
+            Err(reason) => {
+                log::debug!(
+                    "[scan::http] grade_target_not_applicable: target={} reason={}",
+                    target.display_name(),
+                    reason
+                );
+                return ObservatoryOutcome::NotApplicable(reason);
+            }
+        };
+        match tokio::time::timeout_at(budget_end, self.grade_host(&host, budget_end)).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                log::debug!("[scan::http] grade_target_budget_spent: host={}", host);
+                ObservatoryOutcome::Failed("timed out".to_string())
+            }
+        }
+    }
+}
+
+/// The host Observatory grades for `target`, or why it refuses: the URL's host for a URL target,
+/// never its port or path.
+fn observatory_host(target: &Target) -> Result<String, String> {
+    match &target.target_type {
+        TargetType::Url(url) => match url.host() {
+            Some(url::Host::Domain(domain)) => eligible_host(domain),
+            Some(_) => Err("IP address".to_string()),
+            None => Err("no host".to_string()),
+        },
+        TargetType::Domain(domain) => eligible_host(domain),
+        TargetType::IpAddress(_) => Err("IP address".to_string()),
+    }
+}
+
+/// Join the target observation and the grade. The scan fails only when neither part produced
+/// anything: the target observation failed and the host got no grade. Each part keeps its own
+/// failure reason; a part that worked is never reported failed because the other did not.
+fn assemble(protocol: Protocol, observation: Observation, observatory: ObservatoryOutcome) -> eyre::Result<ScanResult> {
+    let mut result = HttpResult::new(observatory);
+    (result.ipv4_status, result.ipv4_result) = observation.ipv4;
+    (result.ipv6_status, result.ipv6_result) = observation.ipv6;
+
+    if result.has_any_success() || matches!(result.observatory, ObservatoryOutcome::Graded(_)) {
+        return Ok(ScanResult::Http(result));
+    }
+    let target_failure = result.failure(protocol);
+    Err(match &result.observatory {
+        ObservatoryOutcome::Failed(reason) => eyre::eyre!("{target_failure}; grade: {reason}"),
+        _ => target_failure,
+    })
 }
 
 #[async_trait]
@@ -712,6 +739,10 @@ impl Scanner for HttpScanner {
         Duration::from_secs(HTTP_SCAN_INTERVAL_SECS)
     }
 
+    fn deadline(&self) -> Duration {
+        HTTP_SCAN_DEADLINE
+    }
+
     async fn scan(&self, target: &Target, protocol: Protocol) -> eyre::Result<ScanResult> {
         log::debug!(
             "[scan::http] scan: target={} protocol={}",
@@ -720,90 +751,46 @@ impl Scanner for HttpScanner {
         );
 
         let scan_start = Instant::now();
-        let mut result = HttpResult::new();
+        let budget_end = tokio::time::Instant::now() + self.budget;
+        let (observation, observatory) = tokio::join!(
+            self.observe_target(target, protocol, budget_end),
+            self.grade_target(target, budget_end),
+        );
+        log::debug!(
+            "[scan::http] scan_parts: target={} ipv4={:?} ipv6={:?} grade={}",
+            target.display_name(),
+            observation.ipv4.0,
+            observation.ipv6.0,
+            observatory.grade_text()
+        );
 
-        match protocol {
-            Protocol::Ipv4 => {
-                // IPv4 only
-                match self.http_protocol(target, Protocol::Ipv4).await {
-                    Ok(http_data) => {
-                        result.ipv4_status = HttpStatus::Success(http_data.security_grade.clone());
-                        result.ipv4_result = Some(http_data);
-                    }
-                    Err(e) => {
-                        result.ipv4_status = Self::classify_http_error(&e, Family::Ipv4);
-                    }
-                }
+        let mut outcome = assemble(protocol, observation, observatory);
+        match &mut outcome {
+            Ok(ScanResult::Http(result)) => {
+                result.total_duration = scan_start.elapsed();
+                log::trace!(
+                    "[scan::http] http_completed: target={} protocol={} duration={}ms",
+                    target.display_name(),
+                    protocol.as_str(),
+                    result.total_duration.as_millis()
+                );
             }
-            Protocol::Ipv6 => {
-                // IPv6 only
-                match self.http_protocol(target, Protocol::Ipv6).await {
-                    Ok(http_data) => {
-                        result.ipv6_status = HttpStatus::Success(http_data.security_grade.clone());
-                        result.ipv6_result = Some(http_data);
-                    }
-                    Err(e) => {
-                        result.ipv6_status = Self::classify_http_error(&e, Family::Ipv6);
-                    }
-                }
-            }
-            Protocol::Both => {
-                // Both IPv4 and IPv6
-
-                // Try IPv4
-                match self.http_protocol(target, Protocol::Ipv4).await {
-                    Ok(http_data) => {
-                        result.ipv4_status = HttpStatus::Success(http_data.security_grade.clone());
-                        result.ipv4_result = Some(http_data);
-                    }
-                    Err(e) => {
-                        result.ipv4_status = Self::classify_http_error(&e, Family::Ipv4);
-                        log::debug!("[scan::http] ipv4_http_failed: error={}", e);
-                    }
-                }
-
-                // Try IPv6
-                match self.http_protocol(target, Protocol::Ipv6).await {
-                    Ok(http_data) => {
-                        result.ipv6_status = HttpStatus::Success(http_data.security_grade.clone());
-                        result.ipv6_result = Some(http_data);
-                    }
-                    Err(e) => {
-                        result.ipv6_status = Self::classify_http_error(&e, Family::Ipv6);
-                        log::debug!("[scan::http] ipv6_http_failed: error={}", e);
-                    }
-                }
-            }
-        }
-
-        result.total_duration = scan_start.elapsed();
-
-        // Return success if at least one protocol succeeded, or error if all failed
-        if result.has_any_success() {
-            log::trace!(
-                "[scan::http] http_completed: target={} protocol={} duration={}ms best_grade={:?}",
-                target.display_name(),
-                protocol.as_str(),
-                result.total_duration.as_millis(),
-                result.get_best_security_grade()
-            );
-            Ok(ScanResult::Http(result))
-        } else {
-            let error = result.failure(protocol);
-            log::error!(
+            Ok(_) => {}
+            Err(error) => log::error!(
                 "[scan::http] all_http_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
-                result.total_duration.as_millis(),
+                scan_start.elapsed().as_millis(),
                 error
-            );
-            Err(error)
+            ),
         }
+        outcome
     }
 }
 
 // Data structures
 
+/// One family's observation of the target as given.
 #[derive(Debug, Clone)]
 pub struct HttpData {
     pub url: String,
@@ -817,7 +804,6 @@ pub struct HttpData {
     pub cors: Option<CorsPolicy>,
     pub caching: CachingPolicy,
     pub vulnerabilities: Vec<HttpVulnerability>,
-    pub security_grade: SecurityGrade,
     pub scan_duration: Duration,
     /// The pinned IP of the first request.
     pub target_ip: String,
@@ -827,10 +813,10 @@ pub struct HttpData {
 
 #[derive(Debug, Clone)]
 pub enum HttpStatus {
-    NotQueried,             // Protocol not attempted (due to protocol restrictions)
-    Success(SecurityGrade), // HTTP scan succeeded with security grade
-    Failed(String),         // HTTP scan failed with error message
-    NoAddress,              // No address available for this protocol
+    NotQueried,     // Protocol not attempted (due to protocol restrictions)
+    Success,        // The target observation succeeded
+    Failed(String), // The target observation failed with this reason
+    NoAddress,      // No address available for this protocol
 }
 
 impl HttpStatus {
@@ -839,17 +825,12 @@ impl HttpStatus {
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(self, HttpStatus::Success(_))
-    }
-
-    pub fn security_grade(&self) -> Option<&SecurityGrade> {
-        match self {
-            HttpStatus::Success(grade) => Some(grade),
-            _ => None,
-        }
+        matches!(self, HttpStatus::Success)
     }
 }
 
+/// A scan's three independent parts: the target observation per family, and the host's Observatory
+/// outcome, which no family changes.
 #[derive(Debug, Clone)]
 pub struct HttpResult {
     // Protocol-specific results
@@ -860,24 +841,22 @@ pub struct HttpResult {
     pub ipv4_status: HttpStatus,
     pub ipv6_status: HttpStatus,
 
+    /// The host's Observatory grade, or why it has none.
+    pub observatory: ObservatoryOutcome,
+
     // Metadata
     pub queried_at: Instant,
     pub total_duration: Duration,
 }
 
-impl Default for HttpResult {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HttpResult {
-    pub fn new() -> Self {
+    pub fn new(observatory: ObservatoryOutcome) -> Self {
         Self {
             ipv4_result: None,
             ipv6_result: None,
             ipv4_status: HttpStatus::NotQueried,
             ipv6_status: HttpStatus::NotQueried,
+            observatory,
             queried_at: Instant::now(),
             total_duration: Duration::from_millis(0),
         }
@@ -887,44 +866,33 @@ impl HttpResult {
         self.ipv4_status.is_success() || self.ipv6_status.is_success()
     }
 
-    /// Why every attempted family failed, e.g. `IPv4: operation timed out; IPv6: no IPv6 route
-    /// on this host`. Families with no address are left out.
-    pub fn failure(&self, protocol: Protocol) -> eyre::Report {
-        let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
+    /// Each attempted family's failure; families with no address are left out.
+    fn family_failures(&self) -> Vec<(Family, String)> {
+        [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
             .into_iter()
             .filter_map(|(family, status)| match status {
                 HttpStatus::Failed(reason) => Some((family, reason.clone())),
                 _ => None,
             })
-            .collect();
-        family_failure(&failures, protocol)
+            .collect()
     }
 
-    pub fn get_best_security_grade(&self) -> Option<&SecurityGrade> {
-        let ipv4_grade = self.ipv4_status.security_grade();
-        let ipv6_grade = self.ipv6_status.security_grade();
+    /// Why every attempted family failed, e.g. `IPv4: operation timed out; IPv6: no IPv6 route
+    /// on this host`. Families with no address are left out.
+    pub fn failure(&self, protocol: Protocol) -> eyre::Report {
+        family_failure(&self.family_failures(), protocol)
+    }
 
-        match (ipv4_grade, ipv6_grade) {
-            (Some(g4), Some(g6)) => {
-                // Return the better grade (A+ > A > B > C > D > F)
-                if matches!(g4, SecurityGrade::APlus) || matches!(g6, SecurityGrade::APlus) {
-                    if matches!(g4, SecurityGrade::APlus) { Some(g4) } else { Some(g6) }
-                } else if matches!(g4, SecurityGrade::A) || matches!(g6, SecurityGrade::A) {
-                    if matches!(g4, SecurityGrade::A) { Some(g4) } else { Some(g6) }
-                } else if matches!(g4, SecurityGrade::B) || matches!(g6, SecurityGrade::B) {
-                    if matches!(g4, SecurityGrade::B) { Some(g4) } else { Some(g6) }
-                } else if matches!(g4, SecurityGrade::C) || matches!(g6, SecurityGrade::C) {
-                    if matches!(g4, SecurityGrade::C) { Some(g4) } else { Some(g6) }
-                } else if matches!(g4, SecurityGrade::D) || matches!(g6, SecurityGrade::D) {
-                    if matches!(g4, SecurityGrade::D) { Some(g4) } else { Some(g6) }
-                } else {
-                    Some(g4) // Both F, return either
-                }
-            }
-            (Some(g), None) => Some(g),
-            (None, Some(g)) => Some(g),
-            (None, None) => None,
-        }
+    /// The target observation's failures as one line, `None` when no family failed.
+    pub fn target_failure(&self) -> Option<String> {
+        let failures = self.family_failures();
+        (!failures.is_empty()).then(|| {
+            failures
+                .iter()
+                .map(|(family, reason)| format!("{family}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
     }
 
     pub fn get_primary_result(&self) -> Option<&HttpData> {
@@ -989,7 +957,6 @@ pub struct CspPolicy {
     pub header_value: String,
     pub directives: HashMap<String, Vec<String>>,
     pub issues: Vec<CspIssue>,
-    pub strength: CspStrength,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1000,25 +967,6 @@ pub enum CspIssue {
     MissingDirective(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum CspStrength {
-    None,
-    Weak,
-    Moderate,
-    Strong,
-}
-
-impl CspStrength {
-    pub fn label(&self) -> &'static str {
-        match self {
-            CspStrength::None => "none",
-            CspStrength::Weak => "weak",
-            CspStrength::Moderate => "moderate",
-            CspStrength::Strong => "strong",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorsPolicy {
     pub access_control_allow_origin: Option<String>,
@@ -1026,7 +974,6 @@ pub struct CorsPolicy {
     pub access_control_allow_headers: Vec<String>,
     pub access_control_allow_credentials: bool,
     pub issues: Vec<CorsIssue>,
-    pub security_level: CorsSecurityLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1035,25 +982,6 @@ pub enum CorsIssue {
     WildcardMethods,
     WildcardHeaders,
     WildcardWithCredentials,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum CorsSecurityLevel {
-    Secure,
-    Moderate,
-    Weak,
-    Dangerous,
-}
-
-impl CorsSecurityLevel {
-    pub fn label(&self) -> &'static str {
-        match self {
-            CorsSecurityLevel::Secure => "secure",
-            CorsSecurityLevel::Moderate => "moderate",
-            CorsSecurityLevel::Weak => "weak",
-            CorsSecurityLevel::Dangerous => "dangerous",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1070,32 +998,6 @@ pub enum HttpVulnerability {
     MissingXFrameOptions,
     MissingXContentTypeOptions,
     MissingCsp,
-    WeakCsp,
-    InsecureCors,
-    InformationDisclosure,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum SecurityGrade {
-    APlus,
-    A,
-    B,
-    C,
-    D,
-    F,
-}
-
-impl SecurityGrade {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SecurityGrade::APlus => "A+",
-            SecurityGrade::A => "A",
-            SecurityGrade::B => "B",
-            SecurityGrade::C => "C",
-            SecurityGrade::D => "D",
-            SecurityGrade::F => "F",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1137,7 +1039,7 @@ mod tests {
 
     #[test]
     fn failure_names_each_attempted_family_and_skips_no_address() {
-        let mut result = HttpResult::new();
+        let mut result = HttpResult::new(ObservatoryOutcome::Failed("site down".to_string()));
         result.ipv4_status = HttpStatus::Failed("operation timed out".to_string());
         result.ipv6_status = HttpStatus::Failed("no IPv6 route on this host".to_string());
         assert_eq!(
@@ -1158,6 +1060,7 @@ mod tests {
         let addr = silent_listener().await;
         let scanner = HttpScanner {
             timeout: Duration::from_millis(300),
+            ..HttpScanner::new()
         };
         let mut target = Target::parse(&format!("http://{addr}/")).unwrap();
         target.resolve().await.unwrap();
@@ -1230,122 +1133,6 @@ mod tests {
     }
 
     #[test]
-    fn test_security_grade_calculation() {
-        let scanner = HttpScanner::new();
-
-        // Perfect security headers
-        let security_headers = SecurityHeaders {
-            strict_transport_security: Some("max-age=31536000".to_string()),
-            x_frame_options: Some("DENY".to_string()),
-            x_content_type_options: Some("nosniff".to_string()),
-            x_xss_protection: Some("1; mode=block".to_string()),
-            referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
-            permissions_policy: Some("geolocation=()".to_string()),
-        };
-
-        let csp = Some(CspPolicy {
-            header_value: "default-src 'self'".to_string(),
-            directives: HashMap::new(),
-            issues: vec![],
-            strength: CspStrength::Strong,
-        });
-
-        let cors = None;
-        let vulnerabilities = vec![];
-
-        let grade = scanner.calculate_security_grade(&security_headers, &csp, &cors, &vulnerabilities);
-        assert!(matches!(grade, SecurityGrade::APlus));
-    }
-
-    #[test]
-    fn test_vulnerability_assessment() {
-        let scanner = HttpScanner::new();
-
-        let security_headers = SecurityHeaders {
-            strict_transport_security: None,
-            x_frame_options: None,
-            x_content_type_options: None,
-            x_xss_protection: None,
-            referrer_policy: None,
-            permissions_policy: None,
-        };
-
-        let csp = None;
-        let cors = Some(CorsPolicy {
-            access_control_allow_origin: Some("*".to_string()),
-            access_control_allow_methods: vec![],
-            access_control_allow_headers: vec![],
-            access_control_allow_credentials: true,
-            issues: vec![CorsIssue::WildcardWithCredentials],
-            security_level: CorsSecurityLevel::Dangerous,
-        });
-
-        let vulnerabilities = scanner.assess_vulnerabilities(&security_headers, &csp, &cors);
-
-        assert!(vulnerabilities.contains(&HttpVulnerability::MissingHsts));
-        assert!(vulnerabilities.contains(&HttpVulnerability::MissingXFrameOptions));
-        assert!(vulnerabilities.contains(&HttpVulnerability::MissingCsp));
-        assert!(vulnerabilities.contains(&HttpVulnerability::InsecureCors));
-    }
-
-    #[test]
-    fn test_csp_strength_calculation() {
-        let scanner = HttpScanner::new();
-
-        // Strong CSP
-        let mut strong_directives = HashMap::new();
-        strong_directives.insert("default-src".to_string(), vec!["'self'".to_string()]);
-        strong_directives.insert("script-src".to_string(), vec!["'self'".to_string()]);
-        strong_directives.insert("object-src".to_string(), vec!["'none'".to_string()]);
-
-        let strong_issues = vec![];
-        let strength = scanner.calculate_csp_strength(&strong_directives, &strong_issues);
-        // The implementation might be more conservative - accept Moderate or Strong
-        assert!(matches!(strength, CspStrength::Strong | CspStrength::Moderate));
-
-        // Weak CSP with unsafe-inline
-        let mut weak_directives = HashMap::new();
-        weak_directives.insert(
-            "script-src".to_string(),
-            vec!["'self'".to_string(), "'unsafe-inline'".to_string()],
-        );
-
-        let weak_issues = vec![CspIssue::UnsafeInline("script-src".to_string())];
-        let weakness = scanner.calculate_csp_strength(&weak_directives, &weak_issues);
-        assert_eq!(weakness, CspStrength::Weak);
-
-        // No CSP
-        let empty_directives = HashMap::new();
-        let no_issues = vec![];
-        let none_strength = scanner.calculate_csp_strength(&empty_directives, &no_issues);
-        assert_eq!(none_strength, CspStrength::None);
-    }
-
-    #[test]
-    fn test_cors_security_levels() {
-        let scanner = HttpScanner::new();
-
-        // Secure CORS
-        let secure_issues = vec![];
-        let secure_level = scanner.calculate_cors_security(&Some("https://example.com".to_string()), &secure_issues);
-        assert_eq!(secure_level, CorsSecurityLevel::Secure);
-
-        // Dangerous CORS
-        let dangerous_issues = vec![CorsIssue::WildcardWithCredentials];
-        let dangerous_level = scanner.calculate_cors_security(&Some("*".to_string()), &dangerous_issues);
-        assert_eq!(dangerous_level, CorsSecurityLevel::Dangerous);
-
-        // Weak CORS
-        let weak_issues = vec![CorsIssue::WildcardOrigin];
-        let weak_level = scanner.calculate_cors_security(&Some("*".to_string()), &weak_issues);
-        // Implementation might classify this as Moderate rather than Weak
-        assert!(matches!(
-            weak_level,
-            CorsSecurityLevel::Weak | CorsSecurityLevel::Moderate
-        ));
-    }
-
-    #[test]
     fn test_security_header_parsing() {
         let scanner = HttpScanner::new();
         let mut headers = reqwest::header::HeaderMap::new();
@@ -1409,72 +1196,6 @@ mod tests {
     }
 
     #[test]
-    fn test_security_grade_edge_cases() {
-        let scanner = HttpScanner::new();
-
-        // Perfect security should get A+
-        let perfect_headers = SecurityHeaders {
-            strict_transport_security: Some("max-age=31536000; includeSubDomains; preload".to_string()),
-            x_frame_options: Some("DENY".to_string()),
-            x_content_type_options: Some("nosniff".to_string()),
-            x_xss_protection: Some("1; mode=block".to_string()),
-            referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
-            permissions_policy: Some("geolocation=(), camera=()".to_string()),
-        };
-
-        let perfect_csp = Some(CspPolicy {
-            header_value: "default-src 'self'; script-src 'self'; object-src 'none'".to_string(),
-            directives: HashMap::new(),
-            issues: vec![],
-            strength: CspStrength::Strong,
-        });
-
-        let no_vulnerabilities = vec![];
-        let grade = scanner.calculate_security_grade(&perfect_headers, &perfect_csp, &None, &no_vulnerabilities);
-        assert_eq!(grade, SecurityGrade::APlus);
-
-        // Terrible security should get F
-        let terrible_headers = SecurityHeaders {
-            strict_transport_security: None,
-            x_frame_options: None,
-            x_content_type_options: None,
-            x_xss_protection: None,
-            referrer_policy: None,
-            permissions_policy: None,
-        };
-
-        let many_vulnerabilities = vec![
-            HttpVulnerability::MissingHsts,
-            HttpVulnerability::MissingXFrameOptions,
-            HttpVulnerability::MissingCsp,
-            HttpVulnerability::InsecureCors,
-        ];
-
-        let bad_grade = scanner.calculate_security_grade(&terrible_headers, &None, &None, &many_vulnerabilities);
-        assert_eq!(bad_grade, SecurityGrade::F);
-    }
-
-    fn all_headers_present() -> SecurityHeaders {
-        SecurityHeaders {
-            strict_transport_security: Some("max-age=31536000".to_string()),
-            x_frame_options: Some("DENY".to_string()),
-            x_content_type_options: Some("nosniff".to_string()),
-            x_xss_protection: Some("1; mode=block".to_string()),
-            referrer_policy: None,
-            permissions_policy: None,
-        }
-    }
-
-    fn strong_csp() -> Option<CspPolicy> {
-        Some(CspPolicy {
-            header_value: "default-src 'self'".to_string(),
-            directives: HashMap::new(),
-            issues: vec![],
-            strength: CspStrength::Strong,
-        })
-    }
-
-    #[test]
     fn request_plan_keeps_github_host_for_url_target() {
         let target = Target::parse("https://github.com/scottidler/scan").unwrap();
         let plan = request_plan(&target).unwrap();
@@ -1514,46 +1235,6 @@ mod tests {
             Some("http://google.com/")
         );
         assert_eq!(pinned_host(&plan.primary), Some("google.com"));
-    }
-
-    #[test]
-    fn missing_hsts_lowers_score_exactly_once() {
-        let scanner = HttpScanner::new();
-        let cors = None;
-
-        let full = all_headers_present();
-        let full_vulns = scanner.assess_vulnerabilities(&full, &strong_csp(), &cors);
-        let full_score = scanner.calculate_security_score(&full, &strong_csp(), &cors, &full_vulns);
-
-        let no_hsts = SecurityHeaders {
-            strict_transport_security: None,
-            ..all_headers_present()
-        };
-        let no_hsts_vulns = scanner.assess_vulnerabilities(&no_hsts, &strong_csp(), &cors);
-        assert!(no_hsts_vulns.contains(&HttpVulnerability::MissingHsts));
-        let no_hsts_score = scanner.calculate_security_score(&no_hsts, &strong_csp(), &cors, &no_hsts_vulns);
-
-        assert_eq!(full_score - no_hsts_score, HSTS_MISSING_PENALTY);
-    }
-
-    #[test]
-    fn information_disclosure_is_still_penalized() {
-        let scanner = HttpScanner::new();
-        let headers = all_headers_present();
-        let clean = scanner.calculate_security_score(&headers, &strong_csp(), &None, &[]);
-        let disclosed = scanner.calculate_security_score(
-            &headers,
-            &strong_csp(),
-            &None,
-            &[HttpVulnerability::InformationDisclosure],
-        );
-        assert_eq!(clean - disclosed, INFORMATION_DISCLOSURE_PENALTY);
-    }
-
-    #[test]
-    fn security_grade_labels() {
-        assert_eq!(SecurityGrade::APlus.as_str(), "A+");
-        assert_eq!(SecurityGrade::F.as_str(), "F");
     }
 
     #[test]
@@ -1610,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_failure_falls_back_to_plain_http_visibly_with_grade_f() {
+    async fn https_failure_falls_back_to_plain_http_visibly() {
         let (port, server) = plain_http_server(2).await;
         let plan = RequestPlan {
             primary: Url::parse(&format!("https://pinned.invalid:{}/", port)).unwrap(),
@@ -1622,7 +1303,6 @@ mod tests {
 
         assert!(result.url.starts_with("http://pinned.invalid"), "url={}", result.url);
         assert!(result.https_failure.is_some(), "fallback must record why HTTPS failed");
-        assert_eq!(result.security_grade, SecurityGrade::F);
         server.await.unwrap();
     }
 
@@ -1639,24 +1319,429 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_http_scanner_timeout() {
-        // Test that the scanner respects timeouts
-        let short_timeout_scanner = HttpScanner::new();
+    use crate::scan::cache::FETCH_TIMEOUT;
+    use crate::scan::observatory::hsts::PRELOAD_CACHE_FILE;
+    use crate::scan::observatory::session::transport::{ReqwestTransport, TransportOptions};
+    use crate::scan::observatory::session::{IncomingResponse, OutgoingRequest, Transport, TransportError};
+    use crate::scan::observatory::tests::google_com_result;
+    use crate::scan::psl::{PSL_CACHE_FILE, PSL_FIXTURE};
+    use crate::scan::testing::{FakeHttp, FakeRoute, dead_http_url, temp_dir};
+    use std::sync::Arc;
 
-        // Test with a very slow/non-responsive target
-        let target = Target::parse("httpbin.org:12345").unwrap(); // Non-standard port likely to timeout
+    const SITE: &str = "site.com";
 
-        let result = short_timeout_scanner.scan(&target, Protocol::Both).await;
+    async fn dead_port() -> u16 {
+        Url::parse(&dead_http_url().await).unwrap().port().unwrap()
+    }
 
-        // Should either succeed or fail, but not hang indefinitely
-        match result {
-            Ok(_) => {
-                // Connection succeeded (unexpected but possible)
-            }
-            Err(_) => {
-                // Connection failed as expected
+    fn graded(host: &str) -> ObservatoryOutcome {
+        let mut result = google_com_result();
+        result.host = host.to_string();
+        ObservatoryOutcome::Graded(result)
+    }
+
+    fn observation(ipv4: (HttpStatus, Option<HttpData>)) -> Observation {
+        Observation {
+            ipv4,
+            ipv6: (HttpStatus::NotQueried, None),
+        }
+    }
+
+    fn data() -> HttpData {
+        HttpData {
+            url: "https://site.com/".to_string(),
+            status_code: 200,
+            response_time: Duration::from_millis(5),
+            content_length: 2,
+            content_type: None,
+            redirect_chain: vec![],
+            security_headers: SecurityHeaders {
+                strict_transport_security: None,
+                x_frame_options: None,
+                x_content_type_options: None,
+                x_xss_protection: None,
+                referrer_policy: None,
+                permissions_policy: None,
+            },
+            csp: None,
+            cors: None,
+            caching: CachingPolicy {
+                cache_control: None,
+                expires: None,
+                etag: None,
+                last_modified: None,
+            },
+            vulnerabilities: vec![],
+            scan_duration: Duration::from_millis(5),
+            target_ip: "127.0.0.1".to_string(),
+            https_failure: None,
+        }
+    }
+
+    fn http_result(outcome: eyre::Result<ScanResult>) -> HttpResult {
+        match outcome.expect("the scan returns Ok") {
+            ScanResult::Http(result) => result,
+            other => panic!("not an HTTP result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_scan_deadline_leaves_the_inner_budget_room_to_return_partial_results() {
+        let scanner = HttpScanner::new();
+        assert_eq!(Scanner::deadline(&scanner), Duration::from_secs(40));
+        assert_eq!(scanner.budget, Duration::from_secs(35));
+        assert!(scanner.budget < Scanner::deadline(&scanner));
+    }
+
+    #[test]
+    fn assemble_returns_ok_when_the_url_fails_and_the_host_grades() {
+        let failed = observation((HttpStatus::Failed("operation timed out".to_string()), None));
+        let result = http_result(assemble(Protocol::Ipv4, failed, graded("example.com")));
+        assert_eq!(result.target_failure().as_deref(), Some("IPv4: operation timed out"));
+        assert_eq!(result.observatory.grade_text(), "C- (45) · example.com");
+    }
+
+    #[test]
+    fn assemble_returns_ok_when_the_url_works_and_the_grade_fails() {
+        let worked = observation((HttpStatus::Success, Some(data())));
+        let result = http_result(assemble(
+            Protocol::Ipv4,
+            worked,
+            ObservatoryOutcome::Failed("site down".to_string()),
+        ));
+        assert!(result.has_any_success());
+        assert_eq!(result.observatory.grade_text(), "none (site down)");
+    }
+
+    #[test]
+    fn assemble_returns_err_only_when_the_url_and_the_grade_both_fail() {
+        let failed = || observation((HttpStatus::Failed("operation timed out".to_string()), None));
+        let error = assemble(
+            Protocol::Ipv4,
+            failed(),
+            ObservatoryOutcome::Failed("site down".to_string()),
+        )
+        .expect_err("both failed");
+        assert_eq!(error.to_string(), "IPv4: operation timed out; grade: site down");
+
+        // A host Observatory refuses is not a failure to mention: the URL's failure stands alone.
+        let error = assemble(
+            Protocol::Ipv4,
+            failed(),
+            ObservatoryOutcome::NotApplicable("IP address".to_string()),
+        )
+        .expect_err("the URL failed and nothing graded");
+        assert_eq!(error.to_string(), "IPv4: operation timed out");
+
+        // No address to probe stays the typed, not-a-fault error.
+        let none = observation((HttpStatus::NoAddress, None));
+        let error = assemble(
+            Protocol::Ipv4,
+            none,
+            ObservatoryOutcome::NotApplicable("IP address".to_string()),
+        )
+        .expect_err("nothing to probe");
+        assert!(error.downcast_ref::<crate::scan::NoAddress>().is_some(), "{error}");
+    }
+
+    #[test]
+    fn observatory_host_is_the_urls_host_never_its_port_or_path() {
+        for (input, expected) in [
+            ("google.com", Ok("google.com")),
+            ("https://example.com:8443/a/b?c=d", Ok("example.com")),
+            ("www.tatari.tv", Ok("www.tatari.tv")),
+            ("1.1.1.1", Err("IP address")),
+            ("2606:4700:4700::1111", Err("IP address")),
+            ("http://127.0.0.1:8080/", Err("IP address")),
+            ("localhost", Err("not a public hostname")),
+            ("http://localhost:3000/", Err("not a public hostname")),
+        ] {
+            let target = Target::parse(input).unwrap();
+            assert_eq!(
+                observatory_host(&target),
+                expected.map(str::to_string).map_err(str::to_string),
+                "{input}"
+            );
+        }
+    }
+
+    /// The lists a scan reads, served from a fake so nothing touches the network or `~/.cache`.
+    struct Lists {
+        fake: FakeHttp,
+    }
+
+    impl Lists {
+        async fn new() -> Self {
+            Self {
+                fake: FakeHttp::start(vec![
+                    ("/preload", 200, r#"{"entries": []}"#.to_string()),
+                    ("/psl", 200, PSL_FIXTURE.to_string()),
+                ])
+                .await,
             }
         }
+
+        fn client() -> reqwest::Client {
+            reqwest::Client::builder().no_proxy().build().unwrap()
+        }
+
+        fn preload(&self) -> PreloadSource {
+            PreloadSource::from_url(
+                Self::client(),
+                self.fake.url("/preload"),
+                Some(temp_dir("http-preload")),
+            )
+        }
+
+        fn suffixes(&self) -> SuffixList {
+            SuffixList {
+                client: Self::client(),
+                url: self.fake.url("/psl"),
+                cache_dir: Some(temp_dir("http-psl")),
+                fetch_timeout: FETCH_TIMEOUT,
+            }
+        }
+    }
+
+    /// An Observatory retriever whose sessions reach `http_port` and `https_port` on loopback for
+    /// `site.com`.
+    fn retriever(http_port: u16, https_port: u16) -> Retriever {
+        let transport = ReqwestTransport::new(&TransportOptions {
+            built_in_roots: false,
+            extra_roots: vec![],
+            resolve: vec![(SITE.to_string(), "127.0.0.1:0".parse().unwrap())],
+            env_proxy: false,
+        })
+        .unwrap();
+        Retriever::new(Arc::new(transport)).with_ports(Some(http_port), Some(https_port))
+    }
+
+    fn site_target(port: u16) -> Target {
+        let mut target = Target::parse(&format!("http://{SITE}:{port}/")).unwrap();
+        target.update_resolved_ips(vec!["127.0.0.1".parse().unwrap()]);
+        target
+    }
+
+    async fn page_server() -> FakeHttp {
+        FakeHttp::start_routes(vec![
+            FakeRoute::get("/", 200)
+                .header("Content-Type", "text/html")
+                .body("<html></html>"),
+        ])
+        .await
+    }
+
+    /// End to end over loopback: the URL as given and the host's grade both land in the result.
+    #[tokio::test]
+    async fn scan_grades_the_host_and_observes_the_url() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let scanner = HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        );
+
+        let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
+
+        assert!(result.ipv4_status.is_success());
+        let ObservatoryOutcome::Graded(graded) = &result.observatory else {
+            panic!("the host should grade: {:?}", result.observatory);
+        };
+        assert_eq!(graded.host, SITE);
+        assert_eq!(graded.tests.len(), 12);
+        assert!(graded.preload_available);
+        assert!(result.observatory.grade_text().ends_with(" · site.com"));
+        let requests = site.requests();
+        assert!(
+            requests.iter().any(|r| r
+                .header("user-agent")
+                .is_some_and(|ua| ua.contains("Observatory/129.0"))),
+            "Observatory's request shape: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| r.header("user-agent") == Some("scan/1.0")),
+            "the target observation's own request: {requests:?}"
+        );
+    }
+
+    /// The doc's example: the URL's port times out, the host still grades; nothing is painted failed
+    /// for the other's sake.
+    #[tokio::test]
+    async fn a_failed_url_with_a_working_grade_returns_ok_with_both() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let scanner = HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        );
+
+        let result = http_result(Scanner::scan(&scanner, &site_target(dead_port().await), Protocol::Ipv4).await);
+
+        assert!(
+            matches!(result.ipv4_status, HttpStatus::Failed(_)),
+            "{:?}",
+            result.ipv4_status
+        );
+        assert!(result.get_primary_result().is_none());
+        assert!(
+            matches!(result.observatory, ObservatoryOutcome::Graded(_)),
+            "{:?}",
+            result.observatory
+        );
+    }
+
+    #[tokio::test]
+    async fn a_working_url_with_a_down_site_returns_ok_with_both() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let scanner = HttpScanner::with_observatory(
+            retriever(dead_port().await, dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        );
+
+        let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
+
+        assert!(result.ipv4_status.is_success());
+        assert_eq!(result.observatory, ObservatoryOutcome::Failed("site down".to_string()));
+        assert_eq!(result.observatory.grade_text(), "none (site down)");
+    }
+
+    #[tokio::test]
+    async fn a_failed_url_and_a_down_site_return_err() {
+        let lists = Lists::new().await;
+        let scanner = HttpScanner::with_observatory(
+            retriever(dead_port().await, dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        );
+
+        let outcome = Scanner::scan(&scanner, &site_target(dead_port().await), Protocol::Ipv4).await;
+
+        let error = outcome.expect_err("both parts failed");
+        assert!(error.to_string().starts_with("IPv4: "), "{error}");
+        assert!(error.to_string().ends_with("; grade: site down"), "{error}");
+    }
+
+    /// An IP target gets no grade and no Observatory traffic at all.
+    #[tokio::test]
+    async fn an_ip_target_is_not_graded_and_sends_no_observatory_request() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let scanner = HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        );
+        let mut target = Target::parse(&format!("http://127.0.0.1:{}/", site.port())).unwrap();
+        target.resolve().await.unwrap();
+
+        let result = http_result(Scanner::scan(&scanner, &target, Protocol::Ipv4).await);
+
+        assert_eq!(
+            result.observatory,
+            ObservatoryOutcome::NotApplicable("IP address".to_string())
+        );
+        assert!(result.ipv4_status.is_success());
+        assert!(
+            site.requests()
+                .iter()
+                .all(|r| r.header("user-agent") == Some("scan/1.0")),
+            "only the target observation's request: {:?}",
+            site.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_preload_list_grades_and_says_so() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let dead_list = PreloadSource::from_url(Lists::client(), dead_http_url().await, None);
+        let scanner =
+            HttpScanner::with_observatory(retriever(site.port(), dead_port().await), dead_list, lists.suffixes());
+
+        let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
+
+        let ObservatoryOutcome::Graded(graded) = &result.observatory else {
+            panic!("a missing list must not stop the grade: {:?}", result.observatory);
+        };
+        assert!(!graded.preload_available);
+        assert!(result.observatory.grade_text().ends_with(" · preload list unavailable"));
+    }
+
+    /// The cookie jars need the public suffix list; without it the run fails loudly, not silently
+    /// with a wrong jar.
+    #[tokio::test]
+    async fn a_missing_suffix_list_fails_the_grade_with_its_reason() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let dead_list = SuffixList {
+            client: Lists::client(),
+            url: dead_http_url().await,
+            cache_dir: None,
+            fetch_timeout: FETCH_TIMEOUT,
+        };
+        let scanner =
+            HttpScanner::with_observatory(retriever(site.port(), dead_port().await), lists.preload(), dead_list);
+
+        let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
+
+        let ObservatoryOutcome::Failed(reason) = &result.observatory else {
+            panic!("{:?}", result.observatory);
+        };
+        assert!(reason.starts_with("public suffix list unavailable"), "{reason}");
+        assert!(result.ipv4_status.is_success());
+    }
+
+    /// A transport that never answers.
+    struct Stalled;
+
+    #[async_trait]
+    impl Transport for Stalled {
+        async fn send(&self, _request: OutgoingRequest) -> Result<IncomingResponse, TransportError> {
+            std::future::pending().await
+        }
+    }
+
+    /// The budget returns what finished: a stalled Observatory run costs only its own part.
+    #[tokio::test]
+    async fn a_stalled_grade_returns_the_target_observation_at_the_budget() {
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let mut scanner =
+            HttpScanner::with_observatory(Retriever::new(Arc::new(Stalled)), lists.preload(), lists.suffixes());
+        scanner.budget = Duration::from_millis(600);
+
+        let started = Instant::now();
+        let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(result.ipv4_status.is_success(), "{:?}", result.ipv4_status);
+        assert_eq!(result.observatory, ObservatoryOutcome::Failed("timed out".to_string()));
+    }
+
+    /// Stalled sessions hit their own 9s request cap, far inside the 35s budget and the runner's
+    /// 40s: the budget is the backstop, not the usual limit.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_observatory_run_ends_at_the_session_cap_inside_the_budget() {
+        // Warm caches serve both lists from disk, so no socket races the paused clock.
+        let (preload_dir, psl_dir) = (temp_dir("http-warm-preload"), temp_dir("http-warm-psl"));
+        std::fs::write(preload_dir.join(PRELOAD_CACHE_FILE), r#"{"entries": []}"#).unwrap();
+        std::fs::write(psl_dir.join(PSL_CACHE_FILE), PSL_FIXTURE).unwrap();
+        let preload = PreloadSource::from_url(Lists::client(), dead_http_url().await, Some(preload_dir));
+        let suffixes = SuffixList {
+            client: Lists::client(),
+            url: dead_http_url().await,
+            cache_dir: Some(psl_dir),
+            fetch_timeout: FETCH_TIMEOUT,
+        };
+        let mut target = Target::parse("stalled.example.com").unwrap();
+        target.update_resolved_ips(vec![]);
+        let scanner = HttpScanner::with_observatory(Retriever::new(Arc::new(Stalled)), preload, suffixes);
+
+        let started = tokio::time::Instant::now();
+        let error = Scanner::scan(&scanner, &target, Protocol::Ipv4)
+            .await
+            .expect_err("no address and no grade");
+
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(9), "{elapsed:?}");
+        assert!(elapsed < scanner.budget, "{elapsed:?}");
+        assert!(error.to_string().ends_with("grade: site down"), "{error}");
     }
 }

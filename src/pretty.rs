@@ -184,20 +184,25 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
         }
 
         ScanResult::Http(http) => {
+            let grade = format!("grade {}", http.observatory.grade_text());
             let Some(primary_data) = http.get_primary_result() else {
-                return (Outcome::Failed, "HTTP scan failed for all protocols".to_string());
+                // The target observation failed but the host got a grade (or the scan would be an Err).
+                let failure = http
+                    .target_failure()
+                    .unwrap_or_else(|| "no address to request".to_string());
+                return (Outcome::Failed, format!("{failure}\n  └─ {grade}"));
             };
             let security_features = count_security_features(primary_data);
             let vuln_count = http.total_vulnerabilities();
 
-            // The grade is the primary result's, the same one whose HTTPS failure is printed.
+            // The grade is the host's, the same line the HTTP pane shows.
             let mut text = format!(
-                "{} {}, {} security features, {} vulnerabilities, grade {} ({}ms)",
+                "{} {}, {} security features, {} vulnerabilities, {} ({}ms)",
                 primary_data.status_code,
                 primary_data.content_type.as_deref().unwrap_or("unknown"),
                 security_features,
                 vuln_count,
-                primary_data.security_grade.as_str(),
+                grade,
                 primary_data.response_time.as_millis()
             );
             if let Some(reason) = &primary_data.https_failure {
@@ -500,9 +505,9 @@ pub fn print_header(target: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::http::{
-        CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade as HttpSecurityGrade, SecurityHeaders,
-    };
+    use crate::scan::http::{CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityHeaders};
+    use crate::scan::observatory::ObservatoryOutcome;
+    use crate::scan::observatory::tests::google_com_result;
     use crate::scan::ping::{PingFailure, PingResult, PingStatus};
     use crate::scan::whois::{NotApplicableReason, WhoisResult};
     use std::collections::VecDeque;
@@ -525,7 +530,7 @@ mod tests {
         ScanResult::Ping(ping)
     }
 
-    fn http_data(grade: HttpSecurityGrade, https_failure: Option<&str>) -> HttpData {
+    fn http_data(https_failure: Option<&str>) -> HttpData {
         HttpData {
             url: "http://example.com".to_string(),
             status_code: 200,
@@ -550,7 +555,6 @@ mod tests {
                 last_modified: None,
             },
             vulnerabilities: vec![],
-            security_grade: grade,
             scan_duration: Duration::from_millis(120),
             target_ip: "192.0.2.1".to_string(),
             https_failure: https_failure.map(str::to_string),
@@ -652,19 +656,26 @@ mod tests {
         assert!(out.starts_with("❌ TLS: Error - timed out after 30s"), "{out}");
     }
 
+    fn http_result(observatory: ObservatoryOutcome, data: Option<HttpData>) -> ScanResult {
+        let mut result = HttpResult::new(observatory);
+        if data.is_some() {
+            result.ipv4_status = HttpStatus::Success;
+        } else {
+            result.ipv4_status = HttpStatus::Failed("operation timed out".to_string());
+        }
+        result.ipv4_result = data;
+        ScanResult::Http(result)
+    }
+
     #[test]
-    fn http_prints_https_failure_and_primary_grade() {
-        let result = ScanResult::Http(HttpResult {
-            ipv4_status: HttpStatus::Success(HttpSecurityGrade::F),
-            ipv4_result: Some(http_data(HttpSecurityGrade::F, Some("certificate expired"))),
-            ipv6_status: HttpStatus::Success(HttpSecurityGrade::APlus),
-            ipv6_result: Some(http_data(HttpSecurityGrade::APlus, None)),
-            queried_at: Instant::now(),
-            total_duration: Duration::from_millis(240),
-        });
+    fn http_prints_https_failure_and_the_hosts_grade() {
+        let result = http_result(
+            ObservatoryOutcome::Graded(google_com_result()),
+            Some(http_data(Some("certificate expired"))),
+        );
         let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
-        assert!(out.contains("grade F "), "grade must be the primary result's: {out}");
-        assert!(!out.contains("APlus"), "grade printed with Debug: {out}");
+        assert!(out.contains("grade C- (45) · google.com "), "grade and host: {out}");
+        assert!(!out.contains("CMinus"), "grade printed with Debug: {out}");
         assert!(
             out.contains("HTTPS failed: certificate expired"),
             "https_failure missing: {out}"
@@ -730,18 +741,51 @@ mod tests {
         assert!(out.starts_with("❌ TLS: Connection failed: handshake refused"), "{out}");
     }
 
+    /// Same grade text as the HTTP and Security panes, for every kind of outcome.
     #[test]
-    fn http_grade_uses_display_form() {
-        let result = ScanResult::Http(HttpResult {
-            ipv4_status: HttpStatus::Success(HttpSecurityGrade::APlus),
-            ipv4_result: Some(http_data(HttpSecurityGrade::APlus, None)),
-            ipv6_status: HttpStatus::NotQueried,
-            ipv6_result: None,
-            queried_at: Instant::now(),
-            total_duration: Duration::from_millis(120),
-        });
+    fn http_grade_matches_the_panes_text_for_every_outcome() {
+        for (outcome, text) in [
+            (
+                ObservatoryOutcome::Graded(google_com_result()),
+                "grade C- (45) · google.com ",
+            ),
+            (
+                ObservatoryOutcome::NotApplicable("IP address".to_string()),
+                "grade n/a (IP address) ",
+            ),
+            (
+                ObservatoryOutcome::NotApplicable("not a public hostname".to_string()),
+                "grade n/a (not a public hostname) ",
+            ),
+            (
+                ObservatoryOutcome::Failed("site down".to_string()),
+                "grade none (site down) ",
+            ),
+        ] {
+            let result = http_result(outcome, Some(http_data(None)));
+            let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
+            assert!(out.contains(text), "{text}: {out}");
+            assert!(!out.contains("HTTPS failed"), "{out}");
+        }
+        let mut no_list = google_com_result();
+        no_list.preload_available = false;
+        let out = format_scan_state(
+            "http",
+            &state(
+                ScanStatus::Complete,
+                Some(http_result(ObservatoryOutcome::Graded(no_list), Some(http_data(None)))),
+                None,
+            ),
+        );
+        assert!(out.contains("google.com · preload list unavailable "), "{out}");
+    }
+
+    /// The URL failed but the host graded: both show, the failure first.
+    #[test]
+    fn http_prints_a_failed_url_and_a_working_grade_together() {
+        let result = http_result(ObservatoryOutcome::Graded(google_com_result()), None);
         let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
-        assert!(out.contains("grade A+ "), "{out}");
-        assert!(!out.contains("HTTPS failed"), "{out}");
+        assert!(out.starts_with("❌ HTTP: IPv4: operation timed out"), "{out}");
+        assert!(out.contains("grade C- (45) · google.com"), "{out}");
     }
 }

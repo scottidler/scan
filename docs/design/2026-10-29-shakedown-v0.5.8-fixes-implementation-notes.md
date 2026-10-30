@@ -745,3 +745,128 @@ Success criteria (all tests, `cargo test --lib`, 758 passing):
 ### Open questions
 - Phase 6 must hand the jar an ICANN-plus-private suffix list (`publicsuffix::List`); `psl.rs` parses the ICANN section only (`IcannList`). Both can come from the one cached file.
 - The expired-cookie removal on a later matching request is ported from tough-cookie's source; Phase 0c's crafted server only measured cookies set on the last hop. A cross-hop check against the local CLI would confirm it.
+
+## Phase 6: Wire the Observatory grade into scan
+
+`HttpScanner` now runs three independent parts: the target observation (per family, as before), the
+host's Observatory run (`ObservatoryOutcome`, in `observatory.rs`), and, in Phase 7, the lenses.
+`assemble` in `scan/http.rs` joins them. The old penalty grade is deleted; `tui/http.rs`,
+`tui/security.rs` and `pretty.rs` read the outcome. The ignored live test is
+`scan::observatory::live::scan_matches_the_live_observatory_api` (`observatory/live.rs`).
+
+Live test run (`cargo test --release --lib -- --ignored --exact --nocapture
+scan::observatory::live::scan_matches_the_live_observatory_api`), 2026-10-30, from talos, sandbox
+on (the API was reachable). Result: `test result: ok. 1 passed`, 383.64 s. Output:
+
+```
+google.com (pair 1/4): google.com
+    API: scan id 132262723, scanned_at 2026-10-30T09:48:12.964Z, C- (45)
+    scan: C- (45), verified=true, preload_available=true
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+google.com: identical
+www.tatari.tv (pair 1/4): www.tatari.tv
+    API: scan id 132263074, scanned_at 2026-10-30T09:50:05.251Z, B (75)
+    scan: B (75), verified=true, preload_available=true
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+www.tatari.tv: identical
+github.com (pair 1/4): github.com
+    API: scan id 132263079, scanned_at 2026-10-30T09:50:06.633Z, A+ (115)
+    scan: A+ (115), verified=true, preload_available=true
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+github.com: identical
+example.com (pair 1/4): example.com
+    API: scan id 132263049, scanned_at 2026-10-30T09:49:58.514Z, F (10)
+    scan: F (10), verified=true, preload_available=true
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+example.com: identical
+mozilla.org (pair 1/4): mozilla.org
+    API: scan id 132263258, scanned_at 2026-10-30T09:50:56.304Z, B+ (80)
+    scan: B+ (80), verified=true, preload_available=true
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+mozilla.org: identical
+neverssl.com (pair 1/4): neverssl.com
+    API: scan id 132263282, scanned_at 2026-10-30T09:51:02.509Z, D (30)
+    scan: none (site down)
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+neverssl.com: retrying the pair after the API's cooldown
+neverssl.com (pair 2/4): neverssl.com
+    API: scan id 132263607, scanned_at 2026-10-30T09:52:40.917Z, D (30)
+    scan: F (10), verified=true, preload_available=true
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+neverssl.com: retrying the pair after the API's cooldown
+neverssl.com (pair 3/4): neverssl.com
+    API: "The site seems to be down."
+    scan: none (site down)
+    preload sha256: d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+neverssl.com: identical
+test scan::observatory::live::scan_matches_the_live_observatory_api ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 775 filtered out; finished in 383.64s
+```
+
+Five hosts agreed on the first pair. neverssl.com flapped as Phase 0 measured: pair 1 had the API at D 30 while scan saw the site down, pair 2 had the API at D 30 and scan at F 10 (only one port answered each side), and pair 3 had both sides report the site down, which the test counts as agreement.
+
+Success criteria (all tests, `cargo test --lib`, 775 passing plus the one ignored live test):
+
+| Criterion | Test(s) | Result |
+|---|---|---|
+| HTTP pane for google fixture: `Grade: C- (45) · google.com` in `WARN`; zoom lists all 12 tests | `tui::http::tests::google_fixture_shows_the_grade_score_and_host_in_warn_and_zoom_lists_12_tests` | pass |
+| Security pane shows the same grade | `tui::security::tests::http_grade_csp_and_cors_show_observatory_results` | pass |
+| `pretty.rs` shows the same grade | `pretty::tests::http_grade_matches_the_panes_text_for_every_outcome`, `http_prints_https_failure_and_the_hosts_grade` | pass |
+| IP -> `Grade: n/a (IP address)`, `localhost` -> `Grade: n/a (not a public hostname)`, both `MUTED` | `tui::http::tests::hosts_with_no_grade_read_why_in_muted`; `observatory::tests::eligible_host_refuses_ips_and_dotless_names`; `http::tests::observatory_host_is_the_urls_host_never_its_port_or_path`; end to end `an_ip_target_is_not_graded_and_sends_no_observatory_request` | pass |
+| Site down -> `Grade: none (site down)` | same `hosts_with_no_grade...` test; `http::tests::a_working_url_with_a_down_site_returns_ok_with_both` | pass |
+| URL fails, grade works: both shown, scan `Ok` | `tui::http::tests::a_failed_url_and_a_working_grade_show_together`, `http::tests::a_failed_url_with_a_working_grade_returns_ok_with_both`, `assemble_returns_ok_when_the_url_fails_and_the_host_grades`, `pretty::tests::http_prints_a_failed_url_and_a_working_grade_together` | pass |
+| Both failing -> `Err` | `http::tests::a_failed_url_and_a_down_site_return_err`, `assemble_returns_err_only_when_the_url_and_the_grade_both_fail` | pass |
+| `· preload list unavailable` in `WARN` on the grade line | `tui::http::tests::a_missing_preload_list_is_noted_in_warn_on_the_grade_line`; end to end `http::tests::a_missing_preload_list_grades_and_says_so` | pass |
+| `HttpScanner::deadline()` 40s, inner 35s budget returns partial results | `http::tests::the_scan_deadline_leaves_the_inner_budget_room_to_return_partial_results`, `a_stalled_grade_returns_the_target_observation_at_the_budget`, `a_stalled_observatory_run_ends_at_the_session_cap_inside_the_budget` (paused time) | pass |
+| Live test | `scan::observatory::live::scan_matches_the_live_observatory_api` | see below |
+
+### Design decisions
+- Outcome on `HttpResult`, not `HttpData`: `observatory: ObservatoryOutcome` lives on `HttpResult` beside the per-family results (`scan/http.rs:HttpResult`). It is one value per scan whatever `p` selects, and the doc's "URL fails, grade works" case has no `HttpData` to carry it.
+- Scan `Ok` iff the target observation succeeded for some family or the host graded (`http.rs:assemble`). A host Observatory refuses (`NotApplicable`) is not a grade: a failing IP target is still `Err` with the URL's own reason (the typed `NoAddress` survives), as it was before. When both fail and the grade `Failed`, the error reads `IPv4: operation timed out; grade: site down`.
+- `HttpStatus::Success` carries nothing, `HttpResult::new(observatory)` takes the outcome (no `Default`, no "not run" value), `HttpData` lost `security_grade`, `CspPolicy` lost `strength`, `CorsPolicy` lost `security_level`.
+- The target observation and the two families run concurrently (`tokio::join!`), each under the 35s budget through `timeout_at`; a family cut off reads `operation timed out` through the route classifier. `HttpScanner.budget` is a field (default 35s) so a test can shrink it.
+- The Observatory part cannot reach 35s on its own: sessions end at 9s/10s, robots.txt and the preflight add 9s each, 28s worst case (Phase 5). The budget is the backstop for a slow suffix-list or preload fetch (10s each, concurrent with each other, ahead of `observe`); it yields `Failed("timed out")`.
+- One public suffix file, two lists: `psl::parse_suffixes` returns `Suffixes { icann: IcannList, all: List }` from the one cached file under the same ICANN-marker corruption check, held in memory by a `Refreshing<Suffixes>` on `HttpScanner` (parsed once per 24h refresh, not per scan). This resolves Phase 5's open question. The jars get `all`, the SRI test `icann`.
+- A missing suffix list fails the grade loudly (`Failed("public suffix list unavailable: ...")`) instead of grading with a wrong jar. A missing preload list does not: it grades as "not preloaded" with `preload_available=false` (the doc's rule).
+- `ObservatoryOutcome::from_analysis` maps every `AnalyzeError` (site down, unexpected status, invalid site, invalid script src) to `Failed(error.to_string())`; the Display strings (`site down`, `HTTP 500`) are the grade line's wording. `grade_summary`/`grade_text`/`preload_unavailable` live on the outcome so the HTTP pane, Security pane and `pretty.rs` share one wording; the panes own only color (`tui/http.rs:grade_line`, letter -> GOOD / WARN / BAD, `NotApplicable` and `Failed` -> MUTED).
+- `eligible_host` (`observatory.rs`) ports `validHostname`'s trailing-dot strip, IP refusal and dotless refusal. The API's TLD-list check is not ported: a name under an unknown TLD is retrieved and reads as site down.
+- The plain-HTTP fallback for a bare host stays as target observation (it shows the URL's real status when HTTPS fails and keeps `https_failure` in the pane); only the forced `F` is deleted. The grade is the host's Observatory run, independent of it.
+- Security pane: `CSP:` and `CORS:` rows show Observatory's result string for `content-security-policy` and `cross-origin-resource-sharing`, colored by the test's `pass`; the target's own policy text and `CspIssue`/`CorsIssue` lists stay as listed facts. The `HTTP Grade:` row is the shared grade line. When the URL failed but the host graded, the HTTP section is the grade line alone.
+- Zoom lists the 12 tests as `name: result (+N)` under `Observatory tests (algorithm 6)`, colored by `pass`.
+- Live test (decision for Scott to confirm, also an open question): each host is retried as a pair (fresh `POST /scan` plus `analyze`, then a fresh local grade) up to 4 times, 61s apart (the API returns the earlier scan for a repeat POST inside 60s; measured 2026-10-30, the second POST of example.com returned the same scan id), until the two sides agree. Both sides reporting site down (`422 scan-failed` vs `Failed("site down")`) is agreement. neverssl.com stays in the list, per the doc. A POST or analyze that returns 5xx or errors is retried 3 times 15s apart; the HTTP timeout is 120s (google.com takes 15-60s). A disagreement prints the provenance: API scan id, `scanned_at`, grade and score, our `verified` and `preload_available`, the sha256 of the cached Chromium list, our effective URL (from a second retrieval) and every difference by name. The comparison covers each test's result string and modifier, score, grade and `algorithm_version` 6, never `pass`.
+
+### Deviations
+- `ObservatoryOutcome` is in `observatory.rs` and held by `HttpResult`, not `HttpData` (see Design decisions): same effect, correct seam.
+- `Failed(reason)` carries no host, so the no-grade line reads `Grade: none (site down)` as the Architecture bullet says, not `Grade: none (site down) · example.com` as the result-model example in the doc does. The criteria text (`Grade: none (site down)`) holds either way. Adding the host needs a `String` on `Failed`/`NotApplicable`; say if you want it.
+- `HttpVulnerability` lost `WeakCsp` and `InsecureCors` as well as `InformationDisclosure`: they were derived from the deleted `CspStrength` and `CorsSecurityLevel`, which the Resolved Decisions delete ("Two signals never encode one fact"). `assess_vulnerabilities` lost its `cors` argument. The four `Missing ...` header-presence issues stay.
+- `test_http_scanner_timeout` is deleted: it asserted nothing (both arms empty) and, with the new scan, would have made live requests to httpbin.org and written `~/.cache/scan`. The scanner timeout paths are covered by the loopback tests above.
+- Tests that pinned the old grade were deleted, not inverted, because the behavior no longer exists: `test_security_grade_calculation`, `test_security_grade_edge_cases`, `test_csp_strength_calculation`, `test_cors_security_levels`, `missing_hsts_lowers_score_exactly_once`, `information_disclosure_is_still_penalized`, `security_grade_labels`, `test_vulnerability_assessment` (http.rs), `render_grade_comes_from_primary_result_not_best_family` and the A+ label test (`tui/http.rs`). `render_plain_http_fallback...` and `https_failure_falls_back...` were inverted: the fallback no longer forces `F`, and each asserts that.
+- `Observatory run resolves once per scan, whatever p selects`: on a target with no address in the selected family the scan used to be `Err(NoAddress)`; it is now `Ok` when the host grades, with the target block replaced by `no address to request`. The doc's rule (Err only when both fail) produces this.
+
+### Tradeoffs
+- `Refreshing<Suffixes>` on `HttpScanner` vs reusing `SuffixList::registrable_domain` per call: the latter re-parses the 338 KB list per scan (the Phase 0 finding for DNS); the held copy costs one `Arc` and reuses Phase 5's `Refreshing`.
+- Failing the grade on a missing suffix list vs bundling a list: the doc has no bundled data and the jar rules need the PRIVATE section; failing visibly (`none (public suffix list unavailable: ...)`) beats a quietly different grade. The list is cached on disk after the first fetch and a stale copy of any age is kept.
+- Injecting `Retriever`, `PreloadSource` and `SuffixList` through `HttpScanner::with_observatory` vs a trait for the whole Observatory run: the three concrete types are already the seams Phase 5 built (transport port, `from_url`, `SuffixList` fields), so the end-to-end tests run the real code over loopback.
+- Bite proofs ran as scripted string mutations of the working tree with `cargo test --lib`, then restored. Every undo broke at least one test:
+
+| Fix undone | Failing tests |
+|---|---|
+| `assemble` errs on a URL failure even when the host graded | `a_failed_url_with_a_working_grade_returns_ok_with_both`, `assemble_returns_ok_when_the_url_fails_and_the_host_grades` |
+| `assemble` never errs | `a_failed_url_and_a_down_site_return_err`, `assemble_returns_err_only_when_the_url_and_the_grade_both_fail`, `a_stalled_observatory_run_ends_at_the_session_cap_inside_the_budget`, `timed_out_scan_renders_operation_timed_out_in_the_pane` |
+| `deadline()` left at the runner default | `the_scan_deadline_leaves_the_inner_budget_room_to_return_partial_results` |
+| IP addresses graded | `observatory::tests::eligible_host_refuses_ips_and_dotless_names` |
+| C grades colored `BAD` | `every_grade_letter_is_colored_by_its_letter`, `google_fixture_shows_the_grade_score_and_host_in_warn_and_zoom_lists_12_tests`, `tui::security::tests::http_grade_csp_and_cors_show_observatory_results` |
+| preload note dropped from the grade text | `pretty::tests::http_grade_matches_the_panes_text_for_every_outcome`, `a_missing_preload_list_grades_and_says_so`, `observatory::tests::grade_text_names_the_grade_score_and_host` |
+| zoom lists no tests | `google_fixture_shows_the_grade_score_and_host_in_warn_and_zoom_lists_12_tests` |
+| host dropped from the grade text | 14 tests across `pretty`, `http`, `tui::http`, `tui::security`, `observatory` |
+| Security pane drops the grade line | `http_grade_csp_and_cors_show_observatory_results`, `security_pane_grade_line_for_hosts_with_no_grade_and_a_failed_url` |
+| `pretty.rs` drops the grade | `http_grade_matches_the_panes_text_for_every_outcome`, `http_prints_a_failed_url_and_a_working_grade_together`, `http_prints_https_failure_and_the_hosts_grade` |
+| PRIVATE section ignored in the jar's list | `psl::tests::suffixes_read_the_one_file_with_and_without_the_private_section` |
+| no inner budget on the grade | `a_stalled_grade_returns_the_target_observation_at_the_budget` |
+
+### Open questions
+- neverssl.com in the live test: kept, with a 4-pair retry and "both site down is agreement" (Scott's call on this was open since Phase 0). It adds up to 3 minutes of cooldown waits when the host flaps. Keep this rule, or replace the host by a dated Resolved Decision?
+- The HTTP pane's `Issues:` list (`Missing HSTS` and three more) comes from the target observation's own request, which still sends `scan/1.0` over reqwest. google.com sends HSTS only to Observatory's Firefox UA over HTTP/1.1, so the pane can show `Missing HSTS` beside a grade whose HSTS test passed. The doc says the target observation stays "as today". Should those four issues go, or the target observation adopt Observatory's request shape?
+- No-grade lines carry no host (see Deviations). Add it?
+- The API's TLD-list check is not ported (`eligible_host`); a dotted name under an unknown TLD reads `none (site down)`, not `n/a`. Acceptable, or port `conf/tld-list.json`?

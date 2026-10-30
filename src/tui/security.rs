@@ -18,6 +18,22 @@ const CERT_EXPIRY_CRITICAL_DAYS: i64 = 7;
 const MIN_SECURITY_PANE_WIDTH: u16 = 50;
 const MIN_SECURITY_PANE_HEIGHT: u16 = 35;
 
+/// Observatory's result for one test of a graded host, colored by whether it passed; `None` when
+/// the host has no grade.
+fn observatory_label(
+    outcome: &crate::scan::observatory::ObservatoryOutcome,
+    test_name: &str,
+) -> Option<(String, ratatui::style::Color)> {
+    let crate::scan::observatory::ObservatoryOutcome::Graded(result) = outcome else {
+        return None;
+    };
+    let test = result.tests.iter().find(|test| test.name == test_name)?;
+    Some((
+        test.result.as_str().to_string(),
+        if test.pass { theme::GOOD } else { theme::BAD },
+    ))
+}
+
 /// SECURITY pane displays TLS/SSL certificate information and security analysis
 pub struct SecurityPane {
     title: &'static str,
@@ -129,7 +145,6 @@ impl SecurityPane {
                             .unwrap_or_else(|| "missing".to_string()),
                         primary_data.csp.as_ref().map(|csp| {
                             (
-                                csp.strength.clone(),
                                 csp.header_value.clone(),
                                 csp.issues
                                     .iter()
@@ -153,7 +168,6 @@ impl SecurityPane {
                         }),
                         primary_data.cors.as_ref().map(|cors| {
                             (
-                                cors.security_level.clone(),
                                 cors.access_control_allow_origin.clone(),
                                 cors.access_control_allow_methods.clone(),
                                 cors.access_control_allow_credentials,
@@ -186,21 +200,9 @@ impl SecurityPane {
                                 crate::scan::http::HttpVulnerability::MissingCsp => {
                                     "Missing Content Security Policy".to_string()
                                 }
-                                crate::scan::http::HttpVulnerability::WeakCsp => {
-                                    "Weak Content Security Policy".to_string()
-                                }
-                                crate::scan::http::HttpVulnerability::InsecureCors => {
-                                    "Insecure CORS configuration".to_string()
-                                }
-                                crate::scan::http::HttpVulnerability::InformationDisclosure => {
-                                    "Information disclosure risk".to_string()
-                                }
                             })
                             .collect::<Vec<_>>(),
-                        http_result
-                            .get_best_security_grade()
-                            .map(|g| g.as_str().to_string())
-                            .unwrap_or_else(|| "N/A".to_string()),
+                        http_result.observatory.clone(),
                     )
                 })
             } else {
@@ -209,6 +211,17 @@ impl SecurityPane {
         } else {
             None
         };
+
+        // A scan whose target observation failed can still carry a grade.
+        let http_grade_only = state
+            .scanners
+            .get("http")
+            .and_then(|http_state| match http_state.result.as_ref() {
+                Some(crate::types::ScanResult::Http(http_result)) if http_result.get_primary_result().is_none() => {
+                    Some(http_result.observatory.clone())
+                }
+                _ => None,
+            });
 
         // Extract DNS data upfront
         let dns_data = if let Some(dns_state) = state.scanners.get("dns") {
@@ -508,19 +521,13 @@ impl SecurityPane {
                 ),
             ]));
 
-            // CSP
-            if let Some((strength, header_value, issues)) = csp_data {
+            // CSP: Observatory's result for the graded host; the policy below is the target's own.
+            let csp_label = observatory_label(&http_grade, "content-security-policy");
+            if let Some((header_value, issues)) = csp_data {
+                let (label, color) = csp_label.unwrap_or(("present".to_string(), theme::MUTED));
                 lines.push(Line::from(vec![
                     Span::styled("  CSP: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(
-                        strength.label(),
-                        Style::default().fg(match strength {
-                            crate::scan::http::CspStrength::Strong => theme::GOOD,
-                            crate::scan::http::CspStrength::Moderate => theme::WARN,
-                            crate::scan::http::CspStrength::Weak => theme::BAD,
-                            crate::scan::http::CspStrength::None => theme::BAD,
-                        }),
-                    ),
+                    Span::styled(label, Style::default().fg(color)),
                 ]));
 
                 // CSP Header Value
@@ -537,32 +544,26 @@ impl SecurityPane {
                     ]));
                 }
             } else {
+                let (label, color) = csp_label.unwrap_or(("missing".to_string(), theme::BAD));
                 lines.push(Line::from(vec![
                     Span::styled("  CSP: ", Style::default().fg(theme::LABEL)),
-                    Span::styled("missing", Style::default().fg(theme::BAD)),
+                    Span::styled(label, Style::default().fg(color)),
                 ]));
             }
 
             // CORS
             if let Some((
-                security_level,
                 access_control_allow_origin,
                 access_control_allow_methods,
                 access_control_allow_credentials,
                 issues,
             )) = cors_data
             {
+                let (label, color) = observatory_label(&http_grade, "cross-origin-resource-sharing")
+                    .unwrap_or(("present".to_string(), theme::MUTED));
                 lines.push(Line::from(vec![
                     Span::styled("  CORS: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(
-                        security_level.label(),
-                        Style::default().fg(match security_level {
-                            crate::scan::http::CorsSecurityLevel::Secure => theme::GOOD,
-                            crate::scan::http::CorsSecurityLevel::Moderate => theme::WARN,
-                            crate::scan::http::CorsSecurityLevel::Weak => theme::BAD,
-                            crate::scan::http::CorsSecurityLevel::Dangerous => theme::BAD,
-                        }),
-                    ),
+                    Span::styled(label, Style::default().fg(color)),
                 ]));
 
                 // CORS Details (compact)
@@ -616,19 +617,16 @@ impl SecurityPane {
                 }
             }
 
-            // HTTP Security Grade
+            // HTTP Security Grade: the same line the HTTP pane shows.
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("📊 HTTP Grade: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    http_grade.clone(),
-                    Style::default().fg(match http_grade.as_str() {
-                        "A+" | "A" => theme::GOOD,
-                        "B" => theme::WARN,
-                        _ => theme::BAD,
-                    }),
-                ),
-            ]));
+            lines.push(crate::tui::http::grade_line("📊 HTTP Grade: ", &http_grade));
+        } else if let Some(observatory) = http_grade_only {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "🌐 HTTP Security",
+                Style::default().fg(theme::VALUE),
+            )]));
+            lines.push(crate::tui::http::grade_line("📊 HTTP Grade: ", &observatory));
         }
 
         // DNS Security Records
@@ -814,10 +812,9 @@ fn common_name_display(distinguished_name: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan::dns::{DnsResult, EmailSecurityAnalysis};
-    use crate::scan::http::{
-        CorsIssue, CorsPolicy, CorsSecurityLevel, CspIssue, CspPolicy, CspStrength, HttpVulnerability,
-        SecurityGrade as HttpSecurityGrade, SecurityHeaders,
-    };
+    use crate::scan::http::{CorsIssue, CorsPolicy, CspIssue, CspPolicy, HttpVulnerability, SecurityHeaders};
+    use crate::scan::observatory::ObservatoryOutcome;
+    use crate::scan::observatory::tests::google_com_result;
     use crate::scan::tls::{
         CertificateInfo, SecurityGrade, TlsData, TlsResult, TlsStatus, TlsVersion, TlsVulnerability,
     };
@@ -966,7 +963,6 @@ mod tests {
             header_value: "default-src 'self'; script-src 'self' 'unsafe-inline'".to_string(),
             directives: csp_directives,
             issues: vec![CspIssue::UnsafeInline("script-src".to_string())],
-            strength: CspStrength::Moderate,
         };
 
         let cors_policy = CorsPolicy {
@@ -975,7 +971,6 @@ mod tests {
             access_control_allow_headers: vec!["Content-Type".to_string()],
             access_control_allow_credentials: true,
             issues: vec![CorsIssue::WildcardWithCredentials],
-            security_level: CorsSecurityLevel::Dangerous,
         };
 
         let http_data = crate::scan::http::HttpData {
@@ -994,8 +989,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![HttpVulnerability::WeakCsp, HttpVulnerability::InsecureCors],
-            security_grade: HttpSecurityGrade::C,
+            vulnerabilities: vec![HttpVulnerability::MissingHsts, HttpVulnerability::MissingCsp],
             scan_duration: Duration::from_millis(300),
             target_ip: "1.2.3.4".to_string(),
             https_failure: None,
@@ -1004,8 +998,9 @@ mod tests {
         let http_result = crate::scan::http::HttpResult {
             ipv4_result: Some(http_data.clone()),
             ipv6_result: None,
-            ipv4_status: crate::scan::http::HttpStatus::Success(http_data.security_grade.clone()),
+            ipv4_status: crate::scan::http::HttpStatus::Success,
             ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+            observatory: ObservatoryOutcome::Graded(google_com_result()),
             queried_at: Instant::now(),
             total_duration: Duration::from_millis(300),
         };
@@ -1044,13 +1039,11 @@ mod tests {
 
             // Test CSP
             let csp = primary_data.csp.as_ref().unwrap();
-            assert_eq!(csp.strength, CspStrength::Moderate);
             assert!(csp.header_value.contains("default-src 'self'"));
             assert_eq!(csp.issues.len(), 1);
 
             // Test CORS
             let cors = primary_data.cors.as_ref().unwrap();
-            assert_eq!(cors.security_level, CorsSecurityLevel::Dangerous);
             assert_eq!(cors.access_control_allow_origin.as_ref().unwrap(), "*");
             assert_eq!(cors.access_control_allow_methods.len(), 2);
             assert!(cors.access_control_allow_credentials);
@@ -1059,15 +1052,14 @@ mod tests {
             // Test vulnerabilities using helper methods
             let all_vulnerabilities = http_result.get_all_vulnerabilities();
             assert_eq!(all_vulnerabilities.len(), 2);
-            assert!(all_vulnerabilities.iter().any(|v| **v == HttpVulnerability::WeakCsp));
             assert!(
                 all_vulnerabilities
                     .iter()
-                    .any(|v| **v == HttpVulnerability::InsecureCors)
+                    .any(|v| **v == HttpVulnerability::MissingHsts)
             );
+            assert!(all_vulnerabilities.iter().any(|v| **v == HttpVulnerability::MissingCsp));
 
-            // Test grade using helper method
-            assert_eq!(*http_result.get_best_security_grade().unwrap(), HttpSecurityGrade::C);
+            assert_eq!(http_result.observatory.grade_text(), "C- (45) · google.com");
         }
     }
 
@@ -1243,7 +1235,6 @@ mod tests {
                 last_modified: None,
             },
             vulnerabilities: vec![HttpVulnerability::MissingCsp],
-            security_grade: HttpSecurityGrade::B,
             scan_duration: Duration::from_millis(200),
             target_ip: "1.2.3.4".to_string(),
             https_failure: None,
@@ -1252,8 +1243,9 @@ mod tests {
         let http_result = crate::scan::http::HttpResult {
             ipv4_result: Some(http_data.clone()),
             ipv6_result: None,
-            ipv4_status: crate::scan::http::HttpStatus::Success(http_data.security_grade.clone()),
+            ipv4_status: crate::scan::http::HttpStatus::Success,
             ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+            observatory: ObservatoryOutcome::Graded(google_com_result()),
             queried_at: Instant::now(),
             total_duration: Duration::from_millis(200),
         };
@@ -1346,7 +1338,7 @@ mod tests {
             if let Some(ScanResult::Http(http_result)) = http_state.result.as_ref() {
                 let primary_data = http_result.get_primary_result().unwrap();
                 assert!(primary_data.security_headers.strict_transport_security.is_some());
-                assert_eq!(*http_result.get_best_security_grade().unwrap(), HttpSecurityGrade::B);
+                assert_eq!(http_result.observatory.grade_text(), "C- (45) · google.com");
                 assert!(!http_result.get_all_vulnerabilities().is_empty());
             } else {
                 panic!("HTTP result should be extractable");
@@ -1403,11 +1395,7 @@ mod tests {
         assert!(vuln_strings.contains(&"Certificate expired".to_string()));
 
         // Test HTTP vulnerability extraction
-        let http_vulnerabilities = [
-            HttpVulnerability::MissingHsts,
-            HttpVulnerability::WeakCsp,
-            HttpVulnerability::InsecureCors,
-        ];
+        let http_vulnerabilities = [HttpVulnerability::MissingHsts, HttpVulnerability::MissingCsp];
 
         let http_vuln_strings: Vec<String> = http_vulnerabilities
             .iter()
@@ -1416,16 +1404,12 @@ mod tests {
                 HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options".to_string(),
                 HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options".to_string(),
                 HttpVulnerability::MissingCsp => "Missing Content Security Policy".to_string(),
-                HttpVulnerability::WeakCsp => "Weak Content Security Policy".to_string(),
-                HttpVulnerability::InsecureCors => "Insecure CORS configuration".to_string(),
-                HttpVulnerability::InformationDisclosure => "Information disclosure risk".to_string(),
             })
             .collect();
 
-        assert_eq!(http_vuln_strings.len(), 3);
+        assert_eq!(http_vuln_strings.len(), 2);
         assert!(http_vuln_strings.contains(&"Missing HSTS header".to_string()));
-        assert!(http_vuln_strings.contains(&"Weak Content Security Policy".to_string()));
-        assert!(http_vuln_strings.contains(&"Insecure CORS configuration".to_string()));
+        assert!(http_vuln_strings.contains(&"Missing Content Security Policy".to_string()));
     }
 
     fn state_with_tls(status: ScanStatus) -> AppState {
@@ -1599,7 +1583,6 @@ mod tests {
                 HttpVulnerability::MissingXContentTypeOptions,
                 HttpVulnerability::MissingCsp,
             ],
-            security_grade: HttpSecurityGrade::F,
             scan_duration: Duration::from_millis(300),
             target_ip: "192.0.2.1".to_string(),
             https_failure: None,
@@ -1608,10 +1591,11 @@ mod tests {
             "http".to_string(),
             ScanState {
                 result: Some(ScanResult::Http(crate::scan::http::HttpResult {
-                    ipv4_status: crate::scan::http::HttpStatus::Success(HttpSecurityGrade::F),
+                    ipv4_status: crate::scan::http::HttpStatus::Success,
                     ipv4_result: Some(http_data),
                     ipv6_result: None,
                     ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+                    observatory: ObservatoryOutcome::Failed("site down".to_string()),
                     queried_at: Instant::now(),
                     total_duration: Duration::from_millis(300),
                 })),
@@ -1701,7 +1685,7 @@ mod tests {
         assert!(!out.contains("PFS: no"), "{out}");
     }
 
-    fn http_state_with_policies(grade: HttpSecurityGrade, strength: CspStrength, level: CorsSecurityLevel) -> AppState {
+    fn http_state_with_policies(observatory: ObservatoryOutcome) -> AppState {
         let state = AppState::new("example.com".to_string());
         let http_data = crate::scan::http::HttpData {
             url: "https://example.com".to_string(),
@@ -1722,7 +1706,6 @@ mod tests {
                 header_value: "default-src 'self'".to_string(),
                 directives: HashMap::new(),
                 issues: vec![],
-                strength,
             }),
             cors: Some(CorsPolicy {
                 access_control_allow_origin: Some("*".to_string()),
@@ -1730,7 +1713,6 @@ mod tests {
                 access_control_allow_headers: vec![],
                 access_control_allow_credentials: false,
                 issues: vec![],
-                security_level: level,
             }),
             caching: crate::scan::http::CachingPolicy {
                 cache_control: None,
@@ -1739,7 +1721,6 @@ mod tests {
                 last_modified: None,
             },
             vulnerabilities: vec![],
-            security_grade: grade.clone(),
             scan_duration: Duration::from_millis(300),
             target_ip: "192.0.2.1".to_string(),
             https_failure: None,
@@ -1748,10 +1729,11 @@ mod tests {
             "http".to_string(),
             ScanState {
                 result: Some(ScanResult::Http(crate::scan::http::HttpResult {
-                    ipv4_status: crate::scan::http::HttpStatus::Success(grade),
+                    ipv4_status: crate::scan::http::HttpStatus::Success,
                     ipv4_result: Some(http_data),
                     ipv6_result: None,
                     ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+                    observatory,
                     queried_at: Instant::now(),
                     total_duration: Duration::from_millis(300),
                 })),
@@ -1764,20 +1746,77 @@ mod tests {
         state
     }
 
+    /// The Security pane's HTTP section shows the HTTP pane's grade line, and Observatory's CSP and
+    /// CORS results in place of the deleted strength labels.
     #[test]
-    fn http_grade_csp_and_cors_render_user_labels_not_enum_names() {
-        let state = http_state_with_policies(
-            HttpSecurityGrade::APlus,
-            CspStrength::Moderate,
-            CorsSecurityLevel::Dangerous,
-        );
+    fn http_grade_csp_and_cors_show_observatory_results() {
+        let state = http_state_with_policies(ObservatoryOutcome::Graded(google_com_result()));
         let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
-        assert!(out.contains("HTTP Grade: A+"), "{out}");
-        assert!(out.contains("CSP: moderate"), "{out}");
-        assert!(out.contains("CORS: dangerous"), "{out}");
-        for enum_name in ["APlus", "Moderate", "Dangerous"] {
+        assert!(out.contains("HTTP Grade: C- (45) · google.com"), "{out}");
+        let google = google_com_result();
+        let result_of = |name: &str| {
+            google
+                .tests
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .result
+                .as_str()
+                .to_string()
+        };
+        assert!(
+            out.contains(&format!("CSP: {}", result_of("content-security-policy"))),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("CORS: {}", result_of("cross-origin-resource-sharing"))),
+            "{out}"
+        );
+        for enum_name in ["CMinus", "CspStrength"] {
             assert!(!out.contains(enum_name), "enum name {enum_name} leaked:\n{out}");
         }
+        let buffer = crate::tui::testing::render_buffer(&SecurityPane::new(), &state, 100, 80, false);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "C- (45) · google.com"), theme::WARN);
+    }
+
+    #[test]
+    fn security_pane_grade_line_for_hosts_with_no_grade_and_a_failed_url() {
+        for (outcome, line) in [
+            (
+                ObservatoryOutcome::NotApplicable("IP address".to_string()),
+                "HTTP Grade: n/a (IP address)",
+            ),
+            (
+                ObservatoryOutcome::Failed("site down".to_string()),
+                "HTTP Grade: none (site down)",
+            ),
+        ] {
+            let state = http_state_with_policies(outcome);
+            let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
+            assert!(out.contains(line), "{line}:\n{out}");
+            let buffer = crate::tui::testing::render_buffer(&SecurityPane::new(), &state, 100, 80, false);
+            assert_eq!(
+                crate::tui::testing::fg_of(&buffer, line.trim_start_matches("HTTP Grade: ")),
+                theme::MUTED
+            );
+        }
+
+        // The URL failed but the host graded: the HTTP section is the grade alone.
+        let state = AppState::new("example.com".to_string());
+        let mut result = crate::scan::http::HttpResult::new(ObservatoryOutcome::Graded(google_com_result()));
+        result.ipv4_status = crate::scan::http::HttpStatus::Failed("operation timed out".to_string());
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: Some(ScanResult::Http(result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
+        assert!(out.contains("HTTP Grade: C- (45) · google.com"), "{out}");
     }
 
     #[test]

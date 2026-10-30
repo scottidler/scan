@@ -1,3 +1,4 @@
+use crate::scan::observatory::{GradeLetter, ObservatoryOutcome, PRELOAD_UNAVAILABLE_NOTE};
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
@@ -17,6 +18,7 @@ const HTTP_CLIENT_ERROR_STATUS_MAX: u16 = 499;
 const HTTP_SERVER_ERROR_STATUS_MIN: u16 = 500;
 const HTTP_SERVER_ERROR_STATUS_MAX: u16 = 599;
 const RESPONSE_TIME_SLOW_THRESHOLD_MS: u128 = 500;
+const GRADE_LABEL: &str = "🔒 Grade: ";
 const MIN_HTTP_PANE_WIDTH: u16 = 30;
 const MIN_HTTP_PANE_HEIGHT: u16 = 12;
 
@@ -114,6 +116,56 @@ fn zoomed_lines(data: &crate::scan::http::HttpData) -> Vec<Line<'static>> {
     lines
 }
 
+/// The grade line, `<label>C- (45) · google.com`, the grade colored by its letter (A good, B and C
+/// warn, D and F bad), a missing preload list noted in `WARN`, and a host with no grade in `MUTED`.
+pub(crate) fn grade_line(label: &str, observatory: &ObservatoryOutcome) -> Line<'static> {
+    let color = match observatory {
+        ObservatoryOutcome::Graded(result) => match result.grade {
+            GradeLetter::APlus | GradeLetter::A | GradeLetter::AMinus => theme::GOOD,
+            GradeLetter::BPlus | GradeLetter::B | GradeLetter::BMinus => theme::WARN,
+            GradeLetter::CPlus | GradeLetter::C | GradeLetter::CMinus => theme::WARN,
+            GradeLetter::DPlus | GradeLetter::D | GradeLetter::DMinus | GradeLetter::F => theme::BAD,
+        },
+        ObservatoryOutcome::NotApplicable(_) | ObservatoryOutcome::Failed(_) => theme::MUTED,
+    };
+    let mut spans = vec![
+        Span::styled(label.to_string(), Style::default().fg(theme::LABEL)),
+        Span::styled(observatory.grade_summary(), Style::default().fg(color)),
+    ];
+    if observatory.preload_unavailable() {
+        spans.push(Span::styled(
+            format!(" · {PRELOAD_UNAVAILABLE_NOTE}"),
+            Style::default().fg(theme::WARN),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Zoomed only: the 12 Observatory tests, each `name: result (modifier)`, colored by whether it
+/// passed.
+fn observatory_lines(observatory: &ObservatoryOutcome) -> Vec<Line<'static>> {
+    let ObservatoryOutcome::Graded(result) = observatory else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Observatory tests (algorithm {})", result.algorithm_version),
+            Style::default().fg(theme::VALUE),
+        )),
+    ];
+    for test in &result.tests {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}: ", test.name), Style::default().fg(theme::LABEL)),
+            Span::styled(
+                format!("{} ({:+})", test.result.as_str(), test.score_modifier),
+                Style::default().fg(if test.pass { theme::GOOD } else { theme::BAD }),
+            ),
+        ]));
+    }
+    lines
+}
+
 impl Pane for HttpPane {
     fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
         log::trace!("[tui::http] content: width={} detail={:?}", width, detail);
@@ -201,18 +253,7 @@ impl Pane for HttpPane {
                         ),
                     ]));
 
-                    // Grade of the primary result: the same result whose fallback line shows above.
-                    let security_grade = &primary_data.security_grade;
-                    let grade_color = match security_grade {
-                        crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => theme::GOOD,
-                        crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => theme::WARN,
-                        crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => theme::BAD,
-                    };
-
-                    lines.push(Line::from(vec![
-                        Span::styled("🔒 Grade: ", Style::default().fg(theme::LABEL)),
-                        Span::styled(security_grade.as_str(), Style::default().fg(grade_color)),
-                    ]));
+                    lines.push(grade_line(GRADE_LABEL, &http_result.observatory));
 
                     // Redirect chain - show details
                     if !primary_data.redirect_chain.is_empty() {
@@ -267,9 +308,6 @@ impl Pane for HttpPane {
                                     "Missing X-Content-Type-Options"
                                 }
                                 crate::scan::http::HttpVulnerability::MissingCsp => "Missing CSP",
-                                crate::scan::http::HttpVulnerability::WeakCsp => "Weak CSP",
-                                crate::scan::http::HttpVulnerability::InsecureCors => "Insecure CORS",
-                                crate::scan::http::HttpVulnerability::InformationDisclosure => "Information Disclosure",
                             };
 
                             lines.push(Line::from(vec![
@@ -283,11 +321,22 @@ impl Pane for HttpPane {
                         lines.extend(zoomed_lines(primary_data));
                     }
                 } else {
-                    // HTTP scan failed for all protocols
-                    lines.push(Line::from(vec![
-                        Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
-                        Span::styled("all protocols failed", Style::default().fg(theme::BAD)),
-                    ]));
+                    // No family got a target observation: the grade, if any, is all there is.
+                    wrapped.push(lines.len());
+                    lines.push(match http_result.target_failure() {
+                        Some(reason) => Line::from(vec![
+                            Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                            Span::styled(format!("failed: {reason}"), Style::default().fg(theme::BAD)),
+                        ]),
+                        None => Line::from(vec![
+                            Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("no address to request", Style::default().fg(theme::MUTED)),
+                        ]),
+                    });
+                    lines.push(grade_line(GRADE_LABEL, &http_result.observatory));
+                }
+                if detail == Detail::Zoomed {
+                    lines.extend(observatory_lines(&http_result.observatory));
                 }
             } else if matches!(http_state.status, crate::types::ScanStatus::Failed) || http_state.error.is_some() {
                 // The header carries the reason, failed or retrying after a failure; nothing is
@@ -347,7 +396,8 @@ impl Pane for HttpPane {
 mod tests {
     use super::*;
 
-    use crate::scan::http::{CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityGrade, SecurityHeaders};
+    use crate::scan::http::{CachingPolicy, HttpData, HttpResult, HttpStatus, SecurityHeaders};
+    use crate::scan::observatory::tests::google_com_result;
     use crate::tui::testing::render_pane;
     use crate::types::{ScanState, ScanStatus};
     use std::time::{Duration, Instant};
@@ -356,7 +406,7 @@ mod tests {
     const LIVE_PANE_WIDTH: u16 = 50;
     const LIVE_PANE_HEIGHT: u16 = 19;
 
-    fn http_data(url: &str, https_failure: Option<&str>, grade: SecurityGrade) -> HttpData {
+    fn http_data(url: &str, https_failure: Option<&str>) -> HttpData {
         HttpData {
             url: url.to_string(),
             status_code: 200,
@@ -381,18 +431,17 @@ mod tests {
                 last_modified: None,
             },
             vulnerabilities: vec![],
-            security_grade: grade,
             scan_duration: Duration::from_millis(50),
             target_ip: "192.0.2.1".to_string(),
             https_failure: https_failure.map(String::from),
         }
     }
 
-    fn state_with_http(data: HttpData) -> AppState {
+    fn state_with(data: Option<HttpData>, observatory: ObservatoryOutcome, ipv4_status: HttpStatus) -> AppState {
         let state = AppState::new("example.com".to_string());
-        let mut result = HttpResult::new();
-        result.ipv4_status = HttpStatus::Success(data.security_grade.clone());
-        result.ipv4_result = Some(data);
+        let mut result = HttpResult::new(observatory);
+        result.ipv4_status = ipv4_status;
+        result.ipv4_result = data;
         state.scanners.insert(
             "http".to_string(),
             ScanState {
@@ -406,10 +455,27 @@ mod tests {
         state
     }
 
+    /// A succeeded target observation beside google.com's `C-` 45 grade.
+    fn state_with_http(data: HttpData) -> AppState {
+        state_with(
+            Some(data),
+            ObservatoryOutcome::Graded(google_com_result()),
+            HttpStatus::Success,
+        )
+    }
+
+    fn state_with_grade(observatory: ObservatoryOutcome) -> AppState {
+        state_with(
+            Some(http_data("https://example.com/", None)),
+            observatory,
+            HttpStatus::Success,
+        )
+    }
+
     #[test]
-    fn render_plain_http_fallback_names_https_failure_and_grade_f() {
+    fn render_plain_http_fallback_names_https_failure() {
         let reason = "invalid peer certificate: UnknownIssuer";
-        let state = state_with_http(http_data("http://example.com/", Some(reason), SecurityGrade::F));
+        let state = state_with_http(http_data("http://example.com/", Some(reason)));
         let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
         let flat: String = out
             .lines()
@@ -422,41 +488,147 @@ mod tests {
             out
         );
         assert!(flat.contains("UnknownIssuer"), "reason not visible:\n{}", out);
-        assert!(out.contains("Grade: F"), "fallback must grade F:\n{}", out);
-    }
-
-    #[test]
-    fn render_grade_comes_from_primary_result_not_best_family() {
-        let reason = "invalid peer certificate: UnknownIssuer";
-        let state = state_with_http(http_data("http://example.com/", Some(reason), SecurityGrade::F));
-        if let Some(mut http_state) = state.scanners.get_mut("http")
-            && let Some(ScanResult::Http(result)) = http_state.result.as_mut()
-        {
-            let ipv6 = http_data("https://example.com/", None, SecurityGrade::A);
-            result.ipv6_status = HttpStatus::Success(ipv6.security_grade.clone());
-            result.ipv6_result = Some(ipv6);
-        }
-        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
-        assert!(out.contains("HTTPS failed"), "fallback not shown:\n{}", out);
-        assert!(out.contains("Grade: F"), "primary (fallback) grade must show:\n{}", out);
         assert!(
-            !out.contains("Grade: A"),
-            "other family's grade must not show:\n{}",
+            !out.contains("Grade: F"),
+            "the fallback no longer forces an F:\n{}",
             out
         );
     }
 
+    /// The grade is the host's: it reads the same whichever family's observation is primary.
     #[test]
-    fn render_a_plus_grade_as_a_plus() {
-        let state = state_with_http(http_data("https://example.com/", None, SecurityGrade::APlus));
+    fn google_fixture_shows_the_grade_score_and_host_in_warn_and_zoom_lists_12_tests() {
+        let state = state_with_http(http_data("https://google.com/", None));
+        let buffer =
+            crate::tui::testing::render_buffer(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
         let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
-        assert!(out.contains("Grade: A+"), "A+ label missing:\n{}", out);
-        assert!(!out.contains("APlus"), "enum Debug leaked:\n{}", out);
+        assert!(out.contains("Grade: C- (45) · google.com"), "{out}");
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "C- (45) · google.com"), theme::WARN);
+        assert!(
+            !out.contains("preload list unavailable"),
+            "a loaded list adds no note:\n{out}"
+        );
+
+        let zoomed = crate::tui::testing::content_rows(&HttpPane::new(), &state, 120, Detail::Zoomed).join("\n");
+        let google = google_com_result();
+        assert_eq!(google.tests.len(), 12);
+        for test in &google.tests {
+            assert!(
+                zoomed.contains(&format!(
+                    "{}: {} ({:+})",
+                    test.name,
+                    test.result.as_str(),
+                    test.score_modifier
+                )),
+                "{}:\n{zoomed}",
+                test.name
+            );
+        }
+        let normal = crate::tui::testing::content_rows(&HttpPane::new(), &state, 120, Detail::Normal).join("\n");
+        assert!(!normal.contains("content-security-policy"), "{normal}");
+    }
+
+    #[test]
+    fn every_grade_letter_is_colored_by_its_letter() {
+        use GradeLetter::*;
+        let cases = [
+            (APlus, theme::GOOD),
+            (A, theme::GOOD),
+            (AMinus, theme::GOOD),
+            (BPlus, theme::WARN),
+            (B, theme::WARN),
+            (BMinus, theme::WARN),
+            (CPlus, theme::WARN),
+            (C, theme::WARN),
+            (CMinus, theme::WARN),
+            (DPlus, theme::BAD),
+            (D, theme::BAD),
+            (DMinus, theme::BAD),
+            (F, theme::BAD),
+        ];
+        for (letter, color) in cases {
+            let mut result = google_com_result();
+            result.grade = letter;
+            let state = state_with_grade(ObservatoryOutcome::Graded(result));
+            let buffer =
+                crate::tui::testing::render_buffer(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+            let needle = format!("{} (45) · google.com", letter.as_str());
+            assert_eq!(crate::tui::testing::fg_of(&buffer, &needle), color, "{needle}");
+        }
+    }
+
+    #[test]
+    fn hosts_with_no_grade_read_why_in_muted() {
+        for (outcome, line) in [
+            (
+                ObservatoryOutcome::NotApplicable("IP address".to_string()),
+                "Grade: n/a (IP address)",
+            ),
+            (
+                ObservatoryOutcome::NotApplicable("not a public hostname".to_string()),
+                "Grade: n/a (not a public hostname)",
+            ),
+            (
+                ObservatoryOutcome::Failed("site down".to_string()),
+                "Grade: none (site down)",
+            ),
+            (
+                ObservatoryOutcome::Failed("HTTP 500".to_string()),
+                "Grade: none (HTTP 500)",
+            ),
+        ] {
+            let state = state_with_grade(outcome);
+            let buffer =
+                crate::tui::testing::render_buffer(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+            let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+            assert!(out.contains(line), "{line}:\n{out}");
+            let value = line.trim_start_matches("Grade: ");
+            assert_eq!(crate::tui::testing::fg_of(&buffer, value), theme::MUTED, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_missing_preload_list_is_noted_in_warn_on_the_grade_line() {
+        let mut result = google_com_result();
+        result.preload_available = false;
+        let state = state_with_grade(ObservatoryOutcome::Graded(result));
+        let buffer = crate::tui::testing::render_buffer(&HttpPane::new(), &state, 80, LIVE_PANE_HEIGHT, false);
+        let out = render_pane(&HttpPane::new(), &state, 80, LIVE_PANE_HEIGHT, false);
+        assert!(
+            out.contains("Grade: C- (45) · google.com · preload list unavailable"),
+            "{out}"
+        );
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "· preload list unavailable"),
+            theme::WARN
+        );
+    }
+
+    /// The URL fails while the host grades: both lines show, each with its own reason.
+    #[test]
+    fn a_failed_url_and_a_working_grade_show_together() {
+        let state = state_with(
+            None,
+            ObservatoryOutcome::Graded(google_com_result()),
+            HttpStatus::Failed("operation timed out".to_string()),
+        );
+        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+        assert!(out.contains("failed: IPv4: operation timed out"), "{out}");
+        assert!(out.contains("Grade: C- (45) · google.com"), "{out}");
+    }
+
+    /// The grade fails while the URL works: the target block is intact and the grade line says why.
+    #[test]
+    fn a_working_url_and_a_failed_grade_show_together() {
+        let state = state_with_grade(ObservatoryOutcome::Failed("site down".to_string()));
+        let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
+        assert!(out.contains("Status: 200"), "{out}");
+        assert!(out.contains("Grade: none (site down)"), "{out}");
     }
 
     #[test]
     fn render_https_success_has_no_fallback_line() {
-        let state = state_with_http(http_data("https://example.com/", None, SecurityGrade::A));
+        let state = state_with_http(http_data("https://example.com/", None));
         let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
         assert!(!out.contains("HTTPS failed"), "unexpected fallback line:\n{}", out);
     }
@@ -476,7 +648,7 @@ mod tests {
 
     #[test]
     fn long_content_type_is_fit_with_ellipsis_in_narrow_terminals() {
-        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        let mut data = http_data("https://example.com/", None);
         data.content_type = Some(LONG_CONTENT_TYPE.to_string());
         crate::tui::testing::assert_clipped_in_narrow_terminals(
             &HttpPane::new(),
@@ -489,7 +661,7 @@ mod tests {
 
     #[test]
     fn long_redirect_target_url_is_fit_on_its_own_row() {
-        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        let mut data = http_data("https://example.com/", None);
         data.redirect_chain = vec![crate::scan::http::RedirectInfo {
             from: "http://example.com/".to_string(),
             to: LONG_REDIRECT_TO.to_string(),
@@ -506,7 +678,7 @@ mod tests {
         assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
     }
 
-    const ALL_ISSUES: [(crate::scan::http::HttpVulnerability, &str); 7] = [
+    const ALL_ISSUES: [(crate::scan::http::HttpVulnerability, &str); 4] = [
         (crate::scan::http::HttpVulnerability::MissingHsts, "Missing HSTS"),
         (
             crate::scan::http::HttpVulnerability::MissingXFrameOptions,
@@ -517,16 +689,10 @@ mod tests {
             "Missing X-Content-Type-Options",
         ),
         (crate::scan::http::HttpVulnerability::MissingCsp, "Missing CSP"),
-        (crate::scan::http::HttpVulnerability::WeakCsp, "Weak CSP"),
-        (crate::scan::http::HttpVulnerability::InsecureCors, "Insecure CORS"),
-        (
-            crate::scan::http::HttpVulnerability::InformationDisclosure,
-            "Information Disclosure",
-        ),
     ];
 
     fn render_redirects_and_issues(redirects: &[(&str, &str)], issues: usize) -> String {
-        let mut data = http_data("https://www.tatari.tv/", None, SecurityGrade::C);
+        let mut data = http_data("https://www.tatari.tv/", None);
         data.redirect_chain = redirects
             .iter()
             .map(|(from, to)| crate::scan::http::RedirectInfo {
@@ -552,17 +718,17 @@ mod tests {
         type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, usize);
         let cases: [Case; 3] = [
             (
-                "1 redirect, 7 issues",
+                "1 redirect, 4 issues",
                 vec![("http://tatari.tv/", "https://tatari.tv/")],
-                7,
+                4,
             ),
             (
-                "2 redirects, 5 issues",
+                "2 redirects, 3 issues",
                 vec![
                     ("http://tatari.tv/", "https://tatari.tv/"),
                     ("https://tatari.tv/", "https://www.tatari.tv/"),
                 ],
-                5,
+                3,
             ),
             (
                 "4 short redirects, 4 issues",
@@ -590,7 +756,7 @@ mod tests {
     #[test]
     fn long_multibyte_redirect_url_is_fit_by_display_width() {
         let to = format!("https://ex.com/{}", "ü".repeat(40));
-        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        let mut data = http_data("https://example.com/", None);
         data.redirect_chain = vec![crate::scan::http::RedirectInfo {
             from: "http://ex.com/".to_string(),
             to: to.clone(),
@@ -609,15 +775,14 @@ mod tests {
 
     #[test]
     fn zoomed_content_shows_header_values_policies_and_caching() {
-        use crate::scan::http::{CorsPolicy, CorsSecurityLevel, CspPolicy, CspStrength};
+        use crate::scan::http::{CorsPolicy, CspPolicy};
         use crate::tui::pane::Detail;
-        let mut data = http_data("https://example.com/", None, SecurityGrade::A);
+        let mut data = http_data("https://example.com/", None);
         data.security_headers.strict_transport_security = Some("max-age=31536000; includeSubDomains".to_string());
         data.csp = Some(CspPolicy {
             header_value: "default-src 'self'; script-src 'self' https://cdn.example.com".to_string(),
             directives: Default::default(),
             issues: vec![],
-            strength: CspStrength::Strong,
         });
         data.cors = Some(CorsPolicy {
             access_control_allow_origin: Some("https://app.example.com".to_string()),
@@ -625,7 +790,6 @@ mod tests {
             access_control_allow_headers: vec![],
             access_control_allow_credentials: false,
             issues: vec![],
-            security_level: CorsSecurityLevel::Secure,
         });
         data.caching.cache_control = Some("private, max-age=0".to_string());
         let state = state_with_http(data);
