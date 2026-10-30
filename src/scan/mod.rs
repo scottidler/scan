@@ -3,6 +3,7 @@ pub mod connect;
 pub mod dns;
 pub mod geoip;
 pub mod http;
+pub mod observatory;
 pub mod ping;
 pub mod port;
 pub mod psl;

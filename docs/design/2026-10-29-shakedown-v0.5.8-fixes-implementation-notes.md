@@ -487,3 +487,164 @@ Each fix undone in turn (scripted string mutation, `cargo test --lib <filter>`, 
 
 ### Open questions
 - `--no-tui` reads `, 2 no reply`; Scott may prefer `, 2 hops no reply`.
+
+## Phase 4: Observatory analyzers and grader (pure, no network)
+
+`src/scan/observatory.rs` plus one file per upstream module under `src/scan/observatory/`. Every
+file carries the MPL-2.0 Exhibit A header naming `mdn/mdn-http-observatory` at `2776308` and the
+upstream file(s) it derives from; the 19 `test/files` pages are copied to
+`tests/fixtures/observatory/files/` with the same header as an HTML comment. `LICENSE-MPL-2.0` (the
+upstream `LICENSE`, byte for byte) is at the repo root, and `README.md` names the MPL-2.0 tree.
+
+Ported tests: upstream has 103 `it(` in the 15 listed files (csp 16, csp-parser 5, cookies 13, cors
+4, redirection 8, referrer-policy 7, strict-transport-security 7, subresource-integrity 10,
+x-content-type-options 3, x-frame-options 6, cross-origin-resource-policy 6,
+cross-origin-embedder-policy 4, cross-origin-opener-policy 4, grader 5, analyzer-utils 5). The port
+has 103 tests in `mod upstream` blocks: `cargo test --lib observatory -- --list | grep -c
+'::upstream::.*: test'` prints 103. An `it(` inside a JS loop (csp "header invalid", COOP/COEP
+"rejects"/"accepts") is one Rust test looping the same values, so the runtime count upstream (127,
+`node --test` over the 15 files) is higher than its literal count.
+
+google.com: `tests/fixtures/observatory/google-com.json` (API scan 132240279) fed through `analyze`
+grades `C-` 45, all 12 results and modifiers equal to the API's, `pass` equal to the CLI's, 6
+passed (`google_com_grades_c_minus_45_with_the_apis_12_results`). The meta tags come from parsing
+the captured body with the port's parser, and they equal the capture's
+(`google_com_meta_tags_match_the_capture`).
+
+### Design decisions
+- `Retrieval` (the analyzers' only input) is data, in `retriever.rs`: `host`, `http`/`https:
+  Option<Session>` (`Session { url, response, redirects }`), `cors: Option<Response>`, `cookies`
+  (the `auto` jar), `meta: MetaTags`, `auto_body`. `auto()` is https when present, else http,
+  which is upstream's `clientInstanceRecordingRedirects` choice. Phase 5 fills it; nothing in Phase
+  4 touches the network.
+- `analyze(retrieval, preload, domains) -> Result<ObservatoryResult, AnalyzeError>` in
+  `observatory.rs` is `analyzeScan`: status gate (`SiteIsDown`, `UnexpectedStatusCode`), the 12
+  tests in `ALL_TESTS` order, `grade::grade`. It returns the doc's `ObservatoryResult` (host,
+  algorithm_version 6, score, grade, tests, verified, preload_available) so Phase 5's `observe`
+  only retrieves and calls it.
+- `TestResult.score_modifier` is filled from the score table when the test runs, and `grade::grade`
+  sums the field: that is what lets the 89/90 boundary test feed a synthetic -11.
+- `charts.rs` holds upstream's full `SCORE_TABLE` (modifier, description, recommendation for all 77
+  results), `GRADE_CHART`, `TEST_TITLES`, `TEST_TOPIC_LINKS`, generated from `charts.js` by a node
+  script (not committed); the grader tests read the descriptions and recommendations.
+- Headers: `Headers` keeps axios's shape, one entry per case-insensitive name holding
+  `HeaderValue::Single` or `HeaderValue::List`, because upstream's results depend on the
+  difference (COOP/COEP grade a list of two as invalid; a CSP-Report-Only `[]` is truthy, `""` is
+  not). The Node duplicate-join that produces it is Phase 5's.
+- HTML: `html.rs` is a port of htmlparser2 12.0.0's tokenizer state machine plus the tree-builder
+  state that changes which tags it sees (the open-element stack, foreign-content contexts,
+  raw-text elements, implied closes, the second `<form>`, SVG name adjustments, first duplicate
+  attribute wins). Text, comments and declarations are tracked as states only. Character
+  references are decoded in attribute values only, with entities 8.1.0's attribute-mode rules;
+  `html/entities.rs` is the WHATWG named-reference table (2231 entries, generated from Python's
+  `html.entities.html5`). `script_discovery_matches_htmlparser2` pins 22 inputs (raw text,
+  comments, CDATA, foreign content, plaintext, entities, duplicates) against node's output for
+  the same strings.
+- Structured fields: `structured.rs` is a full port of structured-headers 2.1.1's `parseItem`
+  (every bare-item type, parameters, the trailing-input check), not only the token subset: a
+  parameter's value type decides whether the whole header parses (`report-to=coop endpoint` is
+  invalid, `report-to` alone is valid). 18 inputs pinned against node.
+- CSP: `csp/parser.rs` sorts sources with an ICU `en` collation (punctuation, digits, letters, case
+  second), because `parseCsp`'s "drop the longer of two adjacent sources" depends on which sources
+  are adjacent. `SourceList` keeps upstream's aliasing: when `script-src` falls back to
+  `default-src`, removing `'unsafe-inline'` for a nonce removes it from `default-src` too, as the
+  shared `Set` does.
+- Cookies: `Cookie::parse` mirrors tough-cookie's `Cookie.parse` (strict mode, last attribute
+  wins, `SameSite` only strict/lax/none, `Path` reset by an invalid value). The jar's accept/reject
+  rules (domain match, public suffix, prefixes, replacement) are the retriever's, Phase 5; the
+  ported cookie tests store parsed cookies as a `Domain=mozilla.org` cookie from
+  `https://mozilla.org/` is stored.
+- SRI's `tldts` registrable domain is a port trait, `RegistrableDomain`, implemented for any
+  `publicsuffix::Psl` (scan's `IcannList`): ICANN only, `None` for an IP or a bare suffix. The
+  analyzers stay pure; Phase 5 passes the list `psl.rs` already caches.
+- `HstsPreload { entries, available }` with `lookup` (trim, lowercase, exact `force-https`, else the
+  first parent with `force-https` and `include_subdomains`, a non-qualifying parent not stopping
+  the walk). `HstsPreload::unavailable()` misses every lookup and sets `preload_available=false`;
+  `unavailable_preload_scores_as_not_preloaded` pins that the score equals a list lacking the host.
+  Parsing Chromium's JSON and the 24h refresh are Phase 5.
+- Upstream throws, failing the whole scan, on a redirect hop whose host is not a valid site
+  (`Site.fromSiteString`) and on a full-URL `<script src>` that `new URL` rejects. The port returns
+  `AnalyzeError::InvalidSite` / `InvalidScriptSrc`: no grade, as upstream gives none.
+- `js.rs` holds the JS string semantics the analyzers depend on: `trim` with JS's whitespace set,
+  `slice` in UTF-16 units (upstream truncates headers at 1024/256 units), `split(/\s+/)`,
+  `Number.parseInt` (so `max-age=forever` is `NaN`, which upstream grades at least six months).
+
+### Deviations
+- CORS: production behavior wins (Phase 0c). The port never reads a request `Origin`, so
+  `cross-origin-resource-sharing-implemented-with-universal-access` is never emitted. Upstream's
+  "checks for universal access" (expects universal, failing) is inverted by name as
+  `checks_for_universal_access_grades_restricted_as_production_does` (restricted, passing).
+- Files beyond the doc's list, each following its "one file per upstream module" rule: `types.rs`
+  (`src/types.js`), `charts.rs` (`src/grader/charts.js`), `csp/parser.rs` (`cspParser.js`),
+  `cookies/cookie.rs` (tough-cookie's parser), `structured.rs` (structured-headers), `html/
+  entities.rs` (the reference table), `js.rs`, and `helpers.rs` (`test/helpers.js`, test-only).
+  `session.rs` is not created: it is network code (Phase 5). `xcto.rs`, `xfo.rs`, `corp.rs`,
+  `coop.rs`, `coep.rs`, `referrer.rs` use the doc's short names.
+- `grade(tests)` returns `(i32, GradeLetter)`, not the doc's `(i32, Option<GradeLetter>)`:
+  `getGradeForScore` maps every score to a grade (floored at 0, keyed at `min(score - score % 5,
+  100)`), so a `None` would never occur. "No grade" lives in `AnalyzeError`.
+- The ported tests run against an empty preload list plus the specific upstream entries a test
+  reads (cloudflare.com, bugzilla.mozilla.org, facebook.com, each copied from the Chromium list of
+  2026-10-30), not the 14 MB list itself.
+- The copied HTML fixtures are renamed with hyphens (`test_content_sri_no_scripts.html` ->
+  `test-content-sri-no-scripts.html`), per the repo's no-underscore rule; each header names the
+  upstream file.
+- `Cookie.expires` keeps the raw attribute instead of tough-cookie's parsed date: no analyzer and
+  no jar rule reads it (Phase 0c: expired cookies are kept and graded). A cookie with an
+  unparseable `Expires` therefore shows it in `CookieData` where upstream shows none; results are
+  unaffected.
+- The HTML parser decodes no entities in text content, and does not port htmlparser2's text,
+  comment or processing-instruction callbacks: they never produce an open tag, and a character
+  reference never consumes a `<`.
+- `tests/fixtures/observatory/google-com.json` stays without an MPL header (JSON has no comments,
+  Phase 0 decision): it is captured site data and Observatory's output, not Observatory source.
+
+### Tradeoffs
+- One Rust test per upstream `it(` (loops inside) vs one per runtime case: keeps the count checkable
+  against `grep -c 'it('` while every upstream value still runs.
+- Full structured-field and entity tables vs the subset the doc named: the subset would grade
+  `same-origin; a=1.2345` valid (upstream: invalid) and decode `&notin;` wrongly; the tables are
+  data, and fidelity is the requirement.
+- Porting `SCORE_TABLE`'s descriptions and recommendations (HTML) vs only the modifiers: two
+  ported grader tests read them, and Phase 6's zoom can show what a result means.
+- An approximate ICU collation (an ASCII order table, non-ASCII after ASCII by code point) vs
+  linking ICU: CSP sources are lowercase ASCII in practice; a non-ASCII source would only change
+  which of two adjacent sources is dropped.
+
+### Bite proofs
+Each fix undone in turn (scripted string mutation of the working tree, `cargo test --lib
+observatory`, restore), with the tests it broke:
+
+| Fix undone | Failing tests |
+|---|---|
+| bonus threshold 90 -> 89 | `grade::bonuses_count_only_from_a_penalty_only_score_of_90` |
+| bonuses always count | `grade::bonuses_count_only_from_a_penalty_only_score_of_90`, `google_com_grades_c_minus_45_with_the_apis_12_results` |
+| score not floored at 0 | `grade::upstream::gets_the_grade`, `grade::every_score_maps_to_its_bucket`, `grade::heavy_penalties_floor_at_zero` |
+| CSP multi-policy intersection (`keep = true`) removed | `csp::parser::upstream::should_parse_policy_correctly`, `csp::upstream::multiple_csp_headers_combined_per_rfc_9110_are_not_treated_as_invalid`, `csp::upstream::multiple_csp_headers_with_differing_policies_produce_correct_intersection` |
+| nonce/hash no longer neutralizes `'unsafe-inline'` | `csp::upstream::no_unsafe`, `csp::upstream::unsafe_inline_in_style_src_only` |
+| meta-disallowed directives kept | `csp::upstream::ignore_frame_anchestors_in_http_equiv` |
+| CSP-Report-Only ignored | `csp::upstream::report_only`, `google_com_grades_c_minus_45_with_the_apis_12_results` |
+| `<script>` content not raw text | `html::script_discovery_matches_htmlparser2` |
+| attribute entities not decoded | `html::script_discovery_matches_htmlparser2` |
+| duplicate attribute: last wins | `html::script_discovery_matches_htmlparser2`, `html::duplicate_attributes_keep_the_first` |
+| structured item: trailing input allowed | `coep::upstream::rejects_invalid_headers`, `coop::upstream::rejects_invalid_headers`, `coep::a_joined_duplicate_header_is_invalid`, `coop::a_joined_duplicate_header_is_invalid`, `structured::token_items_match_structured_headers` |
+| HSTS comma not invalid | `hsts::upstream::header_invalid` |
+| preload parent walk ignores `include_subdomains` | `hsts::preload_lookup_walks_parents_with_include_subdomains` |
+| redirection: initial http hop allowed | `redirection::upstream::checks_for_first_redirection_to_http`, `google_com_grades_c_minus_45_with_the_apis_12_results` |
+| SRI: `//host` treated as same origin | `sri::upstream::checks_if_implemented_with_external_scripts_and_no_protocol`, `sri::upstream::checks_for_same_origin`, `sri::upstream::checks_if_not_implemented_with_external_scripts_and_no_protocol` |
+| cookies ignore HSTS | `cookies::upstream::checks_regular_cookie_no_secure_but_hsts`, `cookies::upstream::checks_session_cookie_no_secure_but_hsts`, `google_com_grades_c_minus_45_with_the_apis_12_results` |
+| referrer: first valid policy wins | `referrer::upstream::checks_for_multiple_valid_referrer_headers`, `referrer::upstream::checks_for_private_referrer_header` |
+| XFO ignores CSP `frame-ancestors` | `xfo::upstream::checks_implemented_via_csp` |
+| CORS universal access restored (echoed origin + credentials) | `cors::upstream::checks_for_universal_access_grades_restricted_as_production_does` |
+| status gate rejects 401 | `tests::status_gate_admits_2xx_3xx_401_403` |
+| unknown `SameSite` kept as `none` | `cookies::cookie::samesite_keeps_only_strict_lax_and_none` |
+| collation is byte order | `csp::parser::collation_matches_icu_en` |
+
+### Open questions
+- Third-party notices: `html.rs`, `structured.rs`, `cookies/cookie.rs` and `html/entities.rs` mirror
+  htmlparser2 (MIT), structured-headers (MIT), tough-cookie (BSD-3-Clause), entities
+  (BSD-2-Clause) and the WHATWG table (CC BY 4.0); each header names the package, version,
+  license and copyright holder. They are behavioral ports, not copies. Should the repo also carry
+  the full MIT/BSD license texts (e.g. a `THIRD-PARTY-NOTICES` file)?
+- `README.md` gained a License section (the repo's README was two lines); Scott may want different
+  wording.
