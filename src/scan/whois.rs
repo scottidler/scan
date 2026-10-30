@@ -436,6 +436,8 @@ impl WhoisScanner {
             }
         }
 
+        Self::apply_redactions(&mut result, &rdap_redactions(&data));
+
         // Calculate derived fields
         self.calculate_derived_fields(&mut result);
 
@@ -581,35 +583,21 @@ impl WhoisScanner {
         if registrar.name.is_empty() { None } else { Some(registrar) }
     }
 
+    /// A contact's vCard fields. An empty vCard value is absent, never `Some("")`; a `REDACTED FOR
+    /// PRIVACY` remark withholds every field.
     fn parse_contact_info(&self, entity: &serde_json::Value) -> Option<ContactInfo> {
-        // Check if contact is redacted
         if let Some(remarks) = entity.get("remarks").and_then(|r| r.as_array()) {
             for remark in remarks {
                 if let Some(title) = remark.get("title").and_then(|t| t.as_str())
                     && title.contains("REDACTED FOR PRIVACY")
                 {
-                    return Some(ContactInfo {
-                        name: None,
-                        organization: None,
-                        email: None,
-                        phone: None,
-                        address: None,
-                        is_redacted: true,
-                    });
+                    return Some(ContactInfo::fully_redacted());
                 }
             }
         }
 
-        let mut contact = ContactInfo {
-            name: None,
-            organization: None,
-            email: None,
-            phone: None,
-            address: None,
-            is_redacted: false,
-        };
+        let mut contact = ContactInfo::default();
 
-        // Parse vCard data
         if let Some(vcard) = entity.get("vcardArray").and_then(|v| v.as_array())
             && vcard.len() > 1
             && let Some(properties) = vcard[1].as_array()
@@ -619,37 +607,42 @@ impl WhoisScanner {
                     && prop_array.len() >= 4
                     && let Some(prop_name) = prop_array[0].as_str()
                 {
+                    let value = prop_array[3]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string);
                     match prop_name {
-                        "fn" => {
-                            if let Some(name) = prop_array[3].as_str() {
-                                contact.name = Some(name.to_string());
-                            }
-                        }
-                        "org" => {
-                            if let Some(org) = prop_array[3].as_str() {
-                                contact.organization = Some(org.to_string());
-                            }
-                        }
-                        "email" => {
-                            if let Some(email) = prop_array[3].as_str() {
-                                contact.email = Some(email.to_string());
-                            }
-                        }
-                        "tel" => {
-                            if let Some(tel) = prop_array[3].as_str() {
-                                contact.phone = Some(tel.to_string());
-                            }
-                        }
+                        "fn" => contact.name = value,
+                        "org" => contact.organization = value,
+                        "email" => contact.email = value,
+                        "tel" => contact.phone = value,
                         _ => {}
                     }
                 }
             }
         }
 
-        if contact.name.is_some() || contact.organization.is_some() || contact.email.is_some() || contact.is_redacted {
+        if contact.name.is_some() || contact.organization.is_some() || contact.email.is_some() {
             Some(contact)
         } else {
             None
+        }
+    }
+
+    /// Marks each RFC 9537 redaction on its contact, creating the contact when the registry
+    /// withheld everything that would have made `parse_contact_info` return one.
+    fn apply_redactions(result: &mut WhoisResult, redactions: &[(ContactRole, ContactField)]) {
+        for (role, field) in redactions {
+            let contact = match role {
+                ContactRole::Registrant => &mut result.registrant,
+                ContactRole::Administrative => &mut result.admin_contact,
+                ContactRole::Technical => &mut result.tech_contact,
+            };
+            let contact = contact.get_or_insert_with(ContactInfo::default);
+            if !contact.redacted.contains(field) {
+                contact.redacted.push(*field);
+            }
         }
     }
 
@@ -709,29 +702,21 @@ impl WhoisScanner {
         result.risk_indicators = self.identify_risk_indicators(result);
     }
 
+    /// The registrant's name and email are judged separately: both visible is `Open`, one of them
+    /// `Partial`. With neither, a visible organization is `Corporate`, a registry redaction
+    /// `Protected`, and anything else `Unknown`.
     fn assess_privacy_level(&self, result: &WhoisResult) -> PrivacyLevel {
-        let has_contact_info = result
-            .registrant
-            .as_ref()
-            .map(|c| !c.is_redacted && (c.name.is_some() || c.email.is_some()))
-            .unwrap_or(false);
-
-        let has_org_info = result
-            .registrant
-            .as_ref()
-            .and_then(|c| c.organization.as_ref())
-            .is_some();
-
-        match (has_contact_info, has_org_info) {
-            (true, _) => PrivacyLevel::Open,
-            (false, true) => PrivacyLevel::Corporate,
-            (false, false) => {
-                if result.registrant.as_ref().map(|c| c.is_redacted).unwrap_or(false) {
-                    PrivacyLevel::Protected
-                } else {
-                    PrivacyLevel::Unknown
-                }
-            }
+        let Some(registrant) = result.registrant.as_ref() else {
+            return PrivacyLevel::Unknown;
+        };
+        let name_visible = registrant.visible(ContactField::Name).is_some();
+        let email_visible = registrant.visible(ContactField::Email).is_some();
+        match (name_visible, email_visible) {
+            (true, true) => PrivacyLevel::Open,
+            (true, false) | (false, true) => PrivacyLevel::Partial,
+            (false, false) if registrant.visible(ContactField::Organization).is_some() => PrivacyLevel::Corporate,
+            (false, false) if !registrant.redacted.is_empty() => PrivacyLevel::Protected,
+            (false, false) => PrivacyLevel::Unknown,
         }
     }
 
@@ -929,21 +914,139 @@ pub struct RegistrarInfo {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContactInfo {
     pub name: Option<String>,
     pub organization: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
     pub address: Option<String>,
-    pub is_redacted: bool,
+    /// Fields the registry withholds: from RFC 9537 `redacted` entries, or every field for a
+    /// `REDACTED FOR PRIVACY` remark.
+    pub redacted: Vec<ContactField>,
+}
+
+impl ContactInfo {
+    /// A contact whose every field the registry withholds.
+    pub fn fully_redacted() -> Self {
+        Self {
+            redacted: ContactField::ALL.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_redacted(&self, field: ContactField) -> bool {
+        self.redacted.contains(&field)
+    }
+
+    pub fn is_fully_redacted(&self) -> bool {
+        ContactField::ALL.iter().all(|field| self.is_redacted(*field))
+    }
+
+    /// The field's value, unless the registry withholds it.
+    pub fn visible(&self, field: ContactField) -> Option<&str> {
+        if self.is_redacted(field) {
+            return None;
+        }
+        match field {
+            ContactField::Name => self.name.as_deref(),
+            ContactField::Organization => self.organization.as_deref(),
+            ContactField::Email => self.email.as_deref(),
+            ContactField::Phone => self.phone.as_deref(),
+            ContactField::Address => self.address.as_deref(),
+        }
+    }
+}
+
+/// One field of an RDAP contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactField {
+    Name,
+    Organization,
+    Email,
+    Phone,
+    Address,
+}
+
+impl ContactField {
+    pub const ALL: [ContactField; 5] = [
+        ContactField::Name,
+        ContactField::Organization,
+        ContactField::Email,
+        ContactField::Phone,
+        ContactField::Address,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ContactField::Name => "Name",
+            ContactField::Organization => "Organization",
+            ContactField::Email => "Email",
+            ContactField::Phone => "Phone",
+            ContactField::Address => "Address",
+        }
+    }
+}
+
+/// The contact role an RFC 9537 redaction names, as `parse_rdap_response` stores contacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContactRole {
+    Registrant,
+    Administrative,
+    Technical,
+}
+
+/// Maps an RFC 9537 redaction name (e.g. `Registrant Name`, `Tech Email`, `Admin Phone Ext`) to
+/// the contact role and field it withholds; `None` for one this scanner does not store (billing,
+/// registry IDs, unknown names).
+fn redaction_target(name: &str) -> Option<(ContactRole, ContactField)> {
+    let (role, field) = name.trim().split_once(' ')?;
+    let role = match role.to_ascii_lowercase().as_str() {
+        "registrant" => ContactRole::Registrant,
+        "admin" | "administrative" => ContactRole::Administrative,
+        "tech" | "technical" => ContactRole::Technical,
+        _ => return None,
+    };
+    let field = match field.trim().to_ascii_lowercase().as_str() {
+        "name" => ContactField::Name,
+        "organization" | "organisation" => ContactField::Organization,
+        "email" => ContactField::Email,
+        "phone" | "phone ext" | "fax" | "fax ext" => ContactField::Phone,
+        "street" | "city" | "postal code" | "state/province" | "country" | "address" => ContactField::Address,
+        _ => return None,
+    };
+    Some((role, field))
+}
+
+/// Every (role, field) the RDAP answer's RFC 9537 `redacted` array withholds. A redaction's name
+/// is `name.description`, or `name.type` for a registered redaction type.
+fn rdap_redactions(data: &serde_json::Value) -> Vec<(ContactRole, ContactField)> {
+    let Some(entries) = data.get("redacted").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?;
+            let text = name
+                .get("description")
+                .or_else(|| name.get("type"))
+                .and_then(|t| t.as_str())?;
+            let target = redaction_target(text);
+            if target.is_none() {
+                log::trace!("[scan::whois] rdap_redaction_ignored: name={}", text);
+            }
+            target
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PrivacyLevel {
-    Open,      // Contact info visible
-    Corporate, // Organization visible, contacts hidden
-    Protected, // Full privacy protection
+    Open,      // Registrant name and email visible
+    Partial,   // One of name and email visible, the other withheld or empty
+    Corporate, // Organization visible, name and email hidden
+    Protected, // Registry redaction, nothing personal visible
     Unknown,   // Cannot determine privacy level
 }
 
@@ -951,6 +1054,7 @@ impl PrivacyLevel {
     pub fn label(&self) -> &'static str {
         match self {
             PrivacyLevel::Open => "open (contacts visible)",
+            PrivacyLevel::Partial => "partial (some contact fields visible)",
             PrivacyLevel::Corporate => "organization only",
             PrivacyLevel::Protected => "protected",
             PrivacyLevel::Unknown => "unknown",
@@ -1894,6 +1998,95 @@ mod tests {
         assert_eq!(scanner.interval(), Duration::from_secs(3600));
     }
 
+    /// An RDAP domain answer whose registrant vCard carries `fn` = `fn_value` and a visible email,
+    /// plus the given RFC 9537 `redacted` entries (by name description).
+    fn rdap_registrant(fn_value: &str, email: &str, redacted: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "objectClassName": "domain",
+            "ldhName": "example.tv",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [
+                    ["version", {}, "text", "4.0"],
+                    ["fn", {}, "text", fn_value],
+                    ["email", {}, "text", email],
+                ]],
+            }],
+            "redacted": redacted.iter().map(|name| serde_json::json!({
+                "name": {"description": name},
+                "method": "emptyValue",
+                "reason": {"description": "Server policy"},
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    async fn parse_fixture(data: serde_json::Value) -> WhoisResult {
+        WhoisScanner::new()
+            .parse_rdap_response("example.tv", data, Duration::from_millis(1))
+            .await
+            .expect("fixture parses")
+    }
+
+    /// Item 4, rdap.nic.tv's shape: `["fn",{},"text",""]` with a visible email. The empty name is
+    /// absent, never `Some("")`, and the registrant reads partial, not open.
+    #[tokio::test]
+    async fn empty_fn_with_visible_email_is_partial() {
+        let result = parse_fixture(rdap_registrant("", "owner@example.tv", &[])).await;
+        let registrant = result.registrant.as_ref().expect("registrant");
+        assert_eq!(registrant.name, None);
+        assert_eq!(registrant.email.as_deref(), Some("owner@example.tv"));
+        assert_eq!(result.privacy_score, PrivacyLevel::Partial);
+    }
+
+    /// Item 4: an RFC 9537 `redacted` entry for the name only withholds the name, not the email.
+    #[tokio::test]
+    async fn rfc9537_name_redaction_with_visible_email_is_partial() {
+        let result = parse_fixture(rdap_registrant("", "owner@example.tv", &["Registrant Name"])).await;
+        let registrant = result.registrant.as_ref().expect("registrant");
+        assert!(registrant.is_redacted(ContactField::Name));
+        assert!(!registrant.is_redacted(ContactField::Email));
+        assert_eq!(result.privacy_score, PrivacyLevel::Partial);
+    }
+
+    /// Item 4: every contact field redacted reads protected, even with no vCard values at all.
+    #[tokio::test]
+    async fn rfc9537_full_redaction_is_protected() {
+        let redacted = [
+            "Registrant Name",
+            "Registrant Organization",
+            "Registrant Street",
+            "Registrant Phone",
+            "Registrant Email",
+            "Tech Email",
+        ];
+        let result = parse_fixture(rdap_registrant("", "", &redacted)).await;
+        let registrant = result.registrant.as_ref().expect("registrant");
+        assert!(registrant.is_fully_redacted(), "{registrant:?}");
+        assert_eq!(result.privacy_score, PrivacyLevel::Protected);
+        let tech = result.tech_contact.as_ref().expect("tech contact from its redaction");
+        assert!(tech.is_redacted(ContactField::Email));
+    }
+
+    #[test]
+    fn redaction_names_map_to_role_and_field() {
+        assert_eq!(
+            redaction_target("Registrant Name"),
+            Some((ContactRole::Registrant, ContactField::Name))
+        );
+        assert_eq!(
+            redaction_target("Admin Phone Ext"),
+            Some((ContactRole::Administrative, ContactField::Phone))
+        );
+        assert_eq!(
+            redaction_target("Tech Postal Code"),
+            Some((ContactRole::Technical, ContactField::Address))
+        );
+        assert_eq!(redaction_target("Registry Registrant ID"), None);
+        assert_eq!(redaction_target("Billing Email"), None);
+        assert_eq!(redaction_target("Name"), None);
+    }
+
     #[test]
     fn test_privacy_level_assessment() {
         let scanner = WhoisScanner::new();
@@ -1917,7 +2110,7 @@ mod tests {
                 email: Some("john@example.com".to_string()),
                 phone: None,
                 address: None,
-                is_redacted: false,
+                redacted: Vec::new(),
             }),
             admin_contact: None,
             tech_contact: None,
@@ -1939,20 +2132,13 @@ mod tests {
             email: None,
             phone: None,
             address: None,
-            is_redacted: false,
+            redacted: Vec::new(),
         });
 
         assert_eq!(scanner.assess_privacy_level(&result), PrivacyLevel::Corporate);
 
         // Test protected privacy (redacted)
-        result.registrant = Some(ContactInfo {
-            name: None,
-            organization: None,
-            email: None,
-            phone: None,
-            address: None,
-            is_redacted: true,
-        });
+        result.registrant = Some(ContactInfo::fully_redacted());
 
         assert_eq!(scanner.assess_privacy_level(&result), PrivacyLevel::Protected);
     }
@@ -2016,7 +2202,7 @@ mod tests {
                 email: Some("abuse@godaddy.com".to_string()),
                 phone: Some("+1.4805058800".to_string()),
                 address: None,
-                is_redacted: false,
+                redacted: Vec::new(),
             }),
             url: Some("https://www.godaddy.com".to_string()),
         };
@@ -2035,23 +2221,16 @@ mod tests {
             email: Some("john@example.com".to_string()),
             phone: Some("+1.555.123.4567".to_string()),
             address: Some("123 Main St, Anytown, USA".to_string()),
-            is_redacted: false,
+            redacted: Vec::new(),
         };
 
-        let redacted_contact = ContactInfo {
-            name: None,
-            organization: None,
-            email: None,
-            phone: None,
-            address: None,
-            is_redacted: true,
-        };
+        let redacted_contact = ContactInfo::fully_redacted();
 
-        assert!(!public_contact.is_redacted);
+        assert!(public_contact.redacted.is_empty());
         assert!(public_contact.name.is_some());
         assert!(public_contact.email.is_some());
 
-        assert!(redacted_contact.is_redacted);
+        assert!(redacted_contact.is_fully_redacted());
         assert!(redacted_contact.name.is_none());
         assert!(redacted_contact.email.is_none());
     }
@@ -2236,7 +2415,7 @@ mod tests {
                 email: None,
                 phone: None,
                 address: None,
-                is_redacted: true, // Contradictory: has org but is redacted
+                redacted: ContactField::ALL.to_vec(), // Contradictory: has org but is redacted
             }),
             admin_contact: Some(ContactInfo {
                 name: Some("Admin Person".to_string()),
@@ -2244,7 +2423,7 @@ mod tests {
                 email: Some("admin@example.com".to_string()),
                 phone: None,
                 address: None,
-                is_redacted: false,
+                redacted: Vec::new(),
             }),
             tech_contact: None,
             privacy_score: PrivacyLevel::Unknown,

@@ -5,12 +5,13 @@ use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use hickory_resolver::lookup::Lookup;
+use hickory_resolver::ResolveError;
+use hickory_resolver::lookup::{Lookup, ReverseLookup};
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::{Resolver, TokioResolver};
 use log;
 use reqwest::Client;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 const DNS_SCAN_INTERVAL_SECS: u64 = 60;
@@ -20,6 +21,10 @@ const DEFAULT_DNS_TTL: u32 = 300;
 /// ceiling keeps the old once-a-minute refresh for long TTLs.
 const DNS_REQUERY_FLOOR: Duration = Duration::from_secs(10);
 const DNS_REQUERY_CEILING: Duration = Duration::from_secs(60);
+/// The re-query lands this long after the earliest record expires. The stub reports TTLs in whole
+/// seconds, so a query at exactly `queried_at + ttl` still hits the cache entry's last second and
+/// comes back with TTL 0; one second later the entry is gone and the answer carries a fresh TTL.
+const DNS_REQUERY_GRACE: Duration = Duration::from_secs(1);
 /// RFC 7489: a DMARC policy record is a TXT record at `_dmarc.<domain>` starting with this tag.
 const DMARC_PREFIX: &str = "_dmarc";
 const DMARC_VERSION_TAG: &str = "v=DMARC1";
@@ -98,7 +103,7 @@ pub struct EmailSecurityAnalysis {
     pub mx_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryStatus {
     NotQueried,     // Query was not attempted (due to protocol restrictions)
     Success(usize), // Query succeeded with N records
@@ -240,12 +245,13 @@ impl DnsResult {
             .min()
     }
 
-    /// Time from `now` to the earliest record expiry, clamped to `DNS_REQUERY_FLOOR`..
-    /// `DNS_REQUERY_CEILING`; `None` when there are no records (NXDOMAIN, every query failed).
+    /// Time from `now` to the earliest record expiry plus `DNS_REQUERY_GRACE`, clamped to
+    /// `DNS_REQUERY_FLOOR`..`DNS_REQUERY_CEILING`; `None` when there are no records (NXDOMAIN, every
+    /// query failed).
     pub fn requery_delay(&self, now: Instant) -> Option<Duration> {
         let expiry = self.earliest_expiry()?;
         Some(
-            expiry
+            (expiry + DNS_REQUERY_GRACE)
                 .saturating_duration_since(now)
                 .clamp(DNS_REQUERY_FLOOR, DNS_REQUERY_CEILING),
         )
@@ -296,7 +302,7 @@ impl DnsScanner {
         log::debug!("[scan::dns] timed_lookup: name={} type={}", name, record_type);
         match tokio::time::timeout(self.timeout, resolver.lookup(name, record_type)).await {
             Ok(Ok(lookup)) => Ok(Some(lookup)),
-            Ok(Err(e)) if e.is_no_records_found() || e.is_nx_domain() => {
+            Ok(Err(e)) if is_empty_answer(&e) => {
                 log::trace!("[scan::dns] lookup_no_records: name={} type={}", name, record_type);
                 Ok(None)
             }
@@ -840,10 +846,7 @@ impl DnsScanner {
             result.PTR_status = QueryStatus::NotQueried;
             log::trace!("[scan::dns] no_ips_for_protocol: protocol={}", protocol.as_str());
         } else {
-            let mut ptr_queries_attempted = 0;
-            let mut ptr_queries_successful = 0;
-            let mut ptr_errors = Vec::new();
-
+            let mut answers = Vec::with_capacity(target_ips.len());
             for ip in &target_ips {
                 log::trace!("[scan::dns] reverse_lookup: ip={} protocol={}", ip, protocol.as_str());
 
@@ -852,52 +855,19 @@ impl DnsScanner {
                     .wrap_err("Failed to create DNS resolver")?
                     .build();
 
-                ptr_queries_attempted += 1;
-                // Perform reverse DNS lookup (PTR records)
-                match resolver.reverse_lookup(*ip).await {
-                    Ok(response) => {
-                        ptr_queries_successful += 1;
-                        for ptr in response.iter() {
-                            let ttl = response
-                                .as_lookup()
-                                .records()
-                                .first()
-                                .map(|record| record.ttl())
-                                .unwrap_or(DEFAULT_DNS_TTL);
-                            result.PTR.push(DnsRecord::new(ptr.to_string(), ttl));
-                        }
-                        log::trace!(
-                            "[scan::dns] ptr_records_found: ip={} count={} protocol={}",
-                            ip,
-                            result.PTR.len(),
-                            protocol.as_str()
-                        );
-                    }
-                    Err(e) => {
-                        ptr_errors.push(format!("{}: {}", ip, e));
-                        log::trace!(
-                            "[scan::dns] ptr_records_failed: ip={} error={} protocol={}",
-                            ip,
-                            e,
-                            protocol.as_str()
-                        );
-                    }
-                }
+                let answer = ptr_answer(*ip, resolver.reverse_lookup(*ip).await);
+                log::trace!(
+                    "[scan::dns] ptr_answer: ip={} answer={:?} protocol={}",
+                    ip,
+                    answer,
+                    protocol.as_str()
+                );
+                answers.push(answer);
             }
 
-            // Set PTR status based on overall results
-            result.PTR_status = if ptr_queries_attempted == 0 {
-                QueryStatus::NotQueried
-            } else if !result.PTR.is_empty() {
-                QueryStatus::Success(result.PTR.len())
-            } else if ptr_queries_successful > 0 {
-                QueryStatus::NoRecords
-            } else {
-                QueryStatus::Failed(format!(
-                    "All {} PTR queries failed: {:?}",
-                    ptr_queries_attempted, ptr_errors
-                ))
-            };
+            let (records, status) = ptr_records_and_status(answers);
+            result.PTR = records;
+            result.PTR_status = status;
         }
 
         result.sort_records();
@@ -971,7 +941,7 @@ impl Scanner for DnsScanner {
         "dns"
     }
 
-    /// Re-query when the first cached record expires (10s..60s), so a TTL never sits at 0.
+    /// Re-query 1s after the first cached record expires (10s..60s), so the answer carries a fresh TTL.
     fn next_delay(&self, result: &ScanResult) -> Option<Duration> {
         let ScanResult::Dns(dns) = result else {
             return None;
@@ -980,6 +950,71 @@ impl Scanner for DnsScanner {
         log::debug!("[scan::dns] next_delay: delay={:?}", delay);
         delay
     }
+}
+
+/// No records and NXDOMAIN are an answer with nothing in it, not a failed query.
+fn is_empty_answer(error: &ResolveError) -> bool {
+    error.is_no_records_found() || error.is_nx_domain()
+}
+
+/// One address's reverse lookup, classified.
+#[derive(Debug)]
+enum PtrAnswer {
+    Names(Vec<DnsRecord<String>>),
+    /// The resolver answered: this address has no PTR record.
+    Empty,
+    Failed(String),
+}
+
+/// Classifies one `reverse_lookup` outcome. No records and NXDOMAIN are `Empty`, exactly as
+/// `timed_lookup` treats them for forward queries.
+fn ptr_answer(ip: IpAddr, lookup: std::result::Result<ReverseLookup, ResolveError>) -> PtrAnswer {
+    match lookup {
+        Ok(response) => {
+            let ttl = response
+                .as_lookup()
+                .records()
+                .first()
+                .map(|record| record.ttl())
+                .unwrap_or(DEFAULT_DNS_TTL);
+            let names: Vec<_> = response
+                .iter()
+                .map(|ptr| DnsRecord::new(ptr.to_string(), ttl))
+                .collect();
+            if names.is_empty() { PtrAnswer::Empty } else { PtrAnswer::Names(names) }
+        }
+        Err(e) if is_empty_answer(&e) => PtrAnswer::Empty,
+        Err(e) => PtrAnswer::Failed(format!("{}: {}", ip, e)),
+    }
+}
+
+/// Every address's PTR names and the section's status: `Success` with any name, `NoRecords` when
+/// at least one lookup answered and none had a name, `Failed` only when every lookup failed.
+fn ptr_records_and_status(answers: Vec<PtrAnswer>) -> (Vec<DnsRecord<String>>, QueryStatus) {
+    let attempted = answers.len();
+    let mut records = Vec::new();
+    let mut answered = 0;
+    let mut errors = Vec::new();
+    for answer in answers {
+        match answer {
+            PtrAnswer::Names(names) => {
+                answered += 1;
+                records.extend(names);
+            }
+            PtrAnswer::Empty => answered += 1,
+            PtrAnswer::Failed(error) => errors.push(error),
+        }
+    }
+    let status = if attempted == 0 {
+        QueryStatus::NotQueried
+    } else if !records.is_empty() {
+        QueryStatus::Success(records.len())
+    } else if answered > 0 {
+        QueryStatus::NoRecords
+    } else {
+        QueryStatus::Failed(format!("All {} PTR queries failed: {:?}", attempted, errors))
+    };
+    (records, status)
 }
 
 /// `Success(n)` for an answer with records, `NoRecords` for an empty one.
@@ -1118,11 +1153,12 @@ mod tests {
         }
     }
 
-    /// Item B: the re-query follows the earliest expiry, clamped to 10s..60s.
+    /// Item 1: the re-query lands 1s after the earliest expiry, so the stub's cache entry is gone
+    /// and the answer carries a fresh TTL; clamped to 10s..60s.
     #[test]
-    fn requery_delay_is_the_earliest_expiry_clamped_to_10s_60s() {
+    fn requery_delay_is_one_second_past_the_earliest_expiry_clamped_to_10s_60s() {
         let now = Instant::now();
-        for (ttl, expected) in [(4, 10), (30, 30), (300, 60)] {
+        for (ttl, expected) in [(4, 10), (30, 31), (300, 60)] {
             let mut result = DnsResult::new();
             result.A.push(expiring_in(ttl, now));
             assert_eq!(
@@ -1148,7 +1184,7 @@ mod tests {
             ttl_original: 45,
             queried_at: now,
         });
-        assert_eq!(result.requery_delay(now), Some(Duration::from_secs(25)));
+        assert_eq!(result.requery_delay(now), Some(Duration::from_secs(26)));
         // 20s later the TXT record has 5s left: the floor holds.
         assert_eq!(
             result.requery_delay(now + Duration::from_secs(20)),
@@ -1168,7 +1204,7 @@ mod tests {
         result.A.push(expiring_in(30, Instant::now()));
         let delay = scanner.next_delay(&ScanResult::Dns(result)).unwrap();
         assert!(
-            delay <= Duration::from_secs(30) && delay >= Duration::from_secs(29),
+            delay <= Duration::from_secs(31) && delay >= Duration::from_secs(30),
             "{delay:?}"
         );
         assert_eq!(scanner.next_delay(&ScanResult::Dns(DnsResult::new())), None);
@@ -1176,6 +1212,58 @@ mod tests {
             scanner.next_delay(&ScanResult::Ping(crate::scan::ping::PingResult::new())),
             None
         );
+    }
+
+    /// A resolver's "no records" answer for `code` (NOERROR with an empty answer, or NXDOMAIN).
+    fn no_records_error(code: hickory_resolver::proto::op::ResponseCode) -> ResolveError {
+        hickory_resolver::proto::ProtoError::nx_error(
+            Box::new(hickory_resolver::proto::op::Query::new()),
+            None,
+            None,
+            None,
+            code,
+            false,
+            None,
+        )
+        .into()
+    }
+
+    /// Item 2: an address with no PTR record is an empty answer, not a failure, exactly as
+    /// `timed_lookup` treats forward queries.
+    #[test]
+    fn ptr_without_a_record_is_no_records_never_failed() {
+        use hickory_resolver::proto::op::ResponseCode;
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+            let answer = ptr_answer(ip, Err(no_records_error(code)));
+            assert!(matches!(answer, PtrAnswer::Empty), "{code:?}: {answer:?}");
+            let (records, status) = ptr_records_and_status(vec![answer]);
+            assert!(records.is_empty());
+            assert_eq!(status, QueryStatus::NoRecords, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn ptr_resolver_error_still_fails() {
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let answer = ptr_answer(ip, Err(ResolveError::from("connection refused")));
+        assert!(
+            matches!(answer, PtrAnswer::Failed(ref e) if e.contains("192.0.2.1")),
+            "{answer:?}"
+        );
+        let (_, status) = ptr_records_and_status(vec![answer]);
+        assert!(matches!(status, QueryStatus::Failed(_)), "{status:?}");
+    }
+
+    #[test]
+    fn ptr_status_is_failed_only_when_every_lookup_failed() {
+        let names = PtrAnswer::Names(vec![DnsRecord::new("host.example.".to_string(), 300)]);
+        let (records, status) = ptr_records_and_status(vec![names, PtrAnswer::Failed("x".to_string())]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(status, QueryStatus::Success(1));
+        let (_, status) = ptr_records_and_status(vec![PtrAnswer::Empty, PtrAnswer::Failed("x".to_string())]);
+        assert_eq!(status, QueryStatus::NoRecords);
+        assert_eq!(ptr_records_and_status(Vec::new()).1, QueryStatus::NotQueried);
     }
 
     #[test]

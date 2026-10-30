@@ -1,4 +1,3 @@
-use crate::scan::dns::QueryStatus;
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::theme;
 use crate::types::{AppState, ScanState, ScanStatus};
@@ -136,8 +135,10 @@ impl TargetPane {
         summary
     }
 
-    /// One IPv4/IPv6 status row. `Target` resolution (`state.resolved_ips`) answers first, so an IP
-    /// target needs no DNS scan; the DNS scanner's records and status are the fallback.
+    /// One IPv4/IPv6 status row, from `Target` resolution (`state.resolved_ips`): the system
+    /// resolver's answer, the same addresses every scanner (and Connectivity) uses. A family that
+    /// resolution did not return reads `none`, even if the DNS pane's own query found one (e.g.
+    /// hickory's `::1` for `localhost`, which `/etc/hosts` maps only to 127.0.0.1).
     fn address_line(state: &AppState, family: AddressFamily) -> Line<'static> {
         let label = family.label();
         let selected = match family {
@@ -157,52 +158,15 @@ impl TargetPane {
                 log::trace!("[tui::target] address_from_resolution: family={} ip={}", label, ip);
                 ("✅", ip.to_string(), theme::GOOD)
             }
-            None => Self::address_from_dns(state, family),
+            // An IP literal has exactly one family; the other does not apply.
+            None if state.target.parse::<IpAddr>().is_ok() => ("⚫", "n/a".to_string(), theme::MUTED),
+            None => ("⚫", "none".to_string(), theme::MUTED),
         };
         Line::from(vec![
             Span::styled("▶ ", Style::default().fg(theme::GOOD)),
             Span::styled(format!("{} {}: ", icon, label), Style::default().fg(color)),
             Span::styled(value, Style::default().fg(color)),
         ])
-    }
-
-    /// Fallback when `Target` resolution has no address of this family. A family that simply has
-    /// no address is neutral gray; red is kept for a DNS query that errored.
-    fn address_from_dns(state: &AppState, family: AddressFamily) -> (&'static str, String, Color) {
-        if state.target.parse::<IpAddr>().is_ok() {
-            return ("⚫", "n/a".to_string(), theme::MUTED);
-        }
-        let Some(dns_state) = state.scanners.get("dns") else {
-            return ("⚫", "initializing...".to_string(), theme::MUTED);
-        };
-        match &dns_state.result {
-            Some(crate::types::ScanResult::Dns(dns_result)) => {
-                let (first, status) = match family {
-                    AddressFamily::V4 => (dns_result.A.first().map(|r| r.value.to_string()), &dns_result.A_status),
-                    AddressFamily::V6 => (
-                        dns_result.AAAA.first().map(|r| r.value.to_string()),
-                        &dns_result.AAAA_status,
-                    ),
-                };
-                match (first, status) {
-                    (Some(ip), _) => ("✅", ip, theme::GOOD),
-                    (None, QueryStatus::Failed(_) | QueryStatus::Timeout) => ("❌", "no data".to_string(), theme::BAD),
-                    (None, QueryStatus::NotQueried) => ("⚫", "not queried".to_string(), theme::MUTED),
-                    (None, QueryStatus::NoRecords | QueryStatus::Success(_)) => {
-                        ("⚫", "none".to_string(), theme::MUTED)
-                    }
-                }
-            }
-            Some(_) => {
-                log::warn!("[tui::target] dns_unexpected_result_type:");
-                ("❌", "error".to_string(), theme::BAD)
-            }
-            None => match dns_state.status {
-                ScanStatus::Running => ("🔄", "resolving...".to_string(), theme::WARN),
-                ScanStatus::Failed => ("❌", "resolution failed".to_string(), theme::BAD),
-                ScanStatus::Complete => ("⚫", "waiting to resolve...".to_string(), theme::MUTED),
-            },
-        }
     }
 
     /// Count scanners by status.
@@ -569,31 +533,6 @@ mod tests {
         assert!(!out.contains("IPv4: 1.1.1.1"), "{}", out);
     }
 
-    #[test]
-    fn dns_records_fill_in_when_resolution_has_no_address() {
-        use crate::scan::dns::{DnsRecord, DnsResult};
-        use crate::tui::testing::render_pane;
-        use crate::types::ScanResult;
-        let state = AppState::new("example.com".to_string());
-        let mut dns = DnsResult::new();
-        dns.A.push(DnsRecord::new("93.184.216.34".parse().unwrap(), 60));
-        state.scanners.insert(
-            "dns".to_string(),
-            ScanState {
-                result: Some(ScanResult::Dns(dns)),
-                error: None,
-                status: ScanStatus::Complete,
-                last_updated: Instant::now(),
-                history: Default::default(),
-            },
-        );
-        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
-        assert!(out.contains("✅ IPv4: 93.184.216.34"), "{}", out);
-        // AAAA left at its default `NotQueried`: never asked, so neutral rather than red.
-        assert!(out.contains("IPv6: not queried"), "{}", out);
-        assert!(!out.contains("❌"), "{}", out);
-    }
-
     fn state_with_dns(target: &str, dns: crate::scan::dns::DnsResult) -> AppState {
         let state = AppState::new(target.to_string());
         state.scanners.insert(
@@ -607,6 +546,39 @@ mod tests {
             },
         );
         state
+    }
+
+    /// Item 7 inverts the old fallback (`dns_records_fill_in_when_resolution_has_no_address`): the
+    /// DNS scanner's records never stand in for the scanners' resolution.
+    #[test]
+    fn dns_records_never_stand_in_for_resolution() {
+        use crate::scan::dns::{DnsRecord, DnsResult};
+        use crate::tui::testing::render_pane;
+        let mut dns = DnsResult::new();
+        dns.A.push(DnsRecord::new("93.184.216.34".parse().unwrap(), 60));
+        let out = render_pane(&TargetPane::new(), &state_with_dns("example.com", dns), 40, 20, false);
+        assert!(!out.contains("93.184.216.34"), "{}", out);
+        assert!(out.contains("⚫ IPv4: none"), "{}", out);
+        assert!(out.contains("⚫ IPv6: none"), "{}", out);
+    }
+
+    /// Item 7, `localhost`: the system resolver gives 127.0.0.1 only, hickory's AAAA gives `::1`.
+    /// Target shows what the scanners use, so IPv6 reads `none`, as Connectivity's `no IPv6 address`.
+    #[test]
+    fn localhost_rows_equal_the_scanners_resolution_not_hickory() {
+        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+        use crate::tui::testing::render_pane;
+        let mut dns = DnsResult::new();
+        dns.A.push(DnsRecord::new("127.0.0.1".parse().unwrap(), 0));
+        dns.A_status = QueryStatus::Success(1);
+        dns.AAAA.push(DnsRecord::new("::1".parse().unwrap(), 0));
+        dns.AAAA_status = QueryStatus::Success(1);
+        let mut state = state_with_dns("localhost", dns);
+        state.resolved_ips = vec!["127.0.0.1".parse().unwrap()];
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        assert!(out.contains("✅ IPv4: 127.0.0.1"), "{}", out);
+        assert!(out.contains("⚫ IPv6: none"), "{}", out);
+        assert!(!out.contains("::1"), "{}", out);
     }
 
     #[test]
@@ -629,37 +601,31 @@ mod tests {
     }
 
     #[test]
-    fn domain_with_empty_aaaa_shows_neutral_none() {
-        use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
+    fn domain_without_an_ipv6_address_shows_neutral_none() {
         use crate::tui::testing::render_pane;
-        let mut dns = DnsResult::new();
-        dns.A.push(DnsRecord::new("140.82.112.3".parse().unwrap(), 60));
-        dns.A_status = QueryStatus::Success(1);
-        dns.AAAA_status = QueryStatus::NoRecords;
-        let out = render_pane(&TargetPane::new(), &state_with_dns("github.com", dns), 40, 20, false);
+        let mut state = AppState::new("github.com".to_string());
+        state.resolved_ips = vec!["140.82.112.3".parse().unwrap()];
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
         assert!(out.contains("✅ IPv4: 140.82.112.3"), "{}", out);
         assert!(out.contains("IPv6: none"), "{}", out);
         assert!(!out.contains("❌"), "{}", out);
     }
 
+    /// Item 7 inverts `queried_family_that_errored_stays_red`: a DNS-pane query error is the DNS
+    /// pane's to show. The Target row reports resolution, which has no IPv6 address here.
     #[test]
-    fn queried_family_that_errored_stays_red() {
+    fn dns_query_error_does_not_paint_the_address_row() {
         use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
         use crate::tui::testing::render_pane;
         let mut dns = DnsResult::new();
         dns.A.push(DnsRecord::new("93.184.216.34".parse().unwrap(), 60));
         dns.A_status = QueryStatus::Success(1);
-        for status in [QueryStatus::Failed("SERVFAIL".to_string()), QueryStatus::Timeout] {
-            dns.AAAA_status = status;
-            let out = render_pane(
-                &TargetPane::new(),
-                &state_with_dns("example.com", dns.clone()),
-                40,
-                20,
-                false,
-            );
-            assert!(out.contains("❌ IPv6: no data"), "{}", out);
-        }
+        dns.AAAA_status = QueryStatus::Failed("SERVFAIL".to_string());
+        let mut state = state_with_dns("example.com", dns);
+        state.resolved_ips = vec!["93.184.216.34".parse().unwrap()];
+        let out = render_pane(&TargetPane::new(), &state, 40, 20, false);
+        assert!(out.contains("⚫ IPv6: none"), "{}", out);
+        assert!(!out.contains("no data"), "{}", out);
     }
 
     const LONG_TARGET: &str = "a-very-long-subdomain-label.of-a-long-registrable-domain.example.com";

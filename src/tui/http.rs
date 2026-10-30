@@ -289,8 +289,9 @@ impl Pane for HttpPane {
                         Span::styled("all protocols failed", Style::default().fg(theme::BAD)),
                     ]));
                 }
-            } else if matches!(http_state.status, crate::types::ScanStatus::Failed) {
-                // The header carries the reason; nothing is still being checked.
+            } else if matches!(http_state.status, crate::types::ScanStatus::Failed) || http_state.error.is_some() {
+                // The header carries the reason, failed or retrying after a failure; nothing is
+                // being checked for the first time.
             } else {
                 // No HTTP data available yet
                 lines.push(Line::from(vec![
@@ -301,11 +302,6 @@ impl Pane for HttpPane {
                 lines.push(Line::from(vec![
                     Span::styled("⏳ Time: ", Style::default().fg(theme::LABEL)),
                     Span::styled("measuring...", Style::default().fg(theme::MUTED)),
-                ]));
-
-                lines.push(Line::from(vec![
-                    Span::styled("💻 Server: ", Style::default().fg(theme::LABEL)),
-                    Span::styled("detecting...", Style::default().fg(theme::MUTED)),
                 ]));
             }
         } else {
@@ -651,5 +647,43 @@ mod tests {
         }
         let normal = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Normal).join("\n");
         assert!(!normal.contains("Cache-Control"), "{normal}");
+    }
+
+    fn running_state(error: Option<eyre::Report>) -> AppState {
+        let state = AppState::new("example.com:8443".to_string());
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: None,
+                error,
+                status: ScanStatus::Running,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        state
+    }
+
+    /// Item 6: a scanner retrying after a failure shows the failure, never first-run placeholders
+    /// under it.
+    #[test]
+    fn retrying_after_a_failure_shows_no_placeholders() {
+        let state = running_state(Some(eyre::eyre!("operation timed out")));
+        let out = render_pane(&HttpPane::new(), &state, 100, 20, false);
+        assert!(out.contains("failed: operation timed out"), "{out}");
+        for placeholder in ["checking...", "measuring...", "detecting..."] {
+            assert!(!out.contains(placeholder), "{placeholder}:\n{out}");
+        }
+    }
+
+    /// The first run still says what it is doing; the `Server:` row is gone, since nothing ever
+    /// collects it.
+    #[test]
+    fn first_run_shows_placeholders_but_no_server_row() {
+        let out = render_pane(&HttpPane::new(), &running_state(None), 100, 20, false);
+        assert!(out.contains("checking..."), "{out}");
+        assert!(out.contains("measuring..."), "{out}");
+        assert!(!out.contains("Server:"), "{out}");
+        assert!(!out.contains("detecting..."), "{out}");
     }
 }

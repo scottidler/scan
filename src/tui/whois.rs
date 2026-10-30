@@ -50,22 +50,22 @@ fn field_line(label: &str, value: String) -> Line<'static> {
     ])
 }
 
-/// A contact's fields, one row each; `redacted` when the registry withholds them.
+/// A contact's fields, one row each. A fully withheld contact reads `<role> (redacted)` alone; a
+/// partly withheld one prints `(redacted)` for each field the registry withholds.
 fn contact_lines(role: &str, contact: &crate::scan::whois::ContactInfo) -> Vec<Line<'static>> {
+    let fully_redacted = contact.is_fully_redacted();
     let mut lines = vec![Line::from(Span::styled(
-        format!("👤 {role}{}", if contact.is_redacted { " (redacted)" } else { "" }),
+        format!("👤 {role}{}", if fully_redacted { " (redacted)" } else { "" }),
         Style::default().fg(theme::VALUE),
     ))];
-    let fields = [
-        ("Name", &contact.name),
-        ("Organization", &contact.organization),
-        ("Email", &contact.email),
-        ("Phone", &contact.phone),
-        ("Address", &contact.address),
-    ];
-    for (label, value) in fields {
-        if let Some(value) = value {
-            lines.push(field_line(label, value.clone()));
+    if fully_redacted {
+        return lines;
+    }
+    for field in crate::scan::whois::ContactField::ALL {
+        if contact.is_redacted(field) {
+            lines.push(field_line(field.label(), "(redacted)".to_string()));
+        } else if let Some(value) = contact.visible(field) {
+            lines.push(field_line(field.label(), value.to_string()));
         }
     }
     lines
@@ -254,6 +254,7 @@ impl Pane for WhoisPane {
                 // Privacy level
                 let privacy_color = match whois_result.privacy_score {
                     crate::scan::whois::PrivacyLevel::Open => theme::VALUE,
+                    crate::scan::whois::PrivacyLevel::Partial => theme::WARN,
                     crate::scan::whois::PrivacyLevel::Corporate => theme::WARN,
                     crate::scan::whois::PrivacyLevel::Protected => theme::GOOD,
                     crate::scan::whois::PrivacyLevel::Unknown => theme::MUTED,
@@ -516,6 +517,36 @@ mod tests {
         );
     }
 
+    /// Item 4: zoom prints `(redacted)` for each field the registry withholds, the visible fields
+    /// as they are, and no empty `Name:`; the grid reads partial, never open.
+    #[test]
+    fn zoom_marks_each_withheld_field_redacted() {
+        use crate::scan::whois::{
+            ContactField, ContactInfo, DataSource, NotApplicableReason, PrivacyLevel, WhoisResult,
+        };
+        use crate::tui::pane::Detail;
+        let mut result = WhoisResult::not_applicable("example.tv".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.privacy_score = PrivacyLevel::Partial;
+        result.registrant = Some(ContactInfo {
+            email: Some("owner@example.tv".to_string()),
+            redacted: vec![ContactField::Name, ContactField::Phone],
+            ..ContactInfo::default()
+        });
+        let state = state_with_whois(result);
+        let pane = WhoisPane::new();
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Zoomed).join("\n");
+        for expected in ["Name: (redacted)", "Phone: (redacted)", "Email: owner@example.tv"] {
+            assert!(zoomed.contains(expected), "{expected}:\n{zoomed}");
+        }
+        assert!(
+            !zoomed.contains("Registrant (redacted)"),
+            "partly withheld is not fully:\n{zoomed}"
+        );
+        assert!(zoomed.contains("Privacy: partial"), "{zoomed}");
+        assert!(!zoomed.contains("Privacy: open"), "{zoomed}");
+    }
+
     #[test]
     fn privacy_renders_a_label_not_the_enum_name() {
         use crate::scan::whois::{DataSource, NotApplicableReason, PrivacyLevel, WhoisResult};
@@ -551,16 +582,9 @@ mod tests {
             email: Some("tech@example.com".to_string()),
             phone: None,
             address: None,
-            is_redacted: false,
+            redacted: Vec::new(),
         });
-        result.registrant = Some(ContactInfo {
-            name: None,
-            organization: None,
-            email: None,
-            phone: None,
-            address: None,
-            is_redacted: true,
-        });
+        result.registrant = Some(ContactInfo::fully_redacted());
         let state = state_with_whois(result);
         let pane = WhoisPane::new();
         let zoomed = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Zoomed).join("\n");

@@ -9,7 +9,7 @@ use eyre::{Result, WrapErr};
 use log;
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
-use openssl::x509::X509;
+use openssl::x509::{X509, X509Ref};
 use rustls::pki_types::ServerName;
 use rustls::{CertificateError, ClientConfig, ProtocolVersion};
 use std::net::{IpAddr, SocketAddr};
@@ -441,6 +441,16 @@ fn merge_vulnerabilities(
     merged
 }
 
+/// The certificates the server presented, leaf first. On the client side OpenSSL's
+/// `peer_cert_chain()` already starts with the leaf, so it is the whole answer; `peer_certificate()`
+/// stands in only when there is no chain (a resumed session).
+fn presented_chain<C>(leaf: Option<C>, chain: Option<Vec<C>>) -> Vec<C> {
+    match chain {
+        Some(chain) if !chain.is_empty() => chain,
+        _ => leaf.into_iter().collect(),
+    }
+}
+
 /// Leaf expiry fields derive from the chain's first certificate.
 fn apply_certificate_chain(result: &mut TlsData, cert_chain: Vec<CertificateInfo>, now: DateTime<Utc>) {
     if let Some(leaf_cert) = cert_chain.first() {
@@ -713,21 +723,17 @@ impl TlsScanner {
             .connect(sni.unwrap_or_default(), stream)
             .wrap_err("SSL connection failed")?;
 
-        let mut cert_chain = Vec::new();
-
-        // Get peer certificate
-        if let Some(cert) = ssl_stream.ssl().peer_certificate() {
-            cert_chain.push(Self::parse_certificate(&cert)?);
-        }
-
-        // Get certificate chain
-        if let Some(chain) = ssl_stream.ssl().peer_cert_chain() {
-            for cert in chain {
-                // Convert X509Ref to X509
-                let owned_cert = cert.to_owned();
-                cert_chain.push(Self::parse_certificate(&owned_cert)?);
-            }
-        }
+        let presented = presented_chain(
+            ssl_stream.ssl().peer_certificate(),
+            ssl_stream
+                .ssl()
+                .peer_cert_chain()
+                .map(|chain| chain.iter().map(X509Ref::to_owned).collect()),
+        );
+        let cert_chain = presented
+            .iter()
+            .map(Self::parse_certificate)
+            .collect::<Result<Vec<_>>>()?;
 
         log::debug!(
             "[scan::tls] analyze_certificate_with_openssl: addr={} cert_count={}",
@@ -1261,29 +1267,49 @@ pub(crate) mod fixtures {
         builder.build()
     }
 
-    /// Self-signed `fixture.test` identity that serves TLS on a loopback port, answering every
-    /// connection until the test process exits. Returns the bound port.
-    pub(crate) fn spawn_loopback_tls_server() -> u16 {
-        use openssl::ssl::{SslAcceptor, SslMethod};
-        let server_key = key();
+    /// A self-signed certificate for `common_name`, valid from yesterday for 30 days, with a
+    /// distinct `serial`.
+    fn self_signed(common_name: &str, key: &PKey<Private>, serial: u32) -> X509 {
         let now = Utc::now();
         let mut builder = X509Builder::new().expect("x509 builder");
         builder.set_version(2).expect("version");
-        builder.set_subject_name(&name("fixture.test")).expect("subject");
-        builder.set_issuer_name(&name("fixture.test")).expect("issuer");
-        builder.set_pubkey(&server_key).expect("pubkey");
+        let serial = openssl::bn::BigNum::from_u32(serial)
+            .and_then(|bn| bn.to_asn1_integer())
+            .expect("serial");
+        builder.set_serial_number(&serial).expect("set serial");
+        builder.set_subject_name(&name(common_name)).expect("subject");
+        builder.set_issuer_name(&name(common_name)).expect("issuer");
+        builder.set_pubkey(key).expect("pubkey");
         builder
             .set_not_before(&Asn1Time::from_unix((now - chrono::Duration::days(1)).timestamp()).expect("nb"))
             .expect("set not_before");
         builder
             .set_not_after(&Asn1Time::from_unix((now + chrono::Duration::days(30)).timestamp()).expect("na"))
             .expect("set not_after");
-        builder.sign(&server_key, MessageDigest::sha256()).expect("sign");
-        let cert = builder.build();
+        builder.sign(key, MessageDigest::sha256()).expect("sign");
+        builder.build()
+    }
+
+    /// Self-signed `fixture.test` identity that serves TLS on a loopback port, answering every
+    /// connection until the test process exits. Returns the bound port.
+    pub(crate) fn spawn_loopback_tls_server() -> u16 {
+        spawn_loopback_tls_server_with_intermediates(0)
+    }
+
+    /// As [`spawn_loopback_tls_server`], sending `intermediates` extra certificates after the leaf,
+    /// so the server presents `1 + intermediates` certificates.
+    pub(crate) fn spawn_loopback_tls_server_with_intermediates(intermediates: u32) -> u16 {
+        use openssl::ssl::{SslAcceptor, SslMethod};
+        let server_key = key();
+        let cert = self_signed("fixture.test", &server_key, 1);
 
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("acceptor");
         acceptor.set_private_key(&server_key).expect("server key");
         acceptor.set_certificate(&cert).expect("server cert");
+        for n in 1..=intermediates {
+            let intermediate = self_signed(&format!("Fixture Intermediate {n}"), &key(), n + 1);
+            acceptor.add_extra_chain_cert(intermediate).expect("extra chain cert");
+        }
         let acceptor = acceptor.build();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -1910,6 +1936,58 @@ mod tests {
             server_name(Some("example.com"), ip).unwrap(),
             ServerName::DnsName(_)
         ));
+    }
+
+    /// Item 3: client-side `peer_cert_chain()` already holds the leaf, so it is the chain;
+    /// `peer_certificate()` is used only when there is no chain.
+    #[test]
+    fn presented_chain_is_the_peer_chain_and_the_leaf_only_without_one() {
+        assert_eq!(
+            presented_chain(Some("leaf"), Some(vec!["leaf", "int1", "int2"])),
+            vec!["leaf", "int1", "int2"]
+        );
+        assert_eq!(presented_chain(Some("leaf"), None), vec!["leaf"]);
+        assert_eq!(presented_chain(Some("leaf"), Some(Vec::new())), vec!["leaf"]);
+        assert!(presented_chain::<&str>(None, None).is_empty());
+    }
+
+    /// Item 3: a server sending leaf + 2 intermediates yields 3 certificates, each once, and the
+    /// zoomed Security pane says `3 certificates`.
+    #[tokio::test]
+    async fn chain_of_leaf_and_two_intermediates_counts_three_certificates() {
+        use crate::tui::pane::Detail;
+        use crate::types::{AppState, ScanResult, ScanState, ScanStatus};
+        let port = fixtures::spawn_loopback_tls_server_with_intermediates(2);
+        let mut target = Target::parse("127.0.0.1").expect("IP target");
+        target.port = Some(port);
+        let data = TlsScanner::new()
+            .perform_tls_scan_for_ip(&target, "127.0.0.1")
+            .await
+            .expect("scan returns data");
+        let serials: Vec<&str> = data
+            .certificate_chain
+            .iter()
+            .map(|c| c.serial_number.as_str())
+            .collect();
+        assert_eq!(serials, vec!["01", "02", "03"], "errors: {:?}", data.certificate_errors);
+
+        let mut tls_result = TlsResult::new();
+        tls_result.ipv4_result = Some(data);
+        let state = AppState::new("127.0.0.1".to_string());
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: Some(ScanResult::Tls(tls_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let zoomed =
+            crate::tui::testing::content_rows(&crate::tui::security::SecurityPane::new(), &state, 80, Detail::Zoomed)
+                .join("\n");
+        assert!(zoomed.contains("Certificate Chain: 3 certificates"), "{zoomed}");
     }
 
     #[tokio::test]

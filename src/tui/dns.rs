@@ -64,7 +64,8 @@ impl DnsPane {
         // Get DNS results and add them
         let dns_lines = if let Some(dns_state) = state.scanners.get("dns") {
             if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
-                Self::build_dns_result_lines(dns_result.clone(), detail)
+                let refreshing = matches!(dns_state.status, crate::types::ScanStatus::Running);
+                Self::build_dns_result_lines(dns_result.clone(), detail, refreshing)
             } else if matches!(dns_state.status, crate::types::ScanStatus::Failed) {
                 // The header carries the reason; nothing is still resolving.
                 Vec::new()
@@ -79,13 +80,19 @@ impl DnsPane {
         lines
     }
 
-    fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult, detail: Detail) -> Vec<Line<'static>> {
+    /// `refreshing` is true while the DNS scanner is re-querying; only then does an expired TTL
+    /// claim a refresh.
+    fn build_dns_result_lines(
+        dns_result: crate::scan::dns::DnsResult,
+        detail: Detail,
+        refreshing: bool,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
         // An IP target has only reverse DNS, so PTR leads.
         let reverse_only = dns_result.is_reverse_only();
         if reverse_only {
-            lines.extend(ptr_lines(&dns_result, detail));
+            lines.extend(ptr_lines(&dns_result, detail, refreshing));
         }
 
         // A records
@@ -96,7 +103,7 @@ impl DnsPane {
         ]));
 
         if !dns_result.A.is_empty() {
-            let ttl = ttl_span(dns_result.A[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.A[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("  TTL: ", Style::default().fg(theme::LABEL)),
@@ -112,6 +119,7 @@ impl DnsPane {
                     )],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
@@ -124,7 +132,7 @@ impl DnsPane {
         ]));
 
         if !dns_result.AAAA.is_empty() {
-            let ttl = ttl_span(dns_result.AAAA[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.AAAA[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("  TTL: ", Style::default().fg(theme::LABEL)),
@@ -139,6 +147,7 @@ impl DnsPane {
                     )],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
@@ -146,7 +155,7 @@ impl DnsPane {
         // CNAME records
         lines.extend(failed_query_line("CNAME", &dns_result.CNAME_status));
         if !dns_result.CNAME.is_empty() {
-            let ttl = ttl_span(dns_result.CNAME[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.CNAME[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("CNAME: ", Style::default().fg(theme::LABEL)),
@@ -160,13 +169,14 @@ impl DnsPane {
                     vec![Span::styled(record.value.clone(), Style::default().fg(theme::ACCENT))],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
 
         // NS records
         if !dns_result.NS.is_empty() {
-            let ttl = ttl_span(dns_result.NS[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.NS[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("NS: ", Style::default().fg(theme::LABEL)),
@@ -180,13 +190,14 @@ impl DnsPane {
                     vec![Span::styled(record.value.clone(), Style::default().fg(theme::ACCENT))],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
 
         // TXT records (basic display, security analysis goes to security pane)
         if !dns_result.TXT.is_empty() {
-            let ttl = ttl_span(dns_result.TXT[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.TXT[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("TXT: ", Style::default().fg(theme::LABEL)),
@@ -218,6 +229,7 @@ impl DnsPane {
                     vec![Span::styled(display_value, Style::default().fg(theme::WARN))],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
@@ -225,7 +237,7 @@ impl DnsPane {
         // CAA records
         lines.extend(failed_query_line("CAA", &dns_result.CAA_status));
         if !dns_result.CAA.is_empty() {
-            let ttl = ttl_span(dns_result.CAA[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.CAA[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("CAA: ", Style::default().fg(theme::LABEL)),
@@ -242,6 +254,7 @@ impl DnsPane {
                     )],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
@@ -254,7 +267,7 @@ impl DnsPane {
                 Span::styled("none (null MX)", Style::default().fg(theme::MUTED)),
             ]));
         } else if !dns_result.MX.is_empty() {
-            let ttl = ttl_span(dns_result.MX[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.MX[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("MX: ", Style::default().fg(theme::LABEL)),
@@ -273,13 +286,14 @@ impl DnsPane {
                     ],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
 
         // SOA records
         if !dns_result.SOA.is_empty() {
-            let ttl = ttl_span(dns_result.SOA[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.SOA[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("SOA: ", Style::default().fg(theme::LABEL)),
@@ -322,7 +336,7 @@ impl DnsPane {
 
         // SRV records
         if !dns_result.SRV.is_empty() {
-            let ttl = ttl_span(dns_result.SRV[0].ttl_remaining());
+            let ttl = ttl_span(dns_result.SRV[0].ttl_remaining(), refreshing);
 
             lines.push(Line::from(vec![
                 Span::styled("SRV: ", Style::default().fg(theme::LABEL)),
@@ -342,12 +356,13 @@ impl DnsPane {
                     )],
                     record.ttl_remaining(),
                     detail,
+                    refreshing,
                 ));
             }
         }
 
         if !reverse_only {
-            lines.extend(ptr_lines(&dns_result, detail));
+            lines.extend(ptr_lines(&dns_result, detail, refreshing));
         }
 
         lines
@@ -390,11 +405,12 @@ fn status_display(status: &crate::scan::dns::QueryStatus) -> (Color, String) {
 }
 
 /// A record's remaining TTL as the stub resolver reported it: `<n>s (cached)`, since that is the
-/// resolver cache's countdown, not the zone's TTL. At 0 the scanner is already re-querying, so it
-/// reads `expired, refreshing` (MUTED).
-fn ttl_span(ttl: u32) -> Span<'static> {
+/// resolver cache's countdown, not the zone's TTL. At 0 it reads `expired, refreshing` only while
+/// the DNS scanner is re-querying (`refreshing`), and plain `expired` otherwise; both MUTED.
+fn ttl_span(ttl: u32, refreshing: bool) -> Span<'static> {
     if ttl == 0 {
-        return Span::styled("expired, refreshing", Style::default().fg(theme::MUTED));
+        let text = if refreshing { "expired, refreshing" } else { "expired" };
+        return Span::styled(text, Style::default().fg(theme::MUTED));
     }
     let color = if ttl > TTL_WARNING_THRESHOLD { theme::GOOD } else { theme::WARN };
     Span::styled(format!("{}s (cached)", ttl), Style::default().fg(color))
@@ -418,26 +434,30 @@ fn failed_query_line(label: &'static str, status: &crate::scan::dns::QueryStatus
 
 /// One record's row, indented under its section header. Zoomed, it ends with the record's own TTL,
 /// since records of one set can expire apart.
-fn record_line(value: Vec<Span<'static>>, ttl: u32, detail: Detail) -> Line<'static> {
+fn record_line(value: Vec<Span<'static>>, ttl: u32, detail: Detail, refreshing: bool) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", Style::default())];
     spans.extend(value);
     if detail == Detail::Zoomed {
         spans.push(Span::styled("  TTL: ", Style::default().fg(theme::LABEL)));
-        spans.push(ttl_span(ttl));
+        spans.push(ttl_span(ttl, refreshing));
     }
     Line::from(spans)
 }
 
-/// The `PTR:` section: reverse DNS for the target's addresses.
-fn ptr_lines(dns_result: &crate::scan::dns::DnsResult, detail: Detail) -> Vec<Line<'static>> {
-    let (color, text) = status_display(&dns_result.PTR_status);
+/// The `PTR:` section: reverse DNS for the target's addresses. An address with no PTR record is
+/// common and not a fault, so it reads `none` (MUTED).
+fn ptr_lines(dns_result: &crate::scan::dns::DnsResult, detail: Detail, refreshing: bool) -> Vec<Line<'static>> {
+    let (color, text) = match &dns_result.PTR_status {
+        crate::scan::dns::QueryStatus::NoRecords => (theme::MUTED, "none".to_string()),
+        status => status_display(status),
+    };
     let mut header = vec![
         Span::styled("PTR: ", Style::default().fg(theme::LABEL)),
         Span::styled(text, Style::default().fg(color)),
     ];
     if let Some(first) = dns_result.PTR.first() {
         header.push(Span::styled(", TTL: ", Style::default().fg(theme::LABEL)));
-        header.push(ttl_span(first.ttl_remaining()));
+        header.push(ttl_span(first.ttl_remaining(), refreshing));
     }
     let mut lines = vec![Line::from(header)];
     for record in dns_result.PTR.iter().take(MAX_PTR_RECORDS_DISPLAYED) {
@@ -445,6 +465,7 @@ fn ptr_lines(dns_result: &crate::scan::dns::DnsResult, detail: Detail) -> Vec<Li
             vec![Span::styled(record.value.clone(), Style::default().fg(theme::VALUE))],
             record.ttl_remaining(),
             detail,
+            refreshing,
         ));
     }
     lines
@@ -647,6 +668,30 @@ mod tests {
         assert_eq!(rows[first_record_row + 1], "one.one.one.one.", "{out}");
     }
 
+    /// Item 2: an address with no PTR record reads `PTR: none` in MUTED; a resolver error still
+    /// reads `PTR: Failed` in BAD.
+    #[test]
+    fn ptr_without_a_record_reads_none_and_an_error_reads_failed() {
+        let render = |status: QueryStatus| {
+            let mut result = DnsResult::new();
+            result.MX_status = QueryStatus::NoRecords;
+            result.PTR_status = status;
+            let state = complete_state("dns", crate::types::ScanResult::Dns(result));
+            (
+                crate::tui::testing::render_pane(&DnsPane::new(), &state, 80, 40, false),
+                crate::tui::testing::render_buffer(&DnsPane::new(), &state, 80, 40, false),
+            )
+        };
+        let (out, buffer) = render(QueryStatus::NoRecords);
+        assert!(out.contains("PTR: none"), "{out}");
+        assert!(!out.contains("Failed"), "{out}");
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "none"), theme::MUTED);
+
+        let (out, buffer) = render(QueryStatus::Failed("SERVFAIL".to_string()));
+        assert!(out.contains("PTR: Failed"), "{out}");
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "Failed"), theme::BAD);
+    }
+
     /// A name target keeps A first and shows PTR after the forward records.
     #[test]
     fn name_target_renders_ptr_after_the_forward_records() {
@@ -662,10 +707,11 @@ mod tests {
         assert!(a < ptr, "{out}");
     }
 
-    /// Item B: a TTL is the stub resolver's countdown, so it says `cached`; at 0 the scanner is
-    /// re-querying, and the pane says that instead of a bare `0s`.
+    /// Item B: a TTL is the stub resolver's countdown, so it says `cached`. Item 1 (v0.5.8): at 0
+    /// it says `expired, refreshing` only while the DNS scanner is `Running`; an idle scanner's 0
+    /// is plain `expired`, since nothing is refreshing. Both MUTED, never a bare `0s`.
     #[test]
-    fn ttl_reads_cached_and_expired_reads_refreshing() {
+    fn ttl_reads_cached_and_expired_reads_refreshing_only_while_running() {
         let mut result = DnsResult::new();
         result.MX_status = QueryStatus::NoRecords;
         result.A = vec![DnsRecord::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 300)];
@@ -679,11 +725,25 @@ mod tests {
         result.A[0].queried_at = std::time::Instant::now() - std::time::Duration::from_secs(301);
         let mut state = complete_state("dns", crate::types::ScanResult::Dns(result));
         state.target = "example.com".to_string();
-        let buffer = crate::tui::testing::render_buffer(&DnsPane::new(), &state, 80, 40, false);
-        let out = crate::tui::testing::render_pane(&DnsPane::new(), &state, 80, 40, false);
-        assert!(out.contains("TTL: expired, refreshing"), "{out}");
-        assert!(!out.contains("TTL: 0s"), "{out}");
-        assert_eq!(crate::tui::testing::fg_of(&buffer, "expired, refreshing"), Color::Gray);
+
+        let idle_buffer = crate::tui::testing::render_buffer(&DnsPane::new(), &state, 80, 40, false);
+        let idle = crate::tui::testing::render_pane(&DnsPane::new(), &state, 80, 40, false);
+        assert!(idle.contains("TTL: expired"), "{idle}");
+        assert!(
+            !idle.contains("refreshing"),
+            "an idle scanner claims a refresh:\n{idle}"
+        );
+        assert!(!idle.contains("TTL: 0s"), "{idle}");
+        assert_eq!(crate::tui::testing::fg_of(&idle_buffer, "expired"), theme::MUTED);
+
+        state.scanners.get_mut("dns").expect("dns state").status = crate::types::ScanStatus::Running;
+        let running_buffer = crate::tui::testing::render_buffer(&DnsPane::new(), &state, 80, 40, false);
+        let running = crate::tui::testing::render_pane(&DnsPane::new(), &state, 80, 40, false);
+        assert!(running.contains("TTL: expired, refreshing"), "{running}");
+        assert_eq!(
+            crate::tui::testing::fg_of(&running_buffer, "expired, refreshing"),
+            theme::MUTED
+        );
     }
 
     #[test]

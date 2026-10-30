@@ -392,3 +392,60 @@ Also measured on the same server:
   Should keeping the parsed list in memory become a tracked item?
 - **Item 5 text in the design doc:** "Each retained DNS result costs ~1 MB" is refuted (6444 B).
   The parent or Scott decides whether the doc's Problem table gets a correction note.
+
+## Phase 1: Shakedown correctness fixes
+
+Items 1, 2, 3, 4, 6, 7. Item 5 untouched (Phase 2 skipped per 0a).
+
+### Design decisions
+
+- `DNS_REQUERY_GRACE` (1s) is added to the earliest expiry before the 10s..60s clamp: `src/scan/dns.rs:DnsResult::requery_delay`: the clamp still bounds the final delay, so 4s -> 10s, 30s -> 31s, 300s -> 60s.
+- `ttl_span` takes a `refreshing` flag computed once from the DNS `ScanState` (`status == Running`) and threaded through `build_dns_result_lines`, `record_line` and `ptr_lines`: `src/tui/dns.rs`: the label is a fact about the scanner, not the record, so the caller that holds the scanner state decides it. Idle 0 reads `expired`, MUTED.
+- PTR classification moved into two pure functions, `ptr_answer` (one lookup -> `Names`/`Empty`/`Failed`) and `ptr_records_and_status` (all answers -> records + `QueryStatus`): `src/scan/dns.rs`: so the no-records rule is testable without a resolver. `is_empty_answer` is shared with `timed_lookup`, so forward and reverse lookups cannot drift apart again.
+- `PTR: none` (MUTED) is a PTR-only override of `status_display`'s `NoRecords`: `src/tui/dns.rs:ptr_lines`: the other record types keep `No Records` (cosmetic items are Phase 3).
+- The chain is `presented_chain(leaf, chain)`: the peer chain when non-empty, the leaf alone otherwise: `src/scan/tls.rs`: generic over the certificate type so both branches are unit-tested without a handshake. The 3-certificate case is also tested end to end against a loopback OpenSSL server sending leaf + 2 extra chain certs (`fixtures::spawn_loopback_tls_server_with_intermediates`).
+- `ContactInfo.is_redacted: bool` is replaced by `redacted: Vec<ContactField>`: `src/scan/whois.rs`: per-field redaction is what RFC 9537 expresses, and a separate whole-contact bool would encode the same fact twice. A `REDACTED FOR PRIVACY` remark becomes `ContactInfo::fully_redacted()` (every field). `ContactInfo::visible(field)` is the one accessor that hides withheld values.
+- RFC 9537: `rdap_redactions` reads `redacted[].name.description` (or `name.type`), `redaction_target` maps `<Role> <Field>` names (Registrant/Admin/Administrative/Tech/Technical; Name, Organization, Email, Phone/Fax(+Ext), Street/City/Postal Code/State/Province/Country/Address). Billing and registry IDs are ignored with a trace log, since scan stores no billing contact. `apply_redactions` creates the contact when the registry withheld everything that would have made `parse_contact_info` return one.
+- Every empty vCard value (`fn`, `org`, `email`, `tel`) is `None`, not only `fn`: `parse_contact_info`: the same `Some("")` bug applies to each.
+- `PrivacyLevel::Partial` ("partial (some contact fields visible)", WARN) is new: name and email judged separately; both visible `Open`, one `Partial`; neither: visible org `Corporate`, any redaction `Protected`, else `Unknown`.
+- Zoom: a fully withheld contact keeps the one-line `<Role> (redacted)` header; a partly withheld one prints `<Field>: (redacted)` per withheld field: `src/tui/whois.rs:contact_lines`.
+- HTTP: the placeholder branch is skipped when the scanner is `Failed` or has an `error` (retrying): `src/tui/http.rs`. The `💻 Server: detecting...` row is deleted. First-run placeholders (`checking...`, `measuring...`) stay.
+- Target: `address_line` reads only `state.resolved_ips` (main's `Target::resolve`, the system resolver the scanners use); a missing family reads `none` (MUTED), `n/a` for an IP literal. `address_from_dns` is deleted: `src/tui/target.rs`.
+
+### Deviations
+
+- Item 7's old DNS fallback was also what turned a failed AAAA query into a red `❌ IPv6: no data` on the Target row. With one source, that row reads `none`; the DNS failure still shows in the DNS pane. The pinning tests were inverted by name, not deleted: `dns_records_fill_in_when_resolution_has_no_address` -> `dns_records_never_stand_in_for_resolution`, `queried_family_that_errored_stays_red` -> `dns_query_error_does_not_paint_the_address_row`, `domain_with_empty_aaaa_shows_neutral_none` -> `domain_without_an_ipv6_address_shows_neutral_none` (now driven by `resolved_ips`).
+- Item 1's old `ttl_reads_cached_and_expired_reads_refreshing` pinned `expired, refreshing` on a `Complete` scanner; inverted as `ttl_reads_cached_and_expired_reads_refreshing_only_while_running`. `requery_delay_is_the_earliest_expiry_clamped_to_10s_60s` became `requery_delay_is_one_second_past_the_earliest_expiry_clamped_to_10s_60s` (30s -> 31s); the cross-type test's 25s became 26s and `next_delay`'s window 30..31s.
+- `QueryStatus` gained `PartialEq, Eq` so the PTR tests compare statuses directly. Same effect, no behavior change.
+- The chain criterion says "renders `3 certificates`": verified by rendering the zoomed Security pane from the TLS scan of the loopback fixture, not from a hand-built `TlsData`, so the count comes from OpenSSL's `peer_cert_chain()` on a live handshake.
+
+### Tradeoffs
+
+- Per-field `Vec<ContactField>` vs keeping `is_redacted` and adding a field list: one signal, and `fully_redacted()` keeps the remark case a one-liner.
+- A loopback TLS server for the chain vs only the pure `presented_chain` test: the pure test covers the no-chain branch (a resumed session cannot be produced cheaply), the loopback test proves the client-side chain includes the leaf.
+- `PtrAnswer` enum + pure status function vs testing `reverse_lookup` live: no network, and a hickory `ResolveError` for NOERROR-empty and NXDOMAIN is built with `ProtoError::nx_error`.
+
+### Bite proofs
+
+Each fix undone in turn (scripted string mutation of the working tree, `cargo test --lib <filter>`, restore), with the tests it broke:
+
+| Fix undone | Failing tests |
+|---|---|
+| 1: `expiry + DNS_REQUERY_GRACE` -> `expiry` | `requery_delay_is_one_second_past_the_earliest_expiry_clamped_to_10s_60s`, `requery_delay_takes_the_earliest_record_across_types` |
+| 1: `ttl_span` always `expired, refreshing` | `ttl_reads_cached_and_expired_reads_refreshing_only_while_running` |
+| 2: PTR `is_empty_answer` arm removed | `ptr_without_a_record_is_no_records_never_failed` |
+| 2: PTR `none` render arm removed | `ptr_without_a_record_reads_none_and_an_error_reads_failed` |
+| 3: leaf pushed before the peer chain (old code) | `chain_of_leaf_and_two_intermediates_counts_three_certificates` (got 4), `presented_chain_is_the_peer_chain_and_the_leaf_only_without_one` |
+| 4: empty-value filter removed | `empty_fn_with_visible_email_is_partial` |
+| 4: `apply_redactions` call removed | `rfc9537_name_redaction_with_visible_email_is_partial`, `rfc9537_full_redaction_is_protected` |
+| 4: one visible field -> `Open` (old one-flag rule) | `empty_fn_with_visible_email_is_partial`, `rfc9537_name_redaction_with_visible_email_is_partial` |
+| 4: per-field `(redacted)` row removed | `zoom_marks_each_withheld_field_redacted` |
+| 6: `\|\| http_state.error.is_some()` removed | `retrying_after_a_failure_shows_no_placeholders` |
+| 7: DNS records fallback restored | `dns_records_never_stand_in_for_resolution`, `localhost_rows_equal_the_scanners_resolution_not_hickory` |
+
+`first_run_shows_placeholders_but_no_server_row` asserts the deleted `Server:` row is absent; it was not mutation-run (re-adding the row is the only undo).
+
+### Open questions
+
+- `PrivacyLevel::Partial`'s label is `partial (some contact fields visible)`. AC4 only requires `Privacy: ` present and not `open`; Scott may want different wording.
+- With the DNS fallback gone, a domain whose `resolved_ips` is empty would read `none` on both rows. `main` fails before the TUI when resolution errors, so this is not reachable today; noted in case a later phase re-resolves on protocol change.
