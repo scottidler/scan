@@ -1,13 +1,19 @@
+use crate::scan::http::Lenses;
+use crate::scan::http::disclosure::{SecurityTxt, SecurityTxtState};
+use crate::scan::http::timing::HttpTiming;
+use crate::scan::http::views::{CookieFlags, RouteHop, advertises_h3};
+use crate::scan::lens::LensOutcome;
 use crate::scan::observatory::{GradeLetter, ObservatoryOutcome, PRELOAD_UNAVAILABLE_NOTE};
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
 };
 use std::any::Any;
+use std::time::Duration;
 
 const HTTP_SUCCESS_STATUS_MIN: u16 = 200;
 const HTTP_SUCCESS_STATUS_MAX: u16 = 299;
@@ -56,9 +62,169 @@ fn header_line(label: &str, value: Option<&str>) -> Line<'static> {
     ])
 }
 
-/// Zoomed only, after everything the grid shows: the request, every security header with its
-/// value, the CSP and CORS policies, and the caching headers.
-fn zoomed_lines(data: &crate::scan::http::HttpData) -> Vec<Line<'static>> {
+/// A lens's value, `none` in `MUTED` when there is nothing there, or `failed: <reason>` in `BAD`.
+pub(crate) fn lens_value<T>(outcome: &LensOutcome<T>, present: impl FnOnce(&T) -> (String, Color)) -> Span<'static> {
+    let (text, color) = match outcome {
+        LensOutcome::Present(value) => present(value),
+        LensOutcome::Absent => ("none".to_string(), theme::MUTED),
+        LensOutcome::Failed(reason) => (format!("failed: {reason}"), theme::BAD),
+    };
+    Span::styled(text, Style::default().fg(color))
+}
+
+fn lens_row(label: &str, value: Span<'static>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label.to_string(), Style::default().fg(theme::LABEL)),
+        value,
+    ])
+}
+
+fn millis(duration: Duration) -> String {
+    format!("{}ms", duration.as_millis())
+}
+
+/// `DNS: 3ms · Connect: 12ms · TLS: 20ms · TTFB: 45ms · Transfer: 2ms`; an IP host reads
+/// `DNS: n/a`, a plain `http://` URL `TLS: n/a`.
+pub(crate) fn timing_text(timing: &HttpTiming) -> String {
+    let optional = |phase: Option<Duration>| phase.map_or_else(|| "n/a".to_string(), millis);
+    format!(
+        "DNS: {} · Connect: {} · TLS: {} · TTFB: {} · Transfer: {}",
+        optional(timing.dns),
+        millis(timing.connect),
+        optional(timing.tls),
+        millis(timing.ttfb),
+        millis(timing.transfer)
+    )
+}
+
+fn security_txt_text(txt: &SecurityTxt) -> (String, Color) {
+    match &txt.state {
+        SecurityTxtState::Present => (
+            match &txt.contact {
+                Some(contact) => format!("present · {contact}"),
+                None => "present".to_string(),
+            },
+            theme::GOOD,
+        ),
+        SecurityTxtState::Expired => (
+            format!("expired · Expires: {}", txt.expires.as_deref().unwrap_or_default()),
+            theme::WARN,
+        ),
+        SecurityTxtState::Invalid(why) => (format!("invalid ({why})"), theme::BAD),
+    }
+}
+
+fn route_text(hops: &[RouteHop]) -> String {
+    hops.iter()
+        .map(|hop| format!("{} {}", hop.url, hop.status))
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+fn cookie_line(cookie: &CookieFlags) -> Line<'static> {
+    let flag = |set: bool, name: &str| if set { name.to_string() } else { format!("no {name}") };
+    let same_site = cookie
+        .same_site
+        .map_or_else(|| "no SameSite".to_string(), |value| format!("SameSite={value}"));
+    let flags = [
+        flag(cookie.secure, "Secure"),
+        flag(cookie.http_only, "HttpOnly"),
+        same_site,
+    ]
+    .join(" · ");
+    let color = if cookie.fully_flagged() { theme::GOOD } else { theme::WARN };
+    Line::from(vec![
+        Span::styled(format!("  {}: ", cookie.name), Style::default().fg(theme::LABEL)),
+        Span::styled(flags, Style::default().fg(color)),
+    ])
+}
+
+/// Zoomed only, before the header list: ALPN, the timing row, `alt-svc`, security.txt, the
+/// `http://` route and the `auto` jar's cookie flags. The last three are read off the grade's
+/// retrieval; with none, they say why the grade has none.
+fn lens_lines(lenses: &Lenses, observatory: &ObservatoryOutcome) -> Vec<Line<'static>> {
+    let mut lines = vec![lens_row(
+        "🧬 ALPN: ",
+        lens_value(&lenses.alpn, |protocol| {
+            let color = if protocol == "h2" { theme::GOOD } else { theme::VALUE };
+            (protocol.clone(), color)
+        }),
+    )];
+    lines.push(match &lenses.timing {
+        LensOutcome::Present(timing) => lens_row(
+            "⏱ ",
+            Span::styled(timing_text(timing), Style::default().fg(theme::VALUE)),
+        ),
+        LensOutcome::Absent => lens_row("⏱ Timing: ", Span::styled("none", Style::default().fg(theme::MUTED))),
+        LensOutcome::Failed(reason) => lens_row(
+            "⏱ Timing: ",
+            Span::styled(format!("failed: {reason}"), Style::default().fg(theme::BAD)),
+        ),
+    });
+    match &lenses.retrieval {
+        Some(views) => lines.push(lens_row(
+            "alt-svc: ",
+            lens_value(&views.alt_svc, |value| {
+                if advertises_h3(value) {
+                    (format!("{value} (HTTP/3)"), theme::GOOD)
+                } else {
+                    (value.clone(), theme::VALUE)
+                }
+            }),
+        )),
+        None => lines.push(lens_row("alt-svc: ", no_retrieval(observatory))),
+    }
+    lines.push(lens_row(
+        "security.txt: ",
+        match &lenses.security_txt {
+            LensOutcome::Absent => Span::styled("absent", Style::default().fg(theme::MUTED)),
+            other => lens_value(other, security_txt_text),
+        },
+    ));
+    match &lenses.retrieval {
+        Some(views) => {
+            lines.push(lens_row(
+                "http:// route: ",
+                lens_value(&views.http_route, |hops| (route_text(hops), theme::VALUE)),
+            ));
+            lines.push(lens_row(
+                "Cookies: ",
+                lens_value(&views.cookies, |cookies| {
+                    (crate::tui::text::plural(cookies.len(), "cookie"), theme::VALUE)
+                }),
+            ));
+            if let LensOutcome::Present(cookies) = &views.cookies {
+                lines.extend(cookies.iter().map(cookie_line));
+            }
+        }
+        None => {
+            lines.push(lens_row("http:// route: ", no_retrieval(observatory)));
+            lines.push(lens_row("Cookies: ", no_retrieval(observatory)));
+        }
+    }
+    lines
+}
+
+/// Why a view of the retrieval has nothing: the host's grade was refused or failed.
+fn no_retrieval(observatory: &ObservatoryOutcome) -> Span<'static> {
+    match observatory {
+        ObservatoryOutcome::NotApplicable(reason) => {
+            Span::styled(format!("n/a ({reason})"), Style::default().fg(theme::MUTED))
+        }
+        ObservatoryOutcome::Failed(reason) => {
+            Span::styled(format!("failed: {reason}"), Style::default().fg(theme::BAD))
+        }
+        ObservatoryOutcome::Graded(_) => Span::styled("failed: no retrieval", Style::default().fg(theme::BAD)),
+    }
+}
+
+/// Zoomed only, after everything the grid shows: the request, the lenses, every security header
+/// with its value, the CSP and CORS policies, and the caching headers.
+fn zoomed_lines(
+    data: &crate::scan::http::HttpData,
+    lenses: &Lenses,
+    observatory: &ObservatoryOutcome,
+) -> Vec<Line<'static>> {
     let section = |title: &str| Line::from(Span::styled(title.to_string(), Style::default().fg(theme::VALUE)));
     let headers = &data.security_headers;
     let mut lines = vec![
@@ -71,6 +237,9 @@ fn zoomed_lines(data: &crate::scan::http::HttpData) -> Vec<Line<'static>> {
             Span::styled("🎯 IP: ", Style::default().fg(theme::LABEL)),
             Span::styled(data.target_ip.clone(), Style::default().fg(theme::VALUE)),
         ]),
+    ];
+    lines.extend(lens_lines(lenses, observatory));
+    lines.extend([
         Line::from(""),
         section("Security Headers"),
         header_line(
@@ -86,7 +255,7 @@ fn zoomed_lines(data: &crate::scan::http::HttpData) -> Vec<Line<'static>> {
             "Content-Security-Policy",
             data.csp.as_ref().map(|csp| csp.header_value.as_str()),
         ),
-    ];
+    ]);
     if let Some(cors) = &data.cors {
         lines.push(Line::from(""));
         lines.push(section("CORS"));
@@ -318,7 +487,11 @@ impl Pane for HttpPane {
                     }
 
                     if detail == Detail::Zoomed {
-                        lines.extend(zoomed_lines(primary_data));
+                        lines.extend(zoomed_lines(
+                            primary_data,
+                            &http_result.lenses,
+                            &http_result.observatory,
+                        ));
                     }
                 } else {
                     // No family got a target observation: the grade, if any, is all there is.
@@ -334,6 +507,11 @@ impl Pane for HttpPane {
                         ]),
                     });
                     lines.push(grade_line(GRADE_LABEL, &http_result.observatory));
+                    if detail == Detail::Zoomed {
+                        // The lenses do not need the URL to have answered.
+                        lines.push(Line::from(""));
+                        lines.extend(lens_lines(&http_result.lenses, &http_result.observatory));
+                    }
                 }
                 if detail == Detail::Zoomed {
                     lines.extend(observatory_lines(&http_result.observatory));
@@ -439,7 +617,7 @@ mod tests {
 
     fn state_with(data: Option<HttpData>, observatory: ObservatoryOutcome, ipv4_status: HttpStatus) -> AppState {
         let state = AppState::new("example.com".to_string());
-        let mut result = HttpResult::new(observatory);
+        let mut result = HttpResult::new(observatory, crate::scan::http::Lenses::absent());
         result.ipv4_status = ipv4_status;
         result.ipv4_result = data;
         state.scanners.insert(
@@ -849,5 +1027,188 @@ mod tests {
         assert!(out.contains("measuring..."), "{out}");
         assert!(!out.contains("Server:"), "{out}");
         assert!(!out.contains("detecting..."), "{out}");
+    }
+
+    fn timing(dns: Option<u64>, tls: Option<u64>) -> HttpTiming {
+        HttpTiming {
+            dns: dns.map(Duration::from_millis),
+            connect: Duration::from_millis(12),
+            tls: tls.map(Duration::from_millis),
+            ttfb: Duration::from_millis(45),
+            transfer: Duration::from_millis(2),
+            status: 200,
+        }
+    }
+
+    #[test]
+    fn timing_reads_each_phase_and_n_a_for_the_phases_a_url_skips() {
+        assert_eq!(
+            timing_text(&timing(Some(3), Some(20))),
+            "DNS: 3ms · Connect: 12ms · TLS: 20ms · TTFB: 45ms · Transfer: 2ms"
+        );
+        assert_eq!(
+            timing_text(&timing(Some(3), None)),
+            "DNS: 3ms · Connect: 12ms · TLS: n/a · TTFB: 45ms · Transfer: 2ms"
+        );
+        assert!(timing_text(&timing(None, Some(1))).starts_with("DNS: n/a · "));
+    }
+
+    fn state_with_lenses(lenses: Lenses, observatory: ObservatoryOutcome, data: Option<HttpData>) -> AppState {
+        let state = state_with(data.clone(), observatory.clone(), HttpStatus::Success);
+        let mut result = HttpResult::new(observatory, lenses);
+        result.ipv4_status = if data.is_some() {
+            HttpStatus::Success
+        } else {
+            HttpStatus::Failed("operation timed out".to_string())
+        };
+        result.ipv4_result = data;
+        state.scanners.get_mut("http").unwrap().result = Some(ScanResult::Http(result));
+        state
+    }
+
+    fn zoomed(state: &AppState) -> String {
+        crate::tui::testing::content_rows(&HttpPane::new(), state, 160, Detail::Zoomed).join("\n")
+    }
+
+    /// Each lens row shows its value, `none`, or `failed: <reason>`, zoomed only.
+    #[test]
+    fn lens_rows_show_a_value_none_or_failed_in_zoom_only() {
+        use crate::scan::http::disclosure::SecurityTxt;
+        let present = Lenses {
+            timing: LensOutcome::Present(timing(Some(3), Some(20))),
+            alpn: LensOutcome::Present("h2".to_string()),
+            security_txt: LensOutcome::Present(SecurityTxt {
+                state: SecurityTxtState::Present,
+                contact: Some("mailto:sec@example.com".to_string()),
+                expires: Some("2099-01-01T00:00:00Z".to_string()),
+            }),
+            retrieval: None,
+        };
+        let state = state_with_lenses(
+            present,
+            ObservatoryOutcome::Graded(google_com_result()),
+            Some(http_data("https://example.com/", None)),
+        );
+        let out = zoomed(&state);
+        for expected in [
+            "ALPN: h2",
+            "DNS: 3ms · Connect: 12ms · TLS: 20ms · TTFB: 45ms · Transfer: 2ms",
+            "security.txt: present · mailto:sec@example.com",
+        ] {
+            assert!(out.contains(expected), "{expected}:\n{out}");
+        }
+        let normal = crate::tui::testing::content_rows(&HttpPane::new(), &state, 160, Detail::Normal).join("\n");
+        assert!(!normal.contains("ALPN:"), "{normal}");
+
+        let missing = Lenses {
+            timing: LensOutcome::Failed("timed out".to_string()),
+            alpn: LensOutcome::Absent,
+            security_txt: LensOutcome::Absent,
+            retrieval: None,
+        };
+        let out = zoomed(&state_with_lenses(
+            missing,
+            ObservatoryOutcome::Failed("site down".to_string()),
+            Some(http_data("https://example.com/", None)),
+        ));
+        for expected in [
+            "ALPN: none",
+            "Timing: failed: timed out",
+            "security.txt: absent",
+            "alt-svc: failed: site down",
+            "http:// route: failed: site down",
+            "Cookies: failed: site down",
+        ] {
+            assert!(out.contains(expected), "{expected}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn expired_and_invalid_security_txt_say_so() {
+        use crate::scan::http::disclosure::SecurityTxt;
+        for (state, text) in [
+            (
+                SecurityTxtState::Expired,
+                "security.txt: expired · Expires: 2020-01-01T00:00:00Z",
+            ),
+            (
+                SecurityTxtState::Invalid("no Contact:".to_string()),
+                "security.txt: invalid (no Contact:)",
+            ),
+        ] {
+            let lenses = Lenses {
+                security_txt: LensOutcome::Present(SecurityTxt {
+                    state,
+                    contact: None,
+                    expires: Some("2020-01-01T00:00:00Z".to_string()),
+                }),
+                ..Lenses::absent()
+            };
+            let out = zoomed(&state_with_lenses(
+                lenses,
+                ObservatoryOutcome::Graded(google_com_result()),
+                Some(http_data("https://example.com/", None)),
+            ));
+            assert!(out.contains(text), "{text}:\n{out}");
+        }
+    }
+
+    /// The URL failed, the lenses did not: zoom still shows them, and a host Observatory refuses
+    /// reads `n/a` for the retrieval's views.
+    #[test]
+    fn lenses_show_when_the_url_failed_and_views_read_n_a_for_a_refused_host() {
+        let lenses = Lenses {
+            alpn: LensOutcome::Present("http/1.1".to_string()),
+            ..Lenses::absent()
+        };
+        let out = zoomed(&state_with_lenses(
+            lenses,
+            ObservatoryOutcome::NotApplicable("IP address".to_string()),
+            None,
+        ));
+        assert!(out.contains("failed: IPv4: operation timed out"), "{out}");
+        assert!(out.contains("ALPN: http/1.1"), "{out}");
+        assert!(out.contains("alt-svc: n/a (IP address)"), "{out}");
+        assert!(out.contains("Cookies: n/a (IP address)"), "{out}");
+    }
+
+    #[test]
+    fn cookie_rows_list_each_flag_and_color_by_whether_all_are_set() {
+        use crate::scan::http::views::RetrievalViews;
+        let cookie = |name: &str, all: bool| CookieFlags {
+            name: name.to_string(),
+            secure: all,
+            http_only: all,
+            same_site: all.then_some("strict"),
+        };
+        let lenses = Lenses {
+            retrieval: Some(RetrievalViews {
+                alt_svc: LensOutcome::Absent,
+                http_route: LensOutcome::Absent,
+                cookies: LensOutcome::Present(vec![cookie("SID", true), cookie("pref", false)]),
+            }),
+            ..Lenses::absent()
+        };
+        let state = state_with_lenses(
+            lenses,
+            ObservatoryOutcome::Graded(google_com_result()),
+            Some(http_data("https://example.com/", None)),
+        );
+        let out = zoomed(&state);
+        assert!(out.contains("Cookies: 2 cookies"), "{out}");
+        assert!(out.contains("SID: Secure · HttpOnly · SameSite=strict"), "{out}");
+        assert!(out.contains("pref: no Secure · no HttpOnly · no SameSite"), "{out}");
+        assert!(out.contains("alt-svc: none"), "{out}");
+        assert!(out.contains("http:// route: none"), "{out}");
+        let lines = HttpPane::new().content(&state, 160, Detail::Zoomed);
+        let color_of = |text: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content == text)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(color_of("Secure · HttpOnly · SameSite=strict"), Some(theme::GOOD));
+        assert_eq!(color_of("no Secure · no HttpOnly · no SameSite"), Some(theme::WARN));
     }
 }

@@ -232,6 +232,7 @@ impl SecurityPane {
                         email_security.dmarc_record.clone(),
                         email_security.mx_count,
                         email_security.has_mx,
+                        (email_security.mta_sts.clone(), email_security.tls_rpt.clone()),
                     )
                 })
             } else {
@@ -630,7 +631,7 @@ impl SecurityPane {
         }
 
         // DNS Security Records
-        if let Some((spf_record, dmarc_record, mx_count, has_mx)) = dns_data {
+        if let Some((spf_record, dmarc_record, mx_count, has_mx, (mta_sts, tls_rpt))) = dns_data {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "📧 Email Security",
@@ -654,6 +655,16 @@ impl SecurityPane {
                     Style::default().fg(if dmarc_record.is_some() { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
+
+            // Zoomed only, under DMARC: the MTA-STS policy id and the TLS-RPT report address.
+            if detail == Detail::Zoomed {
+                for (label, outcome) in [("  MTA-STS: ", &mta_sts), ("  TLS-RPT: ", &tls_rpt)] {
+                    lines.push(Line::from(vec![
+                        Span::styled(label, Style::default().fg(theme::LABEL)),
+                        crate::tui::http::lens_value(outcome, |value| (value.clone(), theme::GOOD)),
+                    ]));
+                }
+            }
 
             // DKIM keys sit at `<selector>._domainkey`; without a selector there is nothing to query.
             lines.push(Line::from(vec![
@@ -1001,6 +1012,7 @@ mod tests {
             ipv4_status: crate::scan::http::HttpStatus::Success,
             ipv6_status: crate::scan::http::HttpStatus::NotQueried,
             observatory: ObservatoryOutcome::Graded(google_com_result()),
+            lenses: crate::scan::http::Lenses::absent(),
             queried_at: Instant::now(),
             total_duration: Duration::from_millis(300),
         };
@@ -1073,6 +1085,8 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=reject".to_string()),
             has_mx: true,
             mx_count: 1,
+            mta_sts: crate::scan::lens::LensOutcome::Absent,
+            tls_rpt: crate::scan::lens::LensOutcome::Absent,
         });
         state.scanners.insert(
             "dns".to_string(),
@@ -1106,6 +1120,8 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com".to_string()),
             has_mx: true,
             mx_count: 2,
+            mta_sts: crate::scan::lens::LensOutcome::Absent,
+            tls_rpt: crate::scan::lens::LensOutcome::Absent,
         };
 
         let dns_result = DnsResult {
@@ -1246,6 +1262,7 @@ mod tests {
             ipv4_status: crate::scan::http::HttpStatus::Success,
             ipv6_status: crate::scan::http::HttpStatus::NotQueried,
             observatory: ObservatoryOutcome::Graded(google_com_result()),
+            lenses: crate::scan::http::Lenses::absent(),
             queried_at: Instant::now(),
             total_duration: Duration::from_millis(200),
         };
@@ -1266,6 +1283,8 @@ mod tests {
                 dmarc_record: Some("v=DMARC1; p=reject".to_string()),
                 has_mx: true,
                 mx_count: 1,
+                mta_sts: crate::scan::lens::LensOutcome::Absent,
+                tls_rpt: crate::scan::lens::LensOutcome::Absent,
             }),
             A_status: crate::scan::dns::QueryStatus::NoRecords,
             AAAA_status: crate::scan::dns::QueryStatus::NoRecords,
@@ -1596,6 +1615,7 @@ mod tests {
                     ipv6_result: None,
                     ipv6_status: crate::scan::http::HttpStatus::NotQueried,
                     observatory: ObservatoryOutcome::Failed("site down".to_string()),
+                    lenses: crate::scan::http::Lenses::absent(),
                     queried_at: Instant::now(),
                     total_duration: Duration::from_millis(300),
                 })),
@@ -1734,6 +1754,7 @@ mod tests {
                     ipv6_result: None,
                     ipv6_status: crate::scan::http::HttpStatus::NotQueried,
                     observatory,
+                    lenses: crate::scan::http::Lenses::absent(),
                     queried_at: Instant::now(),
                     total_duration: Duration::from_millis(300),
                 })),
@@ -1803,7 +1824,10 @@ mod tests {
 
         // The URL failed but the host graded: the HTTP section is the grade alone.
         let state = AppState::new("example.com".to_string());
-        let mut result = crate::scan::http::HttpResult::new(ObservatoryOutcome::Graded(google_com_result()));
+        let mut result = crate::scan::http::HttpResult::new(
+            ObservatoryOutcome::Graded(google_com_result()),
+            crate::scan::http::Lenses::absent(),
+        );
         result.ipv4_status = crate::scan::http::HttpStatus::Failed("operation timed out".to_string());
         state.scanners.insert(
             "http".to_string(),
@@ -1927,6 +1951,8 @@ mod tests {
             dmarc_record: Some(dmarc.to_string()),
             has_mx: true,
             mx_count: 1,
+            mta_sts: crate::scan::lens::LensOutcome::Absent,
+            tls_rpt: crate::scan::lens::LensOutcome::Absent,
         });
         state.scanners.insert(
             "dns".to_string(),
@@ -1957,6 +1983,76 @@ mod tests {
         let normal = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Normal).join("\n");
         assert!(!normal.contains("Certificate Chain"), "{normal}");
         assert!(!normal.contains("0a:1b:2c"), "{normal}");
+    }
+
+    fn state_with_mail_transport(
+        mta_sts: crate::scan::lens::LensOutcome<String>,
+        tls_rpt: crate::scan::lens::LensOutcome<String>,
+    ) -> AppState {
+        let state = AppState::new("google.com".to_string());
+        let mut dns_result = DnsResult::new();
+        dns_result.email_security = Some(EmailSecurityAnalysis {
+            spf_record: Some("v=spf1 -all".to_string()),
+            dmarc_record: Some("v=DMARC1; p=reject".to_string()),
+            has_mx: true,
+            mx_count: 1,
+            mta_sts,
+            tls_rpt,
+        });
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: Some(ScanResult::Dns(dns_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        state
+    }
+
+    /// AC6's lines: the MTA-STS id and the TLS-RPT address under DMARC, zoomed only.
+    #[test]
+    fn zoom_shows_mta_sts_and_tls_rpt_under_dmarc() {
+        use crate::scan::lens::LensOutcome;
+        let state = state_with_mail_transport(
+            LensOutcome::Present("20210803T010101".to_string()),
+            LensOutcome::Present("mailto:sts-reports@google.com".to_string()),
+        );
+        let pane = SecurityPane::new();
+        let rows = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed);
+        let at = |needle: &str| rows.iter().position(|row| row.contains(needle));
+        let (dmarc, mta_sts, tls_rpt, dkim) = (
+            at("DMARC: configured").expect("DMARC row"),
+            at("MTA-STS: 20210803T010101").expect("MTA-STS row"),
+            at("TLS-RPT: mailto:sts-reports@google.com").expect("TLS-RPT row"),
+            at("DKIM:").expect("DKIM row"),
+        );
+        assert!(dmarc < mta_sts && mta_sts < tls_rpt && tls_rpt < dkim, "{rows:#?}");
+        let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
+        assert!(!normal.contains("MTA-STS"), "{normal}");
+    }
+
+    /// A resolver error reads `failed`, never `none`; no record reads `none`.
+    #[test]
+    fn a_failed_mail_transport_query_reads_failed_not_none() {
+        use crate::scan::lens::LensOutcome;
+        let state = state_with_mail_transport(LensOutcome::Failed("timed out".to_string()), LensOutcome::Absent);
+        let pane = SecurityPane::new();
+        let text = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed).join("\n");
+        assert!(text.contains("MTA-STS: failed: timed out"), "{text}");
+        assert!(text.contains("TLS-RPT: none"), "{text}");
+        let lines = pane.content(&state, 80, Detail::Zoomed);
+        let color_of = |text: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content == text)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(color_of("failed: timed out"), Some(theme::BAD));
+        assert_eq!(color_of("none"), Some(theme::MUTED));
     }
 
     #[test]

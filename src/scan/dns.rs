@@ -1,4 +1,5 @@
 use crate::scan::cache::FETCH_TIMEOUT;
+use crate::scan::lens::LensOutcome;
 use crate::scan::psl::SuffixList;
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
@@ -28,6 +29,12 @@ const DNS_REQUERY_GRACE: Duration = Duration::from_secs(1);
 /// RFC 7489: a DMARC policy record is a TXT record at `_dmarc.<domain>` starting with this tag.
 const DMARC_PREFIX: &str = "_dmarc";
 const DMARC_VERSION_TAG: &str = "v=DMARC1";
+/// RFC 8461 §3.1: the MTA-STS TXT record sits at `_mta-sts.<domain>` and names its policy `id`.
+const MTA_STS_PREFIX: &str = "_mta-sts";
+const MTA_STS_VERSION: &str = "STSv1";
+/// RFC 8460 §3: the TLS-RPT TXT record sits at `_smtp._tls.<domain>` and names where reports go.
+const TLS_RPT_PREFIX: &str = "_smtp._tls";
+const TLS_RPT_VERSION: &str = "TLSRPTv1";
 
 #[derive(Debug, Clone)]
 pub struct DnsRecord<T> {
@@ -93,14 +100,19 @@ pub struct SrvRecord {
     pub target: String,
 }
 
-/// SPF from the apex TXT records, DMARC from `_dmarc.` (RFC 7489). DKIM is not here: its records
-/// sit at `<selector>._domainkey`, and without a selector there is nothing to query.
+/// SPF from the apex TXT records, DMARC from `_dmarc.` (RFC 7489), MTA-STS and TLS-RPT from their
+/// TXT records at the host itself. DKIM is not here: its records sit at `<selector>._domainkey`,
+/// and without a selector there is nothing to query.
 #[derive(Debug, Clone)]
 pub struct EmailSecurityAnalysis {
     pub spf_record: Option<String>,
     pub dmarc_record: Option<String>,
     pub has_mx: bool,
     pub mx_count: usize,
+    /// The MTA-STS record's policy `id`.
+    pub mta_sts: LensOutcome<String>,
+    /// The TLS-RPT record's `rua`, where reports are sent.
+    pub tls_rpt: LensOutcome<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,15 +384,45 @@ impl DnsScanner {
         (records, status)
     }
 
-    /// The TXT strings at `name`; empty when there are none or the query failed.
-    async fn txt_at(&self, resolver: &TokioResolver, name: &str) -> Vec<String> {
-        match self.timed_lookup(resolver, name, RecordType::TXT).await {
-            Ok(Some(lookup)) => lookup
+    /// The TXT strings at `name`, empty when there are none; a timeout or resolver error is the
+    /// query's status, never an empty answer.
+    async fn txt_at(&self, resolver: &TokioResolver, name: &str) -> std::result::Result<Vec<String>, QueryStatus> {
+        Ok(match self.timed_lookup(resolver, name, RecordType::TXT).await? {
+            Some(lookup) => lookup
                 .record_iter()
                 .filter_map(|record| record.data().as_txt().map(txt_text))
                 .collect(),
-            Ok(None) | Err(_) => Vec::new(),
-        }
+            None => Vec::new(),
+        })
+    }
+
+    /// The MTA-STS `id` and TLS-RPT `rua` published at `host`, asked concurrently. The host only:
+    /// MTA-STS does not inherit to subdomains (RFC 8461 §3.4), and TLS-RPT is found at the policy
+    /// domain (RFC 8460 §3).
+    async fn lookup_mail_transport(
+        &self,
+        resolver: &TokioResolver,
+        host: &str,
+    ) -> (LensOutcome<String>, LensOutcome<String>) {
+        let host = host.trim_end_matches('.');
+        let (mta_sts, tls_rpt) = (format!("{MTA_STS_PREFIX}.{host}"), format!("{TLS_RPT_PREFIX}.{host}"));
+        log::debug!(
+            "[scan::dns] lookup_mail_transport: mta_sts={} tls_rpt={}",
+            mta_sts,
+            tls_rpt
+        );
+        let (mta_sts, tls_rpt) = tokio::join!(self.txt_at(resolver, &mta_sts), self.txt_at(resolver, &tls_rpt));
+        let outcomes = (
+            tagged_value(mta_sts, MTA_STS_VERSION, "id"),
+            tagged_value(tls_rpt, TLS_RPT_VERSION, "rua"),
+        );
+        log::debug!(
+            "[scan::dns] lookup_mail_transport_done: host={} mta_sts={:?} tls_rpt={:?}",
+            host,
+            outcomes.0,
+            outcomes.1
+        );
+        outcomes
     }
 
     /// The `_dmarc.` TXT answer for `host`: `_dmarc.<host>` first, then `_dmarc.<registrable
@@ -410,7 +452,8 @@ impl DnsScanner {
             };
         let names = dmarc_names(host, registrable.as_deref());
         for name in &names {
-            let answer = self.txt_at(resolver, name).await;
+            // DMARC keeps its configured/missing reading: a failed query counts as no record here.
+            let answer = self.txt_at(resolver, name).await.unwrap_or_default();
             if dmarc_record(&answer).is_some() {
                 log::debug!("[scan::dns] dmarc_found: host={} answered_by={}", host, name);
                 return answer;
@@ -830,8 +873,14 @@ impl DnsScanner {
             result.CAA = caa;
             result.CAA_status = caa_status;
 
-            let dmarc_txt = self.lookup_dmarc(&resolver, domain).await;
-            result.email_security = Some(analyze_email_security(&result.TXT, &result.MX, &dmarc_txt));
+            let (dmarc_txt, (mta_sts, tls_rpt)) = tokio::join!(
+                self.lookup_dmarc(&resolver, domain),
+                self.lookup_mail_transport(&resolver, domain)
+            );
+            let mut email_security = analyze_email_security(&result.TXT, &result.MX, &dmarc_txt);
+            email_security.mta_sts = mta_sts;
+            email_security.tls_rpt = tls_rpt;
+            result.email_security = Some(email_security);
             log::trace!(
                 "[scan::dns] email_security_analyzed: domain={} protocol={}",
                 domain,
@@ -1051,8 +1100,41 @@ fn dmarc_record(answer: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// The `key` tag of the record in a TXT answer whose `v=` tag is `version` (`v=STSv1; id=...`,
+/// `v=TLSRPTv1; rua=...`). No such record is `Absent`; a failed query is `Failed`, never `Absent`.
+fn tagged_value(
+    answer: std::result::Result<Vec<String>, QueryStatus>,
+    version: &str,
+    key: &str,
+) -> LensOutcome<String> {
+    let records = match answer {
+        Ok(records) => records,
+        Err(QueryStatus::Timeout) => return LensOutcome::Failed("timed out".to_string()),
+        Err(QueryStatus::Failed(reason)) => return LensOutcome::Failed(reason),
+        Err(other) => return LensOutcome::Failed(format!("{other:?}")),
+    };
+    let tags = |record: &str| -> Vec<(String, String)> {
+        record
+            .split(';')
+            .filter_map(|tag| tag.split_once('='))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect()
+    };
+    records
+        .iter()
+        .map(|record| tags(record))
+        .find(|tags| {
+            tags.first()
+                .is_some_and(|(name, value)| name == "v" && value == version)
+        })
+        .and_then(|tags| tags.into_iter().find(|(name, _)| name == key).map(|(_, value)| value))
+        .filter(|value| !value.is_empty())
+        .map_or(LensOutcome::Absent, LensOutcome::Present)
+}
+
 /// SPF from the apex TXT records; DMARC only from the `_dmarc.` answer, since a `v=DMARC1` record
-/// at the apex is not where receivers look.
+/// at the apex is not where receivers look. MTA-STS and TLS-RPT start `Absent` and are filled in
+/// from their own queries.
 fn analyze_email_security(
     txt_records: &[DnsRecord<String>],
     mx_records: &[DnsRecord<MxRecord>],
@@ -1073,6 +1155,8 @@ fn analyze_email_security(
         dmarc_record: dmarc_record(dmarc_answer),
         has_mx: !mx_records.is_empty(),
         mx_count: mx_records.len(),
+        mta_sts: LensOutcome::Absent,
+        tls_rpt: LensOutcome::Absent,
     };
     log::debug!(
         "[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={}",
@@ -1429,6 +1513,8 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=quarantine;".to_string()),
             has_mx: true,
             mx_count: 2,
+            mta_sts: LensOutcome::Absent,
+            tls_rpt: LensOutcome::Absent,
         };
 
         assert!(analysis.spf_record.is_some());
@@ -1545,6 +1631,8 @@ mod tests {
             dmarc_record: None,
             has_mx: false,
             mx_count: 0,
+            mta_sts: LensOutcome::Absent,
+            tls_rpt: LensOutcome::Absent,
         };
 
         assert!(empty_analysis.spf_record.is_none());
@@ -1558,6 +1646,8 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=none;".to_string()),
             has_mx: true,
             mx_count: 1,
+            mta_sts: LensOutcome::Absent,
+            tls_rpt: LensOutcome::Absent,
         };
 
         assert!(malformed_analysis.spf_record.is_some());
@@ -1633,5 +1723,147 @@ mod tests {
             // Note: This might be empty if the reverse lookup fails, which is okay
             // The important thing is that it doesn't crash
         }
+    }
+
+    /// A DNS server on loopback that answers TXT queries for `records` (name, TXT string) and
+    /// NXDOMAIN for everything else.
+    async fn fake_dns(records: Vec<(&'static str, &'static str)>) -> u16 {
+        use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::{RData, Record};
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_vec(&buf[..n]) else {
+                    continue;
+                };
+                let mut response = Message::new();
+                response
+                    .set_id(query.id())
+                    .set_message_type(MessageType::Response)
+                    .set_op_code(query.op_code())
+                    .set_recursion_desired(query.recursion_desired())
+                    .set_recursion_available(true)
+                    .add_queries(query.queries().to_vec());
+                for question in query.queries() {
+                    let name = question.name().to_ascii();
+                    let answers: Vec<_> = records
+                        .iter()
+                        .filter(|(owner, _)| name.trim_end_matches('.').eq_ignore_ascii_case(owner))
+                        .filter(|_| question.query_type() == RecordType::TXT)
+                        .map(|(_, text)| {
+                            Record::from_rdata(
+                                question.name().clone(),
+                                300,
+                                RData::TXT(TXT::new(vec![text.to_string()])),
+                            )
+                        })
+                        .collect();
+                    if answers.is_empty() {
+                        response.set_response_code(ResponseCode::NXDomain);
+                    }
+                    response.add_answers(answers);
+                }
+                let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+            }
+        });
+        port
+    }
+
+    /// A resolver that asks only the server on `port` at 127.0.0.1.
+    fn resolver_at(port: u16) -> TokioResolver {
+        use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
+        use hickory_resolver::name_server::TokioConnectionProvider;
+        let config = ResolverConfig::from_parts(
+            None,
+            vec![],
+            NameServerConfigGroup::from_ips_clear(&["127.0.0.1".parse().unwrap()], port, true),
+        );
+        Resolver::builder_with_config(config, TokioConnectionProvider::default()).build()
+    }
+
+    #[tokio::test]
+    async fn mta_sts_and_tls_rpt_are_read_at_the_host_from_a_dns_fixture() {
+        let port = fake_dns(vec![
+            ("_mta-sts.site.test", "v=STSv1; id=20210803T010101;"),
+            ("_smtp._tls.site.test", "v=TLSRPTv1;rua=mailto:sts-reports@site.test"),
+            // A parent's record is never read for a subdomain (RFC 8461 §3.4).
+            ("_mta-sts.test", "v=STSv1; id=parent"),
+        ])
+        .await;
+        let scanner = test_scanner().await;
+        let resolver = resolver_at(port);
+
+        let (mta_sts, tls_rpt) = scanner.lookup_mail_transport(&resolver, "site.test.").await;
+        assert_eq!(mta_sts, LensOutcome::Present("20210803T010101".to_string()));
+        assert_eq!(
+            tls_rpt,
+            LensOutcome::Present("mailto:sts-reports@site.test".to_string())
+        );
+
+        let (mta_sts, tls_rpt) = scanner.lookup_mail_transport(&resolver, "www.site.test").await;
+        assert_eq!(mta_sts, LensOutcome::Absent, "no parent-domain fallback");
+        assert_eq!(tls_rpt, LensOutcome::Absent);
+    }
+
+    /// A resolver that never answers is a failed query, never an empty answer.
+    #[tokio::test]
+    async fn a_dns_failure_reads_failed_never_none() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let scanner = DnsScanner {
+            timeout: Duration::from_millis(300),
+            ..test_scanner().await
+        };
+        let resolver = resolver_at(port);
+
+        assert_eq!(
+            scanner.txt_at(&resolver, "_mta-sts.site.test").await,
+            Err(QueryStatus::Timeout)
+        );
+        let (mta_sts, tls_rpt) = scanner.lookup_mail_transport(&resolver, "site.test").await;
+        assert_eq!(mta_sts, LensOutcome::Failed("timed out".to_string()));
+        assert_eq!(tls_rpt, LensOutcome::Failed("timed out".to_string()));
+        drop(silent);
+    }
+
+    #[test]
+    fn tagged_value_reads_the_versioned_record_and_keeps_failures() {
+        let answer = |records: &[&str]| Ok(records.iter().map(|r| r.to_string()).collect());
+        assert_eq!(
+            tagged_value(
+                answer(&["google-site-verification=x", "v=STSv1; id=abc"]),
+                "STSv1",
+                "id"
+            ),
+            LensOutcome::Present("abc".to_string())
+        );
+        assert_eq!(
+            tagged_value(answer(&[" v=TLSRPTv1 ; RUA=mailto:a@b.c ; "]), "TLSRPTv1", "rua"),
+            LensOutcome::Present("mailto:a@b.c".to_string())
+        );
+        assert_eq!(tagged_value(answer(&[]), "STSv1", "id"), LensOutcome::Absent);
+        assert_eq!(
+            tagged_value(answer(&["id=abc; v=STSv1"]), "STSv1", "id"),
+            LensOutcome::Absent
+        );
+        assert_eq!(
+            tagged_value(answer(&["v=STSv1; id="]), "STSv1", "id"),
+            LensOutcome::Absent
+        );
+        assert_eq!(
+            tagged_value(
+                Err(QueryStatus::Failed("connection refused".to_string())),
+                "STSv1",
+                "id"
+            ),
+            LensOutcome::Failed("connection refused".to_string())
+        );
+        assert_eq!(
+            tagged_value(Err(QueryStatus::Timeout), "TLSRPTv1", "rua"),
+            LensOutcome::Failed("timed out".to_string())
+        );
     }
 }

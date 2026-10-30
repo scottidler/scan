@@ -870,3 +870,85 @@ Success criteria (all tests, `cargo test --lib`, 775 passing plus the one ignore
 - The HTTP pane's `Issues:` list (`Missing HSTS` and three more) comes from the target observation's own request, which still sends `scan/1.0` over reqwest. google.com sends HSTS only to Observatory's Firefox UA over HTTP/1.1, so the pane can show `Missing HSTS` beside a grade whose HSTS test passed. The doc says the target observation stays "as today". Should those four issues go, or the target observation adopt Observatory's request shape?
 - No-grade lines carry no host (see Deviations). Add it?
 - The API's TLD-list check is not ported (`eligible_host`); a dotted name under an unknown TLD reads `none (site down)`, not `n/a`. Acceptable, or port `conf/tld-list.json`?
+
+## Phase 7: Lenses
+
+`LensOutcome<T>` in `src/scan/lens.rs`, shared by HTTP and DNS. The timing probe and the ALPN
+handshake in `src/scan/http/timing.rs` (`Prober`), security.txt in `src/scan/http/disclosure.rs`,
+the redirect, cookie and `alt-svc` views of the Observatory retrieval in `src/scan/http/views.rs`.
+`HttpScanner` runs the lenses beside the target observation and the grade (`probe_lenses`,
+`grade_and_view` in `scan/http.rs`) and keeps them on `HttpResult::lenses`. MTA-STS and TLS-RPT are
+read in `scan/dns.rs` (`lookup_mail_transport`, `tagged_value`) onto `EmailSecurityAnalysis`, and
+`txt_at` returns the query status. The HTTP zoom (`tui/http.rs:lens_lines`) and the Security zoom
+(under `DMARC:`) render them.
+
+Live check, 2026-10-30, from talos, release build in `tui-test` at 200x55 (not the installed
+binary; AC6 proper is the parent's, after release):
+
+- `github.com`, `shift+tab` x5, `Enter`: `🧬 ALPN: h2`, `⏱ DNS: 0ms · Connect: 36ms · TLS: 12ms · TTFB: 66ms · Transfer: 178ms`, `alt-svc: none`, `security.txt: present · https://hackerone.com/github`, `http:// route: http://github.com/ 301 → https://github.com/ 200`, `Cookies: 3 cookies` (`_gh_sess`, `_octo`, `logged_in` with their flags).
+- `google.com`, `Enter` (Security): `MTA-STS: 20210803T010101`, `TLS-RPT: mailto:sts-reports@google.com`, rows under `DMARC: configured`. `dig +short TXT` gave `"v=STSv1; id=20210803T010101;"` and `"v=TLSRPTv1;rua=mailto:sts-reports@google.com"`.
+
+Success criteria (all tests, `cargo test --lib`, 815 passing plus the one ignored live test):
+
+| Criterion | Test(s) | Result |
+|---|---|---|
+| Local TLS fake: valid HTTP/1.1 exchange, ALPN `http/1.1`, each phase non-zero, sum within 5ms of wall time | `http::timing::tests::the_timed_request_is_a_valid_http1_exchange_whose_phases_sum_to_the_wall_time` (asserts the fake negotiated `http/1.1`, the request line, `Host`, `Connection: close`, every phase non-zero, phases <= wall and wall - phases < 5ms) | pass |
+| ALPN handshake reports `h2` when offered and sends no request bytes | `the_alpn_handshake_reports_h2_and_sends_no_request`; `a_server_without_alpn_negotiates_none` | pass |
+| Plain-HTTP fake reads `TLS: n/a` | `a_plain_http_url_has_no_tls_phase` (`tls == None`); `tui::http::tests::timing_reads_each_phase_and_n_a_for_the_phases_a_url_skips`; end to end `http::tests::lenses_probe_the_target_and_read_the_retrievals_route_and_jar` (zoom contains `TLS: n/a`) | pass |
+| A fake that stalls after the handshake gives `Failed` for timing; the scan still returns | `http::tests::a_target_that_stalls_after_the_handshake_fails_timing_and_the_scan_returns` (timing `Failed("timed out")`, scan `Ok` and graded in < 5s); `timing::tests::a_server_that_stalls_after_the_handshake_never_completes_the_probe` | pass |
+| security.txt `present`, `expired`, `invalid`, `absent` (404 and soft-404 HTML), `failed` (timeout) | `http::disclosure::tests::fetched_files_classify_over_tls` (all four served over TLS by a fake), `a_text_file_with_a_contact_and_a_future_expiry_is_present`, `a_past_expiry_is_expired`, `no_contact_or_a_bad_expiry_or_a_wrong_type_is_invalid`, `a_404_and_a_soft_404_html_page_are_absent`, `a_silent_server_fails_with_a_timeout`, `an_untrusted_certificate_fails` | pass |
+| A DNS fixture renders `MTA-STS:` and `TLS-RPT:` values | `dns::tests::mta_sts_and_tls_rpt_are_read_at_the_host_from_a_dns_fixture` (a UDP DNS fake on loopback); `tui::security::tests::zoom_shows_mta_sts_and_tls_rpt_under_dmarc` | pass |
+| A resolver error renders `failed`, not `none` | `dns::tests::a_dns_failure_reads_failed_never_none` (a silent resolver: `txt_at` is `Err(Timeout)`, both lenses `Failed("timed out")`); `tui::security::tests::a_failed_mail_transport_query_reads_failed_not_none` (`MTA-STS: failed: timed out` in `BAD`, `TLS-RPT: none` in `MUTED`) | pass |
+| Redirect and cookie views show the `http` route and the `auto` jar's flags | `http::views::tests::views_show_the_http_route_the_auto_jar_and_alt_svc`; end to end `lenses_probe_the_target_and_read_the_retrievals_route_and_jar` (a 301 to `/home` setting `pref=1; HttpOnly; SameSite=Lax` reads `http:// route: http://site.com:<p>/ 301 → http://site.com:<p>/home 200` and `pref: no Secure · HttpOnly · SameSite=lax`); `tui::http::tests::cookie_rows_list_each_flag_and_color_by_whether_all_are_set` | pass |
+
+### Design decisions
+- Lenses on `HttpResult`, not `HttpData`: `HttpResult::lenses: Lenses` (`scan/http.rs`), beside `observatory`, as Phase 6 placed the grade. They are one reading per scan whatever `p` selects, and they must be reachable when the URL failed: the HTTP pane shows them in zoom on the no-target-observation branch too (`tui/http.rs`, "The lenses do not need the URL to have answered"). `HttpResult::new(observatory, lenses)` takes them; no default, no "not run" value outside `#[cfg(test)] Lenses::absent()`.
+- `Lenses { timing, alpn, security_txt, retrieval: Option<RetrievalViews> }`. `RetrievalViews { alt_svc, http_route, cookies }` is computed from the `Retrieval` inside `grade_and_view` and the retrieval (with its body) is dropped there. `retrieval` is `None` only when no retrieval ran: a host Observatory refuses, a missing suffix list, or a grade cut off by the 35s budget. Those three rows then read `n/a (<reason>)` or `failed: <reason>` from the grade outcome (`tui/http.rs:no_retrieval`).
+- `observatory::observe_retrieval` returns the analysis and the retrieval; `observe` keeps its signature and calls it, so `live.rs` and the Phase 5 tests are untouched. `grade_host` keeps returning `ObservatoryOutcome` for the live test.
+- Each lens runs under its own 9s timeout (`HttpScanner::lens`, `LENS_TIMEOUT`); the three probing lenses run concurrently (`probe_lenses`), the set runs concurrently with the target observation and the grade, and the set is also cut off at the 35s budget. A lens that runs out reads `failed: timed out`. A lens never changes `assemble`'s `Ok`/`Err`.
+- `Prober` (`timing.rs`) holds three seams: `HostLookup` (hickory with the system configuration in production, a function in tests), `TcpConnector` (`src/scan/connect.rs`) and the root store. The timing request and the ALPN handshake both verify the certificate against the same webpki root store the TLS scanner uses; there is no bypass client in the lenses.
+- The timed exchange is hand-written HTTP/1.1 over the raw (TLS) stream: reqwest exposes no phase times. Phases are cut back to back (`started → looked up → connected → handshaken`, then `written → first byte → end`); the only time not in a phase is the request write. The body is counted, not kept; `Body` decodes chunked framing incrementally (size line, data, CRLF, trailers), `Content-Length` ends at its length, a close-delimited body at EOF, 204/304/1xx have none, interim 1xx heads are skipped. A body cut short is an error, not a short transfer. A TLS peer closing without `close_notify` reads as EOF.
+- Timing goes to `request_plan(target).primary` (the URL as given; a bare host is `https://host/`) at `target.primary_ip_for_protocol(protocol)`. ALPN goes to the URL's host on port 443 (`LensProbes::https_port`) at the same address, offering `h2, http/1.1`, then sends `close_notify` and nothing else.
+- security.txt (`disclosure.rs`): reqwest with built-in roots (verifying), `scan/1.0`, up to 10 redirects, resolved normally (not pinned), `https://<host>:443/.well-known/security.txt`. Classified by `classify(status, content_type, body, now)`: 404 and 410 `Absent`; any other non-2xx `Failed("HTTP <n>")`; 2xx `text/html` `Absent` (soft 404); 2xx with any type but `text/plain` `Invalid("served as <type>")`; `text/plain` with no `Contact:` `Invalid("no Contact:")`, an `Expires:` that is not RFC 3339 `Invalid("unparseable Expires: ...")`, a past one `Expired`, else `Present`. Field names match case-insensitively; `#` comments are skipped.
+- `alt-svc`: every `alt-svc` value of the `auto` response, joined `", "`; the row appends `(HTTP/3)` when an entry is `h3` or `h3-<draft>` (`views.rs:advertises_h3`). The `http://` route is the `http` session's recorded hops (`redirects`, which include the final hop); `Absent` when port 80 gave no response. Cookies are the `auto` jar (`Retrieval::cookies`), name plus Secure, HttpOnly and SameSite; a cookie with all three is `GOOD`, else `WARN`. No auto response makes all three `Failed("site down")`.
+- MTA-STS and TLS-RPT (`dns.rs:lookup_mail_transport`): `_mta-sts.<host>` and `_smtp._tls.<host>` asked concurrently, alongside DMARC, the host only (trailing dot dropped). `tagged_value` takes the first record whose first tag is `v=STSv1` / `v=TLSRPTv1` and returns its `id` / `rua`; no such record or an empty value is `Absent`; a failed query is `Failed(<resolver error>)` and a timeout `Failed("timed out")`.
+- `txt_at` returns `Result<Vec<String>, QueryStatus>`. DMARC keeps its configured/missing reading: `lookup_dmarc` folds a failed query into "no record" as before (`unwrap_or_default`, commented at the call).
+- Display (`tui/http.rs:lens_lines`, `lens_value`): each row is the value, `none` (`MUTED`) or `failed: <reason>` (`BAD`). The timing row is `⏱ DNS: 3ms · Connect: 12ms · TLS: 20ms · TTFB: 45ms · Transfer: 2ms` in whole milliseconds, so `TTFB: \d+ms` matches; an IP host reads `DNS: n/a`, a plain URL `TLS: n/a`; a failed probe reads `⏱ Timing: failed: <reason>`. security.txt reads `present · <contact>`, `expired · Expires: <date>`, `invalid (<why>)`, `absent` or `failed: <reason>`. Security zoom puts `MTA-STS:` then `TLS-RPT:` directly under `DMARC:`. All lens rows are zoom only.
+- Tests never leave loopback: the Phase 6 scanner tests now run with `offline_lenses` (instant lookup, `site.com` resolved to 127.0.0.1, an unlistened HTTPS port, only the test CA trusted), and `timed_out_scan_renders_operation_timed_out_in_the_pane` too. `testing.rs` gained `tls_acceptor(identity, alpn)` and `FakeHttp::start_tls_alpn`; the DNS lens tests run a UDP DNS fake on loopback built from hickory's `Message`.
+
+### Deviations
+- `LensOutcome` lenses live on `HttpResult::lenses`, not `HttpData` (Data Model). Same effect, correct seam: `HttpData` is per family and absent when the URL fails; the lenses are per scan and must survive a failed URL (the Phase 6 seam).
+- `alt_svc` is not a top-level lens field; it sits with the redirect and cookie views in `RetrievalViews`, all three read off one retrieval, and the group is `Option` (`None` = no retrieval ran) instead of three separate `Failed` values. The rows still read `n/a`/`failed` per lens.
+- `probe(host, ip, port) -> (HttpTiming, Option<String>)` became `Prober::probe(&self, url: &Url, ip) -> eyre::Result<HttpTiming>` plus `Prober::alpn(host, ip, port) -> eyre::Result<Option<String>>`. Same effect, correct seam: the timed request needs scheme and path (the doc's own "target URL as given"), the ALPN protocol comes from the separate handshake, and the network seams live on `Prober` so the tests inject a lookup and a root store.
+- `HttpTiming.dns` is `Option<Duration>` (an IP host has no lookup) and `HttpTiming` carries the response `status`. The doc typed `dns` as `Duration`.
+- security.txt states beyond the doc's list: 410 is `absent` like 404; any other non-2xx is `failed: HTTP <n>`; a 2xx that is neither `text/plain` nor `text/html` is `invalid (served as <type>)`. The `absent` state renders `absent`, as the security.txt bullet names it, not the generic `none`.
+- `SecurityTxtState::Invalid` carries its reason, shown as `invalid (<why>)`.
+
+### Tradeoffs
+- A hand-written HTTP/1.1 exchange vs hyper or reqwest for the timed request: reqwest exposes no connect/TLS/first-byte instants, and hyper's would need a custom connector to see them; the raw stream gives exact boundaries with no new crate.
+- Verifying certificates for timing and ALPN vs a bypass verifier: a self-signed or expired target reads `failed: TLS handshake: ...` for both rather than a measurement over an untrusted chain; the TLS pane already reports the certificate. Fail closed, and no `danger` verifier to audit (open question below).
+- A fresh hickory resolver per probe vs one held resolver: no hickory cache between scans, so the DNS phase measures the system stub's answer; on a host with a caching stub it reads `0ms` for a warm name (github.com did). Holding a resolver would read `0ms` more often.
+- A UDP DNS fake in the tests vs a resolver trait: the fake exercises `txt_at`, `timed_lookup` and the record parsing as they run, with no new production seam.
+- Bite proofs ran as scripted string mutations of the working tree with `cargo test --lib <filter>`, then restored. Every undo broke at least one test:
+
+| Fix undone | Failing tests |
+|---|---|
+| `txt_at` folds a failed query into an empty answer | `dns::tests::a_dns_failure_reads_failed_never_none` |
+| the timed request offers `h2` too | `timing::tests::the_timed_request_is_a_valid_http1_exchange_whose_phases_sum_to_the_wall_time` |
+| the ALPN handshake writes a request | `timing::tests::the_alpn_handshake_reports_h2_and_sends_no_request` |
+| a plain `http://` URL gets a TLS phase | `timing::tests::a_plain_http_url_has_no_tls_phase`, `http::tests::lenses_probe_the_target_and_read_the_retrievals_route_and_jar` |
+| transfer measured from the request write | `timing::tests::the_timed_request_is_a_valid_http1_exchange_whose_phases_sum_to_the_wall_time` |
+| no per-lens timeout | `http::tests::a_target_that_stalls_after_the_handshake_fails_timing_and_the_scan_returns` |
+| a soft-404 HTML page not absent | `disclosure::tests::a_404_and_a_soft_404_html_page_are_absent`, `fetched_files_classify_over_tls` |
+| a past `Expires:` not expired | `disclosure::tests::a_past_expiry_is_expired`, `fetched_files_classify_over_tls` |
+| the route read from the `https` session | `views::tests::views_show_the_http_route_the_auto_jar_and_alt_svc`, `views::tests::nothing_on_port_80_no_cookies_and_no_header_are_absent`, `http::tests::lenses_probe_the_target_and_read_the_retrievals_route_and_jar` |
+| Security zoom drops the MTA-STS/TLS-RPT rows | `tui::security::tests::zoom_shows_mta_sts_and_tls_rpt_under_dmarc`, `a_failed_mail_transport_query_reads_failed_not_none` |
+| lenses hidden when the URL failed | `tui::http::tests::lenses_show_when_the_url_failed_and_views_read_n_a_for_a_refused_host` |
+
+### Open questions
+- Timing and ALPN verify the certificate, so a self-signed or expired target (`selfsigned-200`, `expired-200` in the shakedown) reads `failed: TLS handshake: invalid peer certificate: ...` for both. Keep, or measure over an unverified handshake as Observatory's fallback does?
+- A security.txt with a `Contact:` and no `Expires:` reads `present`, as the doc's states define it; RFC 9116 §2.5.5 makes `Expires` required. Should a missing `Expires:` be `invalid`?
+- The ALPN handshake always goes to port 443, as the doc says, even for `https://host:8443/`. Should it follow the target's port when the target is HTTPS?
+- DMARC still reads `missing` when its query fails (only MTA-STS and TLS-RPT got the `failed` state). Give DMARC the same?
+- MTA-STS: with two `v=STSv1` records RFC 8461 §3.1 says no policy is available; `tagged_value` reads the first. Flag that case as `invalid`?
+- `--no-tui` (`pretty.rs`) prints none of the lenses; the doc places them in the two zooms only. Add them there?

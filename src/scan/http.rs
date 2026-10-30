@@ -1,6 +1,11 @@
+pub mod disclosure;
+pub mod timing;
+pub mod views;
+
 use super::cache::Refreshing;
+use super::lens::LensOutcome;
 use super::observatory::{
-    HstsPreload, ObservatoryOutcome, Retriever, SuffixLists, eligible_host, hsts::PreloadSource, observe,
+    HstsPreload, ObservatoryOutcome, Retriever, SuffixLists, eligible_host, hsts::PreloadSource, observe_retrieval,
 };
 use super::psl::{SuffixList, Suffixes, parse_suffixes};
 use super::{Family, classify_route_error, family_failure};
@@ -8,12 +13,16 @@ use crate::scanner::Scanner;
 use crate::target::{Protocol, Target, TargetType};
 use crate::types::ScanResult;
 use async_trait::async_trait;
+use disclosure::SecurityTxt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
+use timing::{HttpTiming, Prober};
 use url::Url;
+use views::RetrievalViews;
 
 const HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 const HTTP_REDIRECT_LIMIT: usize = 10;
@@ -23,6 +32,37 @@ const HTTP_SCAN_INTERVAL_SECS: u64 = 60;
 /// long still returns what finished.
 const HTTP_SCAN_DEADLINE: Duration = Duration::from_secs(40);
 const HTTP_SCAN_BUDGET: Duration = Duration::from_secs(35);
+/// Each lens's own limit, inside the inner budget.
+const LENS_TIMEOUT: Duration = Duration::from_secs(9);
+/// The port the ALPN handshake and the security.txt fetch use.
+const HTTPS_PORT: u16 = 443;
+
+/// How the lenses reach the network: the timing and ALPN prober, the verifying client security.txt
+/// is fetched with, the port both HTTPS lenses use, and each lens's timeout.
+#[derive(Clone)]
+pub struct LensProbes {
+    pub prober: Prober,
+    /// Verifies certificates: security.txt is never read over the certificate-bypass client.
+    pub security_txt_client: Client,
+    pub https_port: u16,
+    pub timeout: Duration,
+}
+
+impl LensProbes {
+    /// The system resolver and the built-in root store, port 443, 9s per lens.
+    pub fn system() -> Self {
+        Self {
+            prober: Prober::system(),
+            security_txt_client: Client::builder()
+                .user_agent("scan/1.0")
+                .redirect(reqwest::redirect::Policy::limited(HTTP_REDIRECT_LIMIT))
+                .build()
+                .expect("Failed to create security.txt client"),
+            https_port: HTTPS_PORT,
+            timeout: LENS_TIMEOUT,
+        }
+    }
+}
 
 /// Probes the target as given and grades its host as MDN HTTP Observatory does, concurrently.
 pub struct HttpScanner {
@@ -35,6 +75,7 @@ pub struct HttpScanner {
     suffix_source: SuffixList,
     /// Both readings of the public suffix file, parsed once per refresh.
     suffixes: Refreshing<Suffixes>,
+    lenses: LensProbes,
 }
 
 impl Default for HttpScanner {
@@ -124,7 +165,14 @@ impl HttpScanner {
             preload,
             suffix_source,
             suffixes: Refreshing::new(),
+            lenses: LensProbes::system(),
         }
+    }
+
+    /// The same scanner with its lenses reaching the network through `lenses`.
+    pub fn with_lenses(mut self, lenses: LensProbes) -> Self {
+        self.lenses = lenses;
+        self
     }
 
     pub fn timeout(&self) -> Duration {
@@ -653,6 +701,16 @@ impl HttpScanner {
 
     /// The Observatory run for `host`: the lists it needs, then `observe`.
     pub async fn grade_host(&self, host: &str, deadline: tokio::time::Instant) -> ObservatoryOutcome {
+        self.grade_and_view(host, deadline).await.0
+    }
+
+    /// [`grade_host`](Self::grade_host) and the lenses read off its retrieval; no views when no
+    /// retrieval ran.
+    async fn grade_and_view(
+        &self,
+        host: &str,
+        deadline: tokio::time::Instant,
+    ) -> (ObservatoryOutcome, Option<RetrievalViews>) {
         log::debug!("[scan::http] grade_host: host={}", host);
         let (preload, suffixes) = tokio::join!(self.preload.get(deadline), self.suffix_lists(deadline));
         let suffixes = match suffixes {
@@ -663,7 +721,10 @@ impl HttpScanner {
                     host,
                     error
                 );
-                return ObservatoryOutcome::Failed(format!("public suffix list unavailable: {}", root_cause(&error)));
+                return (
+                    ObservatoryOutcome::Failed(format!("public suffix list unavailable: {}", root_cause(&error))),
+                    None,
+                );
             }
         };
         let lists = SuffixLists {
@@ -671,11 +732,19 @@ impl HttpScanner {
             all: &suffixes.all,
         };
         let preload: &HstsPreload = &preload;
-        ObservatoryOutcome::from_analysis(observe(&self.retriever, host, preload, lists).await)
+        let (analysis, retrieval) = observe_retrieval(&self.retriever, host, preload, lists).await;
+        (
+            ObservatoryOutcome::from_analysis(analysis),
+            retrieval.as_ref().map(RetrievalViews::of),
+        )
     }
 
     /// The target's graded host, cut off at `budget_end`; no grade for a host Observatory refuses.
-    async fn grade_target(&self, target: &Target, budget_end: tokio::time::Instant) -> ObservatoryOutcome {
+    async fn grade_target(
+        &self,
+        target: &Target,
+        budget_end: tokio::time::Instant,
+    ) -> (ObservatoryOutcome, Option<RetrievalViews>) {
         let host = match observatory_host(target) {
             Ok(host) => host,
             Err(reason) => {
@@ -684,15 +753,97 @@ impl HttpScanner {
                     target.display_name(),
                     reason
                 );
-                return ObservatoryOutcome::NotApplicable(reason);
+                return (ObservatoryOutcome::NotApplicable(reason), None);
             }
         };
-        match tokio::time::timeout_at(budget_end, self.grade_host(&host, budget_end)).await {
-            Ok(outcome) => outcome,
+        match tokio::time::timeout_at(budget_end, self.grade_and_view(&host, budget_end)).await {
+            Ok(graded) => graded,
             Err(_) => {
                 log::debug!("[scan::http] grade_target_budget_spent: host={}", host);
-                ObservatoryOutcome::Failed("timed out".to_string())
+                (ObservatoryOutcome::Failed("timed out".to_string()), None)
             }
+        }
+    }
+
+    /// One lens under its own timeout; a lens that runs out reads `failed: timed out`.
+    async fn lens<T>(&self, name: &str, probe: impl Future<Output = LensOutcome<T>>) -> LensOutcome<T> {
+        match tokio::time::timeout(self.lenses.timeout, probe).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                log::debug!(
+                    "[scan::http] lens_timed_out: lens={} timeout={}ms",
+                    name,
+                    self.lenses.timeout.as_millis()
+                );
+                LensOutcome::Failed("timed out".to_string())
+            }
+        }
+    }
+
+    /// The timing, ALPN and security.txt lenses for the target URL as given, concurrently. The
+    /// timing and ALPN connections go to the selected family's first address.
+    async fn probe_lenses(&self, target: &Target, protocol: Protocol) -> ProbedLenses {
+        let plan = request_plan(target);
+        let ip = target.primary_ip_for_protocol(protocol);
+        log::debug!(
+            "[scan::http] probe_lenses: target={} ip={:?}",
+            target.display_name(),
+            ip
+        );
+        let (Ok(plan), Some(ip)) = (plan, ip) else {
+            return ProbedLenses::failed("no address to connect to");
+        };
+        let url = plan.primary;
+        let host = url.host_str().unwrap_or_default().to_string();
+        let timing = self.lens("timing", async {
+            match self.lenses.prober.probe(&url, ip).await {
+                Ok(timing) => LensOutcome::Present(timing),
+                Err(error) => LensOutcome::Failed(format!("{error:#}")),
+            }
+        });
+        let alpn = self.lens("alpn", async {
+            match self.lenses.prober.alpn(&host, ip, self.lenses.https_port).await {
+                Ok(Some(protocol)) => LensOutcome::Present(protocol),
+                Ok(None) => LensOutcome::Absent,
+                Err(error) => LensOutcome::Failed(format!("{error:#}")),
+            }
+        });
+        let security_txt = self.lens("security.txt", async {
+            match Url::parse(&format!("https://{}:{}/", host, self.lenses.https_port)) {
+                Ok(base) => disclosure::fetch(&self.lenses.security_txt_client, &base).await,
+                Err(error) => LensOutcome::Failed(format!("bad URL: {error}")),
+            }
+        });
+        let (timing, alpn, security_txt) = tokio::join!(timing, alpn, security_txt);
+        log::debug!(
+            "[scan::http] probe_lenses_done: target={} timing={:?} alpn={:?} security_txt={:?}",
+            target.display_name(),
+            timing,
+            alpn,
+            security_txt
+        );
+        ProbedLenses {
+            timing,
+            alpn,
+            security_txt,
+        }
+    }
+}
+
+/// The lenses that open their own connections.
+struct ProbedLenses {
+    timing: LensOutcome<HttpTiming>,
+    alpn: LensOutcome<String>,
+    security_txt: LensOutcome<SecurityTxt>,
+}
+
+impl ProbedLenses {
+    /// Every lens failed for the one `reason`.
+    fn failed(reason: &str) -> Self {
+        Self {
+            timing: LensOutcome::Failed(reason.to_string()),
+            alpn: LensOutcome::Failed(reason.to_string()),
+            security_txt: LensOutcome::Failed(reason.to_string()),
         }
     }
 }
@@ -714,8 +865,13 @@ fn observatory_host(target: &Target) -> Result<String, String> {
 /// Join the target observation and the grade. The scan fails only when neither part produced
 /// anything: the target observation failed and the host got no grade. Each part keeps its own
 /// failure reason; a part that worked is never reported failed because the other did not.
-fn assemble(protocol: Protocol, observation: Observation, observatory: ObservatoryOutcome) -> eyre::Result<ScanResult> {
-    let mut result = HttpResult::new(observatory);
+fn assemble(
+    protocol: Protocol,
+    observation: Observation,
+    observatory: ObservatoryOutcome,
+    lenses: Lenses,
+) -> eyre::Result<ScanResult> {
+    let mut result = HttpResult::new(observatory, lenses);
     (result.ipv4_status, result.ipv4_result) = observation.ipv4;
     (result.ipv6_status, result.ipv6_result) = observation.ipv6;
 
@@ -752,10 +908,22 @@ impl Scanner for HttpScanner {
 
         let scan_start = Instant::now();
         let budget_end = tokio::time::Instant::now() + self.budget;
-        let (observation, observatory) = tokio::join!(
+        let (observation, (observatory, views), probed) = tokio::join!(
             self.observe_target(target, protocol, budget_end),
             self.grade_target(target, budget_end),
+            async {
+                match tokio::time::timeout_at(budget_end, self.probe_lenses(target, protocol)).await {
+                    Ok(probed) => probed,
+                    Err(_) => ProbedLenses::failed("timed out"),
+                }
+            },
         );
+        let lenses = Lenses {
+            timing: probed.timing,
+            alpn: probed.alpn,
+            security_txt: probed.security_txt,
+            retrieval: views,
+        };
         log::debug!(
             "[scan::http] scan_parts: target={} ipv4={:?} ipv6={:?} grade={}",
             target.display_name(),
@@ -764,7 +932,7 @@ impl Scanner for HttpScanner {
             observatory.grade_text()
         );
 
-        let mut outcome = assemble(protocol, observation, observatory);
+        let mut outcome = assemble(protocol, observation, observatory, lenses);
         match &mut outcome {
             Ok(ScanResult::Http(result)) => {
                 result.total_duration = scan_start.elapsed();
@@ -843,6 +1011,8 @@ pub struct HttpResult {
 
     /// The host's Observatory grade, or why it has none.
     pub observatory: ObservatoryOutcome,
+    /// One reading per scan, whatever `p` selects, kept whether or not the URL answered.
+    pub lenses: Lenses,
 
     // Metadata
     pub queried_at: Instant,
@@ -850,13 +1020,14 @@ pub struct HttpResult {
 }
 
 impl HttpResult {
-    pub fn new(observatory: ObservatoryOutcome) -> Self {
+    pub fn new(observatory: ObservatoryOutcome, lenses: Lenses) -> Self {
         Self {
             ipv4_result: None,
             ipv6_result: None,
             ipv4_status: HttpStatus::NotQueried,
             ipv6_status: HttpStatus::NotQueried,
             observatory,
+            lenses,
             queried_at: Instant::now(),
             total_duration: Duration::from_millis(0),
         }
@@ -932,6 +1103,32 @@ impl HttpResult {
         }
 
         vulnerabilities
+    }
+}
+
+/// The per-target lenses beside the grade. Each one fails on its own; none fails the scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lenses {
+    /// One timed exchange with the URL as given, phase by phase.
+    pub timing: LensOutcome<HttpTiming>,
+    /// The protocol `host:443` negotiates when offered `h2` and `http/1.1`.
+    pub alpn: LensOutcome<String>,
+    pub security_txt: LensOutcome<SecurityTxt>,
+    /// `alt-svc`, the `http://` route and the cookie jar, read off the Observatory retrieval;
+    /// `None` when no retrieval ran (a host Observatory refuses, or a grade cut off by the budget).
+    pub retrieval: Option<RetrievalViews>,
+}
+
+impl Lenses {
+    /// Every lens absent and no retrieval: a fixture for tests about other parts of the result.
+    #[cfg(test)]
+    pub fn absent() -> Self {
+        Self {
+            timing: LensOutcome::Absent,
+            alpn: LensOutcome::Absent,
+            security_txt: LensOutcome::Absent,
+            retrieval: None,
+        }
     }
 }
 
@@ -1039,7 +1236,7 @@ mod tests {
 
     #[test]
     fn failure_names_each_attempted_family_and_skips_no_address() {
-        let mut result = HttpResult::new(ObservatoryOutcome::Failed("site down".to_string()));
+        let mut result = HttpResult::new(ObservatoryOutcome::Failed("site down".to_string()), Lenses::absent());
         result.ipv4_status = HttpStatus::Failed("operation timed out".to_string());
         result.ipv6_status = HttpStatus::Failed("no IPv6 route on this host".to_string());
         assert_eq!(
@@ -1061,7 +1258,8 @@ mod tests {
         let scanner = HttpScanner {
             timeout: Duration::from_millis(300),
             ..HttpScanner::new()
-        };
+        }
+        .with_lenses(offline_lenses(unlistened_port(), &[]));
         let mut target = Target::parse(&format!("http://{addr}/")).unwrap();
         target.resolve().await.unwrap();
 
@@ -1325,10 +1523,45 @@ mod tests {
     use crate::scan::observatory::session::{IncomingResponse, OutgoingRequest, Transport, TransportError};
     use crate::scan::observatory::tests::google_com_result;
     use crate::scan::psl::{PSL_CACHE_FILE, PSL_FIXTURE};
-    use crate::scan::testing::{FakeHttp, FakeRoute, dead_http_url, temp_dir};
+    use crate::scan::testing::{FakeHttp, FakeRoute, TestCa, dead_http_url, temp_dir};
     use std::sync::Arc;
 
     const SITE: &str = "site.com";
+
+    /// A loopback port nothing listens on, held bound for the test process's life.
+    fn unlistened_port() -> u16 {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        std::mem::forget(socket);
+        port
+    }
+
+    /// Lenses that stay on loopback: an instant name lookup, `site.com` resolved to 127.0.0.1 for
+    /// security.txt, `https_port` for ALPN and security.txt, trusting only `roots`.
+    fn offline_lenses(https_port: u16, roots: &[Vec<u8>]) -> LensProbes {
+        let mut store = rustls::RootCertStore::empty();
+        let mut client = Client::builder()
+            .no_proxy()
+            .tls_built_in_root_certs(false)
+            .resolve(SITE, "127.0.0.1:0".parse().unwrap());
+        for der in roots {
+            store.add(rustls::pki_types::CertificateDer::from(der.clone())).unwrap();
+            client = client.add_root_certificate(reqwest::Certificate::from_der(der).unwrap());
+        }
+        let lookup = timing::HostLookup::from_fn(|_| Box::pin(async { Ok(()) }));
+        LensProbes {
+            prober: Prober::new(lookup, crate::scan::connect::TcpConnector::system(), store),
+            security_txt_client: client.build().unwrap(),
+            https_port,
+            timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// `scanner` with lenses that never leave loopback.
+    fn offline(scanner: HttpScanner) -> HttpScanner {
+        scanner.with_lenses(offline_lenses(unlistened_port(), &[]))
+    }
 
     async fn dead_port() -> u16 {
         Url::parse(&dead_http_url().await).unwrap().port().unwrap()
@@ -1396,7 +1629,12 @@ mod tests {
     #[test]
     fn assemble_returns_ok_when_the_url_fails_and_the_host_grades() {
         let failed = observation((HttpStatus::Failed("operation timed out".to_string()), None));
-        let result = http_result(assemble(Protocol::Ipv4, failed, graded("example.com")));
+        let result = http_result(assemble(
+            Protocol::Ipv4,
+            failed,
+            graded("example.com"),
+            Lenses::absent(),
+        ));
         assert_eq!(result.target_failure().as_deref(), Some("IPv4: operation timed out"));
         assert_eq!(result.observatory.grade_text(), "C- (45) · example.com");
     }
@@ -1408,6 +1646,7 @@ mod tests {
             Protocol::Ipv4,
             worked,
             ObservatoryOutcome::Failed("site down".to_string()),
+            Lenses::absent(),
         ));
         assert!(result.has_any_success());
         assert_eq!(result.observatory.grade_text(), "none (site down)");
@@ -1420,6 +1659,7 @@ mod tests {
             Protocol::Ipv4,
             failed(),
             ObservatoryOutcome::Failed("site down".to_string()),
+            Lenses::absent(),
         )
         .expect_err("both failed");
         assert_eq!(error.to_string(), "IPv4: operation timed out; grade: site down");
@@ -1429,6 +1669,7 @@ mod tests {
             Protocol::Ipv4,
             failed(),
             ObservatoryOutcome::NotApplicable("IP address".to_string()),
+            Lenses::absent(),
         )
         .expect_err("the URL failed and nothing graded");
         assert_eq!(error.to_string(), "IPv4: operation timed out");
@@ -1439,6 +1680,7 @@ mod tests {
             Protocol::Ipv4,
             none,
             ObservatoryOutcome::NotApplicable("IP address".to_string()),
+            Lenses::absent(),
         )
         .expect_err("nothing to probe");
         assert!(error.downcast_ref::<crate::scan::NoAddress>().is_some(), "{error}");
@@ -1535,11 +1777,11 @@ mod tests {
     #[tokio::test]
     async fn scan_grades_the_host_and_observes_the_url() {
         let (site, lists) = (page_server().await, Lists::new().await);
-        let scanner = HttpScanner::with_observatory(
+        let scanner = offline(HttpScanner::with_observatory(
             retriever(site.port(), dead_port().await),
             lists.preload(),
             lists.suffixes(),
-        );
+        ));
 
         let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
 
@@ -1569,11 +1811,11 @@ mod tests {
     #[tokio::test]
     async fn a_failed_url_with_a_working_grade_returns_ok_with_both() {
         let (site, lists) = (page_server().await, Lists::new().await);
-        let scanner = HttpScanner::with_observatory(
+        let scanner = offline(HttpScanner::with_observatory(
             retriever(site.port(), dead_port().await),
             lists.preload(),
             lists.suffixes(),
-        );
+        ));
 
         let result = http_result(Scanner::scan(&scanner, &site_target(dead_port().await), Protocol::Ipv4).await);
 
@@ -1593,11 +1835,11 @@ mod tests {
     #[tokio::test]
     async fn a_working_url_with_a_down_site_returns_ok_with_both() {
         let (site, lists) = (page_server().await, Lists::new().await);
-        let scanner = HttpScanner::with_observatory(
+        let scanner = offline(HttpScanner::with_observatory(
             retriever(dead_port().await, dead_port().await),
             lists.preload(),
             lists.suffixes(),
-        );
+        ));
 
         let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
 
@@ -1609,11 +1851,11 @@ mod tests {
     #[tokio::test]
     async fn a_failed_url_and_a_down_site_return_err() {
         let lists = Lists::new().await;
-        let scanner = HttpScanner::with_observatory(
+        let scanner = offline(HttpScanner::with_observatory(
             retriever(dead_port().await, dead_port().await),
             lists.preload(),
             lists.suffixes(),
-        );
+        ));
 
         let outcome = Scanner::scan(&scanner, &site_target(dead_port().await), Protocol::Ipv4).await;
 
@@ -1626,11 +1868,11 @@ mod tests {
     #[tokio::test]
     async fn an_ip_target_is_not_graded_and_sends_no_observatory_request() {
         let (site, lists) = (page_server().await, Lists::new().await);
-        let scanner = HttpScanner::with_observatory(
+        let scanner = offline(HttpScanner::with_observatory(
             retriever(site.port(), dead_port().await),
             lists.preload(),
             lists.suffixes(),
-        );
+        ));
         let mut target = Target::parse(&format!("http://127.0.0.1:{}/", site.port())).unwrap();
         target.resolve().await.unwrap();
 
@@ -1654,8 +1896,11 @@ mod tests {
     async fn a_missing_preload_list_grades_and_says_so() {
         let (site, lists) = (page_server().await, Lists::new().await);
         let dead_list = PreloadSource::from_url(Lists::client(), dead_http_url().await, None);
-        let scanner =
-            HttpScanner::with_observatory(retriever(site.port(), dead_port().await), dead_list, lists.suffixes());
+        let scanner = offline(HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            dead_list,
+            lists.suffixes(),
+        ));
 
         let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
 
@@ -1677,8 +1922,11 @@ mod tests {
             cache_dir: None,
             fetch_timeout: FETCH_TIMEOUT,
         };
-        let scanner =
-            HttpScanner::with_observatory(retriever(site.port(), dead_port().await), lists.preload(), dead_list);
+        let scanner = offline(HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            lists.preload(),
+            dead_list,
+        ));
 
         let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
 
@@ -1703,8 +1951,11 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_grade_returns_the_target_observation_at_the_budget() {
         let (site, lists) = (page_server().await, Lists::new().await);
-        let mut scanner =
-            HttpScanner::with_observatory(Retriever::new(Arc::new(Stalled)), lists.preload(), lists.suffixes());
+        let mut scanner = offline(HttpScanner::with_observatory(
+            Retriever::new(Arc::new(Stalled)),
+            lists.preload(),
+            lists.suffixes(),
+        ));
         scanner.budget = Duration::from_millis(600);
 
         let started = Instant::now();
@@ -1732,7 +1983,11 @@ mod tests {
         };
         let mut target = Target::parse("stalled.example.com").unwrap();
         target.update_resolved_ips(vec![]);
-        let scanner = HttpScanner::with_observatory(Retriever::new(Arc::new(Stalled)), preload, suffixes);
+        let scanner = offline(HttpScanner::with_observatory(
+            Retriever::new(Arc::new(Stalled)),
+            preload,
+            suffixes,
+        ));
 
         let started = tokio::time::Instant::now();
         let error = Scanner::scan(&scanner, &target, Protocol::Ipv4)
@@ -1743,5 +1998,152 @@ mod tests {
         assert!(elapsed >= Duration::from_secs(9), "{elapsed:?}");
         assert!(elapsed < scanner.budget, "{elapsed:?}");
         assert!(error.to_string().ends_with("grade: site down"), "{error}");
+    }
+
+    /// A target that completes the TLS handshake and then never answers: the timing lens fails at
+    /// its own timeout, and the scan still returns with the grade and the other lenses.
+    #[tokio::test]
+    async fn a_target_that_stalls_after_the_handshake_fails_timing_and_the_scan_returns() {
+        let ca = TestCa::new("stall CA");
+        let stall = FakeHttp::start_tls(vec![FakeRoute::get("/", 200).stall()], &ca.issue(&[SITE])).await;
+        let (site, lists) = (page_server().await, Lists::new().await);
+        let mut lenses = offline_lenses(unlistened_port(), &[ca.der()]);
+        lenses.timeout = Duration::from_millis(400);
+        let scanner = HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        )
+        .with_lenses(lenses);
+        let mut target = Target::parse(&format!("https://{SITE}:{}/", stall.port())).unwrap();
+        target.update_resolved_ips(vec!["127.0.0.1".parse().unwrap()]);
+
+        let started = Instant::now();
+        let result = http_result(Scanner::scan(&scanner, &target, Protocol::Ipv4).await);
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(result.lenses.timing, LensOutcome::Failed("timed out".to_string()));
+        assert!(stall.hits("/") >= 1, "the probe's request reached the stalled server");
+        assert!(
+            matches!(result.observatory, ObservatoryOutcome::Graded(_)),
+            "{:?}",
+            result.observatory
+        );
+        assert!(
+            matches!(result.lenses.alpn, LensOutcome::Failed(_)),
+            "nothing on the HTTPS port: {:?}",
+            result.lenses.alpn
+        );
+        assert!(result.lenses.retrieval.is_some());
+    }
+
+    /// End to end over loopback: the probes reach the target and the HTTPS port, and the views
+    /// show the Observatory retrieval's `http://` route and `auto` jar.
+    #[tokio::test]
+    async fn lenses_probe_the_target_and_read_the_retrievals_route_and_jar() {
+        use crate::tui::HttpPane;
+        use crate::tui::pane::Detail;
+        use crate::types::{AppState, ScanState, ScanStatus};
+        use disclosure::{SECURITY_TXT_PATH, SecurityTxtState};
+        use views::{CookieFlags, RouteHop};
+
+        let ca = TestCa::new("lens CA");
+        let https = FakeHttp::start_tls_alpn(
+            vec![
+                FakeRoute::get(SECURITY_TXT_PATH, 200)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body("Contact: mailto:security@site.com\nExpires: 2099-01-01T00:00:00Z\n"),
+            ],
+            &ca.issue(&[SITE]),
+            &[b"h2", b"http/1.1"],
+        )
+        .await;
+        let site = FakeHttp::start_routes(vec![]).await;
+        let home = format!("http://{SITE}:{}/home", site.port());
+        site.add(FakeRoute::get("/", 301).header("Location", &home));
+        site.add(
+            FakeRoute::get("/home", 200)
+                .header("Content-Type", "text/html")
+                .header("Set-Cookie", "pref=1; Path=/; HttpOnly; SameSite=Lax")
+                .header("Alt-Svc", "h3=\":443\"; ma=86400")
+                .body("<html></html>"),
+        );
+        let lists = Lists::new().await;
+        let scanner = HttpScanner::with_observatory(
+            retriever(site.port(), dead_port().await),
+            lists.preload(),
+            lists.suffixes(),
+        )
+        .with_lenses(offline_lenses(https.port(), &[ca.der()]));
+
+        let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
+
+        let lenses = &result.lenses;
+        assert_eq!(lenses.alpn, LensOutcome::Present("h2".to_string()));
+        let timing = lenses.timing.present().expect("the plain target was timed");
+        assert_eq!(timing.tls, None, "a plain http:// target has no TLS phase");
+        assert_eq!(timing.status, 301);
+        let txt = lenses.security_txt.present().expect("security.txt was served");
+        assert_eq!(txt.state, SecurityTxtState::Present);
+        assert_eq!(txt.contact.as_deref(), Some("mailto:security@site.com"));
+        let views = lenses.retrieval.as_ref().expect("the host was retrieved");
+        assert_eq!(
+            views.http_route,
+            LensOutcome::Present(vec![
+                RouteHop {
+                    url: format!("http://{SITE}:{}/", site.port()),
+                    status: 301
+                },
+                RouteHop {
+                    url: home.clone(),
+                    status: 200
+                },
+            ])
+        );
+        assert_eq!(
+            views.cookies,
+            LensOutcome::Present(vec![CookieFlags {
+                name: "pref".to_string(),
+                secure: false,
+                http_only: true,
+                same_site: Some("lax"),
+            }])
+        );
+        assert_eq!(views.alt_svc, LensOutcome::Present("h3=\":443\"; ma=86400".to_string()));
+
+        // The HTTP zoom shows each lens before the header list.
+        let state = AppState::new(SITE.to_string());
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: Some(ScanResult::Http(result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let zoomed = crate::tui::testing::content_rows(&HttpPane::new(), &state, 200, Detail::Zoomed).join("\n");
+        for expected in [
+            "ALPN: h2".to_string(),
+            "TLS: n/a".to_string(),
+            "security.txt: present · mailto:security@site.com".to_string(),
+            format!("http:// route: http://{SITE}:{}/ 301 → {home} 200", site.port()),
+            "pref: no Secure · HttpOnly · SameSite=lax".to_string(),
+            "alt-svc: h3=\":443\"; ma=86400 (HTTP/3)".to_string(),
+        ] {
+            assert!(zoomed.contains(&expected), "{expected}:\n{zoomed}");
+        }
+        let ttfb = zoomed
+            .split("TTFB: ")
+            .nth(1)
+            .and_then(|rest| rest.split("ms").next())
+            .expect("a TTFB value");
+        assert!(
+            ttfb.chars().all(|c| c.is_ascii_digit()) && !ttfb.is_empty(),
+            "TTFB: {ttfb}ms"
+        );
+        let headers_at = zoomed.find("Security Headers").unwrap();
+        assert!(zoomed.find("ALPN: h2").unwrap() < headers_at, "{zoomed}");
     }
 }

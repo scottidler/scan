@@ -194,15 +194,29 @@ pub async fn observe(
     preload: &HstsPreload,
     lists: SuffixLists<'_>,
 ) -> Result<ObservatoryResult, AnalyzeError> {
+    observe_retrieval(retriever, host, preload, lists).await.0
+}
+
+/// [`observe`], keeping the [`Retrieval`] the grade was computed from, for the lenses that read
+/// it. The retrieval is `None` only for a host that makes no URL.
+pub async fn observe_retrieval(
+    retriever: &Retriever,
+    host: &str,
+    preload: &HstsPreload,
+    lists: SuffixLists<'_>,
+) -> (Result<ObservatoryResult, AnalyzeError>, Option<Retrieval>) {
     log::debug!("[observatory] observe: host={}", host);
-    let retrieval = retriever.retrieve(host, lists.all).await?;
+    let retrieval = match retriever.retrieve(host, lists.all).await {
+        Ok(retrieval) => retrieval,
+        Err(error) => return (Err(error), None),
+    };
     let result = analyze(&retrieval, preload, lists.icann);
     log::debug!(
         "[observatory] observe: host={} outcome={:?}",
         host,
         result.as_ref().map(|r| (r.score, r.grade))
     );
-    result
+    (result, Some(retrieval))
 }
 
 /// `analyzeScan`: the status gate, the 12 tests, the score and the grade.

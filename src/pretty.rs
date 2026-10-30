@@ -657,7 +657,7 @@ mod tests {
     }
 
     fn http_result(observatory: ObservatoryOutcome, data: Option<HttpData>) -> ScanResult {
-        let mut result = HttpResult::new(observatory);
+        let mut result = HttpResult::new(observatory, crate::scan::http::Lenses::absent());
         if data.is_some() {
             result.ipv4_status = HttpStatus::Success;
         } else {

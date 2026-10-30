@@ -247,6 +247,26 @@ fn cert_builder(common_name: &str, key: &openssl::pkey::PKey<openssl::pkey::Priv
     builder
 }
 
+/// A TLS acceptor serving `identity` that selects from `alpn` (in its order of preference) when
+/// the client offers ALPN; an empty list negotiates none.
+pub fn tls_acceptor(identity: &ServerIdentity, alpn: &[&[u8]]) -> tokio_rustls::TlsAcceptor {
+    use tokio_rustls::rustls;
+    let chain = identity
+        .chain
+        .iter()
+        .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+        .collect();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(identity.key.clone().into());
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .expect("server certificate");
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+}
+
 /// A local HTTP/1.1 server answering fixed routes, one request per connection, and recording every
 /// request. An unknown route gets 404. Plain, or TLS with a [`ServerIdentity`]. It stops when
 /// dropped.
@@ -283,20 +303,13 @@ impl FakeHttp {
 
     /// TLS with `identity`.
     pub async fn start_tls(routes: Vec<FakeRoute>, identity: &ServerIdentity) -> Self {
-        use tokio_rustls::rustls;
-        let chain = identity
-            .chain
-            .iter()
-            .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
-            .collect();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(identity.key.clone().into());
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .expect("server certificate");
-        Self::launch(routes, Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))).await
+        Self::start_tls_alpn(routes, identity, &[]).await
+    }
+
+    /// TLS with `identity`, selecting from `alpn` when the client offers ALPN. Every request is
+    /// still answered as HTTP/1.1, so offer `h2` only to a client that never sends a request.
+    pub async fn start_tls_alpn(routes: Vec<FakeRoute>, identity: &ServerIdentity, alpn: &[&[u8]]) -> Self {
+        Self::launch(routes, Some(tls_acceptor(identity, alpn))).await
     }
 
     async fn launch(routes: Vec<FakeRoute>, tls: Option<tokio_rustls::TlsAcceptor>) -> Self {
