@@ -1027,3 +1027,17 @@ neverssl.com stays in `HOSTS`. In 4 pairs the two sides were never up at the sam
 - The live test now fails on neverssl.com whenever the two sides are never up together in 4 pairs, as it did in this run. The doc's only relief is a dated Resolved Decision with your say-so: swap the host for a stable plain-HTTP host, or keep it and accept a red run when it flaps?
 - `--no-tui` still prints `N security features`: a count of the security headers the `scan/1.0` request saw. It is not a pass or fail, but it is the target request's reading of the same headers Observatory grades (google.com reads `0 security features` beside an HSTS pass). Drop it as well?
 - XSS-Protect and Permissions rows still color the target's own header (`GOOD`/`WARN`) since Observatory has no test for them, as instructed. Should they go `MUTED` like the other no-grade rows?
+
+## Pre-release: drop the `--no-tui` security-features count
+
+### Design decisions
+- `pretty.rs` HTTP line no longer prints `N security features`; `count_security_features` is deleted. The count read the `scan/1.0` target request's headers, so google.com printed `0 security features` beside a passing Observatory HSTS test: a second signal for the fact the grade already encodes. Scott chose "fix then bump" (2026-10-30).
+
+### Deviations
+- None.
+
+### Tradeoffs
+- Delete vs. recount from Observatory's passing tests: the grade line already carries that verdict; a recount would be a derived field that duplicates it.
+
+### Open questions
+- XSS-Protect and Permissions rows still color the target's own header (no Observatory test for either); `partial (some contact fields visible)` wording. Both left for Scott, not release blockers.

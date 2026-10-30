@@ -192,15 +192,12 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                     .unwrap_or_else(|| "no address to request".to_string());
                 return (Outcome::Failed, format!("{failure}\n  └─ {grade}"));
             };
-            let security_features = count_security_features(primary_data);
-
             // The grade is the host's, the same line the HTTP pane shows, and the only verdict on
             // its security headers.
             let mut text = format!(
-                "{} {}, {}, {} ({}ms)",
+                "{} {}, {} ({}ms)",
                 primary_data.status_code,
                 primary_data.content_type.as_deref().unwrap_or("unknown"),
-                crate::tui::text::plural(security_features, "security feature"),
                 grade,
                 primary_data.response_time.as_millis()
             );
@@ -444,34 +441,6 @@ fn tls_status_failure(tls: &crate::scan::tls::TlsResult) -> String {
             _ => None,
         })
         .unwrap_or_else(|| "no address".to_string())
-}
-
-fn count_security_features(http_data: &crate::scan::http::HttpData) -> usize {
-    let mut count = 0;
-
-    if http_data.security_headers.strict_transport_security.is_some() {
-        count += 1;
-    }
-    if http_data.security_headers.x_frame_options.is_some() {
-        count += 1;
-    }
-    if http_data.security_headers.x_content_type_options.is_some() {
-        count += 1;
-    }
-    if http_data.security_headers.x_xss_protection.is_some() {
-        count += 1;
-    }
-    if http_data.security_headers.referrer_policy.is_some() {
-        count += 1;
-    }
-    if http_data.security_headers.permissions_policy.is_some() {
-        count += 1;
-    }
-    if http_data.csp.is_some() {
-        count += 1;
-    }
-
-    count
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -789,21 +758,16 @@ mod tests {
         let result = http_result(ObservatoryOutcome::Graded(google_com_result()), Some(http_data(None)));
         let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
         assert!(
-            out.starts_with("✅ HTTP: 200 text/html, 0 security features, grade C- (45) · google.com ("),
+            out.starts_with("✅ HTTP: 200 text/html, grade C- (45) · google.com ("),
             "{out}"
         );
         assert!(!out.contains("vulnerabilit"), "{out}");
+        assert!(!out.contains("security feature"), "{out}");
     }
 
     /// Item 9: every count in the `--no-tui` lines reads `1 <noun>` at one.
     #[test]
     fn counts_of_one_are_singular() {
-        let mut data = http_data(None);
-        data.security_headers.strict_transport_security = Some("max-age=63072000".to_string());
-        let result = http_result(ObservatoryOutcome::Graded(google_com_result()), Some(data));
-        let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
-        assert!(out.contains(", 1 security feature, "), "{out}");
-
         let mut dns = crate::scan::dns::DnsResult::new();
         dns.A = vec![crate::scan::dns::DnsRecord {
             value: "192.0.2.1".parse().unwrap(),
