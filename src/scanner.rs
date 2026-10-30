@@ -38,6 +38,12 @@ pub trait Scanner {
         true
     }
 
+    /// How long until the next scan after `result`, overriding `interval()` for that one wait.
+    /// `None` keeps the interval schedule. Called before the result is stored.
+    fn next_delay(&self, _result: &ScanResult) -> Option<Duration> {
+        None
+    }
+
     /// Default implementation of the scanner loop.
     ///
     /// Waits on the interval tick or a protocol change, then scans. A protocol change while a scan
@@ -130,7 +136,19 @@ pub trait Scanner {
                 };
 
                 let result = outcome.unwrap_or_else(|_| Err(eyre::eyre!("timed out after {}s", deadline.as_secs())));
+                let next_delay = result.as_ref().ok().and_then(|result| self.next_delay(result));
                 record_outcome(self.name(), self.max_history(), protocol, scan_start, result, &state);
+                if let Some(delay) = next_delay {
+                    ticker.reset_after(delay);
+                }
+                log::debug!(
+                    "[scanner] next_scan: scanner={} delay={}",
+                    self.name(),
+                    match next_delay {
+                        Some(delay) => format!("{}ms (from result)", delay.as_millis()),
+                        None => format!("interval schedule ({}ms)", self.interval().as_millis()),
+                    }
+                );
                 log::debug!(
                     "[scanner] scan_cycle_completed: scanner={} count={} protocol={}",
                     self.name(),
@@ -695,6 +713,71 @@ mod tests {
         let (_, _, retained) = h.calls.recv().await.unwrap();
         assert!(retained, "WHOIS-like scanner lost its result on a protocol change");
         h.handle.abort();
+    }
+
+    /// Interval 60s; `next_delay` returns `delay` after every successful scan.
+    struct DelayStub {
+        calls: tokio::sync::mpsc::UnboundedSender<tokio::time::Instant>,
+        delay: Option<Duration>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Scanner for DelayStub {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn next_delay(&self, _result: &ScanResult) -> Option<Duration> {
+            self.delay
+        }
+        async fn scan(&self, _target: &Target, _protocol: Protocol) -> Result<ScanResult, eyre::Error> {
+            self.calls.send(tokio::time::Instant::now()).unwrap();
+            if self.fail {
+                return Err(eyre::eyre!("stub failure"));
+            }
+            Ok(ScanResult::Ping(PingResult::new()))
+        }
+    }
+
+    /// The gap between the first and second scan of a `DelayStub`.
+    async fn second_scan_gap(delay: Option<Duration>, fail: bool) -> Duration {
+        let (calls_tx, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let scanner = DelayStub {
+            calls: calls_tx,
+            delay,
+            fail,
+        };
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        let target = Target::parse("example.com").unwrap();
+        let handle = tokio::spawn(async move { scanner.run(target, fixed_protocol(), state).await });
+        let first = calls.recv().await.unwrap();
+        let second = calls.recv().await.unwrap();
+        handle.abort();
+        second - first
+    }
+
+    /// Item B: a result-driven delay replaces the 60s interval for the next wait.
+    #[tokio::test(start_paused = true)]
+    async fn next_delay_rescans_after_the_delay_not_the_interval() {
+        let gap = second_scan_gap(Some(Duration::from_secs(2)), false).await;
+        assert!(gap <= Duration::from_secs(2), "rescanned after {gap:?}, not within 2s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_next_delay_keeps_the_interval() {
+        assert_eq!(second_scan_gap(None, false).await, Duration::from_secs(60));
+    }
+
+    /// A failed scan has no result to take a delay from, so the interval holds.
+    #[tokio::test(start_paused = true)]
+    async fn failed_scan_ignores_next_delay() {
+        assert_eq!(
+            second_scan_gap(Some(Duration::from_secs(2)), true).await,
+            Duration::from_secs(60)
+        );
     }
 
     #[test]

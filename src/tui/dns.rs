@@ -24,6 +24,7 @@ const MAX_NS_RECORDS_DISPLAYED: usize = 1000;
 const MAX_CNAME_RECORDS_DISPLAYED: usize = 1000;
 const MAX_CAA_RECORDS_DISPLAYED: usize = 1000;
 const MAX_SRV_RECORDS_DISPLAYED: usize = 1000;
+const MAX_PTR_RECORDS_DISPLAYED: usize = 1000;
 const MIN_DNS_PANE_WIDTH: u16 = 25;
 const MIN_DNS_PANE_HEIGHT: u16 = 10;
 const SCROLL_STEP: u16 = 1;
@@ -129,37 +130,25 @@ impl DnsPane {
     fn build_dns_result_lines(dns_result: crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
-        // Helper function to get status color and text
-        let get_status_display = |status: &crate::scan::dns::QueryStatus| -> (Color, String) {
-            match status {
-                crate::scan::dns::QueryStatus::NotQueried => (Color::Gray, "not queried".to_string()),
-                crate::scan::dns::QueryStatus::Success(count) => (Color::Green, format!("{} records", count)),
-                crate::scan::dns::QueryStatus::NoRecords => (Color::Yellow, "No Records".to_string()),
-                crate::scan::dns::QueryStatus::Failed(_error) => (Color::Red, "Failed".to_string()),
-                crate::scan::dns::QueryStatus::Timeout => (Color::Red, "Timeout".to_string()),
-            }
-        };
+        // An IP target has only reverse DNS, so PTR leads.
+        let reverse_only = dns_result.is_reverse_only();
+        if reverse_only {
+            lines.extend(ptr_lines(&dns_result));
+        }
 
         // A records
-        let (a_color, a_status_text) = get_status_display(&dns_result.A_status);
+        let (a_color, a_status_text) = status_display(&dns_result.A_status);
         lines.push(Line::from(vec![
             Span::styled("A: ", Style::default().fg(Color::White)),
             Span::styled(a_status_text, Style::default().fg(a_color)),
         ]));
 
         if !dns_result.A.is_empty() {
-            let ttl = dns_result.A[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.A[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("  TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
+                ttl,
             ]));
 
             // Show A records
@@ -172,25 +161,18 @@ impl DnsPane {
         }
 
         // AAAA records (IPv6)
-        let (aaaa_color, aaaa_status_text) = get_status_display(&dns_result.AAAA_status);
+        let (aaaa_color, aaaa_status_text) = status_display(&dns_result.AAAA_status);
         lines.push(Line::from(vec![
             Span::styled("AAAA: ", Style::default().fg(Color::White)),
             Span::styled(aaaa_status_text, Style::default().fg(aaaa_color)),
         ]));
 
         if !dns_result.AAAA.is_empty() {
-            let ttl = dns_result.AAAA[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.AAAA[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("  TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
+                ttl,
             ]));
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
@@ -204,22 +186,15 @@ impl DnsPane {
         }
 
         // CNAME records
+        lines.extend(failed_query_line("CNAME", &dns_result.CNAME_status));
         if !dns_result.CNAME.is_empty() {
-            let ttl = dns_result.CNAME[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.CNAME[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("CNAME: ", Style::default().fg(Color::White)),
                 Span::styled(dns_result.CNAME.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             for record in dns_result.CNAME.iter().take(MAX_CNAME_RECORDS_DISPLAYED) {
@@ -232,21 +207,13 @@ impl DnsPane {
 
         // NS records
         if !dns_result.NS.is_empty() {
-            let ttl = dns_result.NS[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.NS[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("NS: ", Style::default().fg(Color::White)),
                 Span::styled(dns_result.NS.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             for record in dns_result.NS.iter().take(MAX_NS_RECORDS_DISPLAYED) {
@@ -259,21 +226,13 @@ impl DnsPane {
 
         // TXT records (basic display, security analysis goes to security pane)
         if !dns_result.TXT.is_empty() {
-            let ttl = dns_result.TXT[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.TXT[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("TXT: ", Style::default().fg(Color::White)),
                 Span::styled(dns_result.TXT.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             for record in dns_result.TXT.iter().take(MAX_TXT_RECORDS_DISPLAYED) {
@@ -300,22 +259,15 @@ impl DnsPane {
         }
 
         // CAA records
+        lines.extend(failed_query_line("CAA", &dns_result.CAA_status));
         if !dns_result.CAA.is_empty() {
-            let ttl = dns_result.CAA[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.CAA[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("CAA: ", Style::default().fg(Color::White)),
                 Span::styled(dns_result.CAA.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" cert auth (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled(" cert auth, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             for record in dns_result.CAA.iter().take(MAX_CAA_RECORDS_DISPLAYED) {
@@ -337,21 +289,13 @@ impl DnsPane {
                 Span::styled("none (null MX)", Style::default().fg(Color::Gray)),
             ]));
         } else if !dns_result.MX.is_empty() {
-            let ttl = dns_result.MX[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.MX[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("MX: ", Style::default().fg(Color::White)),
                 Span::styled(dns_result.MX.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             for record in dns_result.MX.iter().take(MAX_MX_RECORDS_DISPLAYED) {
@@ -378,20 +322,12 @@ impl DnsPane {
 
         // SOA records
         if !dns_result.SOA.is_empty() {
-            let ttl = dns_result.SOA[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.SOA[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("SOA: ", Style::default().fg(Color::White)),
-                Span::styled("authority (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled("authority, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             if let Some(soa) = dns_result.SOA.first() {
@@ -414,21 +350,13 @@ impl DnsPane {
 
         // SRV records
         if !dns_result.SRV.is_empty() {
-            let ttl = dns_result.SRV[0].ttl_remaining();
-            let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
-                Color::Green
-            } else if ttl > TTL_WARNING_THRESHOLD {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
+            let ttl = ttl_span(dns_result.SRV[0].ttl_remaining());
 
             lines.push(Line::from(vec![
                 Span::styled("SRV: ", Style::default().fg(Color::White)),
                 Span::styled(dns_result.SRV.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" services (TTL: ", Style::default().fg(Color::White)),
-                Span::styled(format!("{}s", ttl), Style::default().fg(ttl_color)),
-                Span::styled(")", Style::default().fg(Color::White)),
+                Span::styled(" services, TTL: ", Style::default().fg(Color::White)),
+                ttl,
             ]));
 
             for record in dns_result.SRV.iter().take(MAX_SRV_RECORDS_DISPLAYED) {
@@ -443,6 +371,10 @@ impl DnsPane {
                     ),
                 ]));
             }
+        }
+
+        if !reverse_only {
+            lines.extend(ptr_lines(&dns_result));
         }
 
         lines
@@ -471,6 +403,71 @@ impl DnsPane {
             Span::styled("scanner not available", Style::default().fg(Color::Red)),
         ])]
     }
+}
+
+/// A record set's query outcome: color and text.
+fn status_display(status: &crate::scan::dns::QueryStatus) -> (Color, String) {
+    match status {
+        crate::scan::dns::QueryStatus::NotQueried => (Color::Gray, "not queried".to_string()),
+        crate::scan::dns::QueryStatus::Success(count) => (Color::Green, format!("{} records", count)),
+        crate::scan::dns::QueryStatus::NoRecords => (Color::Yellow, "No Records".to_string()),
+        crate::scan::dns::QueryStatus::Failed(_error) => (Color::Red, "Failed".to_string()),
+        crate::scan::dns::QueryStatus::Timeout => (Color::Red, "Timeout".to_string()),
+    }
+}
+
+/// A record's remaining TTL as the stub resolver reported it: `<n>s (cached)`, since that is the
+/// resolver cache's countdown, not the zone's TTL. At 0 the scanner is already re-querying, so it
+/// reads `expired, refreshing` (MUTED: Gray until the theme lands).
+fn ttl_span(ttl: u32) -> Span<'static> {
+    if ttl == 0 {
+        return Span::styled("expired, refreshing", Style::default().fg(Color::Gray));
+    }
+    let color = if ttl > TTL_GOOD_THRESHOLD {
+        Color::Green
+    } else if ttl > TTL_WARNING_THRESHOLD {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    Span::styled(format!("{}s (cached)", ttl), Style::default().fg(color))
+}
+
+/// `<label>: Failed` or `Timeout` for a lookup that did not answer; nothing otherwise, since most
+/// names have no CNAME or CAA and an empty answer is not news.
+fn failed_query_line(label: &'static str, status: &crate::scan::dns::QueryStatus) -> Option<Line<'static>> {
+    if !matches!(
+        status,
+        crate::scan::dns::QueryStatus::Failed(_) | crate::scan::dns::QueryStatus::Timeout
+    ) {
+        return None;
+    }
+    let (color, text) = status_display(status);
+    Some(Line::from(vec![
+        Span::styled(format!("{}: ", label), Style::default().fg(Color::White)),
+        Span::styled(text, Style::default().fg(color)),
+    ]))
+}
+
+/// The `PTR:` section: reverse DNS for the target's addresses.
+fn ptr_lines(dns_result: &crate::scan::dns::DnsResult) -> Vec<Line<'static>> {
+    let (color, text) = status_display(&dns_result.PTR_status);
+    let mut header = vec![
+        Span::styled("PTR: ", Style::default().fg(Color::White)),
+        Span::styled(text, Style::default().fg(color)),
+    ];
+    if let Some(first) = dns_result.PTR.first() {
+        header.push(Span::styled(", TTL: ", Style::default().fg(Color::White)));
+        header.push(ttl_span(first.ttl_remaining()));
+    }
+    let mut lines = vec![Line::from(header)];
+    for record in dns_result.PTR.iter().take(MAX_PTR_RECORDS_DISPLAYED) {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(record.value.clone(), Style::default().fg(Color::Cyan)),
+        ]));
+    }
+    lines
 }
 
 /// True for the RFC 7505 null MX: exactly one record, priority 0, exchange `.`.
@@ -652,6 +649,111 @@ mod tests {
             30,
             false,
         )
+    }
+
+    use crate::scan::dns::{CaaRecord, DnsRecord, DnsResult, QueryStatus};
+
+    fn render_dns(result: DnsResult, target: &str) -> String {
+        let mut state = complete_state("dns", crate::types::ScanResult::Dns(result));
+        state.target = target.to_string();
+        crate::tui::testing::render_pane(&DnsPane::new(), &state, 80, 40, false)
+    }
+
+    /// The pane's text rows with the border stripped and trailing space trimmed.
+    fn rows(pane: &str) -> Vec<String> {
+        pane.lines()
+            .map(|l| l.trim_matches(['│', ' ']).to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Item 6: CNAME and CAA answers render their own sections.
+    #[test]
+    fn cname_and_caa_render_their_sections() {
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::NoRecords;
+        result.CNAME = vec![DnsRecord::new("cname.vercel-dns.com.".to_string(), 300)];
+        result.CNAME_status = QueryStatus::Success(1);
+        result.CAA = vec![DnsRecord::new(
+            CaaRecord {
+                flags: 0,
+                tag: "issue".to_string(),
+                value: "letsencrypt.org".to_string(),
+            },
+            300,
+        )];
+        result.CAA_status = QueryStatus::Success(1);
+        let out = render_dns(result, "www.tatari.tv");
+        assert!(out.contains("CNAME: 1 records, TTL: "), "{out}");
+        assert!(out.contains("cname.vercel-dns.com."), "{out}");
+        assert!(out.contains("CAA: 1 cert auth, TTL: "), "{out}");
+        assert!(out.contains("issue letsencrypt.org"), "{out}");
+    }
+
+    #[test]
+    fn failed_cname_lookup_says_so_and_an_empty_one_is_silent() {
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::NoRecords;
+        result.CNAME_status = QueryStatus::Timeout;
+        result.CAA_status = QueryStatus::NoRecords;
+        let out = render_dns(result, "example.com");
+        assert!(out.contains("CNAME: Timeout"), "{out}");
+        assert!(!out.contains("CAA:"), "{out}");
+    }
+
+    /// Item 7: an IP target's DNS pane leads with PTR.
+    #[test]
+    fn ip_target_renders_ptr_first() {
+        let mut result = DnsResult::new();
+        result.PTR = vec![DnsRecord::new("one.one.one.one.".to_string(), 300)];
+        result.PTR_status = QueryStatus::Success(1);
+        let out = render_dns(result, "1.1.1.1");
+        let rows = rows(&out);
+        let first_record_row = rows
+            .iter()
+            .position(|r| r.contains(':') && !r.contains("Status"))
+            .unwrap();
+        assert!(rows[first_record_row].starts_with("PTR: 1 records"), "{out}");
+        assert_eq!(rows[first_record_row + 1], "one.one.one.one.", "{out}");
+    }
+
+    /// A name target keeps A first and shows PTR after the forward records.
+    #[test]
+    fn name_target_renders_ptr_after_the_forward_records() {
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::NoRecords;
+        result.A = vec![DnsRecord::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 300)];
+        result.A_status = QueryStatus::Success(1);
+        result.PTR = vec![DnsRecord::new("host.example.".to_string(), 300)];
+        result.PTR_status = QueryStatus::Success(1);
+        let out = render_dns(result, "example.com");
+        let a = out.find("A: 1 records").unwrap();
+        let ptr = out.find("PTR: 1 records").unwrap();
+        assert!(a < ptr, "{out}");
+    }
+
+    /// Item B: a TTL is the stub resolver's countdown, so it says `cached`; at 0 the scanner is
+    /// re-querying, and the pane says that instead of a bare `0s`.
+    #[test]
+    fn ttl_reads_cached_and_expired_reads_refreshing() {
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::NoRecords;
+        result.A = vec![DnsRecord::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 300)];
+        result.A_status = QueryStatus::Success(1);
+        let fresh = render_dns(result.clone(), "example.com");
+        assert!(
+            fresh.contains("TTL: 300s (cached)") || fresh.contains("TTL: 299s (cached)"),
+            "{fresh}"
+        );
+
+        result.A[0].queried_at = std::time::Instant::now() - std::time::Duration::from_secs(301);
+        let mut state = complete_state("dns", crate::types::ScanResult::Dns(result));
+        state.target = "example.com".to_string();
+        let buffer = crate::tui::testing::render_buffer(&DnsPane::new(), &state, 80, 40, false);
+        let out = crate::tui::testing::render_pane(&DnsPane::new(), &state, 80, 40, false);
+        assert!(out.contains("TTL: expired, refreshing"), "{out}");
+        assert!(!out.contains("TTL: 0s"), "{out}");
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "expired, refreshing"), Color::Gray);
     }
 
     #[test]

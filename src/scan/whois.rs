@@ -1,15 +1,12 @@
-mod cache;
-
+use crate::scan::cache::{CachedSource, FETCH_TIMEOUT, default_cache_dir};
+use crate::scan::psl::{PSL_URL, SuffixList};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
-use cache::{CachedSource, FETCH_TIMEOUT};
 use chrono::{DateTime, Utc};
 use hickory_resolver::Resolver;
 use log;
-use psl::Psl;
-use publicsuffix::{self as psl, IcannList};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -36,11 +33,6 @@ const WHOIS_NAMESERVER_KEYS: &[&str] = &["name server", "nameserver", "nserver"]
 /// IANA's RDAP bootstrap for DNS: which RDAP base URL serves each TLD.
 const RDAP_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
 const RDAP_BOOTSTRAP_CACHE_FILE: &str = "rdap-dns.json";
-/// The public suffix list; its ICANN section names the registrable domain of a host.
-const PSL_URL: &str = "https://publicsuffix.org/list/public_suffix_list.dat";
-const PSL_CACHE_FILE: &str = "public_suffix_list.dat";
-/// Directory under the user cache dir (`~/.cache`) holding both files.
-const CACHE_DIR_NAME: &str = "scan";
 /// Headroom on the scan deadline past RDAP plus the fallback, for parsing and scheduling.
 const DEADLINE_SLACK_SECS: u64 = 5;
 const WHOIS_SCAN_INTERVAL_SECS: u64 = 60 * 60; // 1 hour
@@ -90,7 +82,7 @@ impl WhoisScanner {
             iana_server: format!("{}:{}", IANA_WHOIS_SERVER, WHOIS_PORT),
             rdap_bootstrap_url: RDAP_BOOTSTRAP_URL.to_string(),
             psl_url: PSL_URL.to_string(),
-            cache_dir: dirs::cache_dir().map(|dir| dir.join(CACHE_DIR_NAME)),
+            cache_dir: default_cache_dir(),
             source_fetch_timeout: FETCH_TIMEOUT,
             rdap_timeout: Duration::from_secs(RDAP_TIMEOUT_SECS),
             whois_timeout: Duration::from_secs(WHOIS_LOOKUP_TIMEOUT_SECS),
@@ -114,7 +106,7 @@ impl WhoisScanner {
         // Cold-cache fetches of the suffix list and the RDAP bootstrap spend the RDAP budget, so
         // the scan deadline still covers RDAP plus the WHOIS fallback.
         let rdap_deadline = tokio::time::Instant::now() + self.rdap_timeout;
-        let (domain, suffix_list_error) = match self.registrable_domain(&host, rdap_deadline).await {
+        let (domain, suffix_list_error) = match self.suffix_list().registrable_domain(&host, rdap_deadline).await {
             Ok(Some(domain)) => (domain, None),
             Ok(None) => {
                 log::debug!("[scan::whois] no_registrable_domain: host={}", host);
@@ -209,32 +201,14 @@ impl WhoisScanner {
         }
     }
 
-    /// The registrable domain of `host` under the ICANN section of the public suffix list:
-    /// `www.tatari.tv` -> `tatari.tv`. `Ok(None)` when the host has none (`localhost`, a bare
-    /// public suffix, a name `idna` rejects). `Err` when the suffix list is unavailable.
-    async fn registrable_domain(&self, host: &str, deadline: tokio::time::Instant) -> eyre::Result<Option<String>> {
-        log::debug!("[scan::whois] registrable_domain: host={}", host);
-        let ascii = match idna::domain_to_ascii(host.trim_end_matches('.')) {
-            Ok(ascii) => ascii,
-            Err(e) => {
-                log::debug!("[scan::whois] host_not_a_domain_name: host={} error={}", host, e);
-                return Ok(None);
-            }
-        };
-        let list = self
-            .cached_source(&self.psl_url, PSL_CACHE_FILE)
-            .load(deadline, parse_suffix_list)
-            .await?;
-        let domain = list
-            .domain(ascii.as_bytes())
-            .map(|d| String::from_utf8_lossy(d.as_bytes()).into_owned());
-        log::debug!(
-            "[scan::whois] registrable_domain_found: host={} ascii={} domain={:?}",
-            host,
-            ascii,
-            domain
-        );
-        Ok(domain)
+    /// The public suffix list at this scanner's URL, cached beside the RDAP bootstrap.
+    fn suffix_list(&self) -> SuffixList {
+        SuffixList {
+            client: self.client.clone(),
+            url: self.psl_url.clone(),
+            cache_dir: self.cache_dir.clone(),
+            fetch_timeout: self.source_fetch_timeout,
+        }
     }
 
     /// The RDAP base URL IANA's bootstrap lists for `tld`, ending in `/`. `Ok(None)` when the TLD
@@ -1093,23 +1067,6 @@ fn normalized_host(host: &str) -> String {
     idna::domain_to_ascii(host).unwrap_or_else(|_| host.to_lowercase())
 }
 
-/// Marks the start of the ICANN section in the public suffix list.
-const PSL_ICANN_MARKER: &str = "===BEGIN ICANN DOMAINS===";
-
-/// The ICANN section only: the PRIVATE section would make `github.io` a public suffix, so
-/// `foo.github.io` would be its own registrable domain. A list without the ICANN marker is corrupt:
-/// the crate accepts PRIVATE rules alone, and an empty ICANN section maps `a.b.co.uk` to `co.uk`.
-fn parse_suffix_list(text: &str) -> eyre::Result<IcannList> {
-    if !text.contains(PSL_ICANN_MARKER) {
-        return Err(eyre::eyre!(
-            "public suffix list has no ICANN section ({} missing)",
-            PSL_ICANN_MARKER
-        ));
-    }
-    text.parse::<IcannList>()
-        .map_err(|e| eyre::eyre!("public suffix list does not parse: {}", e))
-}
-
 /// IANA's RDAP bootstrap file (RFC 9224): each service is a list of TLDs and their base URLs.
 #[derive(Debug, Deserialize)]
 struct RdapBootstrap {
@@ -1191,6 +1148,7 @@ fn with_whois_port(server: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::psl::{PSL_CACHE_FILE, PSL_FIXTURE};
     use crate::scan::testing::{FakeHttp, dead_http_url, temp_dir};
 
     #[test]
@@ -1614,11 +1572,6 @@ mod tests {
         assert!(printed.contains("❌ WHOIS:"), "{printed}");
     }
 
-    /// ICANN section plus a PRIVATE entry, so a test can tell which section was read.
-    const PSL_FIXTURE: &str = "// ===BEGIN ICANN DOMAINS===\ntv\nuk\nco.uk\nio\ndev\nde\n\
-                               // ===END ICANN DOMAINS===\n// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n\
-                               // ===END PRIVATE DOMAINS===\n";
-
     const RDAP_FIXTURE: &str = r#"{"events":[{"eventAction":"registration","eventDate":"2001-02-03T00:00:00Z"}],
         "entities":[{"roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","Fixture Registrar"]]]}]}"#;
 
@@ -1673,37 +1626,6 @@ mod tests {
         tokio::time::Instant::now() + Duration::from_secs(5)
     }
 
-    /// Defect #4: the registrable domain under the ICANN section only, from a lowercased,
-    /// punycoded host.
-    #[tokio::test]
-    async fn registrable_domain_is_the_icann_registrable_domain() {
-        let fake = fake_sources(&[]).await;
-        let scanner = scanner_with_fakes(&fake, dead_whois().await);
-        for (host, expected) in [
-            ("www.tatari.tv", "tatari.tv"),
-            ("a.b.co.uk", "b.co.uk"),
-            ("foo.github.io", "github.io"),
-            ("WWW.Tatari.TV.", "tatari.tv"),
-            ("www.bücher.de", "xn--bcher-kva.de"),
-        ] {
-            let domain = scanner.registrable_domain(host, far_deadline()).await.unwrap();
-            assert_eq!(domain.as_deref(), Some(expected), "{host}");
-        }
-    }
-
-    #[tokio::test]
-    async fn host_without_a_registrable_domain_has_none() {
-        let fake = fake_sources(&[]).await;
-        let scanner = scanner_with_fakes(&fake, dead_whois().await);
-        for host in ["localhost", "co.uk", "tv"] {
-            assert_eq!(
-                scanner.registrable_domain(host, far_deadline()).await.unwrap(),
-                None,
-                "{host}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn no_registrable_domain_scan_is_not_applicable_and_the_pane_says_why() {
         let fake = fake_sources(&[]).await;
@@ -1754,43 +1676,6 @@ mod tests {
     fn rdap_bootstrap_without_services_is_corrupt() {
         assert!(parse_rdap_bootstrap(r#"{"services":[]}"#).is_err());
         assert!(parse_rdap_bootstrap("<html>").is_err());
-    }
-
-    #[test]
-    fn suffix_list_without_an_icann_section_is_corrupt() {
-        assert!(parse_suffix_list("<html>captive portal</html>").is_err());
-        assert!(parse_suffix_list(PSL_FIXTURE).is_ok());
-    }
-
-    /// Audit round 1: PRIVATE rules alone parse in the crate, which counts rules of either section,
-    /// and an empty ICANN section then makes `a.b.co.uk` resolve to `co.uk`.
-    #[test]
-    fn suffix_list_with_only_a_private_section_is_corrupt() {
-        let private_only = "// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n// ===END PRIVATE DOMAINS===\n";
-        let error = parse_suffix_list(private_only).expect_err("a list with no ICANN section must not parse");
-        assert!(error.to_string().contains("ICANN"), "{error:#}");
-    }
-
-    /// Audit round 1: a PRIVATE-only body is not cached, so the next lookup refetches it.
-    #[tokio::test]
-    async fn fetched_suffix_list_without_an_icann_section_is_not_cached() {
-        let fake = fake_sources(&[]).await;
-        fake.add_route(
-            "/private-only",
-            200,
-            "// ===BEGIN PRIVATE DOMAINS===\ngithub.io\n// ===END PRIVATE DOMAINS===\n".to_string(),
-        );
-        let scanner = WhoisScanner {
-            psl_url: fake.url("/private-only"),
-            ..scanner_with_fakes(&fake, dead_whois().await)
-        };
-
-        for _ in 0..2 {
-            assert!(scanner.registrable_domain("a.b.co.uk", far_deadline()).await.is_err());
-        }
-
-        assert_eq!(fake.hits("/private-only"), 2);
-        assert!(!scanner.cache_dir.as_ref().unwrap().join(PSL_CACHE_FILE).exists());
     }
 
     /// AC1 at the scanner seam: `www.tatari.tv` is looked up as `tatari.tv` over RDAP, and the

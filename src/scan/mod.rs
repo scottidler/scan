@@ -1,9 +1,11 @@
+pub mod cache;
 pub mod connect;
 pub mod dns;
 pub mod geoip;
 pub mod http;
 pub mod ping;
 pub mod port;
+pub mod psl;
 #[cfg(test)]
 pub mod testing;
 pub mod tls;

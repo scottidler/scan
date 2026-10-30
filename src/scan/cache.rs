@@ -1,5 +1,6 @@
-//! Fetched data files the WHOIS scanner caches on disk: the public suffix list and the IANA RDAP
-//! bootstrap. Both change faster than the code, so they are fetched, not compiled in.
+//! Fetched data files the scanners cache on disk: the public suffix list (WHOIS and DNS) and the
+//! IANA RDAP bootstrap (WHOIS). Both change faster than the code, so they are fetched, not compiled
+//! in.
 
 use reqwest::Client;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,14 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time the outer timer gives past reqwest's own request timeout, so a hung fetch normally fails
 /// with reqwest's classified error, which names the stage, not the bare outer deadline.
 const FETCH_DEADLINE_GRACE: Duration = Duration::from_secs(1);
+
+/// Directory under the user cache dir (`~/.cache`) holding every cached file.
+const CACHE_DIR_NAME: &str = "scan";
+
+/// `~/.cache/scan`, or `None` when the platform has no cache dir.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join(CACHE_DIR_NAME))
+}
 
 /// Distinguishes temp files written by concurrent fetches inside one process.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -43,7 +52,7 @@ impl CachedSource<'_> {
         parse: impl Fn(&str) -> eyre::Result<T>,
     ) -> eyre::Result<T> {
         log::debug!(
-            "[scan::whois::cache] load: file={} url={} cache_dir={:?}",
+            "[scan::cache] load: file={} url={} cache_dir={:?}",
             self.file_name,
             self.url,
             self.cache_dir
@@ -53,7 +62,7 @@ impl CachedSource<'_> {
         let stale = match cached {
             Some((value, age)) if age < CACHE_MAX_AGE => {
                 log::debug!(
-                    "[scan::whois::cache] cache_fresh: file={} age={}s",
+                    "[scan::cache] cache_fresh: file={} age={}s",
                     self.file_name,
                     age.as_secs()
                 );
@@ -66,11 +75,7 @@ impl CachedSource<'_> {
         let refresh_error = match fetched.and_then(|text| parse(&text).map(|value| (text, value))) {
             Ok((text, value)) => {
                 self.write_cache(&text).await;
-                log::debug!(
-                    "[scan::whois::cache] fetched: file={} bytes={}",
-                    self.file_name,
-                    text.len()
-                );
+                log::debug!("[scan::cache] fetched: file={} bytes={}", self.file_name, text.len());
                 return Ok(value);
             }
             Err(e) => e,
@@ -79,7 +84,7 @@ impl CachedSource<'_> {
         match stale {
             Some((value, age)) => {
                 log::warn!(
-                    "[scan::whois::cache] refresh_failed_using_stale_cache: file={} age={}s error={:#}",
+                    "[scan::cache] refresh_failed_using_stale_cache: file={} age={}s error={:#}",
                     self.file_name,
                     age.as_secs(),
                     refresh_error
@@ -88,7 +93,7 @@ impl CachedSource<'_> {
             }
             None => {
                 log::warn!(
-                    "[scan::whois::cache] refresh_failed_no_cache: file={} error={:#}",
+                    "[scan::cache] refresh_failed_no_cache: file={} error={:#}",
                     self.file_name,
                     refresh_error
                 );
@@ -107,11 +112,7 @@ impl CachedSource<'_> {
         let modified = match tokio::fs::metadata(&path).await.and_then(|m| m.modified()) {
             Ok(modified) => modified,
             Err(e) => {
-                log::debug!(
-                    "[scan::whois::cache] cache_missing: path={} error={}",
-                    path.display(),
-                    e
-                );
+                log::debug!("[scan::cache] cache_missing: path={} error={}", path.display(), e);
                 return None;
             }
         };
@@ -120,18 +121,14 @@ impl CachedSource<'_> {
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(e) => {
-                log::warn!(
-                    "[scan::whois::cache] cache_unreadable: path={} error={}",
-                    path.display(),
-                    e
-                );
+                log::warn!("[scan::cache] cache_unreadable: path={} error={}", path.display(), e);
                 return None;
             }
         };
         match parse(&text) {
             Ok(value) => {
                 log::debug!(
-                    "[scan::whois::cache] cache_read: path={} age={}s",
+                    "[scan::cache] cache_read: path={} age={}s",
                     path.display(),
                     age.as_secs()
                 );
@@ -139,7 +136,7 @@ impl CachedSource<'_> {
             }
             Err(e) => {
                 log::warn!(
-                    "[scan::whois::cache] cache_corrupt_treated_as_missing: path={} error={:#}",
+                    "[scan::cache] cache_corrupt_treated_as_missing: path={} error={:#}",
                     path.display(),
                     e
                 );
@@ -158,7 +155,7 @@ impl CachedSource<'_> {
             deadline.saturating_duration_since(tokio::time::Instant::now()),
         );
         log::debug!(
-            "[scan::whois::cache] bounded_fetch: url={} limit={:?} window={:?}",
+            "[scan::cache] bounded_fetch: url={} limit={:?} window={:?}",
             self.url,
             limit,
             window
@@ -174,13 +171,13 @@ impl CachedSource<'_> {
         };
         match &fetched {
             Ok(text) => log::debug!(
-                "[scan::whois::cache] fetch_succeeded: url={} elapsed={}ms bytes={}",
+                "[scan::cache] fetch_succeeded: url={} elapsed={}ms bytes={}",
                 self.url,
                 started.elapsed().as_millis(),
                 text.len()
             ),
             Err(failure) => log::warn!(
-                "[scan::whois::cache] fetch_failed: url={} elapsed={}ms class={} {}",
+                "[scan::cache] fetch_failed: url={} elapsed={}ms class={} {}",
                 self.url,
                 started.elapsed().as_millis(),
                 failure.class,
@@ -192,7 +189,7 @@ impl CachedSource<'_> {
 
     /// One GET bounded by `limit` (reqwest's request timeout covers connect, TLS and body).
     async fn fetch(&self, limit: Duration) -> Result<String, FetchFailure> {
-        log::debug!("[scan::whois::cache] fetch: url={} limit={:?}", self.url, limit);
+        log::debug!("[scan::cache] fetch: url={} limit={:?}", self.url, limit);
         let response = self
             .client
             .get(self.url)
@@ -235,7 +232,7 @@ impl CachedSource<'_> {
     async fn write_cache(&self, text: &str) {
         let (Some(dir), Some(path)) = (self.cache_dir, self.cache_path()) else {
             log::debug!(
-                "[scan::whois::cache] no_cache_dir: file={} kept in memory only",
+                "[scan::cache] no_cache_dir: file={} kept in memory only",
                 self.file_name
             );
             return;
@@ -255,7 +252,7 @@ impl CachedSource<'_> {
         if let Err(e) = written {
             let _ = tokio::fs::remove_file(&temp).await;
             log::warn!(
-                "[scan::whois::cache] cache_write_failed: path={} error={}; using fetched data in memory",
+                "[scan::cache] cache_write_failed: path={} error={}; using fetched data in memory",
                 path.display(),
                 e
             );

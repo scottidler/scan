@@ -1,16 +1,28 @@
+use crate::scan::cache::FETCH_TIMEOUT;
+use crate::scan::psl::SuffixList;
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use hickory_resolver::Resolver;
+use hickory_resolver::lookup::Lookup;
+use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::{Resolver, TokioResolver};
 use log;
+use reqwest::Client;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 const DNS_SCAN_INTERVAL_SECS: u64 = 60;
 const DNS_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_DNS_TTL: u32 = 300;
+/// Bounds on the TTL-driven re-query: the floor keeps tiny TTLs from hammering the resolver, the
+/// ceiling keeps the old once-a-minute refresh for long TTLs.
+const DNS_REQUERY_FLOOR: Duration = Duration::from_secs(10);
+const DNS_REQUERY_CEILING: Duration = Duration::from_secs(60);
+/// RFC 7489: a DMARC policy record is a TXT record at `_dmarc.<domain>` starting with this tag.
+const DMARC_PREFIX: &str = "_dmarc";
+const DMARC_VERSION_TAG: &str = "v=DMARC1";
 
 #[derive(Debug, Clone)]
 pub struct DnsRecord<T> {
@@ -35,6 +47,11 @@ impl<T> DnsRecord<T> {
 
     pub fn is_expired(&self) -> bool {
         self.ttl_remaining() == 0
+    }
+
+    /// When the resolver's cached answer runs out: `queried_at + ttl`.
+    pub fn expires_at(&self) -> Instant {
+        self.queried_at + Duration::from_secs(u64::from(self.ttl_original))
     }
 }
 
@@ -71,14 +88,14 @@ pub struct SrvRecord {
     pub target: String,
 }
 
-// Email Security Analysis
+/// SPF from the apex TXT records, DMARC from `_dmarc.` (RFC 7489). DKIM is not here: its records
+/// sit at `<selector>._domainkey`, and without a selector there is nothing to query.
 #[derive(Debug, Clone)]
 pub struct EmailSecurityAnalysis {
     pub spf_record: Option<String>,
     pub dmarc_record: Option<String>,
     pub has_mx: bool,
     pub mx_count: usize,
-    pub dkim_domains: Vec<String>, // Common DKIM selectors found
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +148,8 @@ pub struct DnsResult {
     pub SOA_status: QueryStatus,
     pub SRV_status: QueryStatus,
     pub PTR_status: QueryStatus,
+    pub CNAME_status: QueryStatus,
+    pub CAA_status: QueryStatus,
 
     pub response_time: Duration,
     pub queried_at: Instant,
@@ -164,6 +183,8 @@ impl DnsResult {
             SOA_status: QueryStatus::NotQueried,
             SRV_status: QueryStatus::NotQueried,
             PTR_status: QueryStatus::NotQueried,
+            CNAME_status: QueryStatus::NotQueried,
+            CAA_status: QueryStatus::NotQueried,
             response_time: Duration::from_millis(0),
             queried_at: Instant::now(),
         }
@@ -195,6 +216,41 @@ impl DnsResult {
         });
     }
 
+    /// True when no forward lookup ran: an IP target, which has only PTR. MX is queried for every
+    /// name target whatever the protocol, so its status tells the two apart.
+    pub fn is_reverse_only(&self) -> bool {
+        !self.MX_status.was_attempted()
+    }
+
+    /// When the first record's cached TTL runs out.
+    fn earliest_expiry(&self) -> Option<Instant> {
+        fn expiries<T>(records: &[DnsRecord<T>]) -> impl Iterator<Item = Instant> + '_ {
+            records.iter().map(DnsRecord::expires_at)
+        }
+        expiries(&self.A)
+            .chain(expiries(&self.AAAA))
+            .chain(expiries(&self.CNAME))
+            .chain(expiries(&self.NS))
+            .chain(expiries(&self.TXT))
+            .chain(expiries(&self.CAA))
+            .chain(expiries(&self.MX))
+            .chain(expiries(&self.PTR))
+            .chain(expiries(&self.SOA))
+            .chain(expiries(&self.SRV))
+            .min()
+    }
+
+    /// Time from `now` to the earliest record expiry, clamped to `DNS_REQUERY_FLOOR`..
+    /// `DNS_REQUERY_CEILING`; `None` when there are no records (NXDOMAIN, every query failed).
+    pub fn requery_delay(&self, now: Instant) -> Option<Duration> {
+        let expiry = self.earliest_expiry()?;
+        Some(
+            expiry
+                .saturating_duration_since(now)
+                .clamp(DNS_REQUERY_FLOOR, DNS_REQUERY_CEILING),
+        )
+    }
+
     pub fn update_ttls(&mut self) {
         // TTL updates are handled individually when querying since each record
         // type can have different TTLs and query times
@@ -204,6 +260,8 @@ impl DnsResult {
 pub struct DnsScanner {
     interval: Duration,
     timeout: Duration,
+    /// Names the organizational domain for DMARC's fallback query.
+    suffix_list: SuffixList,
 }
 
 impl Default for DnsScanner {
@@ -215,74 +273,145 @@ impl Default for DnsScanner {
 impl DnsScanner {
     pub fn new() -> Self {
         log::debug!("[scan::dns] new: interval=60s timeout=5s");
+        let client = Client::builder()
+            .connect_timeout(FETCH_TIMEOUT)
+            .user_agent("scan/1.0")
+            .build()
+            .expect("Failed to create HTTP client");
         Self {
-            interval: Duration::from_secs(DNS_SCAN_INTERVAL_SECS), // DNS lookups every 60 seconds
+            interval: Duration::from_secs(DNS_SCAN_INTERVAL_SECS), // ceiling; TTLs drive re-queries
             timeout: Duration::from_secs(DNS_TIMEOUT_SECS),
+            suffix_list: SuffixList::new(client),
         }
     }
 
-    async fn analyze_email_security(
+    /// One `record_type` lookup of `name`, bounded by the per-query timeout. No records and
+    /// NXDOMAIN are an empty answer, not a failure.
+    async fn timed_lookup(
         &self,
-        txt_records: &[DnsRecord<String>],
-        mx_records: &[DnsRecord<MxRecord>],
-    ) -> EmailSecurityAnalysis {
-        log::debug!(
-            "[scan::dns] analyze_email_security: txt_count={} mx_count={}",
-            txt_records.len(),
-            mx_records.len()
-        );
-
-        let mut spf_record = None;
-        let mut dmarc_record = None;
-        let mut dkim_domains = Vec::new();
-
-        // Parse TXT records for SPF and DMARC
-        for (i, record) in txt_records.iter().enumerate() {
-            let txt = &record.value;
-            if txt.starts_with("v=spf1") {
-                spf_record = Some(txt.clone());
-                log::trace!("[scan::dns] found_spf_record: index={} record={}", i, txt);
-            } else if txt.starts_with("v=DMARC1") {
-                dmarc_record = Some(txt.clone());
-                log::trace!("[scan::dns] found_dmarc_record: index={} record={}", i, txt);
+        resolver: &TokioResolver,
+        name: &str,
+        record_type: RecordType,
+    ) -> std::result::Result<Option<Lookup>, QueryStatus> {
+        log::debug!("[scan::dns] timed_lookup: name={} type={}", name, record_type);
+        match tokio::time::timeout(self.timeout, resolver.lookup(name, record_type)).await {
+            Ok(Ok(lookup)) => Ok(Some(lookup)),
+            Ok(Err(e)) if e.is_no_records_found() || e.is_nx_domain() => {
+                log::trace!("[scan::dns] lookup_no_records: name={} type={}", name, record_type);
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                log::debug!(
+                    "[scan::dns] lookup_failed: name={} type={} error={}",
+                    name,
+                    record_type,
+                    e
+                );
+                Err(QueryStatus::Failed(e.to_string()))
+            }
+            Err(_) => {
+                log::warn!(
+                    "[scan::dns] lookup_timeout: name={} type={} timeout={}ms",
+                    name,
+                    record_type,
+                    self.timeout.as_millis()
+                );
+                Err(QueryStatus::Timeout)
             }
         }
+    }
 
-        // Check for common DKIM selectors
-        // In a real implementation, we might query common selectors like:
-        // default._domainkey.domain.com, selector1._domainkey.domain.com, etc.
-        // For now, we'll note if we should implement this
-        let common_selectors = vec!["default", "selector1", "selector2", "google", "k1"];
-        for selector in common_selectors {
-            // We would implement DKIM lookup here
-            // For now, just add to the list if we find evidence of DKIM usage
-            if txt_records
-                .iter()
-                .any(|r| r.value.contains("k=rsa") || r.value.contains("p="))
-            {
-                dkim_domains.push(format!("{}._domainkey", selector));
-                log::trace!("[scan::dns] found_dkim_evidence: selector={}", selector);
-                break; // Only add one entry to avoid duplicates
-            }
-        }
-
-        let analysis = EmailSecurityAnalysis {
-            spf_record: spf_record.clone(),
-            dmarc_record: dmarc_record.clone(),
-            has_mx: !mx_records.is_empty(),
-            mx_count: mx_records.len(),
-            dkim_domains: dkim_domains.clone(),
+    /// CNAME records at `domain`.
+    async fn lookup_cname(&self, resolver: &TokioResolver, domain: &str) -> (Vec<DnsRecord<String>>, QueryStatus) {
+        log::debug!("[scan::dns] lookup_cname: domain={}", domain);
+        let lookup = match self.timed_lookup(resolver, domain, RecordType::CNAME).await {
+            Ok(lookup) => lookup,
+            Err(status) => return (Vec::new(), status),
         };
+        let records: Vec<_> = lookup
+            .iter()
+            .flat_map(|l| l.record_iter())
+            .filter_map(|record| {
+                let cname = record.data().as_cname()?;
+                Some(DnsRecord::new(cname.0.to_string(), record.ttl()))
+            })
+            .collect();
+        let status = records_status(records.len());
+        (records, status)
+    }
 
-        log::debug!(
-            "[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={} dkim_count={}",
-            analysis.spf_record.is_some(),
-            analysis.dmarc_record.is_some(),
-            analysis.mx_count,
-            analysis.dkim_domains.len()
-        );
+    /// CAA records at `domain`.
+    async fn lookup_caa(&self, resolver: &TokioResolver, domain: &str) -> (Vec<DnsRecord<CaaRecord>>, QueryStatus) {
+        log::debug!("[scan::dns] lookup_caa: domain={}", domain);
+        let lookup = match self.timed_lookup(resolver, domain, RecordType::CAA).await {
+            Ok(lookup) => lookup,
+            Err(status) => return (Vec::new(), status),
+        };
+        let records: Vec<_> = lookup
+            .iter()
+            .flat_map(|l| l.record_iter())
+            .filter_map(|record| {
+                let caa = record.data().as_caa()?;
+                Some(DnsRecord::new(
+                    CaaRecord {
+                        flags: caa.flags(),
+                        tag: caa.tag().to_string(),
+                        value: String::from_utf8_lossy(caa.raw_value()).into_owned(),
+                    },
+                    record.ttl(),
+                ))
+            })
+            .collect();
+        let status = records_status(records.len());
+        (records, status)
+    }
 
-        analysis
+    /// The TXT strings at `name`; empty when there are none or the query failed.
+    async fn txt_at(&self, resolver: &TokioResolver, name: &str) -> Vec<String> {
+        match self.timed_lookup(resolver, name, RecordType::TXT).await {
+            Ok(Some(lookup)) => lookup
+                .record_iter()
+                .filter_map(|record| record.data().as_txt().map(txt_text))
+                .collect(),
+            Ok(None) | Err(_) => Vec::new(),
+        }
+    }
+
+    /// The `_dmarc.` TXT answer for `host`: `_dmarc.<host>` first, then `_dmarc.<registrable
+    /// domain>` (RFC 7489 organizational fallback). Without the suffix list only the host is asked.
+    async fn lookup_dmarc(&self, resolver: &TokioResolver, host: &str) -> Vec<String> {
+        log::debug!("[scan::dns] lookup_dmarc: host={}", host);
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let registrable =
+            match tokio::time::timeout_at(deadline, self.suffix_list.registrable_domain(host, deadline)).await {
+                Ok(Ok(domain)) => domain,
+                Ok(Err(e)) => {
+                    log::warn!(
+                        "[scan::dns] suffix_list_unavailable_dmarc_host_only: host={} error={:#}",
+                        host,
+                        e
+                    );
+                    None
+                }
+                Err(_) => {
+                    log::warn!(
+                        "[scan::dns] suffix_list_timeout_dmarc_host_only: host={} timeout={}ms",
+                        host,
+                        self.timeout.as_millis()
+                    );
+                    None
+                }
+            };
+        let names = dmarc_names(host, registrable.as_deref());
+        for name in &names {
+            let answer = self.txt_at(resolver, name).await;
+            if dmarc_record(&answer).is_some() {
+                log::debug!("[scan::dns] dmarc_found: host={} answered_by={}", host, name);
+                return answer;
+            }
+        }
+        log::debug!("[scan::dns] dmarc_not_found: host={} asked={:?}", host, names);
+        Vec::new()
     }
 
     async fn perform_dns_lookup(&self, target: &Target, protocol: Protocol) -> Result<DnsResult> {
@@ -574,7 +703,6 @@ impl DnsScanner {
             }
 
             // SOA records (protocol-independent, but log protocol for consistency)
-            use hickory_resolver::proto::rr::RecordType;
             match resolver.lookup(domain, RecordType::SOA).await {
                 Ok(response) => {
                     for record in response.record_iter() {
@@ -689,8 +817,15 @@ impl DnsScanner {
                 );
             }
 
-            // Email Security Analysis (protocol-independent, but log protocol for consistency)
-            result.email_security = Some(self.analyze_email_security(&result.TXT, &result.MX).await);
+            let (cname, cname_status) = self.lookup_cname(&resolver, domain).await;
+            result.CNAME = cname;
+            result.CNAME_status = cname_status;
+            let (caa, caa_status) = self.lookup_caa(&resolver, domain).await;
+            result.CAA = caa;
+            result.CAA_status = caa_status;
+
+            let dmarc_txt = self.lookup_dmarc(&resolver, domain).await;
+            result.email_security = Some(analyze_email_security(&result.TXT, &result.MX, &dmarc_txt));
             log::trace!(
                 "[scan::dns] email_security_analyzed: domain={} protocol={}",
                 domain,
@@ -770,7 +905,7 @@ impl DnsScanner {
         result.queried_at = start_time;
 
         log::debug!(
-            "[scan::dns] dns_lookup_completed: target={} protocol={} duration={}ms a_status={:?} aaaa_status={:?} mx_status={:?} txt_status={:?} ptr_status={:?}",
+            "[scan::dns] dns_lookup_completed: target={} protocol={} duration={}ms a_status={:?} aaaa_status={:?} mx_status={:?} txt_status={:?} cname_status={:?} caa_status={:?} ptr_status={:?}",
             target.display_name(),
             protocol.as_str(),
             result.response_time.as_millis(),
@@ -778,6 +913,8 @@ impl DnsScanner {
             result.AAAA_status,
             result.MX_status,
             result.TXT_status,
+            result.CNAME_status,
+            result.CAA_status,
             result.PTR_status
         );
 
@@ -833,11 +970,233 @@ impl Scanner for DnsScanner {
     fn name(&self) -> &'static str {
         "dns"
     }
+
+    /// Re-query when the first cached record expires (10s..60s), so a TTL never sits at 0.
+    fn next_delay(&self, result: &ScanResult) -> Option<Duration> {
+        let ScanResult::Dns(dns) = result else {
+            return None;
+        };
+        let delay = dns.requery_delay(Instant::now());
+        log::debug!("[scan::dns] next_delay: delay={:?}", delay);
+        delay
+    }
+}
+
+/// `Success(n)` for an answer with records, `NoRecords` for an empty one.
+fn records_status(count: usize) -> QueryStatus {
+    if count == 0 { QueryStatus::NoRecords } else { QueryStatus::Success(count) }
+}
+
+/// One TXT record's character strings, joined.
+fn txt_text(txt: &hickory_resolver::proto::rr::rdata::TXT) -> String {
+    txt.iter()
+        .map(|bytes| String::from_utf8_lossy(bytes))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Where DMARC is looked up for `host`, in order: `_dmarc.<host>`, then `_dmarc.<registrable>`
+/// when that is a different name.
+fn dmarc_names(host: &str, registrable: Option<&str>) -> Vec<String> {
+    let host = host.trim_end_matches('.');
+    let mut names = vec![format!("{}.{}", DMARC_PREFIX, host)];
+    if let Some(domain) = registrable
+        && !domain.eq_ignore_ascii_case(host)
+    {
+        names.push(format!("{}.{}", DMARC_PREFIX, domain));
+    }
+    names
+}
+
+/// The DMARC policy record in a `_dmarc.` TXT answer.
+fn dmarc_record(answer: &[String]) -> Option<String> {
+    answer
+        .iter()
+        .find(|txt| txt.trim_start().starts_with(DMARC_VERSION_TAG))
+        .cloned()
+}
+
+/// SPF from the apex TXT records; DMARC only from the `_dmarc.` answer, since a `v=DMARC1` record
+/// at the apex is not where receivers look.
+fn analyze_email_security(
+    txt_records: &[DnsRecord<String>],
+    mx_records: &[DnsRecord<MxRecord>],
+    dmarc_answer: &[String],
+) -> EmailSecurityAnalysis {
+    log::debug!(
+        "[scan::dns] analyze_email_security: txt_count={} mx_count={} dmarc_answer_count={}",
+        txt_records.len(),
+        mx_records.len(),
+        dmarc_answer.len()
+    );
+    let analysis = EmailSecurityAnalysis {
+        spf_record: txt_records
+            .iter()
+            .map(|record| &record.value)
+            .find(|txt| txt.starts_with("v=spf1"))
+            .cloned(),
+        dmarc_record: dmarc_record(dmarc_answer),
+        has_mx: !mx_records.is_empty(),
+        mx_count: mx_records.len(),
+    };
+    log::debug!(
+        "[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={}",
+        analysis.spf_record.is_some(),
+        analysis.dmarc_record.is_some(),
+        analysis.mx_count
+    );
+    analysis
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scanner whose suffix list is unreachable and uncached, so tests neither fetch the
+    /// published list nor write the user's cache; DMARC is then asked at the host only.
+    async fn test_scanner() -> DnsScanner {
+        DnsScanner {
+            suffix_list: SuffixList {
+                url: crate::scan::testing::dead_http_url().await,
+                cache_dir: None,
+                ..SuffixList::new(Client::new())
+            },
+            ..DnsScanner::new()
+        }
+    }
+
+    fn txt(values: &[&str]) -> Vec<DnsRecord<String>> {
+        values.iter().map(|v| DnsRecord::new(v.to_string(), 300)).collect()
+    }
+
+    /// Item 4: DMARC comes from the `_dmarc.` answer.
+    #[test]
+    fn email_security_takes_dmarc_from_the_dmarc_answer() {
+        let answer = vec!["v=DMARC1; p=reject; rua=mailto:d@example.com".to_string()];
+        let analysis = analyze_email_security(&txt(&["v=spf1 -all"]), &[], &answer);
+        assert_eq!(
+            analysis.dmarc_record.as_deref(),
+            Some("v=DMARC1; p=reject; rua=mailto:d@example.com")
+        );
+        assert_eq!(analysis.spf_record.as_deref(), Some("v=spf1 -all"));
+    }
+
+    /// Item 4: a `v=DMARC1` string among the apex TXT records is not where receivers look.
+    #[test]
+    fn apex_only_dmarc_txt_is_not_dmarc() {
+        let analysis = analyze_email_security(&txt(&["v=DMARC1; p=none", "v=spf1 -all"]), &[], &[]);
+        assert!(analysis.dmarc_record.is_none(), "{analysis:?}");
+    }
+
+    /// A `_dmarc.` answer without a `v=DMARC1` record (a stray verification string) is no policy.
+    #[test]
+    fn dmarc_answer_without_a_policy_record_is_not_dmarc() {
+        let answer = vec!["some-verification=abc".to_string()];
+        assert!(analyze_email_security(&[], &[], &answer).dmarc_record.is_none());
+    }
+
+    /// RFC 7489 organizational fallback: the host first, then its registrable domain when different.
+    #[test]
+    fn dmarc_is_asked_at_the_host_then_the_registrable_domain() {
+        assert_eq!(
+            dmarc_names("www.tatari.tv", Some("tatari.tv")),
+            vec!["_dmarc.www.tatari.tv", "_dmarc.tatari.tv"]
+        );
+        assert_eq!(
+            dmarc_names("google.com.", Some("google.com")),
+            vec!["_dmarc.google.com"]
+        );
+        assert_eq!(dmarc_names("Google.com", Some("google.com")), vec!["_dmarc.Google.com"]);
+        assert_eq!(dmarc_names("www.tatari.tv", None), vec!["_dmarc.www.tatari.tv"]);
+    }
+
+    fn expiring_in(secs: u32, now: Instant) -> DnsRecord<Ipv4Addr> {
+        DnsRecord {
+            value: Ipv4Addr::new(192, 0, 2, 1),
+            ttl_original: secs,
+            queried_at: now,
+        }
+    }
+
+    /// Item B: the re-query follows the earliest expiry, clamped to 10s..60s.
+    #[test]
+    fn requery_delay_is_the_earliest_expiry_clamped_to_10s_60s() {
+        let now = Instant::now();
+        for (ttl, expected) in [(4, 10), (30, 30), (300, 60)] {
+            let mut result = DnsResult::new();
+            result.A.push(expiring_in(ttl, now));
+            assert_eq!(
+                result.requery_delay(now),
+                Some(Duration::from_secs(expected)),
+                "ttl {ttl}s"
+            );
+        }
+    }
+
+    #[test]
+    fn requery_delay_takes_the_earliest_record_across_types() {
+        let now = Instant::now();
+        let mut result = DnsResult::new();
+        result.A.push(expiring_in(300, now));
+        result.TXT.push(DnsRecord {
+            value: "v=spf1 -all".to_string(),
+            ttl_original: 25,
+            queried_at: now,
+        });
+        result.PTR.push(DnsRecord {
+            value: "host.example.".to_string(),
+            ttl_original: 45,
+            queried_at: now,
+        });
+        assert_eq!(result.requery_delay(now), Some(Duration::from_secs(25)));
+        // 20s later the TXT record has 5s left: the floor holds.
+        assert_eq!(
+            result.requery_delay(now + Duration::from_secs(20)),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn requery_delay_without_records_is_none() {
+        assert_eq!(DnsResult::new().requery_delay(Instant::now()), None);
+    }
+
+    #[tokio::test]
+    async fn next_delay_reads_a_dns_result_and_ignores_others() {
+        let scanner = DnsScanner::new();
+        let mut result = DnsResult::new();
+        result.A.push(expiring_in(30, Instant::now()));
+        let delay = scanner.next_delay(&ScanResult::Dns(result)).unwrap();
+        assert!(
+            delay <= Duration::from_secs(30) && delay >= Duration::from_secs(29),
+            "{delay:?}"
+        );
+        assert_eq!(scanner.next_delay(&ScanResult::Dns(DnsResult::new())), None);
+        assert_eq!(
+            scanner.next_delay(&ScanResult::Ping(crate::scan::ping::PingResult::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn ip_target_result_is_reverse_only() {
+        let mut result = DnsResult::new();
+        assert!(result.is_reverse_only());
+        result.MX_status = QueryStatus::NoRecords;
+        assert!(!result.is_reverse_only());
+    }
+
+    /// Live: google.com publishes DMARC at `_dmarc.google.com`, not at the apex.
+    #[tokio::test]
+    async fn google_dmarc_is_found_at_dmarc() {
+        let scanner = test_scanner().await;
+        let target = Target::parse("google.com").expect("Failed to parse target");
+        let Ok(ScanResult::Dns(result)) = scanner.scan(&target, Protocol::Both).await else {
+            panic!("DNS scan of google.com failed");
+        };
+        let dmarc = result.email_security.and_then(|e| e.dmarc_record);
+        assert!(dmarc.as_deref().is_some_and(|d| d.starts_with("v=DMARC1")), "{dmarc:?}");
+    }
 
     #[test]
     fn test_sort_records_is_order_independent() {
@@ -947,7 +1306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_lookup_google() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
         let target = Target::parse("google.com").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Both).await;
@@ -963,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reverse_dns_lookup() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
         let target = Target::parse("8.8.8.8").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Both).await;
@@ -982,14 +1341,12 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=quarantine;".to_string()),
             has_mx: true,
             mx_count: 2,
-            dkim_domains: vec!["default._domainkey".to_string()],
         };
 
         assert!(analysis.spf_record.is_some());
         assert!(analysis.dmarc_record.is_some());
         assert!(analysis.has_mx);
         assert_eq!(analysis.mx_count, 2);
-        assert_eq!(analysis.dkim_domains.len(), 1);
     }
 
     #[test]
@@ -1024,7 +1381,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_lookup_failure() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
         let target = Target::parse("nonexistent-domain-12345.invalid").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Both).await;
@@ -1100,14 +1457,12 @@ mod tests {
             dmarc_record: None,
             has_mx: false,
             mx_count: 0,
-            dkim_domains: vec![],
         };
 
         assert!(empty_analysis.spf_record.is_none());
         assert!(empty_analysis.dmarc_record.is_none());
         assert!(!empty_analysis.has_mx);
         assert_eq!(empty_analysis.mx_count, 0);
-        assert!(empty_analysis.dkim_domains.is_empty());
 
         // Test with malformed SPF
         let malformed_analysis = EmailSecurityAnalysis {
@@ -1115,16 +1470,14 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=none;".to_string()),
             has_mx: true,
             mx_count: 1,
-            dkim_domains: vec!["selector1._domainkey".to_string(), "selector2._domainkey".to_string()],
         };
 
         assert!(malformed_analysis.spf_record.is_some());
-        assert_eq!(malformed_analysis.dkim_domains.len(), 2);
     }
 
     #[tokio::test]
     async fn test_ipv6_dns_lookup() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
         let target = Target::parse("google.com").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Both).await;
@@ -1139,7 +1492,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_protocol_aware_ipv4_only() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
         let target = Target::parse("google.com").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Ipv4).await;
@@ -1157,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_protocol_aware_ipv6_only() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
         let target = Target::parse("google.com").expect("Failed to parse target");
 
         let result = scanner.scan(&target, Protocol::Ipv6).await;
@@ -1175,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_protocol_aware_reverse_lookup() {
-        let scanner = DnsScanner::new();
+        let scanner = test_scanner().await;
 
         // Test IPv4 reverse lookup
         let ipv4_target = Target::parse("8.8.8.8").expect("Failed to parse IPv4 target");

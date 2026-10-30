@@ -260,7 +260,6 @@ impl SecurityPane {
                     (
                         email_security.spf_record.clone(),
                         email_security.dmarc_record.clone(),
-                        email_security.dkim_domains.clone(),
                         email_security.mx_count,
                         email_security.has_mx,
                     )
@@ -678,7 +677,7 @@ impl SecurityPane {
         }
 
         // DNS Security Records
-        if let Some((spf_record, dmarc_record, dkim_domains, mx_count, has_mx)) = dns_data {
+        if let Some((spf_record, dmarc_record, mx_count, has_mx)) = dns_data {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "📧 Email Security",
@@ -703,17 +702,10 @@ impl SecurityPane {
                 ),
             ]));
 
-            // DKIM
+            // DKIM keys sit at `<selector>._domainkey`; without a selector there is nothing to query.
             lines.push(Line::from(vec![
                 Span::styled("  DKIM: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    if dkim_domains.is_empty() {
-                        "not found".to_string()
-                    } else {
-                        format!("{} domains", dkim_domains.len())
-                    },
-                    Style::default().fg(if !dkim_domains.is_empty() { Color::Green } else { Color::Yellow }),
-                ),
+                Span::styled("not checked (needs selector)", Style::default().fg(Color::Gray)),
             ]));
 
             // MX Records
@@ -737,13 +729,6 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("    DMARC: ", Style::default().fg(Color::White)),
                     Span::styled(dmarc.clone(), Style::default().fg(Color::Gray)),
-                ]));
-            }
-
-            if !dkim_domains.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("    DKIM: ", Style::default().fg(Color::White)),
-                    Span::styled(dkim_domains.join(", "), Style::default().fg(Color::Gray)),
                 ]));
             }
         }
@@ -1113,6 +1098,38 @@ mod tests {
         }
     }
 
+    /// Item 4: DKIM cannot be found without a selector, so the pane says it was not checked.
+    #[test]
+    fn dkim_reads_not_checked_and_dmarc_reads_configured() {
+        let state = AppState::new("google.com".to_string());
+        let mut dns_result = DnsResult::new();
+        dns_result.email_security = Some(EmailSecurityAnalysis {
+            spf_record: Some("v=spf1 -all".to_string()),
+            dmarc_record: Some("v=DMARC1; p=reject".to_string()),
+            has_mx: true,
+            mx_count: 1,
+        });
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: Some(ScanResult::Dns(dns_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        let pane = SecurityPane::new();
+        let out = crate::tui::testing::render_pane(&pane, &state, 120, 80, false);
+        assert!(out.contains("DKIM: not checked (needs selector)"), "{out}");
+        assert!(out.contains("DMARC: configured"), "{out}");
+        let buffer = crate::tui::testing::render_buffer(&pane, &state, 120, 80, false);
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "not checked (needs selector)"),
+            Color::Gray
+        );
+    }
+
     #[test]
     fn test_dns_data_extraction() {
         // False positive: mut is required for state.scanners.insert() calls
@@ -1124,10 +1141,6 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com".to_string()),
             has_mx: true,
             mx_count: 2,
-            dkim_domains: vec![
-                "default._domainkey.example.com".to_string(),
-                "selector1._domainkey.example.com".to_string(),
-            ],
         };
 
         let dns_result = DnsResult {
@@ -1150,6 +1163,8 @@ mod tests {
             SOA_status: crate::scan::dns::QueryStatus::NoRecords,
             SRV_status: crate::scan::dns::QueryStatus::NoRecords,
             PTR_status: crate::scan::dns::QueryStatus::NoRecords,
+            CNAME_status: crate::scan::dns::QueryStatus::NoRecords,
+            CAA_status: crate::scan::dns::QueryStatus::NoRecords,
             response_time: Duration::from_millis(50),
             queried_at: Instant::now(),
         };
@@ -1178,10 +1193,6 @@ mod tests {
             // Test DMARC
             assert!(email_security.dmarc_record.is_some());
             assert!(email_security.dmarc_record.as_ref().unwrap().contains("v=DMARC1"));
-
-            // Test DKIM
-            assert_eq!(email_security.dkim_domains.len(), 2);
-            assert!(email_security.dkim_domains[0].contains("default._domainkey"));
 
             // Test MX
             assert!(email_security.has_mx);
@@ -1290,7 +1301,6 @@ mod tests {
                 dmarc_record: Some("v=DMARC1; p=reject".to_string()),
                 has_mx: true,
                 mx_count: 1,
-                dkim_domains: vec!["default._domainkey.comprehensive.com".to_string()],
             }),
             A_status: crate::scan::dns::QueryStatus::NoRecords,
             AAAA_status: crate::scan::dns::QueryStatus::NoRecords,
@@ -1300,6 +1310,8 @@ mod tests {
             SOA_status: crate::scan::dns::QueryStatus::NoRecords,
             SRV_status: crate::scan::dns::QueryStatus::NoRecords,
             PTR_status: crate::scan::dns::QueryStatus::NoRecords,
+            CNAME_status: crate::scan::dns::QueryStatus::NoRecords,
+            CAA_status: crate::scan::dns::QueryStatus::NoRecords,
             response_time: Duration::from_millis(30),
             queried_at: Instant::now(),
         };
