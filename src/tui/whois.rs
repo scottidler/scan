@@ -87,7 +87,7 @@ fn zoomed_lines(result: &crate::scan::whois::WhoisResult) -> Vec<Line<'static>> 
         },
     ));
     if let Some(age) = result.domain_age_days {
-        lines.push(field_line("Age", format!("{age} days")));
+        lines.push(field_line("Age", crate::tui::text::plural(age, "day")));
     }
     if let Some(registrar) = &result.registrar {
         if let Some(iana_id) = registrar.iana_id {
@@ -613,5 +613,20 @@ mod tests {
         let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), 80, 30, false);
         assert!(out.contains("Risks: 1 indicator"), "{out}");
         assert!(!out.contains("1 indicators"), "{out}");
+    }
+
+    /// Item 9: a domain registered yesterday is `1 day` old.
+    #[test]
+    fn domain_age_of_one_day_reads_in_the_singular() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, WhoisResult};
+        use crate::tui::pane::Detail;
+        let mut result = WhoisResult::not_applicable("example.com".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.domain_age_days = Some(1);
+        let zoomed =
+            crate::tui::testing::content_rows(&WhoisPane::new(), &state_with_whois(result), 100, Detail::Zoomed)
+                .join("\n");
+        assert!(zoomed.contains("Age: 1 day"), "{zoomed}");
+        assert!(!zoomed.contains("1 days"), "{zoomed}");
     }
 }

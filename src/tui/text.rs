@@ -6,9 +6,13 @@ use ratatui::{
     text::{Line, Span},
 };
 
-/// `<n> <noun>`, the noun pluralized with an `s` unless `n` is 1: `1 record`, `0 records`.
-pub fn plural(n: usize, noun: &str) -> String {
-    if n == 1 { format!("{n} {noun}") } else { format!("{n} {noun}s") }
+/// `<n> <noun>`, the noun pluralized with an `s` unless `n` is 1: `1 record`, `0 records`. Any
+/// integer count: `usize` lengths, `u8` hop counts, `i64` day counts.
+pub fn plural<N>(n: N, noun: &str) -> String
+where
+    N: std::fmt::Display + PartialEq + From<u8>,
+{
+    if n == N::from(1) { format!("{n} {noun}") } else { format!("{n} {noun}s") }
 }
 
 /// Marks a line cut short by `fit_line`.
@@ -340,5 +344,8 @@ mod tests {
         assert_eq!(plural(1, "record"), "1 record");
         assert_eq!(plural(2, "domain"), "2 domains");
         assert_eq!(plural(1, "indicator"), "1 indicator");
+        assert_eq!(plural(1u8, "hop"), "1 hop");
+        assert_eq!(plural(1i64, "day"), "1 day");
+        assert_eq!(plural(-3i64, "day"), "-3 days");
     }
 }

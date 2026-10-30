@@ -103,7 +103,7 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
         }
 
         ScanResult::Dns(dns) => {
-            let mut text = format!("{} A records", dns.A.len());
+            let mut text = crate::tui::text::plural(dns.A.len(), "A record");
             if !dns.AAAA.is_empty() {
                 text.push_str(&format!(", {} AAAA", dns.AAAA.len()));
             }
@@ -193,15 +193,14 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 return (Outcome::Failed, format!("{failure}\n  └─ {grade}"));
             };
             let security_features = count_security_features(primary_data);
-            let vuln_count = http.total_vulnerabilities();
 
-            // The grade is the host's, the same line the HTTP pane shows.
+            // The grade is the host's, the same line the HTTP pane shows, and the only verdict on
+            // its security headers.
             let mut text = format!(
-                "{} {}, {} security features, {} vulnerabilities, {} ({}ms)",
+                "{} {}, {}, {} ({}ms)",
                 primary_data.status_code,
                 primary_data.content_type.as_deref().unwrap_or("unknown"),
-                security_features,
-                vuln_count,
+                crate::tui::text::plural(security_features, "security feature"),
                 grade,
                 primary_data.response_time.as_millis()
             );
@@ -314,9 +313,9 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
             (
                 Outcome::Ok,
                 format!(
-                    "{} {} hops, {} ({}{}, {}ms)",
+                    "{} {}, {} ({}{}, {}ms)",
                     protocol_info,
-                    traceroute.total_hops(),
+                    crate::tui::text::plural(traceroute.total_hops(), "hop"),
                     reached,
                     last_hop_rtt,
                     timeout_str,
@@ -554,7 +553,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![],
             scan_duration: Duration::from_millis(120),
             target_ip: "192.0.2.1".to_string(),
             https_failure: https_failure.map(str::to_string),
@@ -758,8 +756,12 @@ mod tests {
                 "grade n/a (not a public hostname) ",
             ),
             (
-                ObservatoryOutcome::Failed("site down".to_string()),
-                "grade none (site down) ",
+                ObservatoryOutcome::failed("example.com", "site down"),
+                "grade none (site down) · example.com ",
+            ),
+            (
+                ObservatoryOutcome::failed("example.com", "HTTP 500"),
+                "grade none (HTTP 500) · example.com ",
             ),
         ] {
             let result = http_result(outcome, Some(http_data(None)));
@@ -778,6 +780,54 @@ mod tests {
             ),
         );
         assert!(out.contains("google.com · preload list unavailable "), "{out}");
+    }
+
+    /// The google.com case: the target request saw none of the security headers, Observatory
+    /// graded the host. The line carries the grade and no count of the target's missing headers.
+    #[test]
+    fn http_prints_the_grade_and_no_count_of_the_targets_missing_headers() {
+        let result = http_result(ObservatoryOutcome::Graded(google_com_result()), Some(http_data(None)));
+        let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
+        assert!(
+            out.starts_with("✅ HTTP: 200 text/html, 0 security features, grade C- (45) · google.com ("),
+            "{out}"
+        );
+        assert!(!out.contains("vulnerabilit"), "{out}");
+    }
+
+    /// Item 9: every count in the `--no-tui` lines reads `1 <noun>` at one.
+    #[test]
+    fn counts_of_one_are_singular() {
+        let mut data = http_data(None);
+        data.security_headers.strict_transport_security = Some("max-age=63072000".to_string());
+        let result = http_result(ObservatoryOutcome::Graded(google_com_result()), Some(data));
+        let out = format_scan_state("http", &state(ScanStatus::Complete, Some(result), None));
+        assert!(out.contains(", 1 security feature, "), "{out}");
+
+        let mut dns = crate::scan::dns::DnsResult::new();
+        dns.A = vec![crate::scan::dns::DnsRecord {
+            value: "192.0.2.1".parse().unwrap(),
+            ttl_original: 300,
+            queried_at: Instant::now(),
+        }];
+        let out = format_scan_state("dns", &state(ScanStatus::Complete, Some(ScanResult::Dns(dns)), None));
+        assert!(out.starts_with("✅ DNS: 1 A record ("), "{out}");
+
+        let mut traceroute = crate::scan::traceroute::TracerouteResult::new();
+        traceroute.ipv4_result = Some(crate::scan::traceroute::TracerouteData {
+            hops: vec![],
+            destination_reached: true,
+            total_hops: 1,
+            max_hops: 30,
+            target_ip: "192.0.2.1".parse().unwrap(),
+            scan_duration: Duration::from_millis(5),
+            ipv6: false,
+        });
+        let out = format_scan_state(
+            "traceroute",
+            &state(ScanStatus::Complete, Some(ScanResult::Traceroute(traceroute)), None),
+        );
+        assert!(out.contains(" 1 hop, "), "{out}");
     }
 
     /// The URL failed but the host graded: both show, the failure first.

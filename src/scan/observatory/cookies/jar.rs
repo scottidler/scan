@@ -201,7 +201,7 @@ fn expiry_time(stored: &Stored) -> Option<SystemTime> {
         }
         return Some(stored.last_accessed + Duration::from_secs_f64(max_age.min(1e12)));
     }
-    stored.cookie.expires.as_deref().and_then(parse_date)
+    stored.cookie.expires
 }
 
 /// `canonicalDomain`: trimmed, a leading dot dropped, lowercased (punycoded when non-ASCII).
@@ -540,6 +540,26 @@ mod tests {
             jar.cookie_header(&url("https://other.example.com/"), &domains(), now),
             None
         );
+    }
+
+    /// `Expires=<past>; Expires=garbage` is expired, as in tough-cookie: the garbage date is
+    /// ignored, so the past one stands and a later matching lookup drops the cookie.
+    #[test]
+    fn a_past_expires_followed_by_garbage_is_expired_at_lookup() {
+        let mut jar = jar_with(
+            &[
+                "stale=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Expires=garbage",
+                "fresh=1; Expires=garbage",
+            ],
+            "https://www.example.com/",
+        );
+        assert_eq!(keys(&jar), ["stale", "fresh"], "both are stored (Phase 0c)");
+        assert_eq!(
+            jar.cookie_header(&url("https://www.example.com/"), &domains(), SystemTime::now())
+                .as_deref(),
+            Some("fresh=1")
+        );
+        assert_eq!(keys(&jar), ["fresh"]);
     }
 
     #[test]

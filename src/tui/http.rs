@@ -211,7 +211,7 @@ fn no_retrieval(observatory: &ObservatoryOutcome) -> Span<'static> {
         ObservatoryOutcome::NotApplicable(reason) => {
             Span::styled(format!("n/a ({reason})"), Style::default().fg(theme::MUTED))
         }
-        ObservatoryOutcome::Failed(reason) => {
+        ObservatoryOutcome::Failed { reason, .. } => {
             Span::styled(format!("failed: {reason}"), Style::default().fg(theme::BAD))
         }
         ObservatoryOutcome::Graded(_) => Span::styled("failed: no retrieval", Style::default().fg(theme::BAD)),
@@ -295,7 +295,7 @@ pub(crate) fn grade_line(label: &str, observatory: &ObservatoryOutcome) -> Line<
             GradeLetter::CPlus | GradeLetter::C | GradeLetter::CMinus => theme::WARN,
             GradeLetter::DPlus | GradeLetter::D | GradeLetter::DMinus | GradeLetter::F => theme::BAD,
         },
-        ObservatoryOutcome::NotApplicable(_) | ObservatoryOutcome::Failed(_) => theme::MUTED,
+        ObservatoryOutcome::NotApplicable(_) | ObservatoryOutcome::Failed { .. } => theme::MUTED,
     };
     let mut spans = vec![
         Span::styled(label.to_string(), Style::default().fg(theme::LABEL)),
@@ -417,7 +417,7 @@ impl Pane for HttpPane {
                     lines.push(Line::from(vec![
                         Span::styled("📏 Size: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
-                            format!("{} bytes", primary_data.content_length),
+                            crate::tui::text::plural(primary_data.content_length, "byte"),
                             Style::default().fg(theme::GOOD),
                         ),
                     ]));
@@ -457,32 +457,6 @@ impl Pane for HttpPane {
                                     to,
                                 ]));
                             }
-                        }
-                    }
-
-                    // Vulnerabilities - show total from all protocols
-                    let all_vulnerabilities = http_result.get_all_vulnerabilities();
-                    if !all_vulnerabilities.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::styled("❗ Issues: ", Style::default().fg(theme::LABEL)),
-                            Span::styled(all_vulnerabilities.len().to_string(), Style::default().fg(theme::BAD)),
-                        ]));
-
-                        // Show each vulnerability
-                        for vulnerability in &all_vulnerabilities {
-                            let vuln_text = match vulnerability {
-                                crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS",
-                                crate::scan::http::HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options",
-                                crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => {
-                                    "Missing X-Content-Type-Options"
-                                }
-                                crate::scan::http::HttpVulnerability::MissingCsp => "Missing CSP",
-                            };
-
-                            lines.push(Line::from(vec![
-                                Span::styled("  • ", Style::default().fg(theme::BAD)),
-                                Span::styled(vuln_text, Style::default().fg(theme::BAD)),
-                            ]));
                         }
                     }
 
@@ -608,7 +582,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![],
             scan_duration: Duration::from_millis(50),
             target_ip: "192.0.2.1".to_string(),
             https_failure: https_failure.map(String::from),
@@ -747,12 +720,12 @@ mod tests {
                 "Grade: n/a (not a public hostname)",
             ),
             (
-                ObservatoryOutcome::Failed("site down".to_string()),
-                "Grade: none (site down)",
+                ObservatoryOutcome::failed("example.com", "site down"),
+                "Grade: none (site down) · example.com",
             ),
             (
-                ObservatoryOutcome::Failed("HTTP 500".to_string()),
-                "Grade: none (HTTP 500)",
+                ObservatoryOutcome::failed("example.com", "HTTP 500"),
+                "Grade: none (HTTP 500) · example.com",
             ),
         ] {
             let state = state_with_grade(outcome);
@@ -798,10 +771,10 @@ mod tests {
     /// The grade fails while the URL works: the target block is intact and the grade line says why.
     #[test]
     fn a_working_url_and_a_failed_grade_show_together() {
-        let state = state_with_grade(ObservatoryOutcome::Failed("site down".to_string()));
+        let state = state_with_grade(ObservatoryOutcome::failed("example.com", "site down"));
         let out = render_pane(&HttpPane::new(), &state, LIVE_PANE_WIDTH, LIVE_PANE_HEIGHT, false);
         assert!(out.contains("Status: 200"), "{out}");
-        assert!(out.contains("Grade: none (site down)"), "{out}");
+        assert!(out.contains("Grade: none (site down) · example.com"), "{out}");
     }
 
     #[test]
@@ -856,20 +829,7 @@ mod tests {
         assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");
     }
 
-    const ALL_ISSUES: [(crate::scan::http::HttpVulnerability, &str); 4] = [
-        (crate::scan::http::HttpVulnerability::MissingHsts, "Missing HSTS"),
-        (
-            crate::scan::http::HttpVulnerability::MissingXFrameOptions,
-            "Missing X-Frame-Options",
-        ),
-        (
-            crate::scan::http::HttpVulnerability::MissingXContentTypeOptions,
-            "Missing X-Content-Type-Options",
-        ),
-        (crate::scan::http::HttpVulnerability::MissingCsp, "Missing CSP"),
-    ];
-
-    fn render_redirects_and_issues(redirects: &[(&str, &str)], issues: usize) -> String {
+    fn render_redirects(redirects: &[(&str, &str)]) -> String {
         let mut data = http_data("https://www.tatari.tv/", None);
         data.redirect_chain = redirects
             .iter()
@@ -879,7 +839,6 @@ mod tests {
                 status_code: 301,
             })
             .collect();
-        data.vulnerabilities = ALL_ISSUES[..issues].iter().map(|(v, _)| v.clone()).collect();
         render_pane(
             &HttpPane::new(),
             &state_with_http(data),
@@ -889,46 +848,56 @@ mod tests {
         )
     }
 
-    /// Audit round 1: a redirect that fits the pane takes one row, so at 200x55 the redirect rows
-    /// do not push issue names below the fold.
+    /// Audit round 1: a redirect that fits the pane takes one row. The pane's former `Issues:`
+    /// list (the target's own missing headers) is gone: whether the host sends HSTS, XFO, XCTO or
+    /// CSP is Observatory's fact, read in the grade.
     #[test]
-    fn redirects_that_fit_take_one_row_and_every_issue_name_stays_visible() {
-        type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, usize);
-        let cases: [Case; 3] = [
+    fn redirects_that_fit_take_one_row_and_no_header_issue_list_is_shown() {
+        let cases: [(&str, Vec<(&str, &str)>); 3] = [
+            ("1 redirect", vec![("http://tatari.tv/", "https://tatari.tv/")]),
             (
-                "1 redirect, 4 issues",
-                vec![("http://tatari.tv/", "https://tatari.tv/")],
-                4,
-            ),
-            (
-                "2 redirects, 3 issues",
+                "2 redirects",
                 vec![
                     ("http://tatari.tv/", "https://tatari.tv/"),
                     ("https://tatari.tv/", "https://www.tatari.tv/"),
                 ],
-                3,
             ),
             (
-                "4 short redirects, 4 issues",
+                "4 short redirects",
                 vec![
                     ("http://x/a", "http://x/b"),
                     ("http://x/b", "http://x/c"),
                     ("http://x/c", "http://x/d"),
                     ("http://x/d", "http://x/e"),
                 ],
-                4,
             ),
         ];
-        for (name, redirects, issues) in cases {
-            let out = render_redirects_and_issues(&redirects, issues);
+        for (name, redirects) in cases {
+            let out = render_redirects(&redirects);
             assert!(
                 out.contains(&format!("301 {} → {}", redirects[0].0, redirects[0].1)),
                 "{name}: redirect not on one row:\n{out}"
             );
-            for (_, issue) in &ALL_ISSUES[..issues] {
-                assert!(out.contains(issue), "{name}: `{issue}` not visible:\n{out}");
+            assert!(out.contains("Grade: "), "{name}: grade line not visible:\n{out}");
+            for gone in ["Issues:", "Missing"] {
+                assert!(!out.contains(gone), "{name}: `{gone}` still shown:\n{out}");
             }
         }
+    }
+
+    /// Item 9: a one-byte body reads `1 byte`.
+    #[test]
+    fn a_one_byte_body_reads_byte() {
+        let mut data = http_data("https://example.com/", None);
+        data.content_length = 1;
+        let out = render_pane(
+            &HttpPane::new(),
+            &state_with_http(data),
+            LIVE_PANE_WIDTH,
+            LIVE_PANE_HEIGHT,
+            false,
+        );
+        assert!(out.contains("Size: 1 byte "), "{out}");
     }
 
     #[test]
@@ -960,14 +929,12 @@ mod tests {
         data.csp = Some(CspPolicy {
             header_value: "default-src 'self'; script-src 'self' https://cdn.example.com".to_string(),
             directives: Default::default(),
-            issues: vec![],
         });
         data.cors = Some(CorsPolicy {
             access_control_allow_origin: Some("https://app.example.com".to_string()),
             access_control_allow_methods: vec!["GET".to_string(), "POST".to_string()],
             access_control_allow_headers: vec![],
             access_control_allow_credentials: false,
-            issues: vec![],
         });
         data.caching.cache_control = Some("private, max-age=0".to_string());
         let state = state_with_http(data);
@@ -1108,7 +1075,7 @@ mod tests {
         };
         let out = zoomed(&state_with_lenses(
             missing,
-            ObservatoryOutcome::Failed("site down".to_string()),
+            ObservatoryOutcome::failed("example.com", "site down"),
             Some(http_data("https://example.com/", None)),
         ));
         for expected in [

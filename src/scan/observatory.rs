@@ -75,29 +75,41 @@ pub enum ObservatoryOutcome {
     Graded(ObservatoryResult),
     /// Observatory refuses the host (an IP address, a name with no dot): no grade, never F.
     NotApplicable(String),
-    /// No grade: site down, an unexpected status, a deadline, or a list the run needed.
-    Failed(String),
+    /// No grade for `host`: site down, an unexpected status, a deadline, or a list the run needed.
+    Failed {
+        host: String,
+        reason: String,
+    },
 }
 
 /// The grade line's note when the HSTS preload list could not be loaded.
 pub const PRELOAD_UNAVAILABLE_NOTE: &str = "preload list unavailable";
 
 impl ObservatoryOutcome {
-    /// The outcome of `observe`: an [`AnalyzeError`] is a failure, worded as it displays.
-    pub fn from_analysis(analysis: Result<ObservatoryResult, AnalyzeError>) -> Self {
+    /// No grade for `host`, for `reason`.
+    pub fn failed(host: &str, reason: &str) -> Self {
+        ObservatoryOutcome::Failed {
+            host: host.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// The outcome of `observe` for `host`: an [`AnalyzeError`] is a failure, worded as it displays.
+    pub fn from_analysis(host: &str, analysis: Result<ObservatoryResult, AnalyzeError>) -> Self {
         match analysis {
             Ok(result) => ObservatoryOutcome::Graded(result),
-            Err(error) => ObservatoryOutcome::Failed(error.to_string()),
+            Err(error) => ObservatoryOutcome::failed(host, &error.to_string()),
         }
     }
 
     /// The grade line after its `Grade: ` label, without the preload note: `C- (45) · google.com`,
-    /// `n/a (IP address)`, `none (site down)`.
+    /// `n/a (IP address)`, `none (site down) · example.com`. A grade, or its absence, is a fact
+    /// about a host, so the line names the host; a refused target (an IP address) has none to name.
     pub fn grade_summary(&self) -> String {
         match self {
             ObservatoryOutcome::Graded(result) => format!("{} ({}) · {}", result.grade, result.score, result.host),
             ObservatoryOutcome::NotApplicable(reason) => format!("n/a ({reason})"),
-            ObservatoryOutcome::Failed(reason) => format!("none ({reason})"),
+            ObservatoryOutcome::Failed { host, reason } => format!("none ({reason}) · {host}"),
         }
     }
 
@@ -351,7 +363,11 @@ pub(crate) mod tests {
         Cookie {
             key: json["key"].as_str().unwrap().to_string(),
             value: json["value"].as_str().unwrap_or_default().to_string(),
-            expires: json["expires"].as_str().map(str::to_string),
+            // `serializeSync` writes a parsed date as ISO 8601 and an absent one as `Infinity`.
+            expires: json["expires"]
+                .as_str()
+                .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+                .map(std::time::SystemTime::from),
             max_age: json["maxAge"].as_f64(),
             domain: json["domain"].as_str().map(str::to_string),
             path: json["path"].as_str().map(str::to_string),
@@ -555,12 +571,12 @@ pub(crate) mod tests {
             "n/a (IP address)"
         );
         assert_eq!(
-            ObservatoryOutcome::from_analysis(Err(AnalyzeError::SiteIsDown)).grade_text(),
-            "none (site down)"
+            ObservatoryOutcome::from_analysis("example.com", Err(AnalyzeError::SiteIsDown)).grade_text(),
+            "none (site down) · example.com"
         );
         assert_eq!(
-            ObservatoryOutcome::from_analysis(Err(AnalyzeError::UnexpectedStatusCode(500))).grade_text(),
-            "none (HTTP 500)"
+            ObservatoryOutcome::from_analysis("example.com", Err(AnalyzeError::UnexpectedStatusCode(500))).grade_text(),
+            "none (HTTP 500) · example.com"
         );
     }
 

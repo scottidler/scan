@@ -40,7 +40,7 @@ const GOODNESS: [Expectation; 7] = [
 #[derive(Debug, Clone, PartialEq)]
 pub struct CookieData {
     pub domain: Option<String>,
-    pub expires: Option<String>,
+    pub expires: Option<std::time::SystemTime>,
     pub http_only: bool,
     pub max_age: Option<f64>,
     pub path: Option<String>,
@@ -154,7 +154,7 @@ pub fn cookies_test(retrieval: &Retrieval, preload: &HstsPreload) -> CookiesOutp
                     .map(|c| {
                         let item = CookieData {
                             domain: c.domain.clone(),
-                            expires: c.expires.clone(),
+                            expires: c.expires,
                             http_only: c.http_only,
                             max_age: c.max_age,
                             path: c.path.clone(),

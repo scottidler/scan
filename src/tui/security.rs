@@ -8,9 +8,6 @@ use ratatui::{
 };
 use std::any::Any;
 
-const MAX_CSP_ISSUES_DISPLAYED: usize = 3;
-const MAX_CORS_ISSUES_DISPLAYED: usize = 3;
-const MAX_HTTP_VULNERABILITIES_DISPLAYED: usize = 5;
 const MAX_TLS_VULNERABILITIES_DISPLAYED: usize = 5;
 const CN_EXTRACT_PREFIX_LENGTH: usize = 3;
 const CERT_EXPIRY_WARNING_DAYS: i64 = 30;
@@ -32,6 +29,23 @@ fn observatory_label(
         test.result.as_str().to_string(),
         if test.pass { theme::GOOD } else { theme::BAD },
     ))
+}
+
+/// A header row with one verdict: Observatory's result for `test_name` when the host is graded.
+/// With no grade the row is the target's own header value, or `missing`, in `MUTED`: a display of
+/// what the target sent, never a pass or fail of its own.
+fn observatory_row(
+    label: &'static str,
+    outcome: &crate::scan::observatory::ObservatoryOutcome,
+    test_name: &str,
+    header: Option<&str>,
+) -> Line<'static> {
+    let (value, color) = observatory_label(outcome, test_name)
+        .unwrap_or_else(|| (header.unwrap_or("missing").to_string(), theme::MUTED));
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(theme::LABEL)),
+        Span::styled(value, Style::default().fg(color)),
+    ])
 }
 
 /// SECURITY pane displays TLS/SSL certificate information and security analysis
@@ -112,96 +126,33 @@ impl SecurityPane {
             None
         };
 
-        // Extract HTTP data upfront
+        // Extract HTTP data upfront: the target's own headers, displayed; every verdict on them is
+        // the host's Observatory result.
         let http_data = if let Some(http_state) = state.scanners.get("http") {
             if let Some(crate::types::ScanResult::Http(http_result)) = http_state.result.as_ref() {
                 http_result.get_primary_result().map(|primary_data| {
+                    let headers = &primary_data.security_headers;
                     (
-                        primary_data.security_headers.strict_transport_security.is_some(),
-                        primary_data
-                            .security_headers
-                            .x_frame_options
-                            .clone()
-                            .unwrap_or_else(|| "missing".to_string()),
-                        primary_data
-                            .security_headers
-                            .x_content_type_options
-                            .clone()
-                            .unwrap_or_else(|| "missing".to_string()),
-                        primary_data
-                            .security_headers
+                        headers.strict_transport_security.clone(),
+                        headers.x_frame_options.clone(),
+                        headers.x_content_type_options.clone(),
+                        headers
                             .x_xss_protection
                             .clone()
                             .unwrap_or_else(|| "missing".to_string()),
-                        primary_data
-                            .security_headers
-                            .referrer_policy
-                            .clone()
-                            .unwrap_or_else(|| "missing".to_string()),
-                        primary_data
-                            .security_headers
+                        headers.referrer_policy.clone(),
+                        headers
                             .permissions_policy
                             .clone()
                             .unwrap_or_else(|| "missing".to_string()),
-                        primary_data.csp.as_ref().map(|csp| {
-                            (
-                                csp.header_value.clone(),
-                                csp.issues
-                                    .iter()
-                                    .take(cap(MAX_CSP_ISSUES_DISPLAYED))
-                                    .map(|issue| match issue {
-                                        crate::scan::http::CspIssue::UnsafeInline(directive) => {
-                                            format!("unsafe-inline in {}", directive)
-                                        }
-                                        crate::scan::http::CspIssue::UnsafeEval(directive) => {
-                                            format!("unsafe-eval in {}", directive)
-                                        }
-                                        crate::scan::http::CspIssue::WildcardSource(directive) => {
-                                            format!("wildcard in {}", directive)
-                                        }
-                                        crate::scan::http::CspIssue::MissingDirective(directive) => {
-                                            format!("missing {}", directive)
-                                        }
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                        }),
+                        primary_data.csp.as_ref().map(|csp| csp.header_value.clone()),
                         primary_data.cors.as_ref().map(|cors| {
                             (
                                 cors.access_control_allow_origin.clone(),
                                 cors.access_control_allow_methods.clone(),
                                 cors.access_control_allow_credentials,
-                                cors.issues
-                                    .iter()
-                                    .take(cap(MAX_CORS_ISSUES_DISPLAYED))
-                                    .map(|issue| match issue {
-                                        crate::scan::http::CorsIssue::WildcardOrigin => "wildcard origin".to_string(),
-                                        crate::scan::http::CorsIssue::WildcardMethods => "wildcard methods".to_string(),
-                                        crate::scan::http::CorsIssue::WildcardHeaders => "wildcard headers".to_string(),
-                                        crate::scan::http::CorsIssue::WildcardWithCredentials => {
-                                            "wildcard + credentials".to_string()
-                                        }
-                                    })
-                                    .collect::<Vec<_>>(),
                             )
                         }),
-                        http_result
-                            .get_all_vulnerabilities()
-                            .iter()
-                            .take(cap(MAX_HTTP_VULNERABILITIES_DISPLAYED))
-                            .map(|vuln| match vuln {
-                                crate::scan::http::HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
-                                crate::scan::http::HttpVulnerability::MissingXFrameOptions => {
-                                    "Missing X-Frame-Options".to_string()
-                                }
-                                crate::scan::http::HttpVulnerability::MissingXContentTypeOptions => {
-                                    "Missing X-Content-Type-Options".to_string()
-                                }
-                                crate::scan::http::HttpVulnerability::MissingCsp => {
-                                    "Missing Content Security Policy".to_string()
-                                }
-                            })
-                            .collect::<Vec<_>>(),
                         http_result.observatory.clone(),
                     )
                 })
@@ -361,7 +312,10 @@ impl SecurityPane {
 
                     lines.push(Line::from(vec![
                         Span::styled("  Expires: ", Style::default().fg(theme::LABEL)),
-                        Span::styled(format!("{} days", days_until_expiry), Style::default().fg(expiry_color)),
+                        Span::styled(
+                            crate::tui::text::plural(days_until_expiry, "day"),
+                            Style::default().fg(expiry_color),
+                        ),
                     ]));
                 }
 
@@ -450,15 +404,14 @@ impl SecurityPane {
 
         // HTTP Security Headers
         if let Some((
-            hsts_present,
+            hsts,
             x_frame,
             x_content,
             xss_protect,
             referrer_policy,
             permissions_policy,
-            csp_data,
+            csp_policy,
             cors_data,
-            http_vulnerabilities,
             http_grade,
         )) = http_data
         {
@@ -468,34 +421,26 @@ impl SecurityPane {
                 Style::default().fg(theme::VALUE),
             )]));
 
-            // HSTS
-            lines.push(Line::from(vec![
-                Span::styled("  HSTS: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    if hsts_present { "yes" } else { "no" },
-                    Style::default().fg(if hsts_present { theme::GOOD } else { theme::BAD }),
-                ),
-            ]));
+            lines.push(observatory_row(
+                "  HSTS: ",
+                &http_grade,
+                "strict-transport-security",
+                hsts.as_deref(),
+            ));
+            lines.push(observatory_row(
+                "  X-Frame: ",
+                &http_grade,
+                "x-frame-options",
+                x_frame.as_deref(),
+            ));
+            lines.push(observatory_row(
+                "  X-Content: ",
+                &http_grade,
+                "x-content-type-options",
+                x_content.as_deref(),
+            ));
 
-            // X-Frame-Options
-            lines.push(Line::from(vec![
-                Span::styled("  X-Frame: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    x_frame.clone(),
-                    Style::default().fg(if x_frame != "missing" { theme::GOOD } else { theme::BAD }),
-                ),
-            ]));
-
-            // X-Content-Type-Options
-            lines.push(Line::from(vec![
-                Span::styled("  X-Content: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    x_content.clone(),
-                    Style::default().fg(if x_content != "missing" { theme::GOOD } else { theme::BAD }),
-                ),
-            ]));
-
-            // X-XSS-Protection
+            // X-XSS-Protection: Observatory has no test for it, so the row is the target's header.
             lines.push(Line::from(vec![
                 Span::styled("  XSS-Protect: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
@@ -504,16 +449,14 @@ impl SecurityPane {
                 ),
             ]));
 
-            // Referrer Policy
-            lines.push(Line::from(vec![
-                Span::styled("  Referrer: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    referrer_policy.clone(),
-                    Style::default().fg(if referrer_policy != "missing" { theme::GOOD } else { theme::WARN }),
-                ),
-            ]));
+            lines.push(observatory_row(
+                "  Referrer: ",
+                &http_grade,
+                "referrer-policy",
+                referrer_policy.as_deref(),
+            ));
 
-            // Permissions Policy
+            // Permissions-Policy: Observatory has no test for it, so the row is the target's header.
             lines.push(Line::from(vec![
                 Span::styled("  Permissions: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
@@ -523,42 +466,22 @@ impl SecurityPane {
             ]));
 
             // CSP: Observatory's result for the graded host; the policy below is the target's own.
-            let csp_label = observatory_label(&http_grade, "content-security-policy");
-            if let Some((header_value, issues)) = csp_data {
-                let (label, color) = csp_label.unwrap_or(("present".to_string(), theme::MUTED));
-                lines.push(Line::from(vec![
-                    Span::styled("  CSP: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(label, Style::default().fg(color)),
-                ]));
-
-                // CSP Header Value
+            lines.push(observatory_row(
+                "  CSP: ",
+                &http_grade,
+                "content-security-policy",
+                csp_policy.as_deref(),
+            ));
+            if let Some(header_value) = csp_policy {
                 lines.push(Line::from(vec![
                     Span::styled("    Policy: ", Style::default().fg(theme::LABEL)),
                     Span::styled(header_value, Style::default().fg(theme::MUTED)),
                 ]));
-
-                // CSP Issues
-                for issue in issues {
-                    lines.push(Line::from(vec![
-                        Span::styled("    • ", Style::default().fg(theme::BAD)),
-                        Span::styled(issue, Style::default().fg(theme::BAD)),
-                    ]));
-                }
-            } else {
-                let (label, color) = csp_label.unwrap_or(("missing".to_string(), theme::BAD));
-                lines.push(Line::from(vec![
-                    Span::styled("  CSP: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(label, Style::default().fg(color)),
-                ]));
             }
 
             // CORS
-            if let Some((
-                access_control_allow_origin,
-                access_control_allow_methods,
-                access_control_allow_credentials,
-                issues,
-            )) = cors_data
+            if let Some((access_control_allow_origin, access_control_allow_methods, access_control_allow_credentials)) =
+                cors_data
             {
                 let (label, color) = observatory_label(&http_grade, "cross-origin-resource-sharing")
                     .unwrap_or(("present".to_string(), theme::MUTED));
@@ -592,30 +515,6 @@ impl SecurityPane {
                         Style::default().fg(if access_control_allow_credentials { theme::WARN } else { theme::GOOD }),
                     ),
                 ]));
-
-                // CORS Issues
-                for issue in issues {
-                    lines.push(Line::from(vec![
-                        Span::styled("    • ", Style::default().fg(theme::BAD)),
-                        Span::styled(issue, Style::default().fg(theme::BAD)),
-                    ]));
-                }
-            }
-
-            // HTTP Vulnerabilities
-            if !http_vulnerabilities.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![Span::styled(
-                    "❗ HTTP Vulnerabilities",
-                    Style::default().fg(theme::BAD),
-                )]));
-
-                for vuln in http_vulnerabilities {
-                    lines.push(Line::from(vec![
-                        Span::styled("  • ", Style::default().fg(theme::BAD)),
-                        Span::styled(vuln, Style::default().fg(theme::BAD)),
-                    ]));
-                }
             }
 
             // HTTP Security Grade: the same line the HTTP pane shows.
@@ -676,7 +575,7 @@ impl SecurityPane {
             lines.push(Line::from(vec![
                 Span::styled("  MX: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
-                    format!("{} records", mx_count),
+                    crate::tui::text::plural(mx_count, "record"),
                     Style::default().fg(if has_mx { theme::GOOD } else { theme::MUTED }),
                 ),
             ]));
@@ -740,7 +639,7 @@ fn zoomed_tls_lines(state: &AppState) -> Vec<Line<'static>> {
     lines.push(Line::from(vec![
         Span::styled("📜 Certificate Chain: ", Style::default().fg(theme::VALUE)),
         Span::styled(
-            format!("{} certificates", data.certificate_chain.len()),
+            crate::tui::text::plural(data.certificate_chain.len(), "certificate"),
             Style::default().fg(theme::MUTED),
         ),
     ]));
@@ -823,7 +722,7 @@ fn common_name_display(distinguished_name: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan::dns::{DnsResult, EmailSecurityAnalysis};
-    use crate::scan::http::{CorsIssue, CorsPolicy, CspIssue, CspPolicy, HttpVulnerability, SecurityHeaders};
+    use crate::scan::http::{CorsPolicy, CspPolicy, SecurityHeaders};
     use crate::scan::observatory::ObservatoryOutcome;
     use crate::scan::observatory::tests::google_com_result;
     use crate::scan::tls::{
@@ -973,7 +872,6 @@ mod tests {
         let csp_policy = CspPolicy {
             header_value: "default-src 'self'; script-src 'self' 'unsafe-inline'".to_string(),
             directives: csp_directives,
-            issues: vec![CspIssue::UnsafeInline("script-src".to_string())],
         };
 
         let cors_policy = CorsPolicy {
@@ -981,7 +879,6 @@ mod tests {
             access_control_allow_methods: vec!["GET".to_string(), "POST".to_string()],
             access_control_allow_headers: vec!["Content-Type".to_string()],
             access_control_allow_credentials: true,
-            issues: vec![CorsIssue::WildcardWithCredentials],
         };
 
         let http_data = crate::scan::http::HttpData {
@@ -1000,7 +897,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![HttpVulnerability::MissingHsts, HttpVulnerability::MissingCsp],
             scan_duration: Duration::from_millis(300),
             target_ip: "1.2.3.4".to_string(),
             https_failure: None,
@@ -1052,24 +948,12 @@ mod tests {
             // Test CSP
             let csp = primary_data.csp.as_ref().unwrap();
             assert!(csp.header_value.contains("default-src 'self'"));
-            assert_eq!(csp.issues.len(), 1);
 
             // Test CORS
             let cors = primary_data.cors.as_ref().unwrap();
             assert_eq!(cors.access_control_allow_origin.as_ref().unwrap(), "*");
             assert_eq!(cors.access_control_allow_methods.len(), 2);
             assert!(cors.access_control_allow_credentials);
-            assert_eq!(cors.issues.len(), 1);
-
-            // Test vulnerabilities using helper methods
-            let all_vulnerabilities = http_result.get_all_vulnerabilities();
-            assert_eq!(all_vulnerabilities.len(), 2);
-            assert!(
-                all_vulnerabilities
-                    .iter()
-                    .any(|v| **v == HttpVulnerability::MissingHsts)
-            );
-            assert!(all_vulnerabilities.iter().any(|v| **v == HttpVulnerability::MissingCsp));
 
             assert_eq!(http_result.observatory.grade_text(), "C- (45) · google.com");
         }
@@ -1250,7 +1134,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![HttpVulnerability::MissingCsp],
             scan_duration: Duration::from_millis(200),
             target_ip: "1.2.3.4".to_string(),
             https_failure: None,
@@ -1358,7 +1241,6 @@ mod tests {
                 let primary_data = http_result.get_primary_result().unwrap();
                 assert!(primary_data.security_headers.strict_transport_security.is_some());
                 assert_eq!(http_result.observatory.grade_text(), "C- (45) · google.com");
-                assert!(!http_result.get_all_vulnerabilities().is_empty());
             } else {
                 panic!("HTTP result should be extractable");
             }
@@ -1412,23 +1294,6 @@ mod tests {
         assert!(vuln_strings.contains(&"POODLE (CVE-2014-3566)".to_string()));
         assert!(vuln_strings.contains(&"Weak cipher: RC4-MD5".to_string()));
         assert!(vuln_strings.contains(&"Certificate expired".to_string()));
-
-        // Test HTTP vulnerability extraction
-        let http_vulnerabilities = [HttpVulnerability::MissingHsts, HttpVulnerability::MissingCsp];
-
-        let http_vuln_strings: Vec<String> = http_vulnerabilities
-            .iter()
-            .map(|vuln| match vuln {
-                HttpVulnerability::MissingHsts => "Missing HSTS header".to_string(),
-                HttpVulnerability::MissingXFrameOptions => "Missing X-Frame-Options".to_string(),
-                HttpVulnerability::MissingXContentTypeOptions => "Missing X-Content-Type-Options".to_string(),
-                HttpVulnerability::MissingCsp => "Missing Content Security Policy".to_string(),
-            })
-            .collect();
-
-        assert_eq!(http_vuln_strings.len(), 2);
-        assert!(http_vuln_strings.contains(&"Missing HSTS header".to_string()));
-        assert!(http_vuln_strings.contains(&"Missing Content Security Policy".to_string()));
     }
 
     fn state_with_tls(status: ScanStatus) -> AppState {
@@ -1596,12 +1461,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![
-                HttpVulnerability::MissingHsts,
-                HttpVulnerability::MissingXFrameOptions,
-                HttpVulnerability::MissingXContentTypeOptions,
-                HttpVulnerability::MissingCsp,
-            ],
             scan_duration: Duration::from_millis(300),
             target_ip: "192.0.2.1".to_string(),
             https_failure: None,
@@ -1614,7 +1473,7 @@ mod tests {
                     ipv4_result: Some(http_data),
                     ipv6_result: None,
                     ipv6_status: crate::scan::http::HttpStatus::NotQueried,
-                    observatory: ObservatoryOutcome::Failed("site down".to_string()),
+                    observatory: ObservatoryOutcome::failed("example.com", "site down"),
                     lenses: crate::scan::http::Lenses::absent(),
                     queried_at: Instant::now(),
                     total_duration: Duration::from_millis(300),
@@ -1725,14 +1584,12 @@ mod tests {
             csp: Some(CspPolicy {
                 header_value: "default-src 'self'".to_string(),
                 directives: HashMap::new(),
-                issues: vec![],
             }),
             cors: Some(CorsPolicy {
                 access_control_allow_origin: Some("*".to_string()),
                 access_control_allow_methods: vec![],
                 access_control_allow_headers: vec![],
                 access_control_allow_credentials: false,
-                issues: vec![],
             }),
             caching: crate::scan::http::CachingPolicy {
                 cache_control: None,
@@ -1740,7 +1597,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![],
             scan_duration: Duration::from_millis(300),
             target_ip: "192.0.2.1".to_string(),
             https_failure: None,
@@ -1800,6 +1656,54 @@ mod tests {
         assert_eq!(crate::tui::testing::fg_of(&buffer, "C- (45) · google.com"), theme::WARN);
     }
 
+    /// The google.com case: the target request (`scan/1.0`) gets no HSTS, X-Frame-Options,
+    /// X-Content-Type-Options or Referrer-Policy, while Observatory's retrieval passes HSTS and
+    /// X-Frame-Options. Each row is Observatory's result alone; nothing reads the target's
+    /// missing headers as a second verdict.
+    #[test]
+    fn header_rows_show_only_observatorys_verdict_when_the_target_request_saw_none() {
+        let state = http_state_with_policies(ObservatoryOutcome::Graded(google_com_result()));
+        let pane = SecurityPane::new();
+        let out = crate::tui::testing::render_pane(&pane, &state, 120, 80, false);
+        let buffer = crate::tui::testing::render_buffer(&pane, &state, 120, 80, false);
+        for (row, result, color) in [
+            ("HSTS: ", "hsts-implemented-max-age-at-least-six-months", theme::GOOD),
+            ("X-Frame: ", "x-frame-options-sameorigin-or-deny", theme::GOOD),
+            ("X-Content: ", "x-content-type-options-not-implemented", theme::BAD),
+            ("Referrer: ", "referrer-policy-unsafe", theme::BAD),
+        ] {
+            assert!(out.contains(&format!("{row}{result}")), "{row}{result}:\n{out}");
+            assert_eq!(crate::tui::testing::fg_of(&buffer, result), color, "{result}");
+        }
+        for second_signal in ["HSTS: no", "X-Frame: missing", "Missing", "Vulnerabilities", "wildcard"] {
+            assert!(!out.contains(second_signal), "`{second_signal}`:\n{out}");
+        }
+        let zoomed = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Zoomed).join("\n");
+        assert!(
+            !zoomed.contains("Missing") && !zoomed.contains("Vulnerabilities"),
+            "{zoomed}"
+        );
+    }
+
+    /// With no grade there is no verdict: the rows show what the target sent, uncolored.
+    #[test]
+    fn header_rows_with_no_grade_show_the_targets_headers_muted() {
+        let state = http_state_with_policies(ObservatoryOutcome::NotApplicable("IP address".to_string()));
+        let pane = SecurityPane::new();
+        let out = crate::tui::testing::render_pane(&pane, &state, 120, 80, false);
+        for row in [
+            "HSTS: missing",
+            "X-Frame: missing",
+            "X-Content: missing",
+            "Referrer: missing",
+        ] {
+            assert!(out.contains(row), "{row}:\n{out}");
+        }
+        assert!(out.contains("CSP: default-src 'self'"), "{out}");
+        let buffer = crate::tui::testing::render_buffer(&pane, &state, 120, 80, false);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "missing"), theme::MUTED);
+    }
+
     #[test]
     fn security_pane_grade_line_for_hosts_with_no_grade_and_a_failed_url() {
         for (outcome, line) in [
@@ -1808,8 +1712,12 @@ mod tests {
                 "HTTP Grade: n/a (IP address)",
             ),
             (
-                ObservatoryOutcome::Failed("site down".to_string()),
-                "HTTP Grade: none (site down)",
+                ObservatoryOutcome::failed("example.com", "site down"),
+                "HTTP Grade: none (site down) · example.com",
+            ),
+            (
+                ObservatoryOutcome::failed("example.com", "HTTP 500"),
+                "HTTP Grade: none (HTTP 500) · example.com",
             ),
         ] {
             let state = http_state_with_policies(outcome);
@@ -1968,7 +1876,7 @@ mod tests {
         let rows = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Zoomed);
         let text = rows.join("\n");
         for expected in [
-            "Certificate Chain: 1 certificates",
+            "Certificate Chain: 1 certificate",
             "Serial: 0a:1b:2c",
             "Subject: CN=www.example.com, O=Example",
             "Signature: SHA256withRSA",
@@ -1979,6 +1887,11 @@ mod tests {
             assert!(text.contains(expected), "{expected}:\n{text}");
         }
         assert!(rows.concat().contains(dmarc), "DMARC text not whole:\n{text}");
+        // Item 9: a one-certificate chain and one MX record read singular.
+        for wrong in ["1 certificates", "MX: 1 records"] {
+            assert!(!text.contains(wrong), "{wrong}:\n{text}");
+        }
+        assert!(text.contains("MX: 1 record"), "{text}");
 
         let normal = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Normal).join("\n");
         assert!(!normal.contains("Certificate Chain"), "{normal}");
@@ -2075,6 +1988,20 @@ mod tests {
     }
 
     /// Item 9: a one-name certificate reads `1 domain`.
+    /// Item 9: a certificate one day from expiry reads `1 day`.
+    #[test]
+    fn expiry_of_one_day_reads_day() {
+        let state = state_with_cert("CN=example.com", "CN=R3");
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.days_until_expiry = Some(1);
+        }
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
+        assert!(out.contains("Expires: 1 day "), "{out}");
+    }
+
     #[test]
     fn san_count_of_one_reads_domain() {
         let state = AppState::new("example.com".to_string());

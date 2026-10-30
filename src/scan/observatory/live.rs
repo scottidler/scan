@@ -13,8 +13,11 @@
 //! ```
 //!
 //! Hosts that flap (neverssl.com answers on port 80 or 443 from one vantage and not the other, run
-//! to run) are retried as a pair, a fresh POST and a fresh local grade, until the two sides agree;
-//! both reporting the site down counts as agreement.
+//! to run) are retried as a pair, a fresh POST and a fresh local grade, until the two sides agree.
+//! Only a graded pair agrees: the same 12 test results and modifiers, score, grade and algorithm
+//! version. A pair where both sides report the site down compares none of those, so it is a retry,
+//! never agreement; a host with no graded agreement in `PAIR_ATTEMPTS` pairs fails with the last
+//! pair's provenance.
 
 use crate::scan::cache::FETCH_TIMEOUT;
 use crate::scan::http::HttpScanner;
@@ -134,16 +137,38 @@ async fn api_scan(client: &reqwest::Client, host: &str) -> eyre::Result<ApiOutco
     })
 }
 
+/// What one pair of runs, the API's and scan's, came to.
+#[derive(Debug, PartialEq)]
+enum PairVerdict {
+    /// Both graded, and every compared field is identical.
+    Agree,
+    /// Both report the site down: nothing was compared, so the pair is retried.
+    BothDown,
+    /// The sides differ, each difference named.
+    Differ(Vec<String>),
+}
+
+/// The verdict on one pair: agreement only when both sides graded and [`differences`] finds none.
+fn pair_verdict(api: &ApiOutcome, local: &ObservatoryOutcome) -> PairVerdict {
+    if let (ApiOutcome::SiteDown { .. }, ObservatoryOutcome::Failed { reason, .. }) = (api, local)
+        && reason == "site down"
+    {
+        return PairVerdict::BothDown;
+    }
+    let found = differences(api, local);
+    if found.is_empty() { PairVerdict::Agree } else { PairVerdict::Differ(found) }
+}
+
 /// Every difference between the API's result and ours, empty when they agree. Compares each test's
 /// result string and modifier, the score, the grade and the algorithm version; never `pass`, which
-/// the API nulls for not-applicable results.
+/// the API nulls for not-applicable results. Any side without a grade is a difference: there is
+/// nothing to compare.
 fn differences(api: &ApiOutcome, local: &ObservatoryOutcome) -> Vec<String> {
     match (api, local) {
-        (ApiOutcome::SiteDown { .. }, ObservatoryOutcome::Failed(reason)) if reason == "site down" => Vec::new(),
         (ApiOutcome::SiteDown { message }, other) => {
             vec![format!("API: {message:?}; scan: {}", other.grade_text())]
         }
-        (ApiOutcome::Graded { grade, score, .. }, ObservatoryOutcome::Failed(reason)) => {
+        (ApiOutcome::Graded { grade, score, .. }, ObservatoryOutcome::Failed { reason, .. }) => {
             vec![format!("API: {grade} ({score}); scan: no grade ({reason})")]
         }
         (ApiOutcome::Graded { grade, score, .. }, ObservatoryOutcome::NotApplicable(reason)) => {
@@ -293,18 +318,24 @@ async fn scan_matches_the_live_observatory_api() {
                 .unwrap_or_else(|e| panic!("{host}: API failed: {e:#}"));
             let deadline = tokio::time::Instant::now() + LOCAL_DEADLINE;
             let local = scanner.grade_host(host, deadline).await;
-            let found = differences(&api, &local);
             println!(
                 "{host} (pair {pair}/{PAIR_ATTEMPTS}): {}",
                 provenance(host, &api, &local)
             );
-            if found.is_empty() {
-                println!("{host}: identical");
-                agreed = true;
-                break;
-            }
+            let found = match pair_verdict(&api, &local) {
+                PairVerdict::Agree => {
+                    println!("{host}: identical");
+                    agreed = true;
+                    break;
+                }
+                PairVerdict::BothDown => {
+                    println!("{host}: both sides report the site down; nothing compared, retrying");
+                    vec!["both sides report the site down: no graded pair to compare".to_string()]
+                }
+                PairVerdict::Differ(found) => found,
+            };
             last_report = format!(
-                "{}\n    effective URL: {}\n    differences:\n      {}",
+                "pair {pair}/{PAIR_ATTEMPTS}: {}\n    effective URL: {}\n    differences:\n      {}",
                 provenance(host, &api, &local),
                 effective_url(host).await,
                 found.join("\n      ")
@@ -390,18 +421,29 @@ mod tests {
     }
 
     #[test]
-    fn site_down_on_both_sides_agrees_and_one_sided_does_not() {
+    fn identical_graded_results_agree() {
+        let local = google_com_result();
+        assert_eq!(
+            pair_verdict(&api_matching(&local), &ObservatoryOutcome::Graded(local.clone())),
+            PairVerdict::Agree
+        );
+    }
+
+    /// Audit: both sides down compares nothing, so it is a retry, never agreement; one side down
+    /// is a difference.
+    #[test]
+    fn site_down_on_both_sides_is_a_retry_and_one_sided_is_a_difference() {
         let down = ApiOutcome::SiteDown {
             message: "The site seems to be down.".to_string(),
         };
-        assert!(differences(&down, &ObservatoryOutcome::Failed("site down".to_string())).is_empty());
+        let local_down = ObservatoryOutcome::failed("neverssl.com", "site down");
+        assert_eq!(pair_verdict(&down, &local_down), PairVerdict::BothDown);
+        assert_ne!(pair_verdict(&down, &local_down), PairVerdict::Agree);
+        assert_eq!(differences(&down, &local_down).len(), 1);
         let graded = ObservatoryOutcome::Graded(google_com_result());
-        assert_eq!(differences(&down, &graded).len(), 1);
+        assert!(matches!(pair_verdict(&down, &graded), PairVerdict::Differ(found) if found.len() == 1));
         let api = api_matching(&google_com_result());
-        assert_eq!(
-            differences(&api, &ObservatoryOutcome::Failed("site down".to_string())).len(),
-            1
-        );
+        assert!(matches!(pair_verdict(&api, &local_down), PairVerdict::Differ(found) if found.len() == 1));
         assert_eq!(
             differences(&api, &ObservatoryOutcome::NotApplicable("IP address".to_string())).len(),
             1

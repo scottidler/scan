@@ -623,11 +623,17 @@ impl WhoisScanner {
             }
         }
 
-        if contact.name.is_some() || contact.organization.is_some() || contact.email.is_some() {
-            Some(contact)
-        } else {
-            None
-        }
+        // Any visible field keeps the contact; a vCard of only empty values is no contact.
+        let any_field = [
+            &contact.name,
+            &contact.organization,
+            &contact.email,
+            &contact.phone,
+            &contact.address,
+        ]
+        .iter()
+        .any(|field| field.is_some());
+        any_field.then_some(contact)
     }
 
     /// Marks each RFC 9537 redaction on its contact, creating the contact when the registry
@@ -2037,6 +2043,36 @@ mod tests {
         assert_eq!(registrant.name, None);
         assert_eq!(registrant.email.as_deref(), Some("owner@example.tv"));
         assert_eq!(result.privacy_score, PrivacyLevel::Partial);
+    }
+
+    /// Audit: an empty `fn` with only a visible phone is still a contact; the phone is not dropped
+    /// with the empty name.
+    #[tokio::test]
+    async fn empty_fn_with_only_a_visible_phone_keeps_the_contact() {
+        let data = serde_json::json!({
+            "objectClassName": "domain",
+            "ldhName": "example.tv",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [
+                    ["version", {}, "text", "4.0"],
+                    ["fn", {}, "text", ""],
+                    ["tel", {"type": "voice"}, "uri", "tel:+1.5555550100"],
+                ]],
+            }],
+        });
+        let result = parse_fixture(data).await;
+        let registrant = result.registrant.as_ref().expect("registrant kept for its phone");
+        assert_eq!(registrant.name, None);
+        assert_eq!(registrant.phone.as_deref(), Some("tel:+1.5555550100"));
+    }
+
+    /// An entity whose vCard values are all empty is no contact.
+    #[tokio::test]
+    async fn a_vcard_of_only_empty_values_is_no_contact() {
+        let result = parse_fixture(rdap_registrant("", "", &[])).await;
+        assert!(result.registrant.is_none(), "{:?}", result.registrant);
     }
 
     /// Item 4: an RFC 9537 `redacted` entry for the name only withholds the name, not the email.

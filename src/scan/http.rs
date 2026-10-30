@@ -358,14 +358,11 @@ impl HttpScanner {
         let cors = self.analyze_cors(&headers);
         let caching = self.analyze_caching(&headers);
 
-        let vulnerabilities = self.assess_vulnerabilities(&security_headers, &csp);
-
         let security_duration = security_start.elapsed();
         log::trace!(
-            "[scan::http] security_analysis_completed: url={} duration={}μs vulnerabilities={}",
+            "[scan::http] security_analysis_completed: url={} duration={}μs",
             url,
-            security_duration.as_micros(),
-            vulnerabilities.len()
+            security_duration.as_micros()
         );
 
         let result = HttpData {
@@ -379,7 +376,6 @@ impl HttpScanner {
             csp,
             cors,
             caching,
-            vulnerabilities,
             scan_duration: start_time.elapsed(),
             target_ip: ip.to_string(),
             https_failure: None,
@@ -444,13 +440,9 @@ impl HttpScanner {
             .or_else(|| headers.get("content-security-policy-report-only"))
             .and_then(|v| v.to_str().ok())?;
 
-        let directives = self.parse_csp_directives(csp_header);
-        let issues = self.analyze_csp_issues(&directives);
-
         Some(CspPolicy {
             header_value: csp_header.to_string(),
-            directives,
-            issues,
+            directives: self.parse_csp_directives(csp_header),
         })
     }
 
@@ -471,33 +463,6 @@ impl HttpScanner {
         }
 
         directives
-    }
-
-    fn analyze_csp_issues(&self, directives: &HashMap<String, Vec<String>>) -> Vec<CspIssue> {
-        let mut issues = Vec::new();
-
-        // Check for unsafe-inline
-        for (directive, values) in directives {
-            if values.contains(&"'unsafe-inline'".to_string()) {
-                issues.push(CspIssue::UnsafeInline(directive.clone()));
-            }
-            if values.contains(&"'unsafe-eval'".to_string()) {
-                issues.push(CspIssue::UnsafeEval(directive.clone()));
-            }
-            if values.contains(&"*".to_string()) {
-                issues.push(CspIssue::WildcardSource(directive.clone()));
-            }
-        }
-
-        // Check for missing important directives
-        if !directives.contains_key("default-src") && !directives.contains_key("script-src") {
-            issues.push(CspIssue::MissingDirective("script-src".to_string()));
-        }
-        if !directives.contains_key("object-src") {
-            issues.push(CspIssue::MissingDirective("object-src".to_string()));
-        }
-
-        issues
     }
 
     fn analyze_cors(&self, headers: &reqwest::header::HeaderMap) -> Option<CorsPolicy> {
@@ -536,50 +501,12 @@ impl HttpScanner {
             .map(|s| s == "true")
             .unwrap_or(false);
 
-        let issues = self.analyze_cors_issues(
-            &access_control_allow_origin,
-            &access_control_allow_methods,
-            &access_control_allow_headers,
-            access_control_allow_credentials,
-        );
-
         Some(CorsPolicy {
             access_control_allow_origin,
             access_control_allow_methods,
             access_control_allow_headers,
             access_control_allow_credentials,
-            issues,
         })
-    }
-
-    fn analyze_cors_issues(
-        &self,
-        origin: &Option<String>,
-        methods: &[String],
-        headers: &[String],
-        credentials: bool,
-    ) -> Vec<CorsIssue> {
-        let mut issues = Vec::new();
-
-        if let Some(origin) = origin
-            && origin == "*"
-        {
-            if credentials {
-                issues.push(CorsIssue::WildcardWithCredentials);
-            } else {
-                issues.push(CorsIssue::WildcardOrigin);
-            }
-        }
-
-        if methods.contains(&"*".to_string()) {
-            issues.push(CorsIssue::WildcardMethods);
-        }
-
-        if headers.contains(&"*".to_string()) {
-            issues.push(CorsIssue::WildcardHeaders);
-        }
-
-        issues
     }
 
     fn analyze_caching(&self, headers: &reqwest::header::HeaderMap) -> CachingPolicy {
@@ -598,33 +525,6 @@ impl HttpScanner {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string()),
         }
-    }
-
-    /// The headers the target's own response did not send. What is wrong with the ones it did
-    /// send is Observatory's to say, in the grade's 12 tests.
-    fn assess_vulnerabilities(
-        &self,
-        security_headers: &SecurityHeaders,
-        csp: &Option<CspPolicy>,
-    ) -> Vec<HttpVulnerability> {
-        let mut vulnerabilities = Vec::new();
-
-        // Missing security headers
-        if security_headers.strict_transport_security.is_none() {
-            vulnerabilities.push(HttpVulnerability::MissingHsts);
-        }
-        if security_headers.x_frame_options.is_none() {
-            vulnerabilities.push(HttpVulnerability::MissingXFrameOptions);
-        }
-        if security_headers.x_content_type_options.is_none() {
-            vulnerabilities.push(HttpVulnerability::MissingXContentTypeOptions);
-        }
-
-        if csp.is_none() {
-            vulnerabilities.push(HttpVulnerability::MissingCsp);
-        }
-
-        vulnerabilities
     }
 }
 
@@ -722,7 +622,10 @@ impl HttpScanner {
                     error
                 );
                 return (
-                    ObservatoryOutcome::Failed(format!("public suffix list unavailable: {}", root_cause(&error))),
+                    ObservatoryOutcome::failed(
+                        host,
+                        &format!("public suffix list unavailable: {}", root_cause(&error)),
+                    ),
                     None,
                 );
             }
@@ -734,7 +637,7 @@ impl HttpScanner {
         let preload: &HstsPreload = &preload;
         let (analysis, retrieval) = observe_retrieval(&self.retriever, host, preload, lists).await;
         (
-            ObservatoryOutcome::from_analysis(analysis),
+            ObservatoryOutcome::from_analysis(host, analysis),
             retrieval.as_ref().map(RetrievalViews::of),
         )
     }
@@ -760,7 +663,7 @@ impl HttpScanner {
             Ok(graded) => graded,
             Err(_) => {
                 log::debug!("[scan::http] grade_target_budget_spent: host={}", host);
-                (ObservatoryOutcome::Failed("timed out".to_string()), None)
+                (ObservatoryOutcome::failed(&host, "timed out"), None)
             }
         }
     }
@@ -781,27 +684,33 @@ impl HttpScanner {
     }
 
     /// The timing, ALPN and security.txt lenses for the target URL as given, concurrently. The
-    /// timing and ALPN connections go to the selected family's first address.
+    /// timing and ALPN connections go to the selected family's first address; security.txt is
+    /// resolved normally, so it runs whether or not that family has an address.
     async fn probe_lenses(&self, target: &Target, protocol: Protocol) -> ProbedLenses {
-        let plan = request_plan(target);
         let ip = target.primary_ip_for_protocol(protocol);
         log::debug!(
             "[scan::http] probe_lenses: target={} ip={:?}",
             target.display_name(),
             ip
         );
-        let (Ok(plan), Some(ip)) = (plan, ip) else {
-            return ProbedLenses::failed("no address to connect to");
+        let url = match request_plan(target) {
+            Ok(plan) => plan.primary,
+            Err(error) => return ProbedLenses::failed(&format!("{error:#}")),
         };
-        let url = plan.primary;
         let host = url.host_str().unwrap_or_default().to_string();
         let timing = self.lens("timing", async {
+            let Some(ip) = ip else {
+                return LensOutcome::Failed(NO_ADDRESS_TO_CONNECT_TO.to_string());
+            };
             match self.lenses.prober.probe(&url, ip).await {
                 Ok(timing) => LensOutcome::Present(timing),
                 Err(error) => LensOutcome::Failed(format!("{error:#}")),
             }
         });
         let alpn = self.lens("alpn", async {
+            let Some(ip) = ip else {
+                return LensOutcome::Failed(NO_ADDRESS_TO_CONNECT_TO.to_string());
+            };
             match self.lenses.prober.alpn(&host, ip, self.lenses.https_port).await {
                 Ok(Some(protocol)) => LensOutcome::Present(protocol),
                 Ok(None) => LensOutcome::Absent,
@@ -829,6 +738,9 @@ impl HttpScanner {
         }
     }
 }
+
+/// Why the timing and ALPN lenses did not run: the selected family has no address.
+const NO_ADDRESS_TO_CONNECT_TO: &str = "no address to connect to";
 
 /// The lenses that open their own connections.
 struct ProbedLenses {
@@ -880,7 +792,7 @@ fn assemble(
     }
     let target_failure = result.failure(protocol);
     Err(match &result.observatory {
-        ObservatoryOutcome::Failed(reason) => eyre::eyre!("{target_failure}; grade: {reason}"),
+        ObservatoryOutcome::Failed { reason, .. } => eyre::eyre!("{target_failure}; grade: {reason}"),
         _ => target_failure,
     })
 }
@@ -971,7 +883,6 @@ pub struct HttpData {
     pub csp: Option<CspPolicy>,
     pub cors: Option<CorsPolicy>,
     pub caching: CachingPolicy,
-    pub vulnerabilities: Vec<HttpVulnerability>,
     pub scan_duration: Duration,
     /// The pinned IP of the first request.
     pub target_ip: String,
@@ -1076,34 +987,6 @@ impl HttpResult {
             None
         }
     }
-
-    pub fn total_vulnerabilities(&self) -> usize {
-        let ipv4_vulns = self.ipv4_result.as_ref().map(|r| r.vulnerabilities.len()).unwrap_or(0);
-        let ipv6_vulns = self.ipv6_result.as_ref().map(|r| r.vulnerabilities.len()).unwrap_or(0);
-        ipv4_vulns + ipv6_vulns
-    }
-
-    pub fn get_all_vulnerabilities(&self) -> Vec<&HttpVulnerability> {
-        let mut vulnerabilities = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        if let Some(ipv4_data) = &self.ipv4_result {
-            for vuln in &ipv4_data.vulnerabilities {
-                if seen.insert(vuln) {
-                    vulnerabilities.push(vuln);
-                }
-            }
-        }
-        if let Some(ipv6_data) = &self.ipv6_result {
-            for vuln in &ipv6_data.vulnerabilities {
-                if seen.insert(vuln) {
-                    vulnerabilities.push(vuln);
-                }
-            }
-        }
-
-        vulnerabilities
-    }
 }
 
 /// The per-target lenses beside the grade. Each one fails on its own; none fails the scan.
@@ -1153,15 +1036,6 @@ pub struct SecurityHeaders {
 pub struct CspPolicy {
     pub header_value: String,
     pub directives: HashMap<String, Vec<String>>,
-    pub issues: Vec<CspIssue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CspIssue {
-    UnsafeInline(String),
-    UnsafeEval(String),
-    WildcardSource(String),
-    MissingDirective(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1170,15 +1044,6 @@ pub struct CorsPolicy {
     pub access_control_allow_methods: Vec<String>,
     pub access_control_allow_headers: Vec<String>,
     pub access_control_allow_credentials: bool,
-    pub issues: Vec<CorsIssue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CorsIssue {
-    WildcardOrigin,
-    WildcardMethods,
-    WildcardHeaders,
-    WildcardWithCredentials,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1187,14 +1052,6 @@ pub struct CachingPolicy {
     pub expires: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum HttpVulnerability {
-    MissingHsts,
-    MissingXFrameOptions,
-    MissingXContentTypeOptions,
-    MissingCsp,
 }
 
 #[cfg(test)]
@@ -1236,7 +1093,7 @@ mod tests {
 
     #[test]
     fn failure_names_each_attempted_family_and_skips_no_address() {
-        let mut result = HttpResult::new(ObservatoryOutcome::Failed("site down".to_string()), Lenses::absent());
+        let mut result = HttpResult::new(ObservatoryOutcome::failed("example.com", "site down"), Lenses::absent());
         result.ipv4_status = HttpStatus::Failed("operation timed out".to_string());
         result.ipv6_status = HttpStatus::Failed("no IPv6 route on this host".to_string());
         assert_eq!(
@@ -1298,36 +1155,6 @@ mod tests {
             Some(&vec!["'self'".to_string(), "'unsafe-inline'".to_string()])
         );
         assert_eq!(directives.get("object-src"), Some(&vec!["'none'".to_string()]));
-    }
-
-    #[test]
-    fn test_csp_issue_detection() {
-        let scanner = HttpScanner::new();
-        let mut directives = HashMap::new();
-        directives.insert(
-            "script-src".to_string(),
-            vec!["'self'".to_string(), "'unsafe-inline'".to_string()],
-        );
-        directives.insert("style-src".to_string(), vec!["*".to_string()]);
-
-        let issues = scanner.analyze_csp_issues(&directives);
-
-        assert!(issues.iter().any(|i| matches!(i, CspIssue::UnsafeInline(_))));
-        assert!(issues.iter().any(|i| matches!(i, CspIssue::WildcardSource(_))));
-    }
-
-    #[test]
-    fn test_cors_issue_detection() {
-        let scanner = HttpScanner::new();
-        let origin = Some("*".to_string());
-        let methods = vec!["GET".to_string(), "POST".to_string()];
-        let headers = vec!["*".to_string()];
-        let credentials = true;
-
-        let issues = scanner.analyze_cors_issues(&origin, &methods, &headers, credentials);
-
-        assert!(issues.iter().any(|i| matches!(i, CorsIssue::WildcardWithCredentials)));
-        assert!(issues.iter().any(|i| matches!(i, CorsIssue::WildcardHeaders)));
     }
 
     #[test]
@@ -1604,7 +1431,6 @@ mod tests {
                 etag: None,
                 last_modified: None,
             },
-            vulnerabilities: vec![],
             scan_duration: Duration::from_millis(5),
             target_ip: "127.0.0.1".to_string(),
             https_failure: None,
@@ -1645,11 +1471,11 @@ mod tests {
         let result = http_result(assemble(
             Protocol::Ipv4,
             worked,
-            ObservatoryOutcome::Failed("site down".to_string()),
+            ObservatoryOutcome::failed("example.com", "site down"),
             Lenses::absent(),
         ));
         assert!(result.has_any_success());
-        assert_eq!(result.observatory.grade_text(), "none (site down)");
+        assert_eq!(result.observatory.grade_text(), "none (site down) · example.com");
     }
 
     #[test]
@@ -1658,7 +1484,7 @@ mod tests {
         let error = assemble(
             Protocol::Ipv4,
             failed(),
-            ObservatoryOutcome::Failed("site down".to_string()),
+            ObservatoryOutcome::failed("example.com", "site down"),
             Lenses::absent(),
         )
         .expect_err("both failed");
@@ -1844,8 +1670,8 @@ mod tests {
         let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
 
         assert!(result.ipv4_status.is_success());
-        assert_eq!(result.observatory, ObservatoryOutcome::Failed("site down".to_string()));
-        assert_eq!(result.observatory.grade_text(), "none (site down)");
+        assert_eq!(result.observatory, ObservatoryOutcome::failed(SITE, "site down"));
+        assert_eq!(result.observatory.grade_text(), "none (site down) · site.com");
     }
 
     #[tokio::test]
@@ -1930,7 +1756,7 @@ mod tests {
 
         let result = http_result(Scanner::scan(&scanner, &site_target(site.port()), Protocol::Ipv4).await);
 
-        let ObservatoryOutcome::Failed(reason) = &result.observatory else {
+        let ObservatoryOutcome::Failed { reason, .. } = &result.observatory else {
             panic!("{:?}", result.observatory);
         };
         assert!(reason.starts_with("public suffix list unavailable"), "{reason}");
@@ -1963,7 +1789,7 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(result.ipv4_status.is_success(), "{:?}", result.ipv4_status);
-        assert_eq!(result.observatory, ObservatoryOutcome::Failed("timed out".to_string()));
+        assert_eq!(result.observatory, ObservatoryOutcome::failed(SITE, "timed out"));
     }
 
     /// Stalled sessions hit their own 9s request cap, far inside the 35s budget and the runner's
@@ -2145,5 +1971,35 @@ mod tests {
         );
         let headers_at = zoomed.find("Security Headers").unwrap();
         assert!(zoomed.find("ALPN: h2").unwrap() < headers_at, "{zoomed}");
+    }
+
+    /// security.txt is fetched by name, not pinned to an address: a selected family with no
+    /// address fails timing and ALPN only, and security.txt still reads the served file.
+    #[tokio::test]
+    async fn security_txt_runs_when_the_selected_family_has_no_address() {
+        use disclosure::{SECURITY_TXT_PATH, SecurityTxtState};
+
+        let ca = TestCa::new("lens CA");
+        let https = FakeHttp::start_tls_alpn(
+            vec![
+                FakeRoute::get(SECURITY_TXT_PATH, 200)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body("Contact: mailto:security@site.com\nExpires: 2099-01-01T00:00:00Z\n"),
+            ],
+            &ca.issue(&[SITE]),
+            &[b"http/1.1"],
+        )
+        .await;
+        let scanner = HttpScanner::new().with_lenses(offline_lenses(https.port(), &[ca.der()]));
+        // Resolved to IPv4 only; the IPv6 family is selected.
+        let target = site_target(unlistened_port());
+
+        let probed = scanner.probe_lenses(&target, Protocol::Ipv6).await;
+
+        assert_eq!(probed.timing, LensOutcome::Failed(NO_ADDRESS_TO_CONNECT_TO.to_string()));
+        assert_eq!(probed.alpn, LensOutcome::Failed(NO_ADDRESS_TO_CONNECT_TO.to_string()));
+        let txt = probed.security_txt.present().expect("security.txt is resolved by name");
+        assert_eq!(txt.state, SecurityTxtState::Present);
+        assert_eq!(txt.contact.as_deref(), Some("mailto:security@site.com"));
     }
 }

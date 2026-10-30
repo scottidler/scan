@@ -952,3 +952,78 @@ Success criteria (all tests, `cargo test --lib`, 815 passing plus the one ignore
 - DMARC still reads `missing` when its query fails (only MTA-STS and TLS-RPT got the `failed` state). Give DMARC the same?
 - MTA-STS: with two `v=STSv1` records RFC 8461 §3.1 says no policy is available; `tagged_value` reads the first. Flag that case as `invalid`?
 - `--no-tui` (`pretty.rs`) prints none of the lenses; the doc places them in the two zooms only. Add them there?
+
+## Implementation audit fixes
+
+Audit synthesis: `/home/saidler/.cache/review-panel/runs/1LhRTHSc/synthesis.md` (probes in `probes.md` beside it). Fixes items 1-6 of the synthesis, and question 4 (the live test's both-down rule).
+
+| Item | Fix | Test(s) |
+|---|---|---|
+| 1. Two signals for one fact | Deleted `HttpVulnerability`, `assess_vulnerabilities`, `HttpData::vulnerabilities`, `total_vulnerabilities`, `get_all_vulnerabilities`, the HTTP pane `Issues:` list, the Security pane `❗ HTTP Vulnerabilities` block, and `pretty.rs`'s `N vulnerabilities`. Deleted `CspIssue`/`CorsIssue`, the `issues` fields and `analyze_csp_issues`/`analyze_cors_issues` along with their bullets. Security pane HSTS, X-Frame, X-Content, Referrer and CSP rows go through `tui/security.rs:observatory_row`: Observatory's test result when graded, else the target's header value (or `missing`) in `MUTED` | `tui::security::tests::header_rows_show_only_observatorys_verdict_when_the_target_request_saw_none` (google.com grade, `scan/1.0` saw no headers: `HSTS: hsts-implemented-max-age-at-least-six-months` GOOD, no `HSTS: no`/`Missing`/`Vulnerabilities`, zoom too); `header_rows_with_no_grade_show_the_targets_headers_muted`; `tui::http::tests::redirects_that_fit_take_one_row_and_no_header_issue_list_is_shown` (inverted from `..._and_every_issue_name_stays_visible`); `pretty::tests::http_prints_the_grade_and_no_count_of_the_targets_missing_headers` |
+| 2. `plural()` everywhere | `plural` is generic over any integer (`From<u8>`). Routed: Security `MX:`, `Certificate Chain:`, cert `Expires: N days`; WHOIS zoom `Age:`; HTTP `Size: N bytes`; `pretty.rs` `A records`, `security features`, traceroute `hops` | `tui::security::tests::zoomed_content_lists_the_certificate_chain_and_dmarc_in_full` (inverted from `1 certificates`, plus `MX: 1 record`), `expiry_of_one_day_reads_day`, `tui::whois::tests::domain_age_of_one_day_reads_in_the_singular`, `tui::http::tests::a_one_byte_body_reads_byte`, `pretty::tests::counts_of_one_are_singular`, `tui::text::tests::plural_adds_an_s_unless_the_count_is_one` |
+| 3. security.txt gated on the family's address | `probe_lenses`: only timing and ALPN need `ip`; security.txt runs on the URL's host regardless | `scan::http::tests::security_txt_runs_when_the_selected_family_has_no_address` |
+| 4. RDAP contact with empty `fn` and a phone dropped | `parse_contact_info` keeps a contact when any of name, organization, email, phone, address is present | `scan::whois::tests::empty_fn_with_only_a_visible_phone_keeps_the_contact`, `a_vcard_of_only_empty_values_is_no_contact` |
+| 5. Cookie `Expires` raw, last-wins | `Cookie::parse` runs `jar::parse_date` on the attribute and assigns only a date that parses. `Cookie.expires`/`CookieData.expires` are `Option<SystemTime>`; `jar::expiry_time` reads it directly. tough-cookie 5.1.2 `dist/cookie/cookie.js`, `case 'expires'`: `const exp = parseDate(av_value); // "If the attribute-value failed to parse as a cookie date, ignore the cookie-av." if (exp) { c.expires = exp; }` | `cookies::cookie::tests::an_unparseable_expires_is_ignored_and_keeps_the_earlier_date`, `cookies::jar::tests::a_past_expires_followed_by_garbage_is_expired_at_lookup` (`Expires=<1970>; Expires=garbage` is dropped at lookup) |
+| 6. No-grade line omits the host | `ObservatoryOutcome::Failed { host, reason }`; `grade_summary` reads `none (<reason>) · <host>` in the HTTP pane, Security pane and `--no-tui`. `n/a (<reason>)` stays hostless | `observatory::tests::grade_text_names_the_grade_score_and_host`, `tui::http::tests::hosts_with_no_grade_read_why_in_muted`, `a_working_url_and_a_failed_grade_show_together`, `tui::security::tests::security_pane_grade_line_for_hosts_with_no_grade_and_a_failed_url`, `pretty::tests::http_grade_matches_the_panes_text_for_every_outcome`, `scan::http::tests::a_working_url_with_a_down_site_returns_ok_with_both` |
+| 7. Live test both-down counted as agreement | `live.rs:pair_verdict` -> `Agree` only for a graded pair with no differences (12 test results and modifiers, score, grade, algorithm_version); `BothDown` is a retry; 4 pairs with no `Agree` fails with the last pair's provenance | `observatory::live::tests::site_down_on_both_sides_is_a_retry_and_one_sided_is_a_difference`, `identical_graded_results_agree` |
+
+Bite proofs (scripted mutation of the working tree, `cargo test --lib <filter>`, restored after):
+
+| Fix undone | Failing tests |
+|---|---|
+| Security rows read the target's headers, not Observatory | `header_rows_show_only_observatorys_verdict_when_the_target_request_saw_none`, `http_grade_csp_and_cors_show_observatory_results` |
+| `pretty.rs` prints a count of the target's missing headers | `pretty::tests::http_prints_the_grade_and_no_count_of_the_targets_missing_headers` |
+| Security `MX: {} records` / `{} certificates` | `zoomed_content_lists_the_certificate_chain_and_dmarc_in_full` (each) |
+| Security `{} days` | `expiry_of_one_day_reads_day` |
+| `pretty.rs` `{} A records` / `{} security features` / `{} hops` | `pretty::tests::counts_of_one_are_singular` (each) |
+| WHOIS `{age} days` | `domain_age_of_one_day_reads_in_the_singular` |
+| HTTP `{} bytes` | `a_one_byte_body_reads_byte` |
+| security.txt gated on `ip` | `security_txt_runs_when_the_selected_family_has_no_address` |
+| RDAP keep condition without phone | `empty_fn_with_only_a_visible_phone_keeps_the_contact` |
+| Unparseable `Expires` overwrites | `an_unparseable_expires_is_ignored_and_keeps_the_earlier_date`, `a_past_expires_followed_by_garbage_is_expired_at_lookup` |
+| No-grade line without host | `grade_text_names_the_grade_score_and_host`, `hosts_with_no_grade_read_why_in_muted`, `a_working_url_and_a_failed_grade_show_together`, `security_pane_grade_line_for_hosts_with_no_grade_and_a_failed_url`, `http_grade_matches_the_panes_text_for_every_outcome`, `a_working_url_with_a_down_site_returns_ok_with_both`, `assemble_returns_ok_when_the_url_works_and_the_grade_fails` |
+| Both-down counts as agreement | `site_down_on_both_sides_is_a_retry_and_one_sided_is_a_difference` |
+
+The HTTP pane's `Issues:` removal has no mutation proof: the list read a field that no longer exists, so the compiler is the guard. Its test is the inverted redirect test above, which asserts no `Issues:` or `Missing` row next to a google.com grade.
+
+Live test, 2026-10-30 10:43-10:51Z, from talos, `cargo test --release --lib -- --ignored --exact --nocapture scan::observatory::live::scan_matches_the_live_observatory_api`: **FAILED** on neverssl.com. Every other host matched on pair 1:
+
+```text
+google.com (pair 1/4): API scan id 132274887, scanned_at 2026-10-30T10:43:40.100Z, C- (45); scan: C- (45), verified=true, preload_available=true -> identical
+www.tatari.tv (pair 1/4): API scan id 132275339, scanned_at 2026-10-30T10:45:33.447Z, B (75); scan: B (75) -> identical
+github.com (pair 1/4): API scan id 132275344, scanned_at 2026-10-30T10:45:35.097Z, A+ (115); scan: A+ (115) -> identical
+example.com (pair 1/4): API scan id 132275226, scanned_at 2026-10-30T10:45:03.919Z, F (10); scan: F (10) -> identical
+mozilla.org (pair 1/4): API scan id 132275435, scanned_at 2026-10-30T10:45:58.074Z, B+ (80); scan: B+ (80) -> identical
+neverssl.com (pair 1/4): API "The site seems to be down."; scan: D (30)
+neverssl.com (pair 2/4): API "The site seems to be down."; scan: F (10)
+neverssl.com (pair 3/4): API scan id 132276236, scanned_at 2026-10-30T10:49:22.164Z, D (30); scan: none (site down) · neverssl.com
+neverssl.com (pair 4/4): API "The site seems to be down."; scan: none (site down) · neverssl.com -> both down, nothing compared
+preload sha256 (all pairs): d132107cad8e71df05e39b042a23843ea1eba648f8206f42ab59e070e2d2486c
+panicked: scan disagrees with the live Observatory API: neverssl.com ... effective URL: no session answered
+    differences: both sides report the site down: no graded pair to compare
+test result: FAILED. 0 passed; 1 failed; finished in 482.15s
+```
+
+neverssl.com stays in `HOSTS`. In 4 pairs the two sides were never up at the same time, so nothing could be compared. Pair 2 is new: scan graded F (10) where pair 1 graded D (30), against an API that was down. That is the host flapping between ports 80 and 443 mid-retrieval, and this run cannot tell it apart from a grading difference. After the run, the failure report's pair label moved from the end of the provenance (after the preload hash) to its front, `pair N/4: <provenance>`. That is a format change only, and the test was not re-run for it.
+
+### Design decisions
+- Security pane header rows: `observatory_row` (`tui/security.rs`) is the one place a header row gets a verdict. With no grade (IP target, site down, timed out) the row shows what the target sent, in `MUTED`, never colored as a pass or fail. CSP joins it, so a missing CSP with no grade is now `missing` in `MUTED` (it was `BAD`).
+- `CspIssue`/`CorsIssue` deleted along with their bullets, not just hidden. `unsafe-inline`, wildcard origins and the rest are what Observatory's CSP and CORS tests judge, so keeping the parsed lists would keep the second signal in the data model. `CspPolicy.directives` and the CORS fields stay for display (Security pane, HTTP zoom).
+- `ObservatoryOutcome::Failed` is a struct variant carrying the graded host (`failed(host, reason)` builds it; `from_analysis(host, ..)`). The host is the one Observatory was asked about, not the target's display name, so a URL target names its host without the port or path. Every no-grade cause carries it, including `timed out` and `public suffix list unavailable`.
+- `plural` is generic (`N: Display + PartialEq + From<u8>`), so `u8` hop counts and `i64` day counts use the same helper as `usize` lengths. A negative count reads plural (`-3 days`).
+- Cookie expiry is parsed once, at the attribute, into `Option<SystemTime>`. That mirrors tough-cookie, which stores a `Date`, and leaves no path where an unparseable string reaches the jar. `CookieData.expires` carries the same type. The google.com fixture's `serializeSync` ISO dates are parsed in `observatory::tests::jar_cookie`.
+- Live test: `PairVerdict { Agree, BothDown, Differ }` from `pair_verdict`. `differences` now reports any side without a grade as a difference, and both-down is classified before it.
+
+### Deviations
+- The CSP row's no-grade fallback changed from `missing` in `BAD` to `missing` in `MUTED` (not named in the audit). A red `missing` is a verdict from the target request, the class item 1 removes.
+- `probe_lenses` now reports a failed request plan with its own error, not `no address to connect to`.
+- The Phase 4 note (Deviations: "`Cookie.expires` keeps the raw attribute ... results are unaffected") is superseded here. `Cookie.expires` is now parsed and an unparseable value is ignored, as upstream does.
+
+### Tradeoffs
+- Struct variant `Failed { host, reason }` vs passing the host at render time: the three surfaces (HTTP pane, Security pane, `--no-tui`) would each have to derive the Observatory host from the target the same way `observatory_host` does. Carrying it on the outcome keeps one source.
+- Deleting the CSP/CORS issue analysis vs keeping it for the zoom: the zoom already shows the raw policy and header values, and Observatory's result names the problem. A second list would only disagree with it.
+
+### Open questions
+- The live test now fails on neverssl.com whenever the two sides are never up together in 4 pairs, as it did in this run. The doc's only relief is a dated Resolved Decision with your say-so: swap the host for a stable plain-HTTP host, or keep it and accept a red run when it flaps?
+- `--no-tui` still prints `N security features`: a count of the security headers the `scan/1.0` request saw. It is not a pass or fail, but it is the target request's reading of the same headers Observatory grades (google.com reads `0 security features` beside an HSTS pass). Drop it as well?
+- XSS-Protect and Permissions rows still color the target's own header (`GOOD`/`WARN`) since Observatory has no test for them, as instructed. Should they go `MUTED` like the other no-grade rows?

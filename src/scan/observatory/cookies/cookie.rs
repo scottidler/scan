@@ -8,7 +8,9 @@
 
 //! One cookie as the jar stores it, and the `Set-Cookie` attribute parser that fills it.
 
+use super::jar::parse_date;
 use crate::scan::observatory::js;
+use std::time::SystemTime;
 
 /// A cookie's `SameSite`: only these three values are kept; anything else leaves it unset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,9 +35,10 @@ impl SameSite {
 pub struct Cookie {
     pub key: String,
     pub value: String,
-    /// The raw `Expires` attribute. No analyzer reads the date, and the jar keeps a cookie whatever
-    /// its expiry (Phase 0c), so it is not parsed.
-    pub expires: Option<String>,
+    /// The `Expires` attribute parsed as an RFC 6265 cookie date. The jar's `Cookie` header lookup
+    /// reads it to drop an expired match, as tough-cookie's `getCookies` does. An unparseable
+    /// value is ignored, never stored: it leaves an earlier parsed `Expires` in place.
+    pub expires: Option<SystemTime>,
     /// `Max-Age` in seconds, a JS number as tough-cookie stores it.
     pub max_age: Option<f64>,
     /// Lowercased, the leading dot dropped.
@@ -94,9 +97,12 @@ impl Cookie {
             };
             let value = value.filter(|v| !v.is_empty()).map(js::trim);
             match js::trim(name).to_lowercase().as_str() {
+                // tough-cookie 5.1.2 `Cookie.parse` (dist/cookie/cookie.js, `case 'expires'`): the
+                // value goes through `parseDate`, and only a date that parses is assigned; "If the
+                // attribute-value failed to parse as a cookie date, ignore the cookie-av."
                 "expires" => {
-                    if let Some(value) = value.filter(|v| !v.is_empty()) {
-                        cookie.expires = Some(value.to_string());
+                    if let Some(expires) = value.filter(|v| !v.is_empty()).and_then(parse_date) {
+                        cookie.expires = Some(expires);
                     }
                 }
                 "max-age" => {
@@ -174,6 +180,20 @@ mod tests {
         assert!(Cookie::parse("a=b\u{1}c").is_none());
         assert!(Cookie::parse("").is_none());
         assert_eq!(Cookie::parse("a=b\nc=d").unwrap().value, "b");
+    }
+
+    /// tough-cookie keeps the last `Expires` that parses: an unparseable one after it is ignored,
+    /// and a cookie with only an unparseable one never expires.
+    #[test]
+    fn an_unparseable_expires_is_ignored_and_keeps_the_earlier_date() {
+        let past = Cookie::parse("a=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Expires=garbage").unwrap();
+        assert_eq!(past.expires, Some(std::time::UNIX_EPOCH));
+        assert_eq!(Cookie::parse("a=1; Expires=garbage").unwrap().expires, None);
+        let later = Cookie::parse("a=1; Expires=garbage; Expires=Wed, 29 Oct 2025 00:00:00 GMT").unwrap();
+        assert_eq!(
+            later.expires,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_761_696_000))
+        );
     }
 
     #[test]
