@@ -16,7 +16,6 @@ const MAX_CORS_ISSUES_DISPLAYED: usize = 3;
 const MAX_HTTP_VULNERABILITIES_DISPLAYED: usize = 5;
 const MAX_TLS_VULNERABILITIES_DISPLAYED: usize = 5;
 const CN_EXTRACT_PREFIX_LENGTH: usize = 3;
-const CN_DISPLAY_MAX_LENGTH: usize = 25;
 const CERT_EXPIRY_WARNING_DAYS: i64 = 30;
 const CERT_EXPIRY_CRITICAL_DAYS: i64 = 7;
 const MIN_SECURITY_PANE_WIDTH: u16 = 50;
@@ -115,7 +114,6 @@ impl SecurityPane {
                         primary_data.negotiated_version.as_ref().map(|v| v.as_str().to_string()),
                         primary_data.negotiated_cipher.as_ref().map(|c| c.name.clone()),
                         primary_data.perfect_forward_secrecy,
-                        primary_data.ocsp_stapling,
                         primary_data.certificate_valid,
                         primary_data.days_until_expiry,
                         tls_result
@@ -244,7 +242,7 @@ impl SecurityPane {
                             .collect::<Vec<_>>(),
                         http_result
                             .get_best_security_grade()
-                            .map(|g| format!("{:?}", g))
+                            .map(|g| g.as_str().to_string())
                             .unwrap_or_else(|| "N/A".to_string()),
                     )
                 })
@@ -299,7 +297,6 @@ impl SecurityPane {
             negotiated_version,
             negotiated_cipher,
             pfs,
-            ocsp,
             cert_valid,
             days_until_expiry,
             security_grade,
@@ -341,18 +338,20 @@ impl SecurityPane {
 
             lines.push(Line::from(vec![
                 Span::styled("  PFS: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    if pfs { "yes" } else { "no" },
-                    Style::default().fg(if pfs { Color::Green } else { Color::Red }),
-                ),
+                if !connection_successful {
+                    Span::styled("n/a", Style::default().fg(Color::Gray))
+                } else {
+                    Span::styled(
+                        if pfs { "yes" } else { "no" },
+                        Style::default().fg(if pfs { Color::Green } else { Color::Red }),
+                    )
+                },
             ]));
 
             lines.push(Line::from(vec![
                 Span::styled("  OCSP: ", Style::default().fg(Color::White)),
-                Span::styled(
-                    if ocsp { "yes" } else { "no" },
-                    Style::default().fg(if ocsp { Color::Green } else { Color::Yellow }),
-                ),
+                // Stapling is never collected, so `no` would claim a check that did not happen.
+                Span::styled("not checked", Style::default().fg(Color::Gray)),
             ]));
 
             // Certificate Details
@@ -558,7 +557,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("  CSP: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        format!("{:?}", strength),
+                        strength.label(),
                         Style::default().fg(match strength {
                             crate::scan::http::CspStrength::Strong => Color::Green,
                             crate::scan::http::CspStrength::Moderate => Color::Yellow,
@@ -600,7 +599,7 @@ impl SecurityPane {
                 lines.push(Line::from(vec![
                     Span::styled("  CORS: ", Style::default().fg(Color::White)),
                     Span::styled(
-                        format!("{:?}", security_level),
+                        security_level.label(),
                         Style::default().fg(match security_level {
                             crate::scan::http::CorsSecurityLevel::Secure => Color::Green,
                             crate::scan::http::CorsSecurityLevel::Moderate => Color::Yellow,
@@ -670,8 +669,7 @@ impl SecurityPane {
                 Span::styled(
                     http_grade.clone(),
                     Style::default().fg(match http_grade.as_str() {
-                        "APlus" => Color::Green,
-                        "A" => Color::Green,
+                        "A+" | "A" => Color::Green,
                         "B" => Color::Yellow,
                         _ => Color::Red,
                     }),
@@ -843,15 +841,15 @@ impl Pane for SecurityPane {
     }
 }
 
-/// The `CN=` value of a distinguished name, cut at the next `,` and to `CN_DISPLAY_MAX_LENGTH` chars.
-/// Counted in chars, not bytes: a byte cut inside a multibyte char panics the draw loop.
+/// The `CN=` value of a distinguished name, cut at the next `,`. Never cut by length: the line is
+/// fit to the pane width, which marks the cut with `…`.
 fn common_name_display(distinguished_name: &str) -> String {
     let Some(cn_start) = distinguished_name.find("CN=") else {
         return "unknown".to_string();
     };
     let cn_part = &distinguished_name[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
     let cn = cn_part.split(',').next().unwrap_or_default();
-    cn.chars().take(CN_DISPLAY_MAX_LENGTH).collect()
+    cn.to_string()
 }
 
 #[cfg(test)]
@@ -1668,26 +1666,133 @@ mod tests {
     }
 
     #[test]
-    fn render_multibyte_cn_truncates_by_chars_without_panic() {
+    fn render_multibyte_cn_is_fit_by_width_without_panic() {
         let cn = "é".repeat(30);
         let state = state_with_cert(&format!("CN={cn}"), &format!("CN={cn},O=Example"));
-        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
-        let shown = "é".repeat(CN_DISPLAY_MAX_LENGTH);
-        assert!(
-            out.contains(&format!("Subject: {shown}")),
-            "subject CN not shown:\n{}",
-            out
+        let wide = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
+        assert!(wide.contains(&format!("Subject: {cn}")), "subject CN cut:\n{wide}");
+        assert!(wide.contains(&format!("Issuer: {cn}")), "issuer CN cut:\n{wide}");
+        // Narrow panes still cut on a char boundary, with an ellipsis.
+        let narrow = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 40, 40, false);
+        assert!(narrow.contains('…'), "narrow CN not marked:\n{narrow}");
+    }
+
+    #[test]
+    fn forty_char_cn_renders_in_full_at_200x55() {
+        let cn = "Sectigo Public Server Authentication CA DV R36";
+        assert!(cn.chars().count() > 40);
+        let state = state_with_cert("CN=example.com", &format!("CN={cn},O=Sectigo Limited"));
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 2, 200, 55);
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, width, height, false);
+        assert!(out.contains(&format!("Issuer: {cn}")), "CN cut:\n{out}");
+    }
+
+    #[test]
+    fn security_features_say_what_was_not_checked() {
+        let out = crate::tui::testing::render_pane(
+            &SecurityPane::new(),
+            &state_with_tls(ScanStatus::Complete),
+            100,
+            80,
+            false,
         );
-        assert!(
-            out.contains(&format!("Issuer: {shown}")),
-            "issuer CN not shown:\n{}",
-            out
+        assert!(out.contains("PFS: yes"), "{out}");
+        assert!(out.contains("OCSP: not checked"), "{out}");
+        assert!(!out.contains("OCSP: no\n") && !out.contains("OCSP: yes"), "{out}");
+    }
+
+    #[test]
+    fn failed_handshake_has_no_pfs_verdict() {
+        let state = state_with_tls(ScanStatus::Complete);
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.connection_successful = false;
+            data.perfect_forward_secrecy = false;
+        }
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
+        assert!(out.contains("PFS: n/a"), "{out}");
+        assert!(!out.contains("PFS: no"), "{out}");
+    }
+
+    fn http_state_with_policies(grade: HttpSecurityGrade, strength: CspStrength, level: CorsSecurityLevel) -> AppState {
+        let state = AppState::new("example.com".to_string());
+        let http_data = crate::scan::http::HttpData {
+            url: "https://example.com".to_string(),
+            status_code: 200,
+            response_time: Duration::from_millis(200),
+            content_length: 1024,
+            content_type: Some("text/html".to_string()),
+            redirect_chain: vec![],
+            security_headers: SecurityHeaders {
+                strict_transport_security: None,
+                x_frame_options: None,
+                x_content_type_options: None,
+                x_xss_protection: None,
+                referrer_policy: None,
+                permissions_policy: None,
+            },
+            csp: Some(CspPolicy {
+                header_value: "default-src 'self'".to_string(),
+                directives: HashMap::new(),
+                issues: vec![],
+                strength,
+            }),
+            cors: Some(CorsPolicy {
+                access_control_allow_origin: Some("*".to_string()),
+                access_control_allow_methods: vec![],
+                access_control_allow_headers: vec![],
+                access_control_allow_credentials: false,
+                issues: vec![],
+                security_level: level,
+            }),
+            caching: crate::scan::http::CachingPolicy {
+                cache_control: None,
+                expires: None,
+                etag: None,
+                last_modified: None,
+            },
+            vulnerabilities: vec![],
+            security_grade: grade.clone(),
+            scan_duration: Duration::from_millis(300),
+            target_ip: "192.0.2.1".to_string(),
+            https_failure: None,
+        };
+        state.scanners.insert(
+            "http".to_string(),
+            ScanState {
+                result: Some(ScanResult::Http(crate::scan::http::HttpResult {
+                    ipv4_status: crate::scan::http::HttpStatus::Success(grade),
+                    ipv4_result: Some(http_data),
+                    ipv6_result: None,
+                    ipv6_status: crate::scan::http::HttpStatus::NotQueried,
+                    queried_at: Instant::now(),
+                    total_duration: Duration::from_millis(300),
+                })),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
         );
-        assert!(
-            !out.contains(&"é".repeat(CN_DISPLAY_MAX_LENGTH + 1)),
-            "CN not truncated:\n{}",
-            out
+        state
+    }
+
+    #[test]
+    fn http_grade_csp_and_cors_render_user_labels_not_enum_names() {
+        let state = http_state_with_policies(
+            HttpSecurityGrade::APlus,
+            CspStrength::Moderate,
+            CorsSecurityLevel::Dangerous,
         );
+        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
+        assert!(out.contains("HTTP Grade: A+"), "{out}");
+        assert!(out.contains("CSP: moderate"), "{out}");
+        assert!(out.contains("CORS: dangerous"), "{out}");
+        for enum_name in ["APlus", "Moderate", "Dangerous"] {
+            assert!(!out.contains(enum_name), "enum name {enum_name} leaked:\n{out}");
+        }
     }
 
     #[test]
@@ -1748,7 +1853,7 @@ mod tests {
         assert_eq!(common_name_display("O=No Common Name"), "unknown");
         assert_eq!(
             common_name_display(&format!("CN={}", "ü".repeat(40))).chars().count(),
-            CN_DISPLAY_MAX_LENGTH
+            40
         );
         assert_eq!(common_name_display("CN="), "");
     }

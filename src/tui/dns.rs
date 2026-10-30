@@ -330,7 +330,13 @@ impl DnsPane {
         }
 
         // MX records
-        if !dns_result.MX.is_empty() {
+        if is_null_mx(&dns_result.MX) {
+            // RFC 7505: a lone `0 .` says the domain accepts no mail; it is not a mail server.
+            lines.push(Line::from(vec![
+                Span::styled("MX: ", Style::default().fg(Color::White)),
+                Span::styled("none (null MX)", Style::default().fg(Color::Gray)),
+            ]));
+        } else if !dns_result.MX.is_empty() {
             let ttl = dns_result.MX[0].ttl_remaining();
             let ttl_color = if ttl > TTL_GOOD_THRESHOLD {
                 Color::Green
@@ -465,6 +471,11 @@ impl DnsPane {
             Span::styled("scanner not available", Style::default().fg(Color::Red)),
         ])]
     }
+}
+
+/// True for the RFC 7505 null MX: exactly one record, priority 0, exchange `.`.
+fn is_null_mx(records: &[crate::scan::dns::DnsRecord<crate::scan::dns::MxRecord>]) -> bool {
+    matches!(records, [record] if record.value.priority == 0 && record.value.exchange == ".")
 }
 
 impl Default for DnsPane {
@@ -617,5 +628,45 @@ mod tests {
             0,
             &format!("  {txt}"),
         );
+    }
+
+    fn mx(priority: u16, exchange: &str) -> crate::scan::dns::DnsRecord<crate::scan::dns::MxRecord> {
+        crate::scan::dns::DnsRecord::new(
+            crate::scan::dns::MxRecord {
+                priority,
+                exchange: exchange.to_string(),
+            },
+            300,
+        )
+    }
+
+    fn render_mx(records: Vec<crate::scan::dns::DnsRecord<crate::scan::dns::MxRecord>>) -> String {
+        use crate::scan::dns::{DnsResult, QueryStatus};
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::Success(records.len());
+        result.MX = records;
+        crate::tui::testing::render_pane(
+            &DnsPane::new(),
+            &complete_state("dns", crate::types::ScanResult::Dns(result)),
+            80,
+            30,
+            false,
+        )
+    }
+
+    #[test]
+    fn null_mx_renders_as_none_not_a_mail_server() {
+        let out = render_mx(vec![mx(0, ".")]);
+        assert!(out.contains("MX: none (null MX)"), "{out}");
+        assert!(!out.contains("pri:"), "null MX shown as a server:\n{out}");
+    }
+
+    #[test]
+    fn real_mx_records_still_render_as_servers() {
+        let out = render_mx(vec![mx(0, "mail.example.com"), mx(10, "backup.example.com")]);
+        assert!(out.contains("MX: 2 records"), "{out}");
+        assert!(out.contains("mail.example.com (pri: 0)"), "{out}");
+        let lone_dot_with_peer = render_mx(vec![mx(0, "."), mx(10, "mail.example.com")]);
+        assert!(!lone_dot_with_peer.contains("null MX"), "{lone_dot_with_peer}");
     }
 }

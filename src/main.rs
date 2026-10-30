@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
         );
 
         let app_create_start = Instant::now();
-        let app = scan::tui::TuiApp::new()?;
+        let app = scan::tui::TuiApp::new()?.with_startup(app_start.into_std());
         let app_create_duration = app_create_start.elapsed();
         log::debug!("[main] tui_app_created: duration={}ms", app_create_duration.as_millis());
 
@@ -169,13 +169,6 @@ async fn main() -> Result<()> {
         let tui_start = Instant::now();
         let result = app.run(&mut terminal, state, &protocol_tx);
         let tui_duration = tui_start.elapsed();
-
-        // Log first render timing (INFO level as requested)
-        let total_startup_duration = app_start.elapsed();
-        log::info!(
-            "[main] First TUI render completed: startup_to_render={}ms",
-            total_startup_duration.as_millis()
-        );
 
         // Restore terminal
         let restore_start = Instant::now();

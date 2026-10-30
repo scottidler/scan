@@ -6,7 +6,6 @@ const PACKET_LOSS_PERCENTAGE_MULTIPLIER: f32 = 100.0;
 const CERT_EXPIRY_WARNING_DAYS: i64 = 30;
 const DAYS_PER_YEAR: i64 = 365;
 const EXPIRY_WARNING_DAYS: i64 = 30;
-const PACKET_LOSS_TIMEOUT_THRESHOLD: f32 = 0.5;
 const MAX_PORTS_DISPLAY: usize = 4;
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 3600;
@@ -288,11 +287,7 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 .unwrap_or_else(|| "timeout".to_string());
 
             // Count timeouts
-            let timeout_hops = primary_data
-                .hops
-                .iter()
-                .filter(|hop| hop.packet_loss > PACKET_LOSS_TIMEOUT_THRESHOLD)
-                .count();
+            let timeout_hops = primary_data.silent_hops();
 
             let timeout_str = if timeout_hops > 0 {
                 format!(", {} timeouts", timeout_hops)

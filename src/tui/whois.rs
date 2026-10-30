@@ -201,10 +201,7 @@ impl Pane for WhoisPane {
 
                 lines.push(Line::from(vec![
                     Span::styled("🔐 Privacy: ", Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{:?}", whois_result.privacy_score),
-                        Style::default().fg(privacy_color),
-                    ),
+                    Span::styled(whois_result.privacy_score.label(), Style::default().fg(privacy_color)),
                 ]));
 
                 // Risk indicators - show all risks
@@ -435,5 +432,16 @@ mod tests {
             rows[domain_row + 1].contains("📡 Source: RDAP"),
             "Source not under Domain:\n{out}"
         );
+    }
+
+    #[test]
+    fn privacy_renders_a_label_not_the_enum_name() {
+        use crate::scan::whois::{DataSource, NotApplicableReason, PrivacyLevel, WhoisResult};
+        let mut result = WhoisResult::not_applicable("example.com".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = DataSource::Rdap;
+        result.privacy_score = PrivacyLevel::Corporate;
+        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), 80, 30, false);
+        assert!(out.contains("Privacy: organization only"), "{out}");
+        assert!(!out.contains("Corporate"), "enum name leaked:\n{out}");
     }
 }

@@ -86,14 +86,26 @@ pub struct TracerouteData {
     pub ipv6: bool,
 }
 
+impl TracerouteHop {
+    /// True when no probe to this hop was answered.
+    pub fn is_silent(&self) -> bool {
+        self.responses.iter().all(|response| response.timeout)
+    }
+}
+
 impl TracerouteData {
     /// The highest hop that answered at least one probe.
     pub fn last_reply_hop(&self) -> Option<u8> {
         self.hops
             .iter()
-            .filter(|hop| hop.responses.iter().any(|r| !r.timeout))
+            .filter(|hop| !hop.is_silent())
             .map(|hop| hop.hop_number)
             .max()
+    }
+
+    /// How many hops had no probe answered. The one count the TUI and `--no-tui` share.
+    pub fn silent_hops(&self) -> usize {
+        self.hops.iter().filter(|hop| hop.is_silent()).count()
     }
 
     /// `reached`, or why not: `target silent (last reply: hop N)` / `target silent (no hop replied)`.

@@ -11,9 +11,6 @@ use ratatui::{
 use std::any::Any;
 
 const MAX_DISPLAYED_PORTS: usize = 5;
-const QUICK_SCAN_EXPECTED_PORTS: usize = 100;
-const STANDARD_SCAN_EXPECTED_PORTS: usize = 1000;
-const MAX_PROGRESS_PERCENT: f32 = 99.0;
 const SECONDS_THRESHOLD_FOR_MINUTES: u64 = 60;
 const MILLISECONDS_THRESHOLD_FOR_SECONDS: u128 = 1000;
 const MIN_PORTS_PANE_WIDTH: u16 = 25;
@@ -98,41 +95,11 @@ impl Pane for PortsPane {
                         };
                         let scan_duration_ms = port_result.total_duration.as_millis();
 
-                        // Calculate estimated progress (rough estimate based on duration and typical scan times)
-                        let progress_info = if matches!(status, crate::types::ScanStatus::Running) {
-                            // Estimate progress based on scan duration and typical port scan timing
-                            let total_expected = if let Some(primary) = port_result.get_primary_result() {
-                                match primary.scan_mode {
-                                    crate::scan::port::ScanMode::Minimal => {
-                                        crate::scan::port::get_minimal_ports().len()
-                                    }
-                                    crate::scan::port::ScanMode::Quick => QUICK_SCAN_EXPECTED_PORTS,
-                                    crate::scan::port::ScanMode::Standard => STANDARD_SCAN_EXPECTED_PORTS,
-                                    crate::scan::port::ScanMode::Custom(ref ports) => ports.len(),
-                                }
-                            } else {
-                                QUICK_SCAN_EXPECTED_PORTS
-                            };
-                            let scanned_so_far = open_count + filtered_ports as usize + closed_ports as usize;
-                            let progress_percent = ((scanned_so_far as f32 / total_expected as f32) * 100.0)
-                                .min(MAX_PROGRESS_PERCENT) as u32;
-                            Some((scanned_so_far, total_expected, progress_percent))
-                        } else {
-                            None
-                        };
-
                         let mut result_lines = Vec::new();
 
-                        // Progress information if actively scanning
-                        if let Some((scanned, total, percent)) = progress_info {
-                            result_lines.push(Line::from(vec![
-                                Span::styled("📊 Progress: ", Style::default().fg(Color::White)),
-                                Span::styled(
-                                    format!("{}% ({}/{})", percent, scanned, total),
-                                    Style::default().fg(Color::Yellow),
-                                ),
-                            ]));
-                        } else {
+                        // A refresh keeps the previous result on screen; the header says `↻ refreshing`,
+                        // so there is no progress to report and no `completed` to claim.
+                        if !matches!(status, crate::types::ScanStatus::Running) {
                             result_lines.push(Line::from(vec![
                                 Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
                                 Span::styled("completed", Style::default().fg(Color::Green)),
@@ -383,5 +350,35 @@ mod tests {
             2,
             &format!("   8080/tcp ({service})"),
         );
+    }
+
+    #[test]
+    fn refreshing_ports_pane_shows_no_progress() {
+        use crate::scan::port::{PortData, PortResult, PortStatus, ScanMode};
+        let mut result = PortResult::new();
+        result.ipv4_status = PortStatus::Success(0);
+        result.ipv4_result = Some(PortData {
+            target_ip: "192.0.2.1".parse().expect("ip"),
+            open_ports: vec![],
+            closed_ports: 6,
+            filtered_ports: 0,
+            scan_duration: std::time::Duration::from_millis(50),
+            scan_mode: ScanMode::Minimal,
+        });
+        let state = AppState::new("example.com".to_string());
+        state.scanners.insert(
+            "port".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Port(result)),
+                error: None,
+                status: crate::types::ScanStatus::Running,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        let out = crate::tui::testing::render_pane(&PortsPane::new(), &state, 60, 16, false);
+        assert!(out.contains("refreshing"), "{out}");
+        assert!(!out.contains("Progress:"), "{out}");
+        assert!(!out.contains("Scanned: completed"), "{out}");
     }
 }

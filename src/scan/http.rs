@@ -1008,6 +1008,17 @@ pub enum CspStrength {
     Strong,
 }
 
+impl CspStrength {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CspStrength::None => "none",
+            CspStrength::Weak => "weak",
+            CspStrength::Moderate => "moderate",
+            CspStrength::Strong => "strong",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorsPolicy {
     pub access_control_allow_origin: Option<String>,
@@ -1032,6 +1043,17 @@ pub enum CorsSecurityLevel {
     Moderate,
     Weak,
     Dangerous,
+}
+
+impl CorsSecurityLevel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CorsSecurityLevel::Secure => "secure",
+            CorsSecurityLevel::Moderate => "moderate",
+            CorsSecurityLevel::Weak => "weak",
+            CorsSecurityLevel::Dangerous => "dangerous",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

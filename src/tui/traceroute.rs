@@ -98,22 +98,24 @@ impl Pane for TraceroutePane {
                     // Show all hops
                     for hop in &primary_data.hops {
                         // Get first responding IP and best RTT
-                        let (ip_display, rtt_display, hop_color) =
-                            if let Some(response) = hop.responses.iter().find(|r| !r.timeout) {
-                                let ip_str = response
-                                    .ip_address
-                                    .as_ref()
-                                    .map(|ip| ip.to_string())
-                                    .unwrap_or_else(|| "*".to_string());
-                                let rtt_str = response
-                                    .rtt
-                                    .as_ref()
-                                    .map(|rtt| format!("{}ms", rtt.as_millis()))
-                                    .unwrap_or_else(|| "*".to_string());
-                                (ip_str, rtt_str, Color::Cyan)
-                            } else {
-                                ("*".to_string(), "timeout".to_string(), Color::Gray)
-                            };
+                        let (ip_display, rtt_display, hop_color) = if let Some(response) =
+                            hop.responses.iter().find(|r| !r.timeout)
+                            && !hop.is_silent()
+                        {
+                            let ip_str = response
+                                .ip_address
+                                .as_ref()
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_else(|| "*".to_string());
+                            let rtt_str = response
+                                .rtt
+                                .as_ref()
+                                .map(|rtt| format!("{}ms", rtt.as_millis()))
+                                .unwrap_or_else(|| "*".to_string());
+                            (ip_str, rtt_str, Color::Cyan)
+                        } else {
+                            ("*".to_string(), "timeout".to_string(), Color::Gray)
+                        };
 
                         // Color code hop number based on position
                         let hop_num_color = if hop.hop_number <= LOCAL_ISP_HOP_THRESHOLD {
@@ -341,5 +343,52 @@ mod tests {
         let silent = render(false);
         assert!(silent.contains("✗ target silent (last reply: hop 1)"), "{silent}");
         assert!(!silent.contains('…'), "{silent}");
+    }
+
+    fn hop(number: u8, replies: &[bool], packet_loss: f32) -> crate::scan::traceroute::TracerouteHop {
+        use crate::scan::traceroute::{HopResponse, TracerouteHop};
+        use std::time::Duration;
+        TracerouteHop {
+            hop_number: number,
+            responses: replies
+                .iter()
+                .map(|answered| HopResponse {
+                    ip_address: answered.then(|| "192.0.2.1".parse().expect("ip")),
+                    rtt: answered.then(|| Duration::from_millis(5)),
+                    timeout: !answered,
+                })
+                .collect(),
+            best_rtt: None,
+            avg_rtt: None,
+            worst_rtt: None,
+            packet_loss,
+        }
+    }
+
+    /// Hop 2 is silent, hop 3 answered one probe in three (loss 0.67), hop 4 is silent.
+    fn route_with_silent_hops() -> crate::scan::traceroute::TracerouteData {
+        let mut data = ipv6_route("2001:db8::1", true);
+        data.hops = vec![
+            hop(1, &[true, true, true], 0.0),
+            hop(2, &[false, false, false], 1.0),
+            hop(3, &[true, false, false], 0.67),
+            hop(4, &[false, false, false], 1.0),
+        ];
+        data
+    }
+
+    #[test]
+    fn tui_and_no_tui_report_the_same_silent_hop_count() {
+        let data = route_with_silent_hops();
+        assert_eq!(data.silent_hops(), 2, "a hop that answered one probe is not silent");
+
+        let state = traced_state(data);
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, 60, 20, false);
+        let tui_silent = out.lines().filter(|row| row.contains("timeout")).count();
+        assert_eq!(tui_silent, 2, "{out}");
+
+        let scan_state = state.scanners.get("traceroute").expect("traceroute state");
+        let summary = crate::pretty::format_scan_state("traceroute", &scan_state);
+        assert!(summary.contains("2 timeouts"), "{summary}");
     }
 }

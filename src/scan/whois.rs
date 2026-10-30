@@ -973,6 +973,17 @@ pub enum PrivacyLevel {
     Unknown,   // Cannot determine privacy level
 }
 
+impl PrivacyLevel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PrivacyLevel::Open => "open (contacts visible)",
+            PrivacyLevel::Corporate => "organization only",
+            PrivacyLevel::Protected => "protected",
+            PrivacyLevel::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RiskIndicator {
     RecentRegistration,  // < 30 days old

@@ -76,12 +76,25 @@ pub fn switch_protocol(state: &Mutex<AppState>, protocol_tx: &watch::Sender<Prot
     new_protocol
 }
 
+/// Wait up to `timeout` for a key press from the terminal.
+fn read_key_press(timeout: Duration) -> io::Result<Option<event::KeyEvent>> {
+    if crossterm::event::poll(timeout)?
+        && let Event::Key(key) = event::read()?
+        && key.kind == KeyEventKind::Press
+    {
+        return Ok(Some(key));
+    }
+    Ok(None)
+}
+
 /// Main TUI application
 pub struct TuiApp {
     layout: PaneLayout,
     should_quit: bool,
     last_tick: Instant,
     tick_rate: Duration,
+    /// When the process started, so the first-render log reports startup latency.
+    startup: Instant,
 }
 
 impl TuiApp {
@@ -114,15 +127,34 @@ impl TuiApp {
             should_quit: false,
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(TUI_TICK_RATE_MS), // 4 FPS
+            startup: Instant::now(),
         })
+    }
+
+    /// Measure `First TUI render completed` from `startup` (the process start) instead of from `new`.
+    pub fn with_startup(mut self, startup: Instant) -> Self {
+        self.startup = startup;
+        self
     }
 
     /// Run the TUI event loop. `protocol_tx` is lent by `main`, which owns it; `p` sends on it.
     pub fn run<B: Backend>(
+        self,
+        terminal: &mut Terminal<B>,
+        state: Arc<Mutex<AppState>>,
+        protocol_tx: &watch::Sender<Protocol>,
+    ) -> io::Result<()> {
+        self.run_with_keys(terminal, state, protocol_tx, read_key_press)
+    }
+
+    /// The event loop with its key source injected: `next_key(timeout)` waits up to `timeout` for a
+    /// key press.
+    fn run_with_keys<B: Backend>(
         mut self,
         terminal: &mut Terminal<B>,
         state: Arc<Mutex<AppState>>,
         protocol_tx: &watch::Sender<Protocol>,
+        mut next_key: impl FnMut(Duration) -> io::Result<Option<event::KeyEvent>>,
     ) -> io::Result<()> {
         log::debug!("[tui] run: starting TUI event loop");
 
@@ -136,6 +168,12 @@ impl TuiApp {
             let draw_duration = draw_start.elapsed();
 
             frame_count += 1;
+            if frame_count == 1 {
+                log::info!(
+                    "[tui] First TUI render completed: startup_to_render={}ms",
+                    self.startup.elapsed().as_millis()
+                );
+            }
             if frame_count % FRAME_STATS_LOG_INTERVAL == 0 {
                 log::trace!(
                     "[tui] frame_stats: frames={} avg_draw_time={}μs uptime={}s",
@@ -151,10 +189,7 @@ impl TuiApp {
                 .checked_sub(self.last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_secs(FALLBACK_TIMEOUT_SECS));
 
-            if crossterm::event::poll(timeout)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
+            if let Some(key) = next_key(timeout)? {
                 log::debug!("[tui] key_event: key={:?} modifiers={:?}", key.code, key.modifiers);
 
                 match key.code {
@@ -401,5 +436,48 @@ mod tests {
         // Test that KeyModifiers is properly imported and accessible
         let ctrl_modifier = KeyModifiers::CONTROL;
         assert_eq!(ctrl_modifier, KeyModifiers::CONTROL);
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Captures `log` records so a test can see what was logged, and when.
+    struct CaptureLogger;
+    static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static LOGGER: CaptureLogger = CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            CAPTURED.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn first_render_is_logged_before_any_key_is_read() {
+        log::set_logger(&LOGGER).expect("no other test installs a logger");
+        log::set_max_level(log::LevelFilter::Info);
+
+        let app = TuiApp::new().expect("app");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        let (tx, _rx) = watch::channel(Protocol::Both);
+        let logged_before_first_key = AtomicBool::new(false);
+        app.run_with_keys(&mut terminal, state, &tx, |_timeout| {
+            let logged = CAPTURED
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("First TUI render completed"));
+            logged_before_first_key.store(logged, Ordering::SeqCst);
+            Ok(Some(event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)))
+        })
+        .expect("run");
+        assert!(
+            logged_before_first_key.load(Ordering::SeqCst),
+            "first render not logged before the first key read"
+        );
     }
 }

@@ -40,6 +40,32 @@ fn family_failure_label(state: &AppState, family: Family) -> String {
     }
 }
 
+/// How much of a family's state a row has room for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateForm {
+    /// Title row: latency, average, state.
+    Full,
+    /// One-row layout: the latest sample only, but a failure keeps its full label.
+    Compact,
+}
+
+/// The one text for a family's state, shared by the full and compact layouts so a failed family
+/// reads the same in both.
+fn family_state_text(
+    state: &AppState,
+    view: &FamilyView,
+    visible: &[Sample],
+    form: StateForm,
+    checking_text: &str,
+) -> String {
+    match (&view.state, form) {
+        (ConnectivityState::Disconnected, _) => family_failure_label(state, view.family),
+        (ConnectivityState::Checking, StateForm::Full) => checking_text.to_string(),
+        (_, StateForm::Full) => view.latency_text(visible),
+        (_, StateForm::Compact) => latest_text(view.data.latest()),
+    }
+}
+
 /// Drawn, in red, for a ping cycle that got no reply.
 const FAILED_SAMPLE_SYMBOL: &str = "░";
 /// Average latency, in µs, above which a family's graph turns yellow, then red.
@@ -535,22 +561,20 @@ impl Pane for ConnectivityPane {
                 for (view, (title_area, graph_area)) in families.iter().zip(family_rows) {
                     let visible = view.data.visible(usize::from(graph_area.width));
                     let max_us = scale_max_us(&visible);
-                    let state_text = match view.state {
-                        ConnectivityState::Disconnected => family_failure_label(state, view.family),
-                        ConnectivityState::Checking => checking_text.to_string(),
-                        _ => view.latency_text(&visible),
-                    };
+                    let state_text = family_state_text(state, view, &visible, StateForm::Full, checking_text);
                     let mut spans = vec![
                         Span::styled(format!("{} ", view.family), Style::default().fg(Color::White)),
                         Span::styled(state_text, Style::default().fg(view.title_color())),
                     ];
                     if !visible.is_empty() {
+                        let has_reply = visible.iter().any(|(_, micros)| micros.is_some());
+                        let scale = if has_reply {
+                            format!("scale 0-{}ms │ ", max_us / 1000)
+                        } else {
+                            String::new()
+                        };
                         spans.push(Span::styled(
-                            format!(
-                                " │ scale 0-{}ms │ ← {}s",
-                                max_us / 1000,
-                                span(&visible).as_secs_f64().round() as u64
-                            ),
+                            format!(" │ {scale}← {}s", span(&visible).as_secs_f64().round() as u64),
                             Style::default().fg(Color::Gray),
                         ));
                     }
@@ -564,7 +588,10 @@ impl Pane for ConnectivityPane {
             } => {
                 let labels: Vec<String> = families
                     .iter()
-                    .map(|view| format!("{} {}", view.short, latest_text(view.data.latest())))
+                    .map(|view| {
+                        let text = family_state_text(state, view, &[], StateForm::Compact, checking_text);
+                        format!("{} {}", view.short, text)
+                    })
                     .collect();
                 let label_width = labels
                     .iter()
@@ -721,10 +748,36 @@ mod tests {
     }
 
     #[test]
-    fn failed_sample_renders_the_absent_symbol_under_a_scaled_title() {
+    fn failed_sample_renders_the_absent_symbol_with_no_scale() {
         let out = render_failures(|| failed_ping_with(PingFailure::NoReply));
         assert!(out.contains('░'), "failed samples not drawn:\n{out}");
-        assert!(out.contains("scale 0-"), "no scale in the title:\n{out}");
+        assert!(!out.contains("scale 0-"), "scale printed with no reply sampled:\n{out}");
+        assert!(out.contains("← "), "span dropped:\n{out}");
+    }
+
+    #[test]
+    fn full_and_compact_modes_render_the_same_no_route_text() {
+        let no_route = || {
+            let mut ping = failed_ping_with(PingFailure::NoReply);
+            ping.ipv6_status = PingStatus::Failed(PingFailure::NoRoute);
+            ping
+        };
+        let full = render_cycles(&ConnectivityPane::new(), &vec![no_route(); 5], 100, 20);
+        let compact = render_cycles(&ConnectivityPane::new(), &vec![no_route(); 5], 100, 6);
+        for (mode, out) in [("full", &full), ("compact", &compact)] {
+            assert!(out.contains("no IPv6 route on this host"), "{mode}:\n{out}");
+            assert!(!out.contains("v6 ---"), "{mode}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn mixed_samples_keep_the_scale() {
+        let pane = ConnectivityPane::new();
+        let mut failed = failed_ping_with(PingFailure::NoReply);
+        failed.ipv4_status = PingStatus::Failed(PingFailure::NoReply);
+        let pings = vec![ok_ping(10, 10), failed, ok_ping(10, 10)];
+        let out = render_cycles(&pane, &pings, 100, 20);
+        assert!(out.contains("scale 0-"), "{out}");
     }
 
     #[test]
