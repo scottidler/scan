@@ -25,7 +25,7 @@ pub use pane::{Detail, Pane, PaneConfig, PanePosition};
 pub use ports::PortsPane;
 pub use security::SecurityPane;
 pub use sparkline::SparklineData;
-pub use status::{failure_text, status_label};
+pub use status::{failure_text, no_address, status_label};
 pub use target::TargetPane;
 pub use traceroute::TraceroutePane;
 pub use whois::WhoisPane;

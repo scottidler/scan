@@ -267,7 +267,7 @@ impl Pane for WhoisPane {
                 // Risk indicators - show all risks
                 if !whois_result.risk_indicators.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("❗  Risks: ", Style::default().fg(theme::LABEL)),
+                        Span::styled("❗ Risks: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
                             whois_result.risk_indicators.len().to_string(),
                             Style::default().fg(theme::BAD),

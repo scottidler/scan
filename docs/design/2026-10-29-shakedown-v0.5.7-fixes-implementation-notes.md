@@ -275,3 +275,49 @@ Run on ripr (no IPv6 default route, so AC2's precondition holds) against `target
 - AC4 (`shift+tab`, Enter, Escape): 0, 0, 0. Pass.
 - AC5: 0. Pass.
 - AC6: `--fg 1` 1, `--fg 2` 0; `192.0.2.1` `no echo reply --fg 9` 0. Pass.
+
+## Implementation audit fixes
+
+Findings from the review-panel implementation audit (run `GMciT91Q`): M1, C1, C2, C3, D1.
+
+### Design decisions
+- M1, typed no-address outcome (`src/scan/mod.rs:NoAddress`, `family_failure`): a scan whose every family had no target address now returns `eyre::Report::new(NoAddress(protocol))`; a family that was attempted and failed still returns the joined `IPv4: <reason>; IPv6: <reason>` text. It stays an `Err` (no result is stored, the scanner shows no stale data), and the TUI tells it apart by `downcast_ref::<NoAddress>()`, not by matching the message. `family_failure_summary` became `family_failure` and each result's `failure_summary` became `failure`, since both now return the error rather than its text (port, tls, http, geoip, traceroute).
+- M1, rendering (`src/tui/status.rs:status_label`, `no_address`, `failure_text`): a `Failed` or `Running` scanner whose last error is `NoAddress` reads `no IPv6 address` (or IPv4) in MUTED; `failure_text` returns `None` for it. A `Running` scanner is covered too, so the label does not flip to red `failed: ... · ↻ retrying` on every re-scan.
+- M1, the two pane bodies that repeated the failure in BAD under the header, `src/tui/security.rs` (`🔗 Status: failed`) and `src/tui/geoip.rs` (`location lookup failed`), print nothing for `NoAddress`; the muted header stands alone, like the other panes' "header carries the reason" branch.
+- M1, Target pane (`src/tui/target.rs:status_icon_and_color`, `calculate_stats`, `ScannerCounts`): a no-address scanner row is `⚫` in MUTED and counts as `N ⚫` on the Status row, not `❌`. The counts moved from a 4-tuple into a named struct to carry the fifth count.
+- C1 (`src/tui/theme.rs:production_lines_with`): skips only the body of an inline `#[cfg(test)] mod <name> {`, up to the `}` at the module line's indent. A `#[cfg(test)]` on a function or a `mod name;` declaration no longer ends the scan.
+- C2 (`src/tui/traceroute.rs:target_rtt`): the destination row's RTT is the first non-timeout probe answered by `target_ip`; another router's answer at the same TTL is never shown as the target's round trip.
+- C3: 13 labels (http 5, traceroute 4, ports 2, whois 1, geoip 1) now have one space after the glyph. `theme::tests::no_pane_label_pads_a_glyph_with_two_spaces` scans `src/tui/*.rs` for any non-ASCII glyph followed by two spaces, so the class cannot return.
+- D1 (`src/tui/text.rs:wrap_line`): the break check is a loop: when the tail carried past a break leaves no room for a wide glyph, the tail becomes its own row. No row exceeds `width`.
+
+### Deviations
+- M1 reaches past `status_label`: the Security and GeoIP body lines and the Target pane's icon and counts also showed the no-address case in BAD, so leaving them would keep red on screen for a non-fault. Same effect as the doc's line 103, applied to every place it rendered.
+- `--no-tui` (`src/pretty.rs`) is unchanged: it has no protocol switch, so the IPv6-only case cannot arise there, and its colors are a non-goal.
+
+### Tradeoffs
+- Typed error vs a new `ScanStatus::NoAddress` variant: a status variant touches every `match` on `ScanStatus` across scanner, pretty and every pane; the typed error is decided at the one seam that already knows (`family_failure`) and read at the one that renders (`status_label`).
+- Typed error vs matching `"no ... address for target"`: a message reword would silently turn the case red again; the type cannot drift.
+- A target with no address at all under IPv4+IPv6 also reads MUTED `no IPv4+IPv6 address` in these five panes. The fault there is resolution, which DNS still shows in BAD.
+- The scanners still log the no-address case at ERROR (`all_scans_failed`); log levels were not part of the finding.
+
+### Open questions
+- Should the five scanners log a no-address outcome below ERROR, since it is not a fault?
+
+Evidence: each new test was run with its fix undone and failed, then the sources were restored byte-for-byte (`cmp` against backups) and `otto ci` re-run green (exit 0, `All CI checks passed!`).
+- `status_label` no-address branch disabled: `no_address_reads_muted_never_failed_while_failed_or_retrying` and `a_family_with_no_address_reads_muted_in_every_protocol_pane_never_failed` fail.
+- `family_failure` returning an untyped `eyre!` with the same text: `family_failure_joins_families_and_names_the_empty_case`, `failure_leaves_out_no_address_families` (traceroute) and the five-pane test fail.
+- Security `failed` body line restored, and separately the GeoIP `location lookup failed` line restored: the five-pane test fails each time (a BAD cell).
+- Target icon arm removed: `test_status_icon_and_color` and the five-pane test fail. Target count arm removed: `test_calculate_stats` and the five-pane test fail.
+- C1 lint reverted to stop at the first `#[cfg(test)]`: `the_color_lint_scans_past_a_test_only_item_and_skips_only_the_test_module_body` fails. Against the real tree: a `Color::Red` inserted at `src/tui/mod.rs:41` (below the indented `#[cfg(test)] pub mod testing;`) fails `no_color_literal_outside_theme_and_test_modules` with the fix and passes with the old lint.
+- C2 destination RTT taken from any IPv4 answer: `destination_row_shows_the_rtt_of_the_target_answer_not_another_router` fails (41ms shown instead of 7ms).
+- C3 `"⏳  Time: "` restored in `http.rs`: `no_pane_label_pads_a_glyph_with_two_spaces` fails naming `src/tui/http.rs:183` and `:302`.
+- D1 `while` back to `if`: `wrap_line_rebreaks_a_carried_tail_with_no_room_for_a_wide_glyph` fails.
+
+Live, release build of the working tree, desk, `tui-test run --session m1 --cols 200 --rows 55 -- target/release/scan www.tatari.tv`: waited until Traceroute read `traced`, pressed `p` twice (IPv4+IPv6 -> IPv4 -> IPv6; Target reads `Protocol: IPv6 (Press 'p' to cycle)`), waited 30s.
+- `expect text "no IPv6 address for target" --fg 9`: 1. `expect text "no IPv6 address"`: 0. `expect text "no IPv6 address" --fg 7` (MUTED): 0. `expect text "failed:"`: 1. `expect text "❌"`: 1.
+- Screen: HTTP, Ports, GeoIP, Traceroute and Security headers read `Status: no IPv6 address`; Target reads `Status: 3/8 ✅ 5 ⚫` with `⚫` on the TLS, HTTP, TRACEROUTE, GEOIP and PORT rows.
+
+## Orchestrator: Phase 2 open questions settled
+
+- `ACCENT` stays `Color::Magenta`. The doc says ACCENT replaces Magenta and Blue body text and names no value; keeping Magenta changes no existing Magenta text.
+- Open ports 1-5 stay `LABEL`. The doc reclassifies only >5 as `WARN`.

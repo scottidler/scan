@@ -44,10 +44,24 @@ fn first_answer(hop: &TracerouteHop) -> Option<(String, String)> {
     Some((ip, rtt))
 }
 
+/// The RTT of the hop's first probe answered by `target_ip`, as text, `*` if it carried none.
+/// A probe answered by another router at the same TTL is not the target's round trip.
+fn target_rtt(hop: &TracerouteHop, target_ip: std::net::IpAddr) -> Option<String> {
+    let response = hop
+        .responses
+        .iter()
+        .find(|r| !r.timeout && r.ip_address == Some(target_ip))?;
+    Some(
+        response
+            .rtt
+            .map_or_else(|| "*".to_string(), |rtt| format!("{}ms", rtt.as_millis())),
+    )
+}
+
 /// `→ <target ip> (<rtt>)`, or `(no reply)` when the target never answered.
 fn destination_line(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> Line<'static> {
-    let note = match destination_hop.and_then(first_answer) {
-        Some((_, rtt)) => format!(" ({rtt})"),
+    let note = match destination_hop.and_then(|hop| target_rtt(hop, data.target_ip)) {
+        Some(rtt) => format!(" ({rtt})"),
         None if data.destination_reached => String::new(),
         None => " (no reply)".to_string(),
     };
@@ -180,7 +194,7 @@ impl Pane for TraceroutePane {
 
         // Traceroute status header
         lines.push(Line::from(vec![
-            Span::styled("🧭  Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
             Span::styled("tracing...", Style::default().fg(theme::MUTED)),
         ]));
 
@@ -189,7 +203,7 @@ impl Pane for TraceroutePane {
             // Update header with current status
             let (label, label_color) = crate::tui::status_label(&traceroute_state, "tracing...", "traced");
             lines[0] = Line::from(vec![
-                Span::styled("🧭  Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]);
 
@@ -213,7 +227,7 @@ impl Pane for TraceroutePane {
                 // Total scan time
                 let scan_time_ms = traceroute_result.total_duration.as_millis();
                 lines.push(Line::from(vec![
-                    Span::styled("⏳  Duration: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("⏳ Duration: ", Style::default().fg(theme::LABEL)),
                     Span::styled(format!("{}ms", scan_time_ms), Style::default().fg(theme::WARN)),
                 ]));
             } else {
@@ -238,7 +252,7 @@ impl Pane for TraceroutePane {
         } else {
             // No traceroute scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🧭  Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 
@@ -462,6 +476,29 @@ mod tests {
         assert!(!out.contains("more"), "nothing is hidden at 80x24:\n{out}");
         let last_row = out.lines().rev().nth(1).expect("row above the border");
         assert!(last_row.contains("Duration"), "Duration is the last row:\n{out}");
+    }
+
+    #[test]
+    fn destination_row_shows_the_rtt_of_the_target_answer_not_another_router() {
+        use crate::scan::traceroute::HopResponse;
+        use std::time::Duration;
+        let mut data = tatari_route();
+        let last = data.hops.last_mut().expect("destination hop");
+        last.responses = vec![
+            HopResponse {
+                ip_address: Some("63.140.62.9".parse().expect("ip")),
+                rtt: Some(Duration::from_millis(41)),
+                timeout: false,
+            },
+            HopResponse {
+                ip_address: Some("216.150.16.193".parse().expect("ip")),
+                rtt: Some(Duration::from_millis(7)),
+                timeout: false,
+            },
+        ];
+        let row = destination_line(&data, data.destination_hop());
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "→ 216.150.16.193 (7ms)");
     }
 
     #[test]

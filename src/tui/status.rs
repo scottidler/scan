@@ -1,5 +1,7 @@
 //! Shared status-line label for panes whose data comes from a scanner.
 
+use crate::scan::NoAddress;
+use crate::target::Protocol;
 use crate::tui::theme;
 use crate::types::{ScanState, ScanStatus};
 use ratatui::style::Color;
@@ -16,8 +18,15 @@ pub const RETRYING_LABEL: &str = "↻ retrying";
 /// lands, so the reason does not vanish for the length of a scan. Otherwise a `Running` scanner
 /// that already holds a result is a refresh, not a first scan, so the retained data is marked
 /// `↻ refreshing` instead of claiming to be fresh or blank. A `Failed` scanner names its error,
-/// whether or not an older result is still on screen below it.
+/// whether or not an older result is still on screen below it. A scanner whose last attempt
+/// found no target address in the selected protocol is not a fault: it reads `no IPv6 address`
+/// in MUTED, while failed or re-running, and never `failed:`.
 pub fn status_label(scan_state: &ScanState, running: &'static str, complete: &'static str) -> (String, Color) {
+    if !matches!(scan_state.status, ScanStatus::Complete)
+        && let Some(protocol) = no_address(scan_state)
+    {
+        return (format!("no {} address", protocol.as_str()), theme::MUTED);
+    }
     match scan_state.status {
         ScanStatus::Running => match (&scan_state.error, &scan_state.result) {
             (Some(error), _) => (format!("failed: {error:#} · {RETRYING_LABEL}"), theme::BAD),
@@ -32,12 +41,24 @@ pub fn status_label(scan_state: &ScanState, running: &'static str, complete: &'s
     }
 }
 
-/// `failed: <error>` for a `Failed` scanner that recorded an error, `None` otherwise.
+/// `failed: <error>` for a `Failed` scanner that recorded an error, `None` otherwise. A
+/// [`NoAddress`] outcome is not a failure, so it is `None` too.
 pub fn failure_text(scan_state: &ScanState) -> Option<String> {
     match (&scan_state.status, &scan_state.error) {
-        (ScanStatus::Failed, Some(error)) => Some(format!("failed: {error:#}")),
+        (ScanStatus::Failed, Some(error)) if error.downcast_ref::<NoAddress>().is_none() => {
+            Some(format!("failed: {error:#}"))
+        }
         _ => None,
     }
+}
+
+/// The protocol the scanner's last attempt had no target address for, if it ended that way.
+pub fn no_address(scan_state: &ScanState) -> Option<Protocol> {
+    scan_state
+        .error
+        .as_ref()?
+        .downcast_ref::<NoAddress>()
+        .map(|no_address| no_address.0)
 }
 
 #[cfg(test)]
@@ -109,6 +130,35 @@ mod tests {
             assert_eq!(label, "failed: timed out after 30s · ↻ retrying");
             assert_eq!(color, Color::LightRed);
         }
+    }
+
+    #[test]
+    fn no_address_reads_muted_never_failed_while_failed_or_retrying() {
+        for status in [ScanStatus::Failed, ScanStatus::Running] {
+            let mut state = scan_state(status, false);
+            state.error = Some(eyre::Report::new(NoAddress(Protocol::Ipv6)));
+            let (label, color) = status_label(&state, "scanning...", "done");
+            assert_eq!(label, "no IPv6 address");
+            assert_eq!(color, theme::MUTED);
+            assert_eq!(no_address(&state), Some(Protocol::Ipv6));
+        }
+        let mut state = scan_state(ScanStatus::Failed, false);
+        state.error = Some(eyre::Report::new(NoAddress(Protocol::Ipv4)));
+        assert!(failure_text(&state).is_none());
+        assert_eq!(status_label(&state, "r", "done").0, "no IPv4 address");
+    }
+
+    #[test]
+    fn a_family_with_an_address_that_fails_stays_bad() {
+        let mut state = scan_state(ScanStatus::Failed, false);
+        state.error = Some(crate::scan::family_failure(
+            &[(crate::scan::Family::Ipv6, "operation timed out".to_string())],
+            Protocol::Ipv6,
+        ));
+        let (label, color) = status_label(&state, "r", "done");
+        assert_eq!(label, "failed: IPv6: operation timed out");
+        assert_eq!(color, theme::BAD);
+        assert_eq!(no_address(&state), None);
     }
 
     #[test]

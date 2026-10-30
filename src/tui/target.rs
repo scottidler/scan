@@ -1,7 +1,7 @@
 use crate::scan::dns::QueryStatus;
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::theme;
-use crate::types::{AppState, ScanStatus};
+use crate::types::{AppState, ScanState, ScanStatus};
 use log;
 use ratatui::{
     style::{Color, Style},
@@ -16,6 +16,17 @@ const MIN_TARGET_PANE_WIDTH: u16 = 25;
 const MIN_TARGET_PANE_HEIGHT: u16 = 12;
 /// Display order of the scanner rows, matching `create_default_scanners`.
 const SCANNER_DISPLAY_ORDER: [&str; 8] = ["ping", "dns", "tls", "http", "whois", "traceroute", "geoip", "port"];
+
+/// Scanner counts for the Status row. A scanner whose last attempt found no target address in the
+/// selected protocol counts as `no_address`, never as `failed`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScannerCounts {
+    total: usize,
+    running: usize,
+    complete: usize,
+    failed: usize,
+    no_address: usize,
+}
 
 #[derive(Clone, Copy)]
 enum AddressFamily {
@@ -70,11 +81,13 @@ impl TargetPane {
         }
     }
 
-    /// Get status icon and color for a scanner status
-    fn status_icon_and_color(status: &ScanStatus) -> (&'static str, Color) {
-        match status {
+    /// Status icon and color for a scanner row. A failed attempt with no target address in the
+    /// selected protocol is not a fault: `⚫` in MUTED.
+    fn status_icon_and_color(scan_state: &ScanState) -> (&'static str, Color) {
+        match scan_state.status {
             ScanStatus::Running => ("🔄", theme::WARN),
             ScanStatus::Complete => ("✅", theme::GOOD),
+            ScanStatus::Failed if crate::tui::no_address(scan_state).is_some() => ("⚫", theme::MUTED),
             ScanStatus::Failed => ("❌", theme::BAD),
         }
     }
@@ -108,14 +121,17 @@ impl TargetPane {
         }
     }
 
-    /// The scanner counts on the Status row, e.g. `6/8 ✅ 1 🔄 1 ❌`.
-    fn collapsed_summary(total: usize, running: usize, complete: usize, failed: usize) -> String {
-        let mut summary = format!("{}/{} ✅", complete, total);
-        if running > 0 {
-            summary.push_str(&format!(" {} 🔄", running));
+    /// The scanner counts on the Status row, e.g. `5/8 ✅ 1 🔄 1 ❌ 1 ⚫`.
+    fn collapsed_summary(counts: &ScannerCounts) -> String {
+        let mut summary = format!("{}/{} ✅", counts.complete, counts.total);
+        if counts.running > 0 {
+            summary.push_str(&format!(" {} 🔄", counts.running));
         }
-        if failed > 0 {
-            summary.push_str(&format!(" {} ❌", failed));
+        if counts.failed > 0 {
+            summary.push_str(&format!(" {} ❌", counts.failed));
+        }
+        if counts.no_address > 0 {
+            summary.push_str(&format!(" {} ⚫", counts.no_address));
         }
         summary
     }
@@ -189,30 +205,25 @@ impl TargetPane {
         }
     }
 
-    /// Calculate scanner statistics
-    fn calculate_stats(state: &AppState) -> (usize, usize, usize, usize) {
-        let total = state.scanners.len();
-        let mut running = 0;
-        let mut complete = 0;
-        let mut failed = 0;
+    /// Count scanners by status.
+    fn calculate_stats(state: &AppState) -> ScannerCounts {
+        let mut counts = ScannerCounts {
+            total: state.scanners.len(),
+            ..ScannerCounts::default()
+        };
 
         for scanner in state.scanners.iter() {
             match scanner.status {
-                ScanStatus::Running => running += 1,
-                ScanStatus::Complete => complete += 1,
-                ScanStatus::Failed => failed += 1,
+                ScanStatus::Running => counts.running += 1,
+                ScanStatus::Complete => counts.complete += 1,
+                ScanStatus::Failed if crate::tui::no_address(&scanner).is_some() => counts.no_address += 1,
+                ScanStatus::Failed => counts.failed += 1,
             }
         }
 
-        log::trace!(
-            "[tui::target] calculate_stats: total={} running={} complete={} failed={}",
-            total,
-            running,
-            complete,
-            failed
-        );
+        log::trace!("[tui::target] calculate_stats: counts={:?}", counts);
 
-        (total, running, complete, failed)
+        counts
     }
 }
 
@@ -243,12 +254,12 @@ impl Pane for TargetPane {
         lines.push(Self::address_line(state, AddressFamily::V4));
         lines.push(Self::address_line(state, AddressFamily::V6));
 
-        let (total, running, complete, failed) = Self::calculate_stats(state);
+        let counts = Self::calculate_stats(state);
         lines.push(Line::from(vec![
             Span::styled("Status: ", Style::default().fg(theme::LABEL)),
             Span::styled(
-                Self::collapsed_summary(total, running, complete, failed),
-                Self::summary_color(running, failed),
+                Self::collapsed_summary(&counts),
+                Self::summary_color(counts.running, counts.failed),
             ),
         ]));
 
@@ -263,7 +274,7 @@ impl Pane for TargetPane {
 
         for key in Self::ordered_scanner_keys(state) {
             if let Some(scanner) = state.scanners.get(&key) {
-                let (icon, color) = Self::status_icon_and_color(&scanner.status);
+                let (icon, color) = Self::status_icon_and_color(&scanner);
                 let elapsed = scanner.last_updated.elapsed();
 
                 lines.push(Line::from(vec![
@@ -334,17 +345,34 @@ mod tests {
 
     #[test]
     fn test_status_icon_and_color() {
-        let (icon, color) = TargetPane::status_icon_and_color(&ScanStatus::Running);
+        let scan_state = |status, error| ScanState {
+            result: None,
+            error,
+            status,
+            last_updated: Instant::now(),
+            history: Default::default(),
+        };
+        let (icon, color) = TargetPane::status_icon_and_color(&scan_state(ScanStatus::Running, None));
         assert_eq!(icon, "🔄");
         assert_eq!(color, Color::Yellow);
 
-        let (icon, color) = TargetPane::status_icon_and_color(&ScanStatus::Complete);
+        let (icon, color) = TargetPane::status_icon_and_color(&scan_state(ScanStatus::Complete, None));
         assert_eq!(icon, "✅");
         assert_eq!(color, Color::Green);
 
-        let (icon, color) = TargetPane::status_icon_and_color(&ScanStatus::Failed);
+        let (icon, color) = TargetPane::status_icon_and_color(&scan_state(
+            ScanStatus::Failed,
+            Some(eyre::eyre!("IPv6: operation timed out")),
+        ));
         assert_eq!(icon, "❌");
         assert_eq!(color, Color::LightRed);
+
+        let (icon, color) = TargetPane::status_icon_and_color(&scan_state(
+            ScanStatus::Failed,
+            Some(eyre::Report::new(crate::scan::NoAddress(Protocol::Ipv6))),
+        ));
+        assert_eq!(icon, "⚫");
+        assert_eq!(color, theme::MUTED);
     }
 
     #[test]
@@ -390,11 +418,27 @@ mod tests {
             },
         );
 
-        let (total, running, complete, failed) = TargetPane::calculate_stats(&state);
-        assert_eq!(total, 3);
-        assert_eq!(running, 1);
-        assert_eq!(complete, 1);
-        assert_eq!(failed, 1);
+        state.scanners.insert(
+            "tls".to_string(),
+            ScanState {
+                result: None,
+                error: Some(eyre::Report::new(crate::scan::NoAddress(Protocol::Ipv6))),
+                status: ScanStatus::Failed,
+                last_updated: Instant::now(),
+                history: Default::default(),
+            },
+        );
+
+        assert_eq!(
+            TargetPane::calculate_stats(&state),
+            ScannerCounts {
+                total: 4,
+                running: 1,
+                complete: 1,
+                failed: 1,
+                no_address: 1,
+            }
+        );
     }
 
     fn state_with_scanners(names: &[&str], status: ScanStatus) -> AppState {
@@ -477,8 +521,19 @@ mod tests {
 
     #[test]
     fn test_collapsed_summary_counts() {
-        assert_eq!(TargetPane::collapsed_summary(8, 0, 8, 0), "8/8 ✅");
-        assert_eq!(TargetPane::collapsed_summary(8, 1, 6, 1), "6/8 ✅ 1 🔄 1 ❌");
+        let counts = |total, running, complete, failed, no_address| ScannerCounts {
+            total,
+            running,
+            complete,
+            failed,
+            no_address,
+        };
+        assert_eq!(TargetPane::collapsed_summary(&counts(8, 0, 8, 0, 0)), "8/8 ✅");
+        assert_eq!(
+            TargetPane::collapsed_summary(&counts(8, 1, 6, 1, 0)),
+            "6/8 ✅ 1 🔄 1 ❌"
+        );
+        assert_eq!(TargetPane::collapsed_summary(&counts(8, 0, 3, 0, 5)), "3/8 ✅ 5 ⚫");
     }
 
     fn ip_target_state(target: &str) -> AppState {

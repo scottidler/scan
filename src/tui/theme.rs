@@ -26,15 +26,44 @@ pub const BORDER_UNFOCUSED: Color = Color::Gray;
 mod tests {
     use std::path::Path;
 
-    /// Non-comment lines of `source` before its `#[cfg(test)]` module that mention `needle`.
+    /// `mod <name> {` or `pub mod <name> {`: an inline module body opens on this line.
+    fn opens_inline_module(line: &str) -> bool {
+        let trimmed = line.trim();
+        let declaration = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+        declaration.starts_with("mod ") && declaration.contains('{')
+    }
+
+    /// Non-comment lines of `source` that mention `needle`, outside the body of any inline
+    /// `#[cfg(test)]` module. Only a module body is skipped: a `#[cfg(test)]` on a function, an
+    /// import or a `mod name;` declaration leaves the lines after it scanned.
     fn production_lines_with(source: &str, needle: &str) -> Vec<(usize, String)> {
-        source
-            .lines()
-            .take_while(|line| line.trim() != "#[cfg(test)]")
-            .enumerate()
-            .filter(|(_, line)| !line.trim_start().starts_with("//") && line.contains(needle))
-            .map(|(index, line)| (index + 1, line.trim().to_string()))
-            .collect()
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            if line.trim() == "#[cfg(test)]"
+                && let Some(next) = lines.get(index + 1)
+                && opens_inline_module(next)
+            {
+                let opened_and_closed = next.matches('{').count() == next.matches('}').count();
+                let indent = &next[..next.len() - next.trim_start().len()];
+                let close = format!("{indent}}}");
+                index += 2;
+                if !opened_and_closed {
+                    while index < lines.len() && lines[index] != close {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            if !line.trim_start().starts_with("//") && line.contains(needle) {
+                found.push((index + 1, line.trim().to_string()));
+            }
+            index += 1;
+        }
+        found
     }
 
     fn tui_sources() -> Vec<(String, String)> {
@@ -79,6 +108,74 @@ mod tests {
             vec![(2, "Style::default().fg(Color::Red)".to_string())]
         );
         assert!(production_lines_with("// Color::Red in a comment\n", "Color::").is_empty());
+    }
+
+    #[test]
+    fn the_color_lint_scans_past_a_test_only_item_and_skips_only_the_test_module_body() {
+        let pane = "\
+#[cfg(test)]
+pub mod testing;
+impl Pane {
+    #[cfg(test)]
+    fn sample_counts() -> usize { 0 }
+
+    fn render() {
+        Style::default().fg(Color::Red)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn helper() {
+        Color::Blue
+    }
+}
+fn after_tests() { Color::Green }
+";
+        assert_eq!(
+            production_lines_with(pane, "Color::"),
+            vec![
+                (8, "Style::default().fg(Color::Red)".to_string()),
+                (18, "fn after_tests() { Color::Green }".to_string()),
+            ]
+        );
+    }
+
+    /// Lines where a non-ASCII glyph is followed by two spaces. The second space made up for a
+    /// glyph drawn 1 cell wide; with 2-cell glyphs it pushes the label a column right of its
+    /// neighbours.
+    fn glyph_double_space_lines(source: &str) -> Vec<usize> {
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| {
+                line.char_indices()
+                    .any(|(at, ch)| !ch.is_ascii() && line[at + ch.len_utf8()..].starts_with("  "))
+            })
+            .map(|(index, _)| index + 1)
+            .collect()
+    }
+
+    #[test]
+    fn no_pane_label_pads_a_glyph_with_two_spaces() {
+        let offenders: Vec<String> = tui_sources()
+            .iter()
+            .flat_map(|(name, source)| {
+                glyph_double_space_lines(source)
+                    .into_iter()
+                    .map(move |line| format!("src/tui/{name}:{line}"))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "one space after a glyph, like the neighbouring labels:\n{}",
+            offenders.join("\n")
+        );
+        assert_eq!(
+            glyph_double_space_lines("\"\u{23F3}  Time: \"\n\"\u{1F4CA} Status: \"\n"),
+            vec![1]
+        );
     }
 
     #[test]

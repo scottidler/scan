@@ -1,4 +1,4 @@
-use super::{Family, classify_route_error, family_failure_summary};
+use super::{Family, classify_route_error, family_failure};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target, TargetType};
 use crate::types::ScanResult;
@@ -789,15 +789,15 @@ impl Scanner for HttpScanner {
             );
             Ok(ScanResult::Http(result))
         } else {
-            let error_msg = result.failure_summary(protocol);
+            let error = result.failure(protocol);
             log::error!(
                 "[scan::http] all_http_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
                 result.total_duration.as_millis(),
-                error_msg
+                error
             );
-            Err(eyre::eyre!(error_msg))
+            Err(error)
         }
     }
 }
@@ -889,7 +889,7 @@ impl HttpResult {
 
     /// Why every attempted family failed, e.g. `IPv4: operation timed out; IPv6: no IPv6 route
     /// on this host`. Families with no address are left out.
-    pub fn failure_summary(&self, protocol: Protocol) -> String {
+    pub fn failure(&self, protocol: Protocol) -> eyre::Report {
         let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
             .into_iter()
             .filter_map(|(family, status)| match status {
@@ -897,7 +897,7 @@ impl HttpResult {
                 _ => None,
             })
             .collect();
-        family_failure_summary(&failures, protocol)
+        family_failure(&failures, protocol)
     }
 
     pub fn get_best_security_grade(&self) -> Option<&SecurityGrade> {
@@ -1136,16 +1136,16 @@ mod tests {
     }
 
     #[test]
-    fn failure_summary_names_each_attempted_family_and_skips_no_address() {
+    fn failure_names_each_attempted_family_and_skips_no_address() {
         let mut result = HttpResult::new();
         result.ipv4_status = HttpStatus::Failed("operation timed out".to_string());
         result.ipv6_status = HttpStatus::Failed("no IPv6 route on this host".to_string());
         assert_eq!(
-            result.failure_summary(Protocol::Both),
+            result.failure(Protocol::Both).to_string(),
             "IPv4: operation timed out; IPv6: no IPv6 route on this host"
         );
         result.ipv6_status = HttpStatus::NoAddress;
-        assert_eq!(result.failure_summary(Protocol::Both), "IPv4: operation timed out");
+        assert_eq!(result.failure(Protocol::Both).to_string(), "IPv4: operation timed out");
     }
 
     #[tokio::test]

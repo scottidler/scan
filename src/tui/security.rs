@@ -401,10 +401,17 @@ impl SecurityPane {
             }
         } else if tls_failed {
             // The first scan failed: the header carries the reason, nothing is still pending.
-            lines.push(Line::from(vec![
-                Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
-                Span::styled("failed", Style::default().fg(theme::BAD)),
-            ]));
+            // With no target address there was nothing to fail, so the muted header stands alone.
+            let no_address = state
+                .scanners
+                .get("tls")
+                .is_some_and(|tls_state| crate::tui::no_address(&tls_state).is_some());
+            if !no_address {
+                lines.push(Line::from(vec![
+                    Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("failed", Style::default().fg(theme::BAD)),
+                ]));
+            }
         } else if state.scanners.contains_key("tls") {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![

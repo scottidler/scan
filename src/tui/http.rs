@@ -146,7 +146,7 @@ impl Pane for HttpPane {
                     if let Some(reason) = &primary_data.https_failure {
                         wrapped.push(lines.len());
                         lines.push(Line::from(vec![
-                            Span::styled("❗  ", Style::default().fg(theme::BAD)),
+                            Span::styled("❗ ", Style::default().fg(theme::BAD)),
                             Span::styled(
                                 format!("plain HTTP (HTTPS failed: {})", reason),
                                 Style::default().fg(theme::BAD),
@@ -180,7 +180,7 @@ impl Pane for HttpPane {
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("⏳  Time: ", Style::default().fg(theme::LABEL)),
+                        Span::styled("⏳ Time: ", Style::default().fg(theme::LABEL)),
                         Span::styled(format!("{}ms", response_time_ms), Style::default().fg(time_color)),
                     ]));
 
@@ -254,7 +254,7 @@ impl Pane for HttpPane {
                     let all_vulnerabilities = http_result.get_all_vulnerabilities();
                     if !all_vulnerabilities.is_empty() {
                         lines.push(Line::from(vec![
-                            Span::styled("❗  Issues: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("❗ Issues: ", Style::default().fg(theme::LABEL)),
                             Span::styled(all_vulnerabilities.len().to_string(), Style::default().fg(theme::BAD)),
                         ]));
 
@@ -299,12 +299,12 @@ impl Pane for HttpPane {
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("⏳  Time: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("⏳ Time: ", Style::default().fg(theme::LABEL)),
                     Span::styled("measuring...", Style::default().fg(theme::MUTED)),
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("💻  Server: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("💻 Server: ", Style::default().fg(theme::LABEL)),
                     Span::styled("detecting...", Style::default().fg(theme::MUTED)),
                 ]));
             }

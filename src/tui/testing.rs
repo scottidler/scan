@@ -248,6 +248,50 @@ mod tests {
         }
     }
 
+    /// The five protocol-following scanners as `p` leaves them on a target with no IPv6 address.
+    fn no_ipv6_address_state() -> AppState {
+        let state = AppState::new("example.com".to_string());
+        for scanner in ["tls", "http", "traceroute", "geoip", "port"] {
+            state.scanners.insert(
+                scanner.to_string(),
+                crate::types::ScanState {
+                    result: None,
+                    error: Some(crate::scan::family_failure(&[], crate::target::Protocol::Ipv6)),
+                    status: crate::types::ScanStatus::Failed,
+                    last_updated: std::time::Instant::now(),
+                    history: std::collections::VecDeque::new(),
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn a_family_with_no_address_reads_muted_in_every_protocol_pane_never_failed() {
+        let state = no_ipv6_address_state();
+        let panes: Vec<(&str, Box<dyn Pane>)> = vec![
+            ("tls", Box::new(SecurityPane::new())),
+            ("http", Box::new(HttpPane::new())),
+            ("traceroute", Box::new(TraceroutePane::new())),
+            ("geoip", Box::new(GeoIpPane::new())),
+            ("port", Box::new(PortsPane::new())),
+        ];
+        for (scanner, pane) in panes {
+            let buffer = render_buffer(pane.as_ref(), &state, 100, 30, false);
+            let out = render_pane(pane.as_ref(), &state, 100, 30, false);
+            assert!(out.contains("no IPv6 address"), "{scanner}:\n{out}");
+            assert!(!out.contains("failed"), "{scanner}:\n{out}");
+            assert_eq!(fg_of(&buffer, "no IPv6 address"), crate::tui::theme::MUTED, "{scanner}");
+            assert!(
+                buffer.content.iter().all(|cell| cell.fg != crate::tui::theme::BAD),
+                "{scanner}: a cell is BAD:\n{out}"
+            );
+        }
+        let out = render_pane(&crate::tui::TargetPane::new(), &state, 100, 30, false);
+        assert!(!out.contains('❌'), "{out}");
+        assert!(out.contains("5 ⚫"), "{out}");
+    }
+
     #[test]
     fn failed_http_traceroute_and_ports_panes_show_status_once() {
         let panes: Vec<(&str, Box<dyn Pane>)> = vec![

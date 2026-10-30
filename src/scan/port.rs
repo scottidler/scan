@@ -1,5 +1,5 @@
 use super::connect::TcpConnector;
-use super::{Family, RouteError, classify_route_error, family_failure_summary};
+use super::{Family, RouteError, classify_route_error, family_failure};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -158,7 +158,7 @@ impl PortResult {
 
     /// Why every attempted family failed, e.g. `IPv6: no IPv6 route on this host`. Families with
     /// no address are left out.
-    pub fn failure_summary(&self, protocol: Protocol) -> String {
+    pub fn failure(&self, protocol: Protocol) -> eyre::Report {
         let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
             .into_iter()
             .filter_map(|(family, status)| match status {
@@ -166,7 +166,7 @@ impl PortResult {
                 _ => None,
             })
             .collect();
-        family_failure_summary(&failures, protocol)
+        family_failure(&failures, protocol)
     }
 
     pub fn get_primary_result(&self) -> Option<&PortData> {
@@ -770,15 +770,15 @@ impl Scanner for PortScanner {
             );
             Ok(ScanResult::Port(result))
         } else {
-            let error_msg = result.failure_summary(protocol);
+            let error = result.failure(protocol);
             log::error!(
                 "[scan::port] all_scans_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
                 result.total_duration.as_millis(),
-                error_msg
+                error
             );
-            Err(eyre::eyre!(error_msg))
+            Err(error)
         }
     }
 
@@ -943,12 +943,12 @@ mod tests {
     }
 
     #[test]
-    fn port_failure_summary_names_each_failed_family() {
+    fn port_failure_names_each_failed_family() {
         let mut result = PortResult::new();
         result.ipv4_status = PortStatus::NoAddress;
         result.ipv6_status = PortStatus::Failed("no IPv6 route on this host".to_string());
         assert_eq!(
-            result.failure_summary(Protocol::Both),
+            result.failure(Protocol::Both).to_string(),
             "IPv6: no IPv6 route on this host"
         );
     }

@@ -101,7 +101,9 @@ pub fn wrap_line(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
     let mut break_at: Option<usize> = None;
     for cell in cells {
         let cell_width = Span::raw(cell.0.as_str()).width();
-        if used + cell_width > width && !current.is_empty() {
+        // A loop, not an `if`: the tail carried past a break can itself leave no room for a wide
+        // glyph, and then it becomes a row of its own.
+        while used + cell_width > width && !current.is_empty() {
             let carried = match break_at {
                 Some(at) if at < current.len() => current.split_off(at),
                 _ => Vec::new(),
@@ -299,6 +301,14 @@ mod tests {
         let rows = wrap_line(Line::from("ab🦀cd"), 3);
         let texts: Vec<String> = rows.iter().map(text).collect();
         assert_eq!(texts, ["ab", "🦀c", "d"]);
+    }
+
+    #[test]
+    fn wrap_line_rebreaks_a_carried_tail_with_no_room_for_a_wide_glyph() {
+        let rows = wrap_line(Line::from(" abc🦀"), 4);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts, [" ", "abc", "🦀"]);
+        assert!(rows.iter().all(|row| row.width() <= 4), "{rows:?}");
     }
 
     #[test]

@@ -113,17 +113,32 @@ pub fn classify_route_error(text: &str, family: Family) -> RouteError {
     route
 }
 
-/// The aggregate message for a scan whose every family failed: `IPv4: <reason>; IPv6: <reason>`.
-/// Families with no address are left out; when none was attempted, the message says so.
-pub fn family_failure_summary(failures: &[(Family, String)], protocol: Protocol) -> String {
-    if failures.is_empty() {
-        return format!("no {} address for target", protocol.as_str());
+/// A scan with nothing to probe: the target has no address in the selected protocol. It is an
+/// `Err` so no result is stored, but it is not a fault, and the TUI tells it apart by type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoAddress(pub Protocol);
+
+impl fmt::Display for NoAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no {} address for target", self.0.as_str())
     }
-    failures
-        .iter()
-        .map(|(family, reason)| format!("{family}: {reason}"))
-        .collect::<Vec<_>>()
-        .join("; ")
+}
+
+impl std::error::Error for NoAddress {}
+
+/// The error for a scan whose every family failed: `IPv4: <reason>; IPv6: <reason>`.
+/// Families with no address are left out; when none was attempted, the error is [`NoAddress`].
+pub fn family_failure(failures: &[(Family, String)], protocol: Protocol) -> eyre::Report {
+    if failures.is_empty() {
+        return eyre::Report::new(NoAddress(protocol));
+    }
+    eyre::eyre!(
+        failures
+            .iter()
+            .map(|(family, reason)| format!("{family}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 pub fn create_default_scanners() -> Vec<Box<dyn Scanner + Send + Sync>> {
@@ -270,19 +285,23 @@ mod tests {
     }
 
     #[test]
-    fn family_failure_summary_joins_families_and_names_the_empty_case() {
+    fn family_failure_joins_families_and_names_the_empty_case() {
         let failures = vec![
             (Family::Ipv4, "operation timed out".to_string()),
             (Family::Ipv6, "no IPv6 route on this host".to_string()),
         ];
+        let joined = family_failure(&failures, Protocol::Both);
         assert_eq!(
-            family_failure_summary(&failures, Protocol::Both),
+            joined.to_string(),
             "IPv4: operation timed out; IPv6: no IPv6 route on this host"
         );
-        assert_eq!(
-            family_failure_summary(&[], Protocol::Ipv6),
-            "no IPv6 address for target"
+        assert!(
+            joined.downcast_ref::<NoAddress>().is_none(),
+            "a real failure is not NoAddress"
         );
+        let empty = family_failure(&[], Protocol::Ipv6);
+        assert_eq!(empty.to_string(), "no IPv6 address for target");
+        assert_eq!(empty.downcast_ref::<NoAddress>(), Some(&NoAddress(Protocol::Ipv6)));
     }
 
     #[test]

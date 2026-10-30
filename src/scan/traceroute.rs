@@ -1,4 +1,4 @@
-use super::{Family, classify_route_error, family_failure_summary};
+use super::{Family, classify_route_error, family_failure};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -221,13 +221,13 @@ impl TracerouteResult {
 
     /// Why every attempted family failed, e.g. `IPv6: no IPv6 route on this host`. Families
     /// with no address are left out.
-    pub fn failure_summary(&self, protocol: Protocol) -> String {
+    pub fn failure(&self, protocol: Protocol) -> eyre::Report {
         let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
             .into_iter()
             .filter(|(_, status)| matches!(status, TracerouteStatus::Failed(_)))
             .map(|(family, status)| (family, status.to_string()))
             .collect();
-        family_failure_summary(&failures, protocol)
+        family_failure(&failures, protocol)
     }
 
     pub fn total_hops(&self) -> u8 {
@@ -648,15 +648,15 @@ impl Scanner for TracerouteScanner {
             );
             Ok(ScanResult::Traceroute(result))
         } else {
-            let error_msg = result.failure_summary(protocol);
+            let error = result.failure(protocol);
             log::error!(
                 "[scan::traceroute] scan_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
                 result.total_duration.as_millis(),
-                error_msg
+                error
             );
-            Err(eyre::eyre!(error_msg))
+            Err(error)
         }
     }
 
@@ -707,19 +707,25 @@ mod tests {
     }
 
     #[test]
-    fn failure_summary_leaves_out_no_address_families() {
+    fn failure_leaves_out_no_address_families() {
         let target = Target::parse("2606:4700:4700::1111").unwrap();
         let result = ipv6_literal_no_route_result(&target);
         assert!(matches!(result.ipv4_status, TracerouteStatus::NoAddress));
         assert_eq!(
-            result.failure_summary(Protocol::Both),
+            result.failure(Protocol::Both).to_string(),
             "IPv6: no IPv6 route on this host"
         );
         let mut none_attempted = TracerouteResult::new();
         none_attempted.ipv4_status = TracerouteStatus::NoAddress;
         assert_eq!(
-            none_attempted.failure_summary(Protocol::Ipv4),
+            none_attempted.failure(Protocol::Ipv4).to_string(),
             "no IPv4 address for target"
+        );
+        assert_eq!(
+            none_attempted
+                .failure(Protocol::Ipv4)
+                .downcast_ref::<crate::scan::NoAddress>(),
+            Some(&crate::scan::NoAddress(Protocol::Ipv4))
         );
     }
 
@@ -731,9 +737,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let target = Target::parse("2606:4700:4700::1111").unwrap();
-        let outcome = Err(eyre::eyre!(
-            ipv6_literal_no_route_result(&target).failure_summary(Protocol::Both)
-        ));
+        let outcome = Err(ipv6_literal_no_route_result(&target).failure(Protocol::Both));
         let state = Arc::new(Mutex::new(AppState::new(target.original.clone())));
         state.lock().unwrap().scanners.insert(
             "traceroute".to_string(),

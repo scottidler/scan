@@ -195,7 +195,7 @@ impl Pane for PortsPane {
 
                         // Scan duration
                         result_lines.push(Line::from(vec![
-                            Span::styled("⏳  Duration: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("⏳ Duration: ", Style::default().fg(theme::LABEL)),
                             Span::styled(
                                 if scan_duration_ms > MILLISECONDS_THRESHOLD_FOR_SECONDS {
                                     format!(
@@ -236,7 +236,7 @@ impl Pane for PortsPane {
                                         Span::styled("initializing scan...", Style::default().fg(theme::WARN)),
                                     ]),
                                     Line::from(vec![
-                                        Span::styled("⏳  Started: ", Style::default().fg(theme::LABEL)),
+                                        Span::styled("⏳ Started: ", Style::default().fg(theme::LABEL)),
                                         Span::styled(time_info, Style::default().fg(theme::MUTED)),
                                     ]),
                                     Line::from(vec![

@@ -1,4 +1,4 @@
-use super::{Family, family_failure_summary};
+use super::{Family, family_failure};
 use crate::scanner::Scanner;
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
@@ -183,7 +183,7 @@ impl GeoIpResult {
 
     /// Why every attempted family failed, e.g. `IPv4: All GeoIP providers failed: ...`. Families
     /// with no address, or with a non-public address, are left out.
-    pub fn failure_summary(&self, protocol: Protocol) -> String {
+    pub fn failure(&self, protocol: Protocol) -> eyre::Report {
         let failures: Vec<(Family, String)> = [(Family::Ipv4, &self.ipv4_status), (Family::Ipv6, &self.ipv6_status)]
             .into_iter()
             .filter_map(|(family, status)| match status {
@@ -191,7 +191,7 @@ impl GeoIpResult {
                 _ => None,
             })
             .collect();
-        family_failure_summary(&failures, protocol)
+        family_failure(&failures, protocol)
     }
 
     pub fn get_all_locations(&self) -> Vec<&GeoLocation> {
@@ -856,15 +856,15 @@ impl Scanner for GeoIpScanner {
             );
             Ok(ScanResult::GeoIp(result))
         } else {
-            let error_msg = result.failure_summary(protocol);
+            let error = result.failure(protocol);
             log::error!(
                 "[scan::geoip] scan_failed: target={} protocol={} duration={}ms error={}",
                 target.display_name(),
                 protocol.as_str(),
                 result.total_duration.as_millis(),
-                error_msg
+                error
             );
-            Err(eyre::eyre!(error_msg))
+            Err(error)
         }
     }
 
@@ -975,12 +975,12 @@ mod tests {
     }
 
     #[test]
-    fn geoip_failure_summary_leaves_out_unlocatable_families() {
+    fn geoip_failure_leaves_out_unlocatable_families() {
         let mut result = GeoIpResult::new();
         result.ipv4_status = GeoIpStatus::Failed("All GeoIP providers failed".to_string());
         result.ipv6_status = GeoIpStatus::NotGeolocatable(AddressKind::LinkLocal);
         assert_eq!(
-            result.failure_summary(Protocol::Both),
+            result.failure(Protocol::Both).to_string(),
             "IPv4: All GeoIP providers failed"
         );
     }

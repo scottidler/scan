@@ -199,7 +199,7 @@ impl Pane for GeoIpPane {
                         // Organization (if different from ISP)
                         if network_info.organization != network_info.isp {
                             lines.push(Line::from(vec![
-                                Span::styled("🏦  Org: ", Style::default().fg(theme::LABEL)),
+                                Span::styled("🏦 Org: ", Style::default().fg(theme::LABEL)),
                                 Span::styled(network_info.organization.clone(), Style::default().fg(theme::ACCENT)),
                             ]));
                         }
@@ -239,6 +239,8 @@ impl Pane for GeoIpPane {
                             Span::styled("identifying...", Style::default().fg(theme::WARN)),
                         ]));
                     }
+                    // With no target address nothing was looked up; the muted header says so.
+                    crate::types::ScanStatus::Failed if crate::tui::no_address(&geoip_state).is_some() => {}
                     crate::types::ScanStatus::Failed => {
                         lines.push(Line::from(vec![
                             Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
