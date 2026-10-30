@@ -12,6 +12,7 @@ pub mod target;
 #[cfg(test)]
 pub mod testing;
 pub mod text;
+pub mod theme;
 pub mod traceroute;
 pub mod whois;
 

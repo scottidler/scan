@@ -233,3 +233,35 @@ Evidence: each new test was run with its fix undone, and each failed. Sources we
 - Connectivity loss/jitter off: `zoomed_render_adds_loss_and_jitter_over_every_sample` fails.
 
 Live, release build of this commit, 200x55: AC5 `google.com` Enter shows `DMARC: configured`. The same text was not visible in the grid within 45s, so the check is meaningful. AC4 passes with `shift+tab` as above, and a second Escape exits 0.
+
+## Orchestrator: AC4 amendment (doc defect)
+
+- AC4 named `key press BackTab`. tui-test has no BackTab key name and types it as literal text. Evidence, `tui-test run -- cat -v` then `key press BackTab Enter shift+tab Enter`: `expect text "BackTab"` exits 0, `expect text '^[[Z'` exits 0. The criterion's intent (Shift-Tab from Security to Traceroute) is unchanged; only the key name is fixed to `shift+tab`. The main-branch observation (1, 0, 1) never exercised the key: its middle check passes on main regardless.
+
+## Phase 0: Glyph width check (operator step)
+
+- Scott ran `printf 'xx|\n⏳|\n❗|\n🧭|\n🔰|\n🏦|\n💻|\n'` on ripr on 2026-10-29 and sent a screenshot. Every glyph row's `|` lines up with the `xx|` ruler, so all six glyphs are 2 cells in his terminal. Phase 2 uses the full replacement set; no glyph is dropped.
+
+## Phase 2: Theme and glyphs
+### Design decisions
+- `src/tui/theme.rs` holds `BAD` (LightRed, ANSI 9), `WARN`, `GOOD`, `VALUE`, `LABEL`, `MUTED`, `ACCENT` (Magenta), `BORDER_FOCUSED`, `BORDER_UNFOCUSED`; `create_block` in `src/tui/pane.rs` reads the borders from it. Every `Color::` in non-test code under `src/tui` migrated, including the stand-ins Phases 3, 4, 5, 7 and 8 left (MUTED/GOOD in connectivity, `ttl_span` expired, DKIM line, `HOP_NUMBER_COLOR`, zoom footer and zoomed field lines).
+- Lint is `theme::tests::no_color_literal_outside_theme_and_test_modules` (reads every `src/tui/*.rs`, stops at the first `#[cfg(test)]`, skips `//` lines) with a companion `the_color_lint_catches_a_color_added_to_a_pane` that exercises the detector on a synthetic source, so the lint itself cannot rot.
+- Glyphs: all six VS16 emoji replaced with the confirmed 2-cell set. `no_pane_source_contains_a_variation_selector` scans sources; `rendered_traceroute_pane_has_no_variation_selector` checks a rendered pane.
+- Reclassifications: hop number LABEL; TTL <=60s WARN (>60s GOOD, never BAD; expired MUTED); MX priority LABEL (thresholds deleted); `Privacy: Open` VALUE; EPP `ok` and `* prohibited` locks GOOD via `whois::is_lock_or_ok`; HTTP time >=500ms WARN (<500ms GOOD, the 100ms tier deleted); HTTP 5xx BAD (was ACCENT); open ports 0 GOOD, 1-5 LABEL, >5 WARN.
+- Verified bites (fix undone, test fails, restored): lint with `Color::Red` in `pane.rs`; U+FE0F re-added in `traceroute.rs` (source and rendered); `prohibited` dropped from `is_lock_or_ok`; `BAD` set to `Color::Red` (six tests fail, including the failed ping label).
+- AC6 equivalent in tests: `client transfer prohibited` renders `Color::Green` (ANSI 2) and `no echo reply` renders `Color::LightRed` (ANSI 9).
+
+### Deviations
+- Open ports 1-5 is LABEL, not WARN: the doc only says >5 is WARN, and keeping 1-5 WARN would make both tiers identical. Same effect on the doc's intent.
+- HTTP 3xx stays WARN and 4xx stays BAD; the doc did not reclassify them.
+- Unknown EPP statuses (for example `serverHold`) stay BAD; `pending*` stays WARN.
+- `ACCENT` is Magenta; the doc names no value.
+- AC6 itself (live `expect text --fg`) not run here; covered by the unit tests above.
+
+### Tradeoffs
+- Source-scanning lint vs a clippy `disallowed` rule: the scan needs no config and its failure message lists file:line.
+- Mechanical per-color mapping then hand reclassification vs hand-editing 500 sites: fewer typos, and the test suite pinned the result.
+
+### Open questions
+- Should `ACCENT` be Magenta or something else on Scott's palette?
+- Should open ports 1-5 stay neutral LABEL?

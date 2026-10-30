@@ -1,11 +1,12 @@
 use crate::tui::pane::{Detail, Pane, PaneConfig, create_block, draw_rows};
+use crate::tui::theme;
 use crate::types::AppState;
 use crossterm::event::{KeyCode, KeyEvent};
 use log;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     text::Line,
     widgets::{Paragraph, Widget},
 };
@@ -287,7 +288,7 @@ impl PaneLayout {
         if let Some(footer) = footer_rect(area) {
             Paragraph::new(crate::tui::text::fit_line(
                 // MUTED: Gray until the theme lands (Phase 2).
-                Line::styled(ZOOM_FOOTER, Style::default().fg(Color::Gray)),
+                Line::styled(ZOOM_FOOTER, Style::default().fg(theme::MUTED)),
                 footer.width,
             ))
             .render(footer, frame.buffer_mut());

@@ -1,5 +1,6 @@
 //! Shared status-line label for panes whose data comes from a scanner.
 
+use crate::tui::theme;
 use crate::types::{ScanState, ScanStatus};
 use ratatui::style::Color;
 
@@ -19,14 +20,14 @@ pub const RETRYING_LABEL: &str = "↻ retrying";
 pub fn status_label(scan_state: &ScanState, running: &'static str, complete: &'static str) -> (String, Color) {
     match scan_state.status {
         ScanStatus::Running => match (&scan_state.error, &scan_state.result) {
-            (Some(error), _) => (format!("failed: {error:#} · {RETRYING_LABEL}"), Color::Red),
-            (None, Some(_)) => (REFRESHING_LABEL.to_string(), Color::Yellow),
-            (None, None) => (running.to_string(), Color::Yellow),
+            (Some(error), _) => (format!("failed: {error:#} · {RETRYING_LABEL}"), theme::BAD),
+            (None, Some(_)) => (REFRESHING_LABEL.to_string(), theme::WARN),
+            (None, None) => (running.to_string(), theme::WARN),
         },
-        ScanStatus::Complete => (complete.to_string(), Color::Green),
+        ScanStatus::Complete => (complete.to_string(), theme::GOOD),
         ScanStatus::Failed => (
             failure_text(scan_state).unwrap_or_else(|| "failed".to_string()),
-            Color::Red,
+            theme::BAD,
         ),
     }
 }
@@ -88,7 +89,7 @@ mod tests {
         state.error = Some(eyre::eyre!("timed out after 30s"));
         let (label, color) = status_label(&state, "r", "done");
         assert_eq!(label, "failed: timed out after 30s");
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, Color::LightRed);
     }
 
     #[test]
@@ -106,7 +107,7 @@ mod tests {
             let (label, color) = status_label(&state, "scanning...", "done");
             assert!(label.contains("failed:"), "{label}");
             assert_eq!(label, "failed: timed out after 30s · ↻ retrying");
-            assert_eq!(color, Color::Red);
+            assert_eq!(color, Color::LightRed);
         }
     }
 

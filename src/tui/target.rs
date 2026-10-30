@@ -1,5 +1,6 @@
 use crate::scan::dns::QueryStatus;
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::{AppState, ScanStatus};
 use log;
 use ratatui::{
@@ -72,9 +73,9 @@ impl TargetPane {
     /// Get status icon and color for a scanner status
     fn status_icon_and_color(status: &ScanStatus) -> (&'static str, Color) {
         match status {
-            ScanStatus::Running => ("🔄", Color::Yellow),
-            ScanStatus::Complete => ("✅", Color::Green),
-            ScanStatus::Failed => ("❌", Color::Red),
+            ScanStatus::Running => ("🔄", theme::WARN),
+            ScanStatus::Complete => ("✅", theme::GOOD),
+            ScanStatus::Failed => ("❌", theme::BAD),
         }
     }
 
@@ -99,11 +100,11 @@ impl TargetPane {
 
     fn summary_color(running: usize, failed: usize) -> Style {
         if failed > 0 {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme::BAD)
         } else if running > 0 {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme::WARN)
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme::GOOD)
         }
     }
 
@@ -129,21 +130,21 @@ impl TargetPane {
         };
         if !selected {
             return Line::from(vec![
-                Span::styled("  ", Style::default().fg(Color::Gray)),
-                Span::styled(format!("⚫ {}: ", label), Style::default().fg(Color::Gray)),
-                Span::styled("disabled", Style::default().fg(Color::Gray)),
+                Span::styled("  ", Style::default().fg(theme::MUTED)),
+                Span::styled(format!("⚫ {}: ", label), Style::default().fg(theme::MUTED)),
+                Span::styled("disabled", Style::default().fg(theme::MUTED)),
             ]);
         }
 
         let (icon, value, color) = match state.resolved_ips.iter().find(|ip| family.matches(ip)) {
             Some(ip) => {
                 log::trace!("[tui::target] address_from_resolution: family={} ip={}", label, ip);
-                ("✅", ip.to_string(), Color::Green)
+                ("✅", ip.to_string(), theme::GOOD)
             }
             None => Self::address_from_dns(state, family),
         };
         Line::from(vec![
-            Span::styled("▶ ", Style::default().fg(Color::Green)),
+            Span::styled("▶ ", Style::default().fg(theme::GOOD)),
             Span::styled(format!("{} {}: ", icon, label), Style::default().fg(color)),
             Span::styled(value, Style::default().fg(color)),
         ])
@@ -153,10 +154,10 @@ impl TargetPane {
     /// no address is neutral gray; red is kept for a DNS query that errored.
     fn address_from_dns(state: &AppState, family: AddressFamily) -> (&'static str, String, Color) {
         if state.target.parse::<IpAddr>().is_ok() {
-            return ("⚫", "n/a".to_string(), Color::Gray);
+            return ("⚫", "n/a".to_string(), theme::MUTED);
         }
         let Some(dns_state) = state.scanners.get("dns") else {
-            return ("⚫", "initializing...".to_string(), Color::Gray);
+            return ("⚫", "initializing...".to_string(), theme::MUTED);
         };
         match &dns_state.result {
             Some(crate::types::ScanResult::Dns(dns_result)) => {
@@ -168,20 +169,22 @@ impl TargetPane {
                     ),
                 };
                 match (first, status) {
-                    (Some(ip), _) => ("✅", ip, Color::Green),
-                    (None, QueryStatus::Failed(_) | QueryStatus::Timeout) => ("❌", "no data".to_string(), Color::Red),
-                    (None, QueryStatus::NotQueried) => ("⚫", "not queried".to_string(), Color::Gray),
-                    (None, QueryStatus::NoRecords | QueryStatus::Success(_)) => ("⚫", "none".to_string(), Color::Gray),
+                    (Some(ip), _) => ("✅", ip, theme::GOOD),
+                    (None, QueryStatus::Failed(_) | QueryStatus::Timeout) => ("❌", "no data".to_string(), theme::BAD),
+                    (None, QueryStatus::NotQueried) => ("⚫", "not queried".to_string(), theme::MUTED),
+                    (None, QueryStatus::NoRecords | QueryStatus::Success(_)) => {
+                        ("⚫", "none".to_string(), theme::MUTED)
+                    }
                 }
             }
             Some(_) => {
                 log::warn!("[tui::target] dns_unexpected_result_type:");
-                ("❌", "error".to_string(), Color::Red)
+                ("❌", "error".to_string(), theme::BAD)
             }
             None => match dns_state.status {
-                ScanStatus::Running => ("🔄", "resolving...".to_string(), Color::Yellow),
-                ScanStatus::Failed => ("❌", "resolution failed".to_string(), Color::Red),
-                ScanStatus::Complete => ("⚫", "waiting to resolve...".to_string(), Color::Gray),
+                ScanStatus::Running => ("🔄", "resolving...".to_string(), theme::WARN),
+                ScanStatus::Failed => ("❌", "resolution failed".to_string(), theme::BAD),
+                ScanStatus::Complete => ("⚫", "waiting to resolve...".to_string(), theme::MUTED),
             },
         }
     }
@@ -233,8 +236,8 @@ impl Pane for TargetPane {
         let mut lines = Vec::new();
 
         lines.push(Line::from(vec![
-            Span::styled("🎯 ", Style::default().fg(Color::Cyan)),
-            Span::styled(state.target.clone(), Style::default().fg(Color::White)),
+            Span::styled("🎯 ", Style::default().fg(theme::VALUE)),
+            Span::styled(state.target.clone(), Style::default().fg(theme::LABEL)),
         ]));
 
         lines.push(Self::address_line(state, AddressFamily::V4));
@@ -242,7 +245,7 @@ impl Pane for TargetPane {
 
         let (total, running, complete, failed) = Self::calculate_stats(state);
         lines.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::White)),
+            Span::styled("Status: ", Style::default().fg(theme::LABEL)),
             Span::styled(
                 Self::collapsed_summary(total, running, complete, failed),
                 Self::summary_color(running, failed),
@@ -250,11 +253,11 @@ impl Pane for TargetPane {
         ]));
 
         lines.push(Line::from(vec![
-            Span::styled("🔗 ", Style::default().fg(Color::Magenta)),
-            Span::styled("Protocol: ", Style::default().fg(Color::White)),
+            Span::styled("🔗 ", Style::default().fg(theme::ACCENT)),
+            Span::styled("Protocol: ", Style::default().fg(theme::LABEL)),
             Span::styled(
                 format!("{} (Press 'p' to cycle)", state.protocol_display()),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::VALUE),
             ),
         ]));
 
@@ -265,8 +268,8 @@ impl Pane for TargetPane {
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("{} ", icon), Style::default().fg(color)),
-                    Span::styled(format!("{}: ", key.to_uppercase()), Style::default().fg(Color::White)),
-                    Span::styled(Self::format_elapsed(elapsed), Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{}: ", key.to_uppercase()), Style::default().fg(theme::LABEL)),
+                    Span::styled(Self::format_elapsed(elapsed), Style::default().fg(theme::MUTED)),
                 ]));
             }
         }
@@ -341,7 +344,7 @@ mod tests {
 
         let (icon, color) = TargetPane::status_icon_and_color(&ScanStatus::Failed);
         assert_eq!(icon, "❌");
-        assert_eq!(color, Color::Red);
+        assert_eq!(color, Color::LightRed);
     }
 
     #[test]

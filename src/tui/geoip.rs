@@ -1,4 +1,5 @@
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
@@ -35,8 +36,8 @@ impl Default for GeoIpPane {
 /// `<label>: <value>`, indented under a zoomed family.
 fn field_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
-        Span::styled(value, Style::default().fg(Color::Gray)),
+        Span::styled(format!("  {label}: "), Style::default().fg(theme::LABEL)),
+        Span::styled(value, Style::default().fg(theme::MUTED)),
     ])
 }
 
@@ -44,11 +45,11 @@ fn field_line(label: &str, value: String) -> Line<'static> {
 fn status_text(status: &crate::scan::geoip::GeoIpStatus) -> (String, Color) {
     use crate::scan::geoip::{GeoIpStatus, NotGeolocatable};
     match status {
-        GeoIpStatus::Success => ("located".to_string(), Color::Green),
-        GeoIpStatus::Failed(reason) => (format!("failed: {reason}"), Color::Red),
-        GeoIpStatus::NoAddress => ("no address".to_string(), Color::Gray),
-        GeoIpStatus::NotQueried => ("not queried".to_string(), Color::Gray),
-        GeoIpStatus::NotGeolocatable(kind) => (NotGeolocatable(*kind).to_string(), Color::Gray),
+        GeoIpStatus::Success => ("located".to_string(), theme::GOOD),
+        GeoIpStatus::Failed(reason) => (format!("failed: {reason}"), theme::BAD),
+        GeoIpStatus::NoAddress => ("no address".to_string(), theme::MUTED),
+        GeoIpStatus::NotQueried => ("not queried".to_string(), theme::MUTED),
+        GeoIpStatus::NotGeolocatable(kind) => (NotGeolocatable(*kind).to_string(), theme::MUTED),
     }
 }
 
@@ -64,14 +65,14 @@ fn zoomed_lines(result: &crate::scan::geoip::GeoIpResult) -> Vec<Line<'static>> 
         let Some(data) = data else {
             let (text, color) = status_text(status);
             lines.push(Line::from(vec![
-                Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{name}: "), Style::default().fg(theme::VALUE)),
                 Span::styled(text, Style::default().fg(color)),
             ]));
             continue;
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{name}: "), Style::default().fg(Color::Cyan)),
-            Span::styled(data.target_ip.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{name}: "), Style::default().fg(theme::VALUE)),
+            Span::styled(data.target_ip.to_string(), Style::default().fg(theme::VALUE)),
         ]));
         if let Some(location) = &data.location {
             lines.push(field_line("City", location.city.clone()));
@@ -119,8 +120,8 @@ impl Pane for GeoIpPane {
 
         // GeoIP status header
         lines.push(Line::from(vec![
-            Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("locating...", Style::default().fg(Color::Gray)),
+            Span::styled("🌍 Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("locating...", Style::default().fg(theme::MUTED)),
         ]));
 
         // Empty line for spacing
@@ -138,10 +139,10 @@ impl Pane for GeoIpPane {
             let complete = if not_geolocatable.is_some() { "not geolocatable" } else { "located" };
             let (label, mut label_color) = crate::tui::status_label(&geoip_state, "locating...", complete);
             if not_geolocatable.is_some() && matches!(geoip_state.status, crate::types::ScanStatus::Complete) {
-                label_color = Color::Gray;
+                label_color = theme::MUTED;
             }
             lines[0] = Line::from(vec![
-                Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌍 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]);
 
@@ -153,23 +154,23 @@ impl Pane for GeoIpPane {
                         let location_text = format!("{}, {}, {}", location.city, location.region, location.country);
 
                         lines.push(Line::from(vec![
-                            Span::styled("📍 Location: ", Style::default().fg(Color::White)),
-                            Span::styled(location_text, Style::default().fg(Color::Green)),
+                            Span::styled("📍 Location: ", Style::default().fg(theme::LABEL)),
+                            Span::styled(location_text, Style::default().fg(theme::GOOD)),
                         ]));
 
                         // Coordinates
                         lines.push(Line::from(vec![
-                            Span::styled("📐 Coords: ", Style::default().fg(Color::White)),
+                            Span::styled("📐 Coords: ", Style::default().fg(theme::LABEL)),
                             Span::styled(
                                 format!("{:.4}, {:.4}", location.latitude, location.longitude),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(theme::WARN),
                             ),
                         ]));
 
                         // Timezone
                         lines.push(Line::from(vec![
-                            Span::styled("🕐 TZ: ", Style::default().fg(Color::White)),
-                            Span::styled(location.timezone.clone(), Style::default().fg(Color::Yellow)),
+                            Span::styled("🕐 TZ: ", Style::default().fg(theme::LABEL)),
+                            Span::styled(location.timezone.clone(), Style::default().fg(theme::WARN)),
                         ]));
                     }
 
@@ -177,8 +178,8 @@ impl Pane for GeoIpPane {
                     if let Some(network_info) = &primary_data.network_info {
                         // ISP/Organization
                         lines.push(Line::from(vec![
-                            Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
-                            Span::styled(network_info.isp.clone(), Style::default().fg(Color::Cyan)),
+                            Span::styled("🏢 ISP: ", Style::default().fg(theme::LABEL)),
+                            Span::styled(network_info.isp.clone(), Style::default().fg(theme::VALUE)),
                         ]));
 
                         // AS Number
@@ -190,24 +191,24 @@ impl Pane for GeoIpPane {
                             };
 
                             lines.push(Line::from(vec![
-                                Span::styled("🔗 ASN: ", Style::default().fg(Color::White)),
-                                Span::styled(as_text, Style::default().fg(Color::Magenta)),
+                                Span::styled("🔗 ASN: ", Style::default().fg(theme::LABEL)),
+                                Span::styled(as_text, Style::default().fg(theme::ACCENT)),
                             ]));
                         }
 
                         // Organization (if different from ISP)
                         if network_info.organization != network_info.isp {
                             lines.push(Line::from(vec![
-                                Span::styled("🏛️  Org: ", Style::default().fg(Color::White)),
-                                Span::styled(network_info.organization.clone(), Style::default().fg(Color::Blue)),
+                                Span::styled("🏦  Org: ", Style::default().fg(theme::LABEL)),
+                                Span::styled(network_info.organization.clone(), Style::default().fg(theme::ACCENT)),
                             ]));
                         }
                     }
 
                     // Data source
                     lines.push(Line::from(vec![
-                        Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                        Span::styled(primary_data.data_source.clone(), Style::default().fg(Color::Gray)),
+                        Span::styled("📡 Source: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(primary_data.data_source.clone(), Style::default().fg(theme::MUTED)),
                     ]));
 
                     if detail == Detail::Zoomed {
@@ -215,13 +216,13 @@ impl Pane for GeoIpPane {
                     }
                 } else if let Some(not_geolocatable) = not_geolocatable {
                     lines.push(Line::from(vec![
-                        Span::styled("📍 Location: ", Style::default().fg(Color::White)),
-                        Span::styled(not_geolocatable.to_string(), Style::default().fg(Color::Gray)),
+                        Span::styled("📍 Location: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(not_geolocatable.to_string(), Style::default().fg(theme::MUTED)),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                        Span::styled("All protocols failed", Style::default().fg(Color::Red)),
+                        Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                        Span::styled("All protocols failed", Style::default().fg(theme::BAD)),
                     ]));
                 }
             } else {
@@ -229,25 +230,25 @@ impl Pane for GeoIpPane {
                 match geoip_state.status {
                     crate::types::ScanStatus::Running => {
                         lines.push(Line::from(vec![
-                            Span::styled("📍 Location: ", Style::default().fg(Color::White)),
-                            Span::styled("locating...", Style::default().fg(Color::Yellow)),
+                            Span::styled("📍 Location: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("locating...", Style::default().fg(theme::WARN)),
                         ]));
 
                         lines.push(Line::from(vec![
-                            Span::styled("🏢 ISP: ", Style::default().fg(Color::White)),
-                            Span::styled("identifying...", Style::default().fg(Color::Yellow)),
+                            Span::styled("🏢 ISP: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("identifying...", Style::default().fg(theme::WARN)),
                         ]));
                     }
                     crate::types::ScanStatus::Failed => {
                         lines.push(Line::from(vec![
-                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                            Span::styled("location lookup failed", Style::default().fg(Color::Red)),
+                            Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("location lookup failed", Style::default().fg(theme::BAD)),
                         ]));
                     }
                     _ => {
                         lines.push(Line::from(vec![
-                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                            Span::styled("waiting to locate...", Style::default().fg(Color::Gray)),
+                            Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("waiting to locate...", Style::default().fg(theme::MUTED)),
                         ]));
                     }
                 }
@@ -255,13 +256,13 @@ impl Pane for GeoIpPane {
         } else {
             // No GeoIP scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🌍 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled("unavailable", Style::default().fg(Color::Red)),
+                Span::styled("🌍 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 
             lines.push(Line::from(vec![
-                Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                Span::styled("GeoIP scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                Span::styled("GeoIP scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
 

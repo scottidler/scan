@@ -1,9 +1,10 @@
+use crate::tui::theme;
 use crate::types::AppState;
 use log;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::Line,
     widgets::{Block, Borders, Paragraph, Widget},
 };
@@ -83,9 +84,9 @@ pub fn create_block(title: &str, focused: bool) -> Block<'_> {
         .title(title.to_uppercase())
         .borders(Borders::ALL)
         .border_style(if focused {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme::WARN)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme::MUTED)
         })
 }
 

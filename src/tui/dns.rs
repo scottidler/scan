@@ -1,4 +1,5 @@
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::AppState;
 use log;
 use ratatui::{
@@ -8,12 +9,9 @@ use ratatui::{
 use std::any::Any;
 
 const MAX_A_RECORDS_DISPLAYED: usize = 1000;
-const TTL_GOOD_THRESHOLD: u32 = 300;
 const TTL_WARNING_THRESHOLD: u32 = 60;
 const MAX_AAAA_RECORDS_DISPLAYED: usize = 1000;
 const MAX_MX_RECORDS_DISPLAYED: usize = 1000;
-const MX_PRIORITY_GOOD_THRESHOLD: u16 = 10;
-const MX_PRIORITY_WARNING_THRESHOLD: u16 = 20;
 const MAX_TXT_RECORDS_DISPLAYED: usize = 1000;
 const MS_RECORD_PREVIEW_LENGTH: usize = 10;
 const MS_RECORD_PREFIX_LENGTH: usize = 3;
@@ -50,13 +48,13 @@ impl DnsPane {
         if let Some(dns_state) = state.scanners.get("dns") {
             let (label, label_color) = crate::tui::status_label(&dns_state, "resolving...", "resolved");
             lines.push(Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled("scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
 
@@ -93,7 +91,7 @@ impl DnsPane {
         // A records
         let (a_color, a_status_text) = status_display(&dns_result.A_status);
         lines.push(Line::from(vec![
-            Span::styled("A: ", Style::default().fg(Color::White)),
+            Span::styled("A: ", Style::default().fg(theme::LABEL)),
             Span::styled(a_status_text, Style::default().fg(a_color)),
         ]));
 
@@ -101,14 +99,17 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.A[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("  TTL: ", Style::default().fg(Color::White)),
+                Span::styled("  TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
             // Show A records
             for record in dns_result.A.iter().take(MAX_A_RECORDS_DISPLAYED) {
                 lines.push(record_line(
-                    vec![Span::styled(record.value.to_string(), Style::default().fg(Color::Cyan))],
+                    vec![Span::styled(
+                        record.value.to_string(),
+                        Style::default().fg(theme::VALUE),
+                    )],
                     record.ttl_remaining(),
                     detail,
                 ));
@@ -118,7 +119,7 @@ impl DnsPane {
         // AAAA records (IPv6)
         let (aaaa_color, aaaa_status_text) = status_display(&dns_result.AAAA_status);
         lines.push(Line::from(vec![
-            Span::styled("AAAA: ", Style::default().fg(Color::White)),
+            Span::styled("AAAA: ", Style::default().fg(theme::LABEL)),
             Span::styled(aaaa_status_text, Style::default().fg(aaaa_color)),
         ]));
 
@@ -126,13 +127,16 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.AAAA[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("  TTL: ", Style::default().fg(Color::White)),
+                Span::styled("  TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
             for record in dns_result.AAAA.iter().take(MAX_AAAA_RECORDS_DISPLAYED) {
                 lines.push(record_line(
-                    vec![Span::styled(record.value.to_string(), Style::default().fg(Color::Cyan))],
+                    vec![Span::styled(
+                        record.value.to_string(),
+                        Style::default().fg(theme::VALUE),
+                    )],
                     record.ttl_remaining(),
                     detail,
                 ));
@@ -145,15 +149,15 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.CNAME[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("CNAME: ", Style::default().fg(Color::White)),
-                Span::styled(dns_result.CNAME.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("CNAME: ", Style::default().fg(theme::LABEL)),
+                Span::styled(dns_result.CNAME.len().to_string(), Style::default().fg(theme::GOOD)),
+                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
             for record in dns_result.CNAME.iter().take(MAX_CNAME_RECORDS_DISPLAYED) {
                 lines.push(record_line(
-                    vec![Span::styled(record.value.clone(), Style::default().fg(Color::Magenta))],
+                    vec![Span::styled(record.value.clone(), Style::default().fg(theme::ACCENT))],
                     record.ttl_remaining(),
                     detail,
                 ));
@@ -165,15 +169,15 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.NS[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("NS: ", Style::default().fg(Color::White)),
-                Span::styled(dns_result.NS.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("NS: ", Style::default().fg(theme::LABEL)),
+                Span::styled(dns_result.NS.len().to_string(), Style::default().fg(theme::GOOD)),
+                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
             for record in dns_result.NS.iter().take(MAX_NS_RECORDS_DISPLAYED) {
                 lines.push(record_line(
-                    vec![Span::styled(record.value.clone(), Style::default().fg(Color::Blue))],
+                    vec![Span::styled(record.value.clone(), Style::default().fg(theme::ACCENT))],
                     record.ttl_remaining(),
                     detail,
                 ));
@@ -185,9 +189,9 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.TXT[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("TXT: ", Style::default().fg(Color::White)),
-                Span::styled(dns_result.TXT.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("TXT: ", Style::default().fg(theme::LABEL)),
+                Span::styled(dns_result.TXT.len().to_string(), Style::default().fg(theme::GOOD)),
+                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -211,7 +215,7 @@ impl DnsPane {
                 };
 
                 lines.push(record_line(
-                    vec![Span::styled(display_value, Style::default().fg(Color::Yellow))],
+                    vec![Span::styled(display_value, Style::default().fg(theme::WARN))],
                     record.ttl_remaining(),
                     detail,
                 ));
@@ -224,9 +228,9 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.CAA[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("CAA: ", Style::default().fg(Color::White)),
-                Span::styled(dns_result.CAA.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" cert auth, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("CAA: ", Style::default().fg(theme::LABEL)),
+                Span::styled(dns_result.CAA.len().to_string(), Style::default().fg(theme::GOOD)),
+                Span::styled(" cert auth, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -234,7 +238,7 @@ impl DnsPane {
                 lines.push(record_line(
                     vec![Span::styled(
                         format!("{} {}", record.value.tag, record.value.value),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(theme::GOOD),
                     )],
                     record.ttl_remaining(),
                     detail,
@@ -246,37 +250,26 @@ impl DnsPane {
         if is_null_mx(&dns_result.MX) {
             // RFC 7505: a lone `0 .` says the domain accepts no mail; it is not a mail server.
             lines.push(Line::from(vec![
-                Span::styled("MX: ", Style::default().fg(Color::White)),
-                Span::styled("none (null MX)", Style::default().fg(Color::Gray)),
+                Span::styled("MX: ", Style::default().fg(theme::LABEL)),
+                Span::styled("none (null MX)", Style::default().fg(theme::MUTED)),
             ]));
         } else if !dns_result.MX.is_empty() {
             let ttl = ttl_span(dns_result.MX[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("MX: ", Style::default().fg(Color::White)),
-                Span::styled(dns_result.MX.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" records, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("MX: ", Style::default().fg(theme::LABEL)),
+                Span::styled(dns_result.MX.len().to_string(), Style::default().fg(theme::GOOD)),
+                Span::styled(" records, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
             for record in dns_result.MX.iter().take(MAX_MX_RECORDS_DISPLAYED) {
-                let priority_color = if record.value.priority <= MX_PRIORITY_GOOD_THRESHOLD {
-                    Color::Green
-                } else if record.value.priority <= MX_PRIORITY_WARNING_THRESHOLD {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
-
                 lines.push(record_line(
                     vec![
-                        Span::styled(record.value.exchange.clone(), Style::default().fg(Color::Magenta)),
-                        Span::styled(" (pri: ", Style::default().fg(Color::Gray)),
-                        Span::styled(
-                            format!("{}", record.value.priority),
-                            Style::default().fg(priority_color),
-                        ),
-                        Span::styled(")", Style::default().fg(Color::Gray)),
+                        Span::styled(record.value.exchange.clone(), Style::default().fg(theme::ACCENT)),
+                        Span::styled(" (pri: ", Style::default().fg(theme::MUTED)),
+                        Span::styled(format!("{}", record.value.priority), Style::default().fg(theme::LABEL)),
+                        Span::styled(")", Style::default().fg(theme::MUTED)),
                     ],
                     record.ttl_remaining(),
                     detail,
@@ -289,8 +282,8 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.SOA[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("SOA: ", Style::default().fg(Color::White)),
-                Span::styled("authority, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("SOA: ", Style::default().fg(theme::LABEL)),
+                Span::styled("authority, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -299,14 +292,14 @@ impl DnsPane {
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         format!("NS: {}", soa.value.primary_ns),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(theme::VALUE),
                     ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
                         format!("Serial: {}", soa.value.serial),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(theme::MUTED),
                     ),
                 ]));
                 if detail == Detail::Zoomed {
@@ -319,8 +312,8 @@ impl DnsPane {
                     ];
                     for (label, value) in fields {
                         lines.push(Line::from(vec![
-                            Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
-                            Span::styled(value, Style::default().fg(Color::Gray)),
+                            Span::styled(format!("  {label}: "), Style::default().fg(theme::LABEL)),
+                            Span::styled(value, Style::default().fg(theme::MUTED)),
                         ]));
                     }
                 }
@@ -332,9 +325,9 @@ impl DnsPane {
             let ttl = ttl_span(dns_result.SRV[0].ttl_remaining());
 
             lines.push(Line::from(vec![
-                Span::styled("SRV: ", Style::default().fg(Color::White)),
-                Span::styled(dns_result.SRV.len().to_string(), Style::default().fg(Color::Green)),
-                Span::styled(" services, TTL: ", Style::default().fg(Color::White)),
+                Span::styled("SRV: ", Style::default().fg(theme::LABEL)),
+                Span::styled(dns_result.SRV.len().to_string(), Style::default().fg(theme::GOOD)),
+                Span::styled(" services, TTL: ", Style::default().fg(theme::LABEL)),
                 ttl,
             ]));
 
@@ -345,7 +338,7 @@ impl DnsPane {
                             "{}:{} (p:{}, w:{})",
                             record.value.target, record.value.port, record.value.priority, record.value.weight
                         ),
-                        Style::default().fg(Color::Blue),
+                        Style::default().fg(theme::ACCENT),
                     )],
                     record.ttl_remaining(),
                     detail,
@@ -363,24 +356,24 @@ impl DnsPane {
     fn build_dns_loading_lines() -> Vec<Line<'static>> {
         vec![
             Line::from(vec![
-                Span::styled("A: ", Style::default().fg(Color::White)),
-                Span::styled("resolving...", Style::default().fg(Color::Gray)),
+                Span::styled("A: ", Style::default().fg(theme::LABEL)),
+                Span::styled("resolving...", Style::default().fg(theme::MUTED)),
             ]),
             Line::from(vec![
-                Span::styled("AAAA: ", Style::default().fg(Color::White)),
-                Span::styled("resolving...", Style::default().fg(Color::Gray)),
+                Span::styled("AAAA: ", Style::default().fg(theme::LABEL)),
+                Span::styled("resolving...", Style::default().fg(theme::MUTED)),
             ]),
             Line::from(vec![
-                Span::styled("MX: ", Style::default().fg(Color::White)),
-                Span::styled("resolving...", Style::default().fg(Color::Gray)),
+                Span::styled("MX: ", Style::default().fg(theme::LABEL)),
+                Span::styled("resolving...", Style::default().fg(theme::MUTED)),
             ]),
         ]
     }
 
     fn build_dns_unavailable_lines() -> Vec<Line<'static>> {
         vec![Line::from(vec![
-            Span::styled("DNS: ", Style::default().fg(Color::White)),
-            Span::styled("scanner not available", Style::default().fg(Color::Red)),
+            Span::styled("DNS: ", Style::default().fg(theme::LABEL)),
+            Span::styled("scanner not available", Style::default().fg(theme::BAD)),
         ])]
     }
 }
@@ -388,28 +381,22 @@ impl DnsPane {
 /// A record set's query outcome: color and text.
 fn status_display(status: &crate::scan::dns::QueryStatus) -> (Color, String) {
     match status {
-        crate::scan::dns::QueryStatus::NotQueried => (Color::Gray, "not queried".to_string()),
-        crate::scan::dns::QueryStatus::Success(count) => (Color::Green, format!("{} records", count)),
-        crate::scan::dns::QueryStatus::NoRecords => (Color::Yellow, "No Records".to_string()),
-        crate::scan::dns::QueryStatus::Failed(_error) => (Color::Red, "Failed".to_string()),
-        crate::scan::dns::QueryStatus::Timeout => (Color::Red, "Timeout".to_string()),
+        crate::scan::dns::QueryStatus::NotQueried => (theme::MUTED, "not queried".to_string()),
+        crate::scan::dns::QueryStatus::Success(count) => (theme::GOOD, format!("{} records", count)),
+        crate::scan::dns::QueryStatus::NoRecords => (theme::WARN, "No Records".to_string()),
+        crate::scan::dns::QueryStatus::Failed(_error) => (theme::BAD, "Failed".to_string()),
+        crate::scan::dns::QueryStatus::Timeout => (theme::BAD, "Timeout".to_string()),
     }
 }
 
 /// A record's remaining TTL as the stub resolver reported it: `<n>s (cached)`, since that is the
 /// resolver cache's countdown, not the zone's TTL. At 0 the scanner is already re-querying, so it
-/// reads `expired, refreshing` (MUTED: Gray until the theme lands).
+/// reads `expired, refreshing` (MUTED).
 fn ttl_span(ttl: u32) -> Span<'static> {
     if ttl == 0 {
-        return Span::styled("expired, refreshing", Style::default().fg(Color::Gray));
+        return Span::styled("expired, refreshing", Style::default().fg(theme::MUTED));
     }
-    let color = if ttl > TTL_GOOD_THRESHOLD {
-        Color::Green
-    } else if ttl > TTL_WARNING_THRESHOLD {
-        Color::Yellow
-    } else {
-        Color::Red
-    };
+    let color = if ttl > TTL_WARNING_THRESHOLD { theme::GOOD } else { theme::WARN };
     Span::styled(format!("{}s (cached)", ttl), Style::default().fg(color))
 }
 
@@ -424,7 +411,7 @@ fn failed_query_line(label: &'static str, status: &crate::scan::dns::QueryStatus
     }
     let (color, text) = status_display(status);
     Some(Line::from(vec![
-        Span::styled(format!("{}: ", label), Style::default().fg(Color::White)),
+        Span::styled(format!("{}: ", label), Style::default().fg(theme::LABEL)),
         Span::styled(text, Style::default().fg(color)),
     ]))
 }
@@ -435,7 +422,7 @@ fn record_line(value: Vec<Span<'static>>, ttl: u32, detail: Detail) -> Line<'sta
     let mut spans = vec![Span::styled("  ", Style::default())];
     spans.extend(value);
     if detail == Detail::Zoomed {
-        spans.push(Span::styled("  TTL: ", Style::default().fg(Color::White)));
+        spans.push(Span::styled("  TTL: ", Style::default().fg(theme::LABEL)));
         spans.push(ttl_span(ttl));
     }
     Line::from(spans)
@@ -445,17 +432,17 @@ fn record_line(value: Vec<Span<'static>>, ttl: u32, detail: Detail) -> Line<'sta
 fn ptr_lines(dns_result: &crate::scan::dns::DnsResult, detail: Detail) -> Vec<Line<'static>> {
     let (color, text) = status_display(&dns_result.PTR_status);
     let mut header = vec![
-        Span::styled("PTR: ", Style::default().fg(Color::White)),
+        Span::styled("PTR: ", Style::default().fg(theme::LABEL)),
         Span::styled(text, Style::default().fg(color)),
     ];
     if let Some(first) = dns_result.PTR.first() {
-        header.push(Span::styled(", TTL: ", Style::default().fg(Color::White)));
+        header.push(Span::styled(", TTL: ", Style::default().fg(theme::LABEL)));
         header.push(ttl_span(first.ttl_remaining()));
     }
     let mut lines = vec![Line::from(header)];
     for record in dns_result.PTR.iter().take(MAX_PTR_RECORDS_DISPLAYED) {
         lines.push(record_line(
-            vec![Span::styled(record.value.clone(), Style::default().fg(Color::Cyan))],
+            vec![Span::styled(record.value.clone(), Style::default().fg(theme::VALUE))],
             record.ttl_remaining(),
             detail,
         ));

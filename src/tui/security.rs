@@ -1,8 +1,9 @@
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::AppState;
 use log;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::any::Any;
@@ -42,8 +43,8 @@ impl SecurityPane {
 
         // Security status header
         lines.push(Line::from(vec![
-            Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("analyzing...", Style::default().fg(Color::Yellow)),
+            Span::styled("🔒 Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("analyzing...", Style::default().fg(theme::WARN)),
         ]));
 
         // Empty line for spacing
@@ -56,7 +57,7 @@ impl SecurityPane {
         if let Some(tls_state) = state.scanners.get("tls") {
             let (label, color) = crate::tui::status_label(&tls_state, "analyzing...", "analyzed");
             lines[0] = Line::from(vec![
-                Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🔒 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(color)),
             ]);
         }
@@ -261,52 +262,52 @@ impl SecurityPane {
         {
             // TLS Connection
             lines.push(Line::from(vec![
-                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
+                Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     if connection_successful { "connected" } else { "failed" },
-                    Style::default().fg(if connection_successful { Color::Green } else { Color::Red }),
+                    Style::default().fg(if connection_successful { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // TLS Version
             if let Some(version) = negotiated_version {
                 lines.push(Line::from(vec![
-                    Span::styled("🔐 Version: ", Style::default().fg(Color::White)),
-                    Span::styled(version, Style::default().fg(Color::Green)),
+                    Span::styled("🔐 Version: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(version, Style::default().fg(theme::GOOD)),
                 ]));
             }
 
             // Cipher Suite
             if let Some(cipher) = negotiated_cipher {
                 lines.push(Line::from(vec![
-                    Span::styled("🔑 Cipher: ", Style::default().fg(Color::White)),
-                    Span::styled(cipher, Style::default().fg(Color::Yellow)),
+                    Span::styled("🔑 Cipher: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(cipher, Style::default().fg(theme::WARN)),
                 ]));
             }
 
             // Security Features
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
-                "🛡️ Security Features",
-                Style::default().fg(Color::Cyan),
+                "🔰 Security Features",
+                Style::default().fg(theme::VALUE),
             )]));
 
             lines.push(Line::from(vec![
-                Span::styled("  PFS: ", Style::default().fg(Color::White)),
+                Span::styled("  PFS: ", Style::default().fg(theme::LABEL)),
                 if !connection_successful {
-                    Span::styled("n/a", Style::default().fg(Color::Gray))
+                    Span::styled("n/a", Style::default().fg(theme::MUTED))
                 } else {
                     Span::styled(
                         if pfs { "yes" } else { "no" },
-                        Style::default().fg(if pfs { Color::Green } else { Color::Red }),
+                        Style::default().fg(if pfs { theme::GOOD } else { theme::BAD }),
                     )
                 },
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("  OCSP: ", Style::default().fg(Color::White)),
+                Span::styled("  OCSP: ", Style::default().fg(theme::LABEL)),
                 // Stapling is never collected, so `no` would claim a check that did not happen.
-                Span::styled("not checked", Style::default().fg(Color::Gray)),
+                Span::styled("not checked", Style::default().fg(theme::MUTED)),
             ]));
 
             // Certificate Details
@@ -314,57 +315,57 @@ impl SecurityPane {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![Span::styled(
                     "📜 Certificate Details",
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme::VALUE),
                 )]));
 
-                let cert_color = if cert_valid { Color::Green } else { Color::Red };
+                let cert_color = if cert_valid { theme::GOOD } else { theme::BAD };
 
                 lines.push(Line::from(vec![
-                    Span::styled("  Valid: ", Style::default().fg(Color::White)),
+                    Span::styled("  Valid: ", Style::default().fg(theme::LABEL)),
                     Span::styled(if cert_valid { "yes" } else { "no" }, Style::default().fg(cert_color)),
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("  Subject: ", Style::default().fg(Color::White)),
-                    Span::styled(common_name_display(&subject), Style::default().fg(Color::Yellow)),
+                    Span::styled("  Subject: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(common_name_display(&subject), Style::default().fg(theme::WARN)),
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("  Issuer: ", Style::default().fg(Color::White)),
-                    Span::styled(common_name_display(&issuer), Style::default().fg(Color::Green)),
+                    Span::styled("  Issuer: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(common_name_display(&issuer), Style::default().fg(theme::GOOD)),
                 ]));
 
                 // Certificate expiry
                 if let Some(days_until_expiry) = days_until_expiry {
                     let expiry_color = if days_until_expiry > CERT_EXPIRY_WARNING_DAYS {
-                        Color::Green
+                        theme::GOOD
                     } else if days_until_expiry > CERT_EXPIRY_CRITICAL_DAYS {
-                        Color::Yellow
+                        theme::WARN
                     } else {
-                        Color::Red
+                        theme::BAD
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("  Expires: ", Style::default().fg(Color::White)),
+                        Span::styled("  Expires: ", Style::default().fg(theme::LABEL)),
                         Span::styled(format!("{} days", days_until_expiry), Style::default().fg(expiry_color)),
                     ]));
                 }
 
                 // Key algorithm and size
                 lines.push(Line::from(vec![
-                    Span::styled("  Key: ", Style::default().fg(Color::White)),
-                    Span::styled(key_algo, Style::default().fg(Color::Yellow)),
+                    Span::styled("  Key: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(key_algo, Style::default().fg(theme::WARN)),
                     Span::styled(
                         key_size.map_or(String::new(), |size| format!(" {}bit", size)),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(theme::MUTED),
                     ),
                 ]));
 
                 // SAN domains count
                 if san_count > 0 {
                     lines.push(Line::from(vec![
-                        Span::styled("  SAN: ", Style::default().fg(Color::White)),
-                        Span::styled(format!("{} domains", san_count), Style::default().fg(Color::Green)),
+                        Span::styled("  SAN: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(format!("{} domains", san_count), Style::default().fg(theme::GOOD)),
                     ]));
                 }
             }
@@ -372,64 +373,64 @@ impl SecurityPane {
             // Grade and vulnerabilities
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("📊 Grade: ", Style::default().fg(Color::White)),
+                Span::styled("📊 Grade: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     security_grade.clone(),
                     Style::default().fg(match security_grade.as_str() {
-                        "A+" | "A" => Color::Green,
-                        "B" => Color::Yellow,
-                        _ => Color::Red,
+                        "A+" | "A" => theme::GOOD,
+                        "B" => theme::WARN,
+                        _ => theme::BAD,
                     }),
                 ),
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("⚠️ Issues: ", Style::default().fg(Color::White)),
+                Span::styled("❗ Issues: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     format!("{}", vuln_count),
-                    Style::default().fg(if vuln_count == 0 { Color::Green } else { Color::Red }),
+                    Style::default().fg(if vuln_count == 0 { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // The reasons `Issues:` counts sit right under it, so a failed handshake's cause is above the fold.
             for issue in tls_issues.into_iter().flatten() {
                 lines.push(Line::from(vec![
-                    Span::styled("  • ", Style::default().fg(Color::Red)),
-                    Span::styled(issue, Style::default().fg(Color::Red)),
+                    Span::styled("  • ", Style::default().fg(theme::BAD)),
+                    Span::styled(issue, Style::default().fg(theme::BAD)),
                 ]));
             }
         } else if tls_failed {
             // The first scan failed: the header carries the reason, nothing is still pending.
             lines.push(Line::from(vec![
-                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
-                Span::styled("failed", Style::default().fg(Color::Red)),
+                Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
+                Span::styled("failed", Style::default().fg(theme::BAD)),
             ]));
         } else if state.scanners.contains_key("tls") {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![
-                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
-                Span::styled("checking...", Style::default().fg(Color::Gray)),
+                Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
+                Span::styled("checking...", Style::default().fg(theme::MUTED)),
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("🔐 Version: ", Style::default().fg(Color::White)),
-                Span::styled("detecting...", Style::default().fg(Color::Gray)),
+                Span::styled("🔐 Version: ", Style::default().fg(theme::LABEL)),
+                Span::styled("detecting...", Style::default().fg(theme::MUTED)),
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("📜 Cert: ", Style::default().fg(Color::White)),
-                Span::styled("validating...", Style::default().fg(Color::Gray)),
+                Span::styled("📜 Cert: ", Style::default().fg(theme::LABEL)),
+                Span::styled("validating...", Style::default().fg(theme::MUTED)),
             ]));
         } else {
             // No TLS scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🔒 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled("unavailable", Style::default().fg(Color::Red)),
+                Span::styled("🔒 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 
             lines.push(Line::from(vec![
-                Span::styled("🔗 Status: ", Style::default().fg(Color::White)),
-                Span::styled("TLS scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
+                Span::styled("TLS scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
 
@@ -450,95 +451,95 @@ impl SecurityPane {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "🌐 HTTP Security",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::VALUE),
             )]));
 
             // HSTS
             lines.push(Line::from(vec![
-                Span::styled("  HSTS: ", Style::default().fg(Color::White)),
+                Span::styled("  HSTS: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     if hsts_present { "yes" } else { "no" },
-                    Style::default().fg(if hsts_present { Color::Green } else { Color::Red }),
+                    Style::default().fg(if hsts_present { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // X-Frame-Options
             lines.push(Line::from(vec![
-                Span::styled("  X-Frame: ", Style::default().fg(Color::White)),
+                Span::styled("  X-Frame: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     x_frame.clone(),
-                    Style::default().fg(if x_frame != "missing" { Color::Green } else { Color::Red }),
+                    Style::default().fg(if x_frame != "missing" { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // X-Content-Type-Options
             lines.push(Line::from(vec![
-                Span::styled("  X-Content: ", Style::default().fg(Color::White)),
+                Span::styled("  X-Content: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     x_content.clone(),
-                    Style::default().fg(if x_content != "missing" { Color::Green } else { Color::Red }),
+                    Style::default().fg(if x_content != "missing" { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // X-XSS-Protection
             lines.push(Line::from(vec![
-                Span::styled("  XSS-Protect: ", Style::default().fg(Color::White)),
+                Span::styled("  XSS-Protect: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     xss_protect.clone(),
-                    Style::default().fg(if xss_protect != "missing" { Color::Green } else { Color::Yellow }),
+                    Style::default().fg(if xss_protect != "missing" { theme::GOOD } else { theme::WARN }),
                 ),
             ]));
 
             // Referrer Policy
             lines.push(Line::from(vec![
-                Span::styled("  Referrer: ", Style::default().fg(Color::White)),
+                Span::styled("  Referrer: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     referrer_policy.clone(),
-                    Style::default().fg(if referrer_policy != "missing" { Color::Green } else { Color::Yellow }),
+                    Style::default().fg(if referrer_policy != "missing" { theme::GOOD } else { theme::WARN }),
                 ),
             ]));
 
             // Permissions Policy
             lines.push(Line::from(vec![
-                Span::styled("  Permissions: ", Style::default().fg(Color::White)),
+                Span::styled("  Permissions: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     permissions_policy.clone(),
-                    Style::default().fg(if permissions_policy != "missing" { Color::Green } else { Color::Yellow }),
+                    Style::default().fg(if permissions_policy != "missing" { theme::GOOD } else { theme::WARN }),
                 ),
             ]));
 
             // CSP
             if let Some((strength, header_value, issues)) = csp_data {
                 lines.push(Line::from(vec![
-                    Span::styled("  CSP: ", Style::default().fg(Color::White)),
+                    Span::styled("  CSP: ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         strength.label(),
                         Style::default().fg(match strength {
-                            crate::scan::http::CspStrength::Strong => Color::Green,
-                            crate::scan::http::CspStrength::Moderate => Color::Yellow,
-                            crate::scan::http::CspStrength::Weak => Color::Red,
-                            crate::scan::http::CspStrength::None => Color::Red,
+                            crate::scan::http::CspStrength::Strong => theme::GOOD,
+                            crate::scan::http::CspStrength::Moderate => theme::WARN,
+                            crate::scan::http::CspStrength::Weak => theme::BAD,
+                            crate::scan::http::CspStrength::None => theme::BAD,
                         }),
                     ),
                 ]));
 
                 // CSP Header Value
                 lines.push(Line::from(vec![
-                    Span::styled("    Policy: ", Style::default().fg(Color::White)),
-                    Span::styled(header_value, Style::default().fg(Color::Gray)),
+                    Span::styled("    Policy: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(header_value, Style::default().fg(theme::MUTED)),
                 ]));
 
                 // CSP Issues
                 for issue in issues {
                     lines.push(Line::from(vec![
-                        Span::styled("    • ", Style::default().fg(Color::Red)),
-                        Span::styled(issue, Style::default().fg(Color::Red)),
+                        Span::styled("    • ", Style::default().fg(theme::BAD)),
+                        Span::styled(issue, Style::default().fg(theme::BAD)),
                     ]));
                 }
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled("  CSP: ", Style::default().fg(Color::White)),
-                    Span::styled("missing", Style::default().fg(Color::Red)),
+                    Span::styled("  CSP: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("missing", Style::default().fg(theme::BAD)),
                 ]));
             }
 
@@ -552,14 +553,14 @@ impl SecurityPane {
             )) = cors_data
             {
                 lines.push(Line::from(vec![
-                    Span::styled("  CORS: ", Style::default().fg(Color::White)),
+                    Span::styled("  CORS: ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         security_level.label(),
                         Style::default().fg(match security_level {
-                            crate::scan::http::CorsSecurityLevel::Secure => Color::Green,
-                            crate::scan::http::CorsSecurityLevel::Moderate => Color::Yellow,
-                            crate::scan::http::CorsSecurityLevel::Weak => Color::Red,
-                            crate::scan::http::CorsSecurityLevel::Dangerous => Color::Red,
+                            crate::scan::http::CorsSecurityLevel::Secure => theme::GOOD,
+                            crate::scan::http::CorsSecurityLevel::Moderate => theme::WARN,
+                            crate::scan::http::CorsSecurityLevel::Weak => theme::BAD,
+                            crate::scan::http::CorsSecurityLevel::Dangerous => theme::BAD,
                         }),
                     ),
                 ]));
@@ -567,8 +568,8 @@ impl SecurityPane {
                 // CORS Details (compact)
                 if let Some(origin) = &access_control_allow_origin {
                     lines.push(Line::from(vec![
-                        Span::styled("    Origin: ", Style::default().fg(Color::White)),
-                        Span::styled(origin.clone(), Style::default().fg(Color::Gray)),
+                        Span::styled("    Origin: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(origin.clone(), Style::default().fg(theme::MUTED)),
                     ]));
                 }
 
@@ -578,27 +579,23 @@ impl SecurityPane {
                     format!("{}", access_control_allow_methods.len())
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("    Methods: ", Style::default().fg(Color::White)),
-                    Span::styled(methods, Style::default().fg(Color::Gray)),
+                    Span::styled("    Methods: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(methods, Style::default().fg(theme::MUTED)),
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("    Credentials: ", Style::default().fg(Color::White)),
+                    Span::styled("    Credentials: ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         if access_control_allow_credentials { "yes" } else { "no" },
-                        Style::default().fg(if access_control_allow_credentials {
-                            Color::Yellow
-                        } else {
-                            Color::Green
-                        }),
+                        Style::default().fg(if access_control_allow_credentials { theme::WARN } else { theme::GOOD }),
                     ),
                 ]));
 
                 // CORS Issues
                 for issue in issues {
                     lines.push(Line::from(vec![
-                        Span::styled("    • ", Style::default().fg(Color::Red)),
-                        Span::styled(issue, Style::default().fg(Color::Red)),
+                        Span::styled("    • ", Style::default().fg(theme::BAD)),
+                        Span::styled(issue, Style::default().fg(theme::BAD)),
                     ]));
                 }
             }
@@ -607,14 +604,14 @@ impl SecurityPane {
             if !http_vulnerabilities.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![Span::styled(
-                    "⚠️ HTTP Vulnerabilities",
-                    Style::default().fg(Color::Red),
+                    "❗ HTTP Vulnerabilities",
+                    Style::default().fg(theme::BAD),
                 )]));
 
                 for vuln in http_vulnerabilities {
                     lines.push(Line::from(vec![
-                        Span::styled("  • ", Style::default().fg(Color::Red)),
-                        Span::styled(vuln, Style::default().fg(Color::Red)),
+                        Span::styled("  • ", Style::default().fg(theme::BAD)),
+                        Span::styled(vuln, Style::default().fg(theme::BAD)),
                     ]));
                 }
             }
@@ -622,13 +619,13 @@ impl SecurityPane {
             // HTTP Security Grade
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("📊 HTTP Grade: ", Style::default().fg(Color::White)),
+                Span::styled("📊 HTTP Grade: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     http_grade.clone(),
                     Style::default().fg(match http_grade.as_str() {
-                        "A+" | "A" => Color::Green,
-                        "B" => Color::Yellow,
-                        _ => Color::Red,
+                        "A+" | "A" => theme::GOOD,
+                        "B" => theme::WARN,
+                        _ => theme::BAD,
                     }),
                 ),
             ]));
@@ -639,54 +636,54 @@ impl SecurityPane {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "📧 Email Security",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::VALUE),
             )]));
 
             // SPF Record
             lines.push(Line::from(vec![
-                Span::styled("  SPF: ", Style::default().fg(Color::White)),
+                Span::styled("  SPF: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     if spf_record.is_some() { "configured" } else { "missing" },
-                    Style::default().fg(if spf_record.is_some() { Color::Green } else { Color::Red }),
+                    Style::default().fg(if spf_record.is_some() { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // DMARC Record
             lines.push(Line::from(vec![
-                Span::styled("  DMARC: ", Style::default().fg(Color::White)),
+                Span::styled("  DMARC: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     if dmarc_record.is_some() { "configured" } else { "missing" },
-                    Style::default().fg(if dmarc_record.is_some() { Color::Green } else { Color::Red }),
+                    Style::default().fg(if dmarc_record.is_some() { theme::GOOD } else { theme::BAD }),
                 ),
             ]));
 
             // DKIM keys sit at `<selector>._domainkey`; without a selector there is nothing to query.
             lines.push(Line::from(vec![
-                Span::styled("  DKIM: ", Style::default().fg(Color::White)),
-                Span::styled("not checked (needs selector)", Style::default().fg(Color::Gray)),
+                Span::styled("  DKIM: ", Style::default().fg(theme::LABEL)),
+                Span::styled("not checked (needs selector)", Style::default().fg(theme::MUTED)),
             ]));
 
             // MX Records
             lines.push(Line::from(vec![
-                Span::styled("  MX: ", Style::default().fg(Color::White)),
+                Span::styled("  MX: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     format!("{} records", mx_count),
-                    Style::default().fg(if has_mx { Color::Green } else { Color::Gray }),
+                    Style::default().fg(if has_mx { theme::GOOD } else { theme::MUTED }),
                 ),
             ]));
 
             // Show actual record contents
             if let Some(spf) = &spf_record {
                 lines.push(Line::from(vec![
-                    Span::styled("    SPF: ", Style::default().fg(Color::White)),
-                    Span::styled(spf.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled("    SPF: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(spf.clone(), Style::default().fg(theme::MUTED)),
                 ]));
             }
 
             if let Some(dmarc) = &dmarc_record {
                 lines.push(Line::from(vec![
-                    Span::styled("    DMARC: ", Style::default().fg(Color::White)),
-                    Span::styled(dmarc.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled("    DMARC: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(dmarc.clone(), Style::default().fg(theme::MUTED)),
                 ]));
             }
         }
@@ -713,35 +710,35 @@ fn zoomed_tls_lines(state: &AppState) -> Vec<Line<'static>> {
     };
     let field = |label: &str, value: String| {
         Line::from(vec![
-            Span::styled(format!("    {label}: "), Style::default().fg(Color::White)),
-            Span::styled(value, Style::default().fg(Color::Gray)),
+            Span::styled(format!("    {label}: "), Style::default().fg(theme::LABEL)),
+            Span::styled(value, Style::default().fg(theme::MUTED)),
         ])
     };
     let mut lines = vec![Line::from("")];
     let versions: Vec<&str> = data.supported_versions.iter().map(|version| version.as_str()).collect();
     lines.push(Line::from(vec![
-        Span::styled("🔐 Supported Versions: ", Style::default().fg(Color::Cyan)),
+        Span::styled("🔐 Supported Versions: ", Style::default().fg(theme::VALUE)),
         Span::styled(
             if versions.is_empty() {
                 "none recorded".to_string()
             } else {
                 versions.join(", ")
             },
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::MUTED),
         ),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("📜 Certificate Chain: ", Style::default().fg(Color::Cyan)),
+        Span::styled("📜 Certificate Chain: ", Style::default().fg(theme::VALUE)),
         Span::styled(
             format!("{} certificates", data.certificate_chain.len()),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::MUTED),
         ),
     ]));
     for (index, cert) in data.certificate_chain.iter().enumerate() {
         lines.push(Line::from(vec![
-            Span::styled(format!("  [{index}] "), Style::default().fg(Color::White)),
-            Span::styled(common_name_display(&cert.subject), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  [{index}] "), Style::default().fg(theme::LABEL)),
+            Span::styled(common_name_display(&cert.subject), Style::default().fg(theme::WARN)),
         ]));
         lines.push(field("Subject", cert.subject.clone()));
         lines.push(field("Issuer", cert.issuer.clone()));
@@ -1102,7 +1099,7 @@ mod tests {
         let buffer = crate::tui::testing::render_buffer(&pane, &state, 120, 80, false);
         assert_eq!(
             crate::tui::testing::fg_of(&buffer, "not checked (needs selector)"),
-            Color::Gray
+            theme::MUTED
         );
     }
 

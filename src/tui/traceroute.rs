@@ -1,15 +1,14 @@
 use crate::scan::traceroute::{TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus};
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::any::Any;
 
-/// LABEL in the design doc; Phase 2 moves it to the theme.
-const HOP_NUMBER_COLOR: Color = Color::White;
 const MIN_TRACEROUTE_PANE_WIDTH: u16 = 35;
 const MIN_TRACEROUTE_PANE_HEIGHT: u16 = 20;
 
@@ -53,9 +52,9 @@ fn destination_line(data: &TracerouteData, destination_hop: Option<&TracerouteHo
         None => " (no reply)".to_string(),
     };
     Line::from(vec![
-        Span::styled("→ ", Style::default().fg(Color::Gray)),
-        Span::styled(data.target_ip.to_string(), Style::default().fg(Color::Cyan)),
-        Span::styled(note, Style::default().fg(Color::Gray)),
+        Span::styled("→ ", Style::default().fg(theme::MUTED)),
+        Span::styled(data.target_ip.to_string(), Style::default().fg(theme::VALUE)),
+        Span::styled(note, Style::default().fg(theme::MUTED)),
     ])
 }
 
@@ -80,19 +79,16 @@ fn hop_lines(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> 
             };
             lines.push(Line::from(Span::styled(
                 format!("  {text}"),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme::MUTED),
             )));
             index += run;
             continue;
         }
         let (ip, rtt) = first_answer(hop).unwrap_or_else(|| ("*".to_string(), "*".to_string()));
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:2}: ", hop.hop_number),
-                Style::default().fg(HOP_NUMBER_COLOR),
-            ),
-            Span::styled(ip, Style::default().fg(Color::Cyan)),
-            Span::styled(format!(" ({rtt})"), Style::default().fg(Color::Gray)),
+            Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(theme::LABEL)),
+            Span::styled(ip, Style::default().fg(theme::VALUE)),
+            Span::styled(format!(" ({rtt})"), Style::default().fg(theme::MUTED)),
         ]));
         index += 1;
     }
@@ -103,11 +99,11 @@ fn hop_lines(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> 
 fn reach_line(data: &TracerouteData) -> Line<'static> {
     let protocol = if data.ipv6 { "IPv6" } else { "IPv4" };
     Line::from(vec![
-        Span::styled(format!("📍 {}", protocol), Style::default().fg(Color::White)),
+        Span::styled(format!("📍 {}", protocol), Style::default().fg(theme::LABEL)),
         if data.destination_reached {
-            Span::styled(" ✓ reached", Style::default().fg(Color::Green))
+            Span::styled(" ✓ reached", Style::default().fg(theme::GOOD))
         } else {
-            Span::styled(format!(" ✗ {}", data.reach_label()), Style::default().fg(Color::Red))
+            Span::styled(format!(" ✗ {}", data.reach_label()), Style::default().fg(theme::BAD))
         },
     ])
 }
@@ -136,14 +132,11 @@ fn every_hop_lines(data: &TracerouteData) -> Vec<Line<'static>> {
             let loss = (lost * 100 + probes_sent / 2)
                 .checked_div(probes_sent)
                 .map_or_else(|| "---".to_string(), |percent| format!("{percent}%"));
-            let probe_color = if hop.is_silent() { Color::Gray } else { Color::Cyan };
+            let probe_color = if hop.is_silent() { theme::MUTED } else { theme::VALUE };
             Line::from(vec![
-                Span::styled(
-                    format!("  {:2}: ", hop.hop_number),
-                    Style::default().fg(HOP_NUMBER_COLOR),
-                ),
+                Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(theme::LABEL)),
                 Span::styled(probes.join(" · "), Style::default().fg(probe_color)),
-                Span::styled(format!("  loss {loss}"), Style::default().fg(Color::Gray)),
+                Span::styled(format!("  loss {loss}"), Style::default().fg(theme::MUTED)),
             ])
         })
         .collect()
@@ -165,11 +158,11 @@ fn zoomed_route_lines(result: &TracerouteResult) -> Vec<Line<'static>> {
             }
             None => {
                 let color = match status {
-                    TracerouteStatus::Failed(_) => Color::Red,
-                    _ => Color::Gray,
+                    TracerouteStatus::Failed(_) => theme::BAD,
+                    _ => theme::MUTED,
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("📍 {name}: "), Style::default().fg(Color::White)),
+                    Span::styled(format!("📍 {name}: "), Style::default().fg(theme::LABEL)),
                     Span::styled(status.to_string(), Style::default().fg(color)),
                 ]));
             }
@@ -187,8 +180,8 @@ impl Pane for TraceroutePane {
 
         // Traceroute status header
         lines.push(Line::from(vec![
-            Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("tracing...", Style::default().fg(Color::Gray)),
+            Span::styled("🧭  Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("tracing...", Style::default().fg(theme::MUTED)),
         ]));
 
         // Get traceroute results and render them
@@ -196,7 +189,7 @@ impl Pane for TraceroutePane {
             // Update header with current status
             let (label, label_color) = crate::tui::status_label(&traceroute_state, "tracing...", "traced");
             lines[0] = Line::from(vec![
-                Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🧭  Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]);
 
@@ -212,32 +205,32 @@ impl Pane for TraceroutePane {
                     lines.extend(hop_lines(primary_data, destination_hop));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                        Span::styled("All protocols failed", Style::default().fg(Color::Red)),
+                        Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                        Span::styled("All protocols failed", Style::default().fg(theme::BAD)),
                     ]));
                 }
 
                 // Total scan time
                 let scan_time_ms = traceroute_result.total_duration.as_millis();
                 lines.push(Line::from(vec![
-                    Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
-                    Span::styled(format!("{}ms", scan_time_ms), Style::default().fg(Color::Yellow)),
+                    Span::styled("⏳  Duration: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(format!("{}ms", scan_time_ms), Style::default().fg(theme::WARN)),
                 ]));
             } else {
                 // No traceroute data available yet - check scanner status
                 match traceroute_state.status {
                     crate::types::ScanStatus::Running => {
                         lines.push(Line::from(vec![
-                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                            Span::styled("tracing route...", Style::default().fg(Color::Yellow)),
+                            Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("tracing route...", Style::default().fg(theme::WARN)),
                         ]));
                     }
                     // The header carries the failure reason.
                     crate::types::ScanStatus::Failed => {}
                     _ => {
                         lines.push(Line::from(vec![
-                            Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                            Span::styled("waiting to trace...", Style::default().fg(Color::Gray)),
+                            Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("waiting to trace...", Style::default().fg(theme::MUTED)),
                         ]));
                     }
                 }
@@ -245,13 +238,13 @@ impl Pane for TraceroutePane {
         } else {
             // No traceroute scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🗺️  Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled("unavailable", Style::default().fg(Color::Red)),
+                Span::styled("🧭  Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 
             lines.push(Line::from(vec![
-                Span::styled("📍 Status: ", Style::default().fg(Color::White)),
-                Span::styled("Traceroute scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+                Span::styled("Traceroute scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
 
@@ -282,6 +275,7 @@ impl Pane for TraceroutePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[test]
     fn test_traceroute_pane_creation() {
@@ -471,6 +465,13 @@ mod tests {
     }
 
     #[test]
+    fn rendered_traceroute_pane_has_no_variation_selector() {
+        let out = tatari_pane(80, 24);
+        assert!(out.contains('🧭') && out.contains('⏳'), "{out}");
+        assert!(!out.contains('\u{FE0F}'), "{out}");
+    }
+
+    #[test]
     fn no_hop_row_says_timeout() {
         let out = tatari_pane(60, 30);
         assert!(!out.contains("timeout"), "{out}");
@@ -532,7 +533,7 @@ mod tests {
         for number in ["12:", "14:", "1:"] {
             let color = crate::tui::testing::fg_of(&buffer, number);
             assert_eq!(color, Color::White, "hop {number}");
-            assert_ne!(color, Color::Red, "hop {number}");
+            assert_ne!(color, Color::LightRed, "hop {number}");
         }
     }
 

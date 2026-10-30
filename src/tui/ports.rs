@@ -1,8 +1,9 @@
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::any::Any;
@@ -41,8 +42,8 @@ impl Default for PortsPane {
 fn service_detail_lines(open_port: &crate::scan::port::OpenPort) -> Vec<Line<'static>> {
     let field = |label: &str, value: String| {
         Line::from(vec![
-            Span::styled(format!("      {label}: "), Style::default().fg(Color::White)),
-            Span::styled(value, Style::default().fg(Color::Gray)),
+            Span::styled(format!("      {label}: "), Style::default().fg(theme::LABEL)),
+            Span::styled(value, Style::default().fg(theme::MUTED)),
         ])
     };
     let mut lines = Vec::new();
@@ -69,8 +70,8 @@ impl Pane for PortsPane {
 
         // Ports status header
         lines.push(Line::from(vec![
-            Span::styled("🔌 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("scanning...", Style::default().fg(Color::Gray)),
+            Span::styled("🔌 Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("scanning...", Style::default().fg(theme::MUTED)),
         ]));
 
         // Empty line for spacing
@@ -86,7 +87,7 @@ impl Pane for PortsPane {
 
                 let (label, label_color) = crate::tui::status_label(&port_state, "scanning...", "completed");
                 lines[0] = Line::from(vec![
-                    Span::styled("🔌 Status: ", Style::default().fg(Color::Cyan)),
+                    Span::styled("🔌 Status: ", Style::default().fg(theme::VALUE)),
                     Span::styled(label, Style::default().fg(label_color)),
                 ]);
 
@@ -107,24 +108,24 @@ impl Pane for PortsPane {
                         // so there is no progress to report and no `completed` to claim.
                         if !matches!(status, crate::types::ScanStatus::Running) {
                             result_lines.push(Line::from(vec![
-                                Span::styled("📊 Scanned: ", Style::default().fg(Color::White)),
-                                Span::styled("completed", Style::default().fg(Color::Green)),
+                                Span::styled("📊 Scanned: ", Style::default().fg(theme::LABEL)),
+                                Span::styled("completed", Style::default().fg(theme::GOOD)),
                             ]));
                         }
 
                         // Open ports count with color coding
                         let port_color = if open_count == 0 {
-                            Color::Green
+                            theme::GOOD
                         } else if open_count <= PORT_COUNT_WARNING_THRESHOLD {
-                            Color::Yellow
+                            theme::LABEL
                         } else {
-                            Color::Red
+                            theme::WARN
                         };
 
                         result_lines.push(Line::from(vec![
-                            Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
+                            Span::styled("🟢 Open: ", Style::default().fg(theme::LABEL)),
                             Span::styled(open_count.to_string(), Style::default().fg(port_color)),
-                            Span::styled(" ports", Style::default().fg(Color::White)),
+                            Span::styled(" ports", Style::default().fg(theme::LABEL)),
                         ]));
 
                         // Show open ports from all protocols (clean display)
@@ -155,11 +156,11 @@ impl Pane for PortsPane {
                                 Span::styled("   ", Style::default()),
                                 Span::styled(
                                     format!("{}/{}", open_port.port, protocol_str),
-                                    Style::default().fg(Color::Cyan),
+                                    Style::default().fg(theme::VALUE),
                                 ),
-                                Span::styled(" (", Style::default().fg(Color::Gray)),
-                                Span::styled(service_name, Style::default().fg(Color::Yellow)),
-                                Span::styled(")", Style::default().fg(Color::Gray)),
+                                Span::styled(" (", Style::default().fg(theme::MUTED)),
+                                Span::styled(service_name, Style::default().fg(theme::WARN)),
+                                Span::styled(")", Style::default().fg(theme::MUTED)),
                             ]));
                             if detail == Detail::Zoomed {
                                 result_lines.extend(service_detail_lines(open_port));
@@ -172,7 +173,7 @@ impl Pane for PortsPane {
                                 Span::styled("   ", Style::default()),
                                 Span::styled(
                                     format!("... and {} more", all_open_ports.len() - displayed_ports),
-                                    Style::default().fg(Color::Gray),
+                                    Style::default().fg(theme::MUTED),
                                 ),
                             ]));
                         }
@@ -180,21 +181,21 @@ impl Pane for PortsPane {
                         // Filtered and closed ports summary
                         if filtered_ports > 0 {
                             result_lines.push(Line::from(vec![
-                                Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
-                                Span::styled(filtered_ports.to_string(), Style::default().fg(Color::Yellow)),
+                                Span::styled("🟡 Filtered: ", Style::default().fg(theme::LABEL)),
+                                Span::styled(filtered_ports.to_string(), Style::default().fg(theme::WARN)),
                             ]));
                         }
 
                         if closed_ports > 0 {
                             result_lines.push(Line::from(vec![
-                                Span::styled("🔴 Closed: ", Style::default().fg(Color::White)),
-                                Span::styled(closed_ports.to_string(), Style::default().fg(Color::Gray)),
+                                Span::styled("🔴 Closed: ", Style::default().fg(theme::LABEL)),
+                                Span::styled(closed_ports.to_string(), Style::default().fg(theme::MUTED)),
                             ]));
                         }
 
                         // Scan duration
                         result_lines.push(Line::from(vec![
-                            Span::styled("⏱️  Duration: ", Style::default().fg(Color::White)),
+                            Span::styled("⏳  Duration: ", Style::default().fg(theme::LABEL)),
                             Span::styled(
                                 if scan_duration_ms > MILLISECONDS_THRESHOLD_FOR_SECONDS {
                                     format!(
@@ -204,7 +205,7 @@ impl Pane for PortsPane {
                                 } else {
                                     format!("{}ms", scan_duration_ms)
                                 },
-                                Style::default().fg(Color::Gray),
+                                Style::default().fg(theme::MUTED),
                             ),
                         ]));
 
@@ -213,8 +214,8 @@ impl Pane for PortsPane {
                     Some(_) => {
                         // Wrong result type (shouldn't happen)
                         vec![Line::from(vec![
-                            Span::styled("❌ Error: ", Style::default().fg(Color::White)),
-                            Span::styled("wrong result type", Style::default().fg(Color::Red)),
+                            Span::styled("❌ Error: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("wrong result type", Style::default().fg(theme::BAD)),
                         ])]
                     }
                     None => {
@@ -231,20 +232,20 @@ impl Pane for PortsPane {
 
                                 vec![
                                     Line::from(vec![
-                                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                                        Span::styled("initializing scan...", Style::default().fg(Color::Yellow)),
+                                        Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                                        Span::styled("initializing scan...", Style::default().fg(theme::WARN)),
                                     ]),
                                     Line::from(vec![
-                                        Span::styled("⏱️  Started: ", Style::default().fg(Color::White)),
-                                        Span::styled(time_info, Style::default().fg(Color::Gray)),
+                                        Span::styled("⏳  Started: ", Style::default().fg(theme::LABEL)),
+                                        Span::styled(time_info, Style::default().fg(theme::MUTED)),
                                     ]),
                                     Line::from(vec![
-                                        Span::styled("🟢 Open: ", Style::default().fg(Color::White)),
-                                        Span::styled("detecting...", Style::default().fg(Color::Yellow)),
+                                        Span::styled("🟢 Open: ", Style::default().fg(theme::LABEL)),
+                                        Span::styled("detecting...", Style::default().fg(theme::WARN)),
                                     ]),
                                     Line::from(vec![
-                                        Span::styled("🟡 Filtered: ", Style::default().fg(Color::White)),
-                                        Span::styled("checking...", Style::default().fg(Color::Yellow)),
+                                        Span::styled("🟡 Filtered: ", Style::default().fg(theme::LABEL)),
+                                        Span::styled("checking...", Style::default().fg(theme::WARN)),
                                     ]),
                                 ]
                             }
@@ -252,8 +253,8 @@ impl Pane for PortsPane {
                             crate::types::ScanStatus::Failed => vec![],
                             _ => {
                                 vec![Line::from(vec![
-                                    Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                                    Span::styled("waiting to start...", Style::default().fg(Color::Gray)),
+                                    Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                                    Span::styled("waiting to start...", Style::default().fg(theme::MUTED)),
                                 ])]
                             }
                         }
@@ -263,8 +264,8 @@ impl Pane for PortsPane {
             None => {
                 // No port scanner registered
                 vec![Line::from(vec![
-                    Span::styled("❌ Error: ", Style::default().fg(Color::White)),
-                    Span::styled("port scanner not available", Style::default().fg(Color::Red)),
+                    Span::styled("❌ Error: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("port scanner not available", Style::default().fg(theme::BAD)),
                 ])]
             }
         };

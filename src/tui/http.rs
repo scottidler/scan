@@ -1,8 +1,9 @@
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::any::Any;
@@ -15,7 +16,6 @@ const HTTP_CLIENT_ERROR_STATUS_MIN: u16 = 400;
 const HTTP_CLIENT_ERROR_STATUS_MAX: u16 = 499;
 const HTTP_SERVER_ERROR_STATUS_MIN: u16 = 500;
 const HTTP_SERVER_ERROR_STATUS_MAX: u16 = 599;
-const RESPONSE_TIME_FAST_THRESHOLD_MS: u128 = 100;
 const RESPONSE_TIME_SLOW_THRESHOLD_MS: u128 = 500;
 const MIN_HTTP_PANE_WIDTH: u16 = 30;
 const MIN_HTTP_PANE_HEIGHT: u16 = 12;
@@ -45,11 +45,11 @@ impl Default for HttpPane {
 /// `<label>: <value>`, indented, with `missing` in place of a header that was not sent.
 fn header_line(label: &str, value: Option<&str>) -> Line<'static> {
     let (text, color) = match value {
-        Some(value) => (value.to_string(), Color::Gray),
-        None => ("missing".to_string(), Color::Yellow),
+        Some(value) => (value.to_string(), theme::MUTED),
+        None => ("missing".to_string(), theme::WARN),
     };
     Line::from(vec![
-        Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
+        Span::styled(format!("  {label}: "), Style::default().fg(theme::LABEL)),
         Span::styled(text, Style::default().fg(color)),
     ])
 }
@@ -57,17 +57,17 @@ fn header_line(label: &str, value: Option<&str>) -> Line<'static> {
 /// Zoomed only, after everything the grid shows: the request, every security header with its
 /// value, the CSP and CORS policies, and the caching headers.
 fn zoomed_lines(data: &crate::scan::http::HttpData) -> Vec<Line<'static>> {
-    let section = |title: &str| Line::from(Span::styled(title.to_string(), Style::default().fg(Color::Cyan)));
+    let section = |title: &str| Line::from(Span::styled(title.to_string(), Style::default().fg(theme::VALUE)));
     let headers = &data.security_headers;
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("🔗 URL: ", Style::default().fg(Color::White)),
-            Span::styled(data.url.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("🔗 URL: ", Style::default().fg(theme::LABEL)),
+            Span::styled(data.url.clone(), Style::default().fg(theme::VALUE)),
         ]),
         Line::from(vec![
-            Span::styled("🎯 IP: ", Style::default().fg(Color::White)),
-            Span::styled(data.target_ip.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("🎯 IP: ", Style::default().fg(theme::LABEL)),
+            Span::styled(data.target_ip.clone(), Style::default().fg(theme::VALUE)),
         ]),
         Line::from(""),
         section("Security Headers"),
@@ -125,8 +125,8 @@ impl Pane for HttpPane {
 
         // HTTP status header
         lines.push(Line::from(vec![
-            Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("scanning...", Style::default().fg(Color::Gray)),
+            Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("scanning...", Style::default().fg(theme::MUTED)),
         ]));
 
         // Empty line for spacing
@@ -137,7 +137,7 @@ impl Pane for HttpPane {
             // Update header with current status
             let (label, label_color) = crate::tui::status_label(&http_state, "scanning...", "completed");
             lines[0] = Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]);
 
@@ -146,25 +146,25 @@ impl Pane for HttpPane {
                     if let Some(reason) = &primary_data.https_failure {
                         wrapped.push(lines.len());
                         lines.push(Line::from(vec![
-                            Span::styled("⚠️  ", Style::default().fg(Color::Red)),
+                            Span::styled("❗  ", Style::default().fg(theme::BAD)),
                             Span::styled(
                                 format!("plain HTTP (HTTPS failed: {})", reason),
-                                Style::default().fg(Color::Red),
+                                Style::default().fg(theme::BAD),
                             ),
                         ]));
                     }
 
                     // Status code
                     let status_color = match primary_data.status_code {
-                        HTTP_SUCCESS_STATUS_MIN..=HTTP_SUCCESS_STATUS_MAX => Color::Green,
-                        HTTP_REDIRECT_STATUS_MIN..=HTTP_REDIRECT_STATUS_MAX => Color::Yellow,
-                        HTTP_CLIENT_ERROR_STATUS_MIN..=HTTP_CLIENT_ERROR_STATUS_MAX => Color::Red,
-                        HTTP_SERVER_ERROR_STATUS_MIN..=HTTP_SERVER_ERROR_STATUS_MAX => Color::Magenta,
-                        _ => Color::Gray,
+                        HTTP_SUCCESS_STATUS_MIN..=HTTP_SUCCESS_STATUS_MAX => theme::GOOD,
+                        HTTP_REDIRECT_STATUS_MIN..=HTTP_REDIRECT_STATUS_MAX => theme::WARN,
+                        HTTP_CLIENT_ERROR_STATUS_MIN..=HTTP_CLIENT_ERROR_STATUS_MAX => theme::BAD,
+                        HTTP_SERVER_ERROR_STATUS_MIN..=HTTP_SERVER_ERROR_STATUS_MAX => theme::BAD,
+                        _ => theme::MUTED,
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
+                        Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
                             format!("{}", primary_data.status_code),
                             Style::default().fg(status_color),
@@ -173,56 +173,54 @@ impl Pane for HttpPane {
 
                     // Response time
                     let response_time_ms = primary_data.response_time.as_millis();
-                    let time_color = if response_time_ms < RESPONSE_TIME_FAST_THRESHOLD_MS {
-                        Color::Green
-                    } else if response_time_ms < RESPONSE_TIME_SLOW_THRESHOLD_MS {
-                        Color::Yellow
+                    let time_color = if response_time_ms < RESPONSE_TIME_SLOW_THRESHOLD_MS {
+                        theme::GOOD
                     } else {
-                        Color::Red
+                        theme::WARN
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
+                        Span::styled("⏳  Time: ", Style::default().fg(theme::LABEL)),
                         Span::styled(format!("{}ms", response_time_ms), Style::default().fg(time_color)),
                     ]));
 
                     // Content type
                     if let Some(content_type) = &primary_data.content_type {
                         lines.push(Line::from(vec![
-                            Span::styled("📄 Type: ", Style::default().fg(Color::White)),
-                            Span::styled(content_type.clone(), Style::default().fg(Color::Yellow)),
+                            Span::styled("📄 Type: ", Style::default().fg(theme::LABEL)),
+                            Span::styled(content_type.clone(), Style::default().fg(theme::WARN)),
                         ]));
                     }
 
                     // Content length
                     lines.push(Line::from(vec![
-                        Span::styled("📏 Size: ", Style::default().fg(Color::White)),
+                        Span::styled("📏 Size: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
                             format!("{} bytes", primary_data.content_length),
-                            Style::default().fg(Color::Green),
+                            Style::default().fg(theme::GOOD),
                         ),
                     ]));
 
                     // Grade of the primary result: the same result whose fallback line shows above.
                     let security_grade = &primary_data.security_grade;
                     let grade_color = match security_grade {
-                        crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => Color::Green,
-                        crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => Color::Yellow,
-                        crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => Color::Red,
+                        crate::scan::http::SecurityGrade::APlus | crate::scan::http::SecurityGrade::A => theme::GOOD,
+                        crate::scan::http::SecurityGrade::B | crate::scan::http::SecurityGrade::C => theme::WARN,
+                        crate::scan::http::SecurityGrade::D | crate::scan::http::SecurityGrade::F => theme::BAD,
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("🔒 Grade: ", Style::default().fg(Color::White)),
+                        Span::styled("🔒 Grade: ", Style::default().fg(theme::LABEL)),
                         Span::styled(security_grade.as_str(), Style::default().fg(grade_color)),
                     ]));
 
                     // Redirect chain - show details
                     if !primary_data.redirect_chain.is_empty() {
                         lines.push(Line::from(vec![
-                            Span::styled("🔗 Redirects: ", Style::default().fg(Color::White)),
+                            Span::styled("🔗 Redirects: ", Style::default().fg(theme::LABEL)),
                             Span::styled(
                                 primary_data.redirect_chain.len().to_string(),
-                                Style::default().fg(Color::Magenta),
+                                Style::default().fg(theme::ACCENT),
                             ),
                         ]));
 
@@ -230,16 +228,14 @@ impl Pane for HttpPane {
                         // names below the fold. A redirect too wide for one row gets a row per URL,
                         // so a long source URL cannot push its target off.
                         for redirect in &primary_data.redirect_chain {
-                            let code = Span::styled(
-                                format!("  {} ", redirect.status_code),
-                                Style::default().fg(Color::Yellow),
-                            );
-                            let from = Span::styled(redirect.from.clone(), Style::default().fg(Color::Gray));
-                            let to = Span::styled(redirect.to.clone(), Style::default().fg(Color::Cyan));
+                            let code =
+                                Span::styled(format!("  {} ", redirect.status_code), Style::default().fg(theme::WARN));
+                            let from = Span::styled(redirect.from.clone(), Style::default().fg(theme::MUTED));
+                            let to = Span::styled(redirect.to.clone(), Style::default().fg(theme::VALUE));
                             let one_row = Line::from(vec![
                                 code.clone(),
                                 from.clone(),
-                                Span::styled(" → ", Style::default().fg(Color::Magenta)),
+                                Span::styled(" → ", Style::default().fg(theme::ACCENT)),
                                 to.clone(),
                             ]);
                             if one_row.width() <= usize::from(width) {
@@ -247,7 +243,7 @@ impl Pane for HttpPane {
                             } else {
                                 lines.push(Line::from(vec![code, from]));
                                 lines.push(Line::from(vec![
-                                    Span::styled("    → ", Style::default().fg(Color::Magenta)),
+                                    Span::styled("    → ", Style::default().fg(theme::ACCENT)),
                                     to,
                                 ]));
                             }
@@ -258,8 +254,8 @@ impl Pane for HttpPane {
                     let all_vulnerabilities = http_result.get_all_vulnerabilities();
                     if !all_vulnerabilities.is_empty() {
                         lines.push(Line::from(vec![
-                            Span::styled("⚠️  Issues: ", Style::default().fg(Color::White)),
-                            Span::styled(all_vulnerabilities.len().to_string(), Style::default().fg(Color::Red)),
+                            Span::styled("❗  Issues: ", Style::default().fg(theme::LABEL)),
+                            Span::styled(all_vulnerabilities.len().to_string(), Style::default().fg(theme::BAD)),
                         ]));
 
                         // Show each vulnerability
@@ -277,8 +273,8 @@ impl Pane for HttpPane {
                             };
 
                             lines.push(Line::from(vec![
-                                Span::styled("  • ", Style::default().fg(Color::Red)),
-                                Span::styled(vuln_text, Style::default().fg(Color::Red)),
+                                Span::styled("  • ", Style::default().fg(theme::BAD)),
+                                Span::styled(vuln_text, Style::default().fg(theme::BAD)),
                             ]));
                         }
                     }
@@ -289,8 +285,8 @@ impl Pane for HttpPane {
                 } else {
                     // HTTP scan failed for all protocols
                     lines.push(Line::from(vec![
-                        Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                        Span::styled("all protocols failed", Style::default().fg(Color::Red)),
+                        Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                        Span::styled("all protocols failed", Style::default().fg(theme::BAD)),
                     ]));
                 }
             } else if matches!(http_state.status, crate::types::ScanStatus::Failed) {
@@ -298,30 +294,30 @@ impl Pane for HttpPane {
             } else {
                 // No HTTP data available yet
                 lines.push(Line::from(vec![
-                    Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                    Span::styled("checking...", Style::default().fg(Color::Gray)),
+                    Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("checking...", Style::default().fg(theme::MUTED)),
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("⏱️  Time: ", Style::default().fg(Color::White)),
-                    Span::styled("measuring...", Style::default().fg(Color::Gray)),
+                    Span::styled("⏳  Time: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("measuring...", Style::default().fg(theme::MUTED)),
                 ]));
 
                 lines.push(Line::from(vec![
-                    Span::styled("🖥️  Server: ", Style::default().fg(Color::White)),
-                    Span::styled("detecting...", Style::default().fg(Color::Gray)),
+                    Span::styled("💻  Server: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("detecting...", Style::default().fg(theme::MUTED)),
                 ]));
             }
         } else {
             // No HTTP scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
-                Span::styled("unavailable", Style::default().fg(Color::Red)),
+                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 
             lines.push(Line::from(vec![
-                Span::styled("📊 Status: ", Style::default().fg(Color::White)),
-                Span::styled("HTTP scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("📊 Status: ", Style::default().fg(theme::LABEL)),
+                Span::styled("HTTP scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
 

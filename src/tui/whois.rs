@@ -1,9 +1,10 @@
 use crate::scan::whois::DataSource;
 use crate::tui::pane::{Detail, Pane};
+use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::any::Any;
@@ -36,10 +37,16 @@ impl Default for WhoisPane {
 }
 
 /// `<label>: <value>`, indented under a zoomed section.
+/// EPP `ok` and the `... prohibited` transfer/delete/update locks are the healthy statuses.
+fn is_lock_or_ok(status: &str) -> bool {
+    let status = status.to_lowercase();
+    status.contains("ok") || status.contains("prohibited")
+}
+
 fn field_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {label}: "), Style::default().fg(Color::White)),
-        Span::styled(value, Style::default().fg(Color::Gray)),
+        Span::styled(format!("  {label}: "), Style::default().fg(theme::LABEL)),
+        Span::styled(value, Style::default().fg(theme::MUTED)),
     ])
 }
 
@@ -47,7 +54,7 @@ fn field_line(label: &str, value: String) -> Line<'static> {
 fn contact_lines(role: &str, contact: &crate::scan::whois::ContactInfo) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!("👤 {role}{}", if contact.is_redacted { " (redacted)" } else { "" }),
-        Style::default().fg(Color::Cyan),
+        Style::default().fg(theme::VALUE),
     ))];
     let fields = [
         ("Name", &contact.name),
@@ -118,8 +125,8 @@ impl Pane for WhoisPane {
 
         // WHOIS status header
         lines.push(Line::from(vec![
-            Span::styled("📋 Status: ", Style::default().fg(Color::Cyan)),
-            Span::styled("querying...", Style::default().fg(Color::Gray)),
+            Span::styled("📋 Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("querying...", Style::default().fg(theme::MUTED)),
         ]));
 
         // Empty line for spacing
@@ -130,7 +137,7 @@ impl Pane for WhoisPane {
             // Update header with current status
             let (label, label_color) = crate::tui::status_label(&whois_state, "querying...", "retrieved");
             lines[0] = Line::from(vec![
-                Span::styled("📋 Status: ", Style::default().fg(Color::Cyan)),
+                Span::styled("📋 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]);
 
@@ -139,17 +146,17 @@ impl Pane for WhoisPane {
             {
                 // Nothing was retrieved, so the header must not claim it was.
                 lines[0] = Line::from(vec![
-                    Span::styled("📋 Status: ", Style::default().fg(Color::Cyan)),
-                    Span::styled("n/a", Style::default().fg(Color::Gray)),
+                    Span::styled("📋 Status: ", Style::default().fg(theme::VALUE)),
+                    Span::styled("n/a", Style::default().fg(theme::MUTED)),
                 ]);
                 lines.push(Line::from(vec![
-                    Span::styled("🎯 Target: ", Style::default().fg(Color::White)),
-                    Span::styled(whois_result.domain.clone(), Style::default().fg(Color::Cyan)),
+                    Span::styled("🎯 Target: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(whois_result.domain.clone(), Style::default().fg(theme::VALUE)),
                 ]));
                 wrapped.push(lines.len());
                 lines.push(Line::from(vec![
-                    Span::styled("📡 Source: ", Style::default().fg(Color::White)),
-                    Span::styled(reason.to_string(), Style::default().fg(Color::Gray)),
+                    Span::styled("📡 Source: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(reason.to_string(), Style::default().fg(theme::MUTED)),
                 ]));
             } else if let Some(ScanResult::Whois(whois_result)) = &whois_state.result {
                 // Domain name. A suffix-list failure rides on it, and then it wraps to keep the cause.
@@ -157,38 +164,35 @@ impl Pane for WhoisPane {
                     wrapped.push(lines.len());
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                    Span::styled(whois_result.domain_label(), Style::default().fg(Color::Cyan)),
+                    Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(whois_result.domain_label(), Style::default().fg(theme::VALUE)),
                 ]));
 
                 // Data source, directly under the domain: a long NS or status list below cannot push
                 // it out of the pane.
                 let source_color = match &whois_result.data_source {
-                    crate::scan::whois::DataSource::Rdap => Color::Green,
-                    crate::scan::whois::DataSource::Whois => Color::Yellow,
-                    crate::scan::whois::DataSource::NotApplicable(_) => Color::Gray,
+                    crate::scan::whois::DataSource::Rdap => theme::GOOD,
+                    crate::scan::whois::DataSource::Whois => theme::WARN,
+                    crate::scan::whois::DataSource::NotApplicable(_) => theme::MUTED,
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("📡 Source: ", Style::default().fg(Color::White)),
+                    Span::styled("📡 Source: ", Style::default().fg(theme::LABEL)),
                     Span::styled(whois_result.data_source.to_string(), Style::default().fg(source_color)),
                 ]));
 
                 // Registrar
                 if let Some(registrar) = &whois_result.registrar {
                     lines.push(Line::from(vec![
-                        Span::styled("🏢 Registrar: ", Style::default().fg(Color::White)),
-                        Span::styled(registrar.name.clone(), Style::default().fg(Color::Green)),
+                        Span::styled("🏢 Registrar: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(registrar.name.clone(), Style::default().fg(theme::GOOD)),
                     ]));
                 }
 
                 // Registration date
                 if let Some(created) = &whois_result.registration_date {
                     lines.push(Line::from(vec![
-                        Span::styled("📅 Created: ", Style::default().fg(Color::White)),
-                        Span::styled(
-                            created.format("%Y-%m-%d").to_string(),
-                            Style::default().fg(Color::Yellow),
-                        ),
+                        Span::styled("📅 Created: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(created.format("%Y-%m-%d").to_string(), Style::default().fg(theme::WARN)),
                     ]));
                 }
 
@@ -199,15 +203,15 @@ impl Pane for WhoisPane {
                     let days_until_expiry = (expires_date - now).num_days();
 
                     let expiry_color = if days_until_expiry < EXPIRY_WARNING_DAYS {
-                        Color::Red
+                        theme::BAD
                     } else if days_until_expiry < EXPIRY_CAUTION_DAYS {
-                        Color::Yellow
+                        theme::WARN
                     } else {
-                        Color::Green
+                        theme::GOOD
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("⏰ Expires: ", Style::default().fg(Color::White)),
+                        Span::styled("⏰ Expires: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
                             format!("{} ({}d)", expires.format("%Y-%m-%d"), days_until_expiry),
                             Style::default().fg(expiry_color),
@@ -221,8 +225,8 @@ impl Pane for WhoisPane {
                         let prefix = if i == 0 { "🔗 NS: " } else { "     " };
 
                         lines.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(Color::White)),
-                            Span::styled(nameserver.clone(), Style::default().fg(Color::Magenta)),
+                            Span::styled(prefix, Style::default().fg(theme::LABEL)),
+                            Span::styled(nameserver.clone(), Style::default().fg(theme::ACCENT)),
                         ]));
                     }
                 }
@@ -230,18 +234,18 @@ impl Pane for WhoisPane {
                 // Status - show all status items
                 if !whois_result.status.is_empty() {
                     for (i, status) in whois_result.status.iter().enumerate() {
-                        let status_color = if status.to_lowercase().contains("ok") {
-                            Color::Green
+                        let status_color = if is_lock_or_ok(status) {
+                            theme::GOOD
                         } else if status.to_lowercase().contains("pending") {
-                            Color::Yellow
+                            theme::WARN
                         } else {
-                            Color::Red
+                            theme::BAD
                         };
 
                         let prefix = if i == 0 { "📊 Status: " } else { "         " };
 
                         lines.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(Color::White)),
+                            Span::styled(prefix, Style::default().fg(theme::LABEL)),
                             Span::styled(status.clone(), Style::default().fg(status_color)),
                         ]));
                     }
@@ -249,26 +253,26 @@ impl Pane for WhoisPane {
 
                 // Privacy level
                 let privacy_color = match whois_result.privacy_score {
-                    crate::scan::whois::PrivacyLevel::Open => Color::Red,
-                    crate::scan::whois::PrivacyLevel::Corporate => Color::Yellow,
-                    crate::scan::whois::PrivacyLevel::Protected => Color::Green,
-                    crate::scan::whois::PrivacyLevel::Unknown => Color::Gray,
+                    crate::scan::whois::PrivacyLevel::Open => theme::VALUE,
+                    crate::scan::whois::PrivacyLevel::Corporate => theme::WARN,
+                    crate::scan::whois::PrivacyLevel::Protected => theme::GOOD,
+                    crate::scan::whois::PrivacyLevel::Unknown => theme::MUTED,
                 };
 
                 lines.push(Line::from(vec![
-                    Span::styled("🔐 Privacy: ", Style::default().fg(Color::White)),
+                    Span::styled("🔐 Privacy: ", Style::default().fg(theme::LABEL)),
                     Span::styled(whois_result.privacy_score.label(), Style::default().fg(privacy_color)),
                 ]));
 
                 // Risk indicators - show all risks
                 if !whois_result.risk_indicators.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("⚠️  Risks: ", Style::default().fg(Color::White)),
+                        Span::styled("❗  Risks: ", Style::default().fg(theme::LABEL)),
                         Span::styled(
                             whois_result.risk_indicators.len().to_string(),
-                            Style::default().fg(Color::Red),
+                            Style::default().fg(theme::BAD),
                         ),
-                        Span::styled(" indicators", Style::default().fg(Color::Red)),
+                        Span::styled(" indicators", Style::default().fg(theme::BAD)),
                     ]));
 
                     // Show each risk indicator
@@ -283,8 +287,8 @@ impl Pane for WhoisPane {
                         };
 
                         lines.push(Line::from(vec![
-                            Span::styled("     • ", Style::default().fg(Color::Red)),
-                            Span::styled(risk_text, Style::default().fg(Color::Red)),
+                            Span::styled("     • ", Style::default().fg(theme::BAD)),
+                            Span::styled(risk_text, Style::default().fg(theme::BAD)),
                         ]));
                     }
                 }
@@ -297,25 +301,25 @@ impl Pane for WhoisPane {
                 match whois_state.status {
                     crate::types::ScanStatus::Running => {
                         lines.push(Line::from(vec![
-                            Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                            Span::styled("querying...", Style::default().fg(Color::Yellow)),
+                            Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("querying...", Style::default().fg(theme::WARN)),
                         ]));
 
                         lines.push(Line::from(vec![
-                            Span::styled("🏢 Registrar: ", Style::default().fg(Color::White)),
-                            Span::styled("looking up...", Style::default().fg(Color::Yellow)),
+                            Span::styled("🏢 Registrar: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("looking up...", Style::default().fg(theme::WARN)),
                         ]));
                     }
                     crate::types::ScanStatus::Failed => {
                         lines.push(Line::from(vec![
-                            Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                            Span::styled("query failed", Style::default().fg(Color::Red)),
+                            Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("query failed", Style::default().fg(theme::BAD)),
                         ]));
                     }
                     _ => {
                         lines.push(Line::from(vec![
-                            Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                            Span::styled("waiting to query...", Style::default().fg(Color::Gray)),
+                            Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("waiting to query...", Style::default().fg(theme::MUTED)),
                         ]));
                     }
                 }
@@ -323,13 +327,13 @@ impl Pane for WhoisPane {
         } else {
             // No WHOIS scanner available
             lines[0] = Line::from(vec![
-                Span::styled("📋 WHOIS: ", Style::default().fg(Color::Cyan)),
-                Span::styled("unavailable", Style::default().fg(Color::Red)),
+                Span::styled("📋 WHOIS: ", Style::default().fg(theme::VALUE)),
+                Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 
             lines.push(Line::from(vec![
-                Span::styled("🌐 Domain: ", Style::default().fg(Color::White)),
-                Span::styled("WHOIS scanner not available", Style::default().fg(Color::Red)),
+                Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                Span::styled("WHOIS scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
 
@@ -362,6 +366,7 @@ impl Pane for WhoisPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[test]
     fn test_whois_pane_creation() {
@@ -447,6 +452,27 @@ mod tests {
         let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), width, height, false);
         assert!(out.contains("Domain: tatari.tv (from www.tatari.tv)"), "{out}");
         assert!(out.contains("Source: RDAP"), "{out}");
+    }
+
+    #[test]
+    fn epp_locks_and_ok_render_good_and_other_statuses_bad() {
+        use crate::scan::whois::{NotApplicableReason, WhoisResult};
+        let mut result = WhoisResult::not_applicable("tatari.tv".to_string(), NotApplicableReason::IpTarget);
+        result.data_source = crate::scan::whois::DataSource::Rdap;
+        result.status = ["client transfer prohibited", "ok", "pendingDelete", "serverHold"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (width, height) = crate::tui::testing::dashboard_pane_size(1, 0, 200, 55);
+        let buffer =
+            crate::tui::testing::render_buffer(&WhoisPane::new(), &state_with_whois(result), width, height, false);
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "client transfer prohibited"),
+            Color::Green
+        );
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "ok"), Color::Green);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "pendingDelete"), Color::Yellow);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "serverHold"), Color::LightRed);
     }
 
     #[test]

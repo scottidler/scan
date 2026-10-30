@@ -245,9 +245,9 @@ mod tests {
 
     #[test]
     fn line_style_and_alignment_survive_the_cut() {
-        let line = two_spans().style(Style::default().fg(Color::Red)).centered();
+        let line = two_spans().style(Style::default().fg(Color::LightRed)).centered();
         let fitted = fit_line(line, 6);
-        assert_eq!(fitted.style, Style::default().fg(Color::Red));
+        assert_eq!(fitted.style, Style::default().fg(Color::LightRed));
         assert_eq!(fitted.alignment, Some(ratatui::layout::Alignment::Center));
     }
 
@@ -311,9 +311,9 @@ mod tests {
 
     #[test]
     fn wrap_line_keeps_line_style_and_alignment_on_every_row() {
-        let line = two_spans().style(Style::default().fg(Color::Red)).centered();
+        let line = two_spans().style(Style::default().fg(Color::LightRed)).centered();
         for row in wrap_line(line, 10) {
-            assert_eq!(row.style, Style::default().fg(Color::Red));
+            assert_eq!(row.style, Style::default().fg(Color::LightRed));
             assert_eq!(row.alignment, Some(ratatui::layout::Alignment::Center));
         }
     }

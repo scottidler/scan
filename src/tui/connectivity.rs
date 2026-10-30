@@ -5,6 +5,7 @@ use crate::tui::pane::{Detail, Pane, create_block};
 use crate::tui::sparkline::{
     Sample, SparklineData, average_us, bars_newest_first, jitter_us, loss_percent, scale_max_us, span,
 };
+use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
 use ratatui::{
@@ -180,21 +181,21 @@ impl FamilyView {
 
     fn title_color(&self) -> Color {
         match self.state {
-            ConnectivityState::Connected => Color::Green,
+            ConnectivityState::Connected => theme::GOOD,
             // MUTED: neither is a fault. Phase 2 moves this to the theme.
-            ConnectivityState::NoAddress | ConnectivityState::Disabled => Color::Gray,
-            _ => Color::Red,
+            ConnectivityState::NoAddress | ConnectivityState::Disabled => theme::MUTED,
+            _ => theme::BAD,
         }
     }
 
     fn graph_color(&self, visible: &[Sample]) -> Color {
         if self.state != ConnectivityState::Connected {
-            return Color::Red;
+            return theme::BAD;
         }
         match average_us(visible) {
-            Some(average) if average > VERY_SLOW_LATENCY_US => Color::Red,
-            Some(average) if average > SLOW_LATENCY_US => Color::Yellow,
-            _ => Color::Green,
+            Some(average) if average > VERY_SLOW_LATENCY_US => theme::BAD,
+            Some(average) if average > SLOW_LATENCY_US => theme::WARN,
+            _ => theme::GOOD,
         }
     }
 }
@@ -207,7 +208,7 @@ fn render_graph(frame: &mut Frame, area: Rect, visible: &[Sample], max_us: u64, 
         .direction(RenderDirection::RightToLeft)
         .style(Style::default().fg(color))
         .absent_value_symbol(FAILED_SAMPLE_SYMBOL)
-        .absent_value_style(Style::default().fg(Color::Red))
+        .absent_value_style(Style::default().fg(theme::BAD))
         .render(area, frame.buffer_mut());
 }
 
@@ -228,21 +229,21 @@ enum ConnectivityState {
 fn overall_status(ipv4: &ConnectivityState, ipv6: &ConnectivityState) -> (&'static str, Color) {
     use ConnectivityState::*;
     match (ipv4, ipv6) {
-        (NoAddress | Disabled, NoAddress | Disabled) => ("no address", Color::Gray),
+        (NoAddress | Disabled, NoAddress | Disabled) => ("no address", theme::MUTED),
         (live, NoAddress | Disabled) => single_family_status(live, "ipv4", "ipv4 intermittent"),
         (NoAddress | Disabled, live) => single_family_status(live, "ipv6", "ipv6 intermittent"),
-        (Connected, Connected) => ("dual-stack", Color::Green),
-        (Connected, Disconnected) => ("ipv4 only", Color::Yellow),
-        (Disconnected, Connected) => ("ipv6 only", Color::Yellow),
-        (Connected, Intermittent) => ("ipv4 stable, ipv6 intermittent", Color::Yellow),
-        (Intermittent, Connected) => ("ipv4 intermittent, ipv6 stable", Color::Yellow),
-        (Intermittent, Intermittent) => ("intermittent connectivity", Color::Yellow),
-        (Intermittent, Disconnected) => ("ipv4 intermittent", Color::Yellow),
-        (Disconnected, Intermittent) => ("ipv6 intermittent", Color::Yellow),
+        (Connected, Connected) => ("dual-stack", theme::GOOD),
+        (Connected, Disconnected) => ("ipv4 only", theme::WARN),
+        (Disconnected, Connected) => ("ipv6 only", theme::WARN),
+        (Connected, Intermittent) => ("ipv4 stable, ipv6 intermittent", theme::WARN),
+        (Intermittent, Connected) => ("ipv4 intermittent, ipv6 stable", theme::WARN),
+        (Intermittent, Intermittent) => ("intermittent connectivity", theme::WARN),
+        (Intermittent, Disconnected) => ("ipv4 intermittent", theme::WARN),
+        (Disconnected, Intermittent) => ("ipv6 intermittent", theme::WARN),
         (Disconnected, Disconnected) | (Disconnected, Checking) | (Checking, Disconnected) => {
-            ("no ping reply", Color::Red)
+            ("no ping reply", theme::BAD)
         }
-        (Checking, _) | (_, Checking) => ("checking connectivity", Color::Gray),
+        (Checking, _) | (_, Checking) => ("checking connectivity", theme::MUTED),
     }
 }
 
@@ -253,10 +254,10 @@ fn single_family_status(
     intermittent_text: &'static str,
 ) -> (&'static str, Color) {
     match state {
-        ConnectivityState::Connected => (connected_text, Color::Green),
-        ConnectivityState::Intermittent => (intermittent_text, Color::Yellow),
-        ConnectivityState::Disconnected => ("no ping reply", Color::Red),
-        _ => ("checking connectivity", Color::Gray),
+        ConnectivityState::Connected => (connected_text, theme::GOOD),
+        ConnectivityState::Intermittent => (intermittent_text, theme::WARN),
+        ConnectivityState::Disconnected => ("no ping reply", theme::BAD),
+        _ => ("checking connectivity", theme::MUTED),
     }
 }
 
@@ -489,7 +490,7 @@ fn status_line(state: &AppState, ipv4_state: &ConnectivityState, ipv6_state: &Co
         && let Some(failure) = scan_failure.take()
     {
         status_text = failure;
-        status_color = Color::Red;
+        status_color = theme::BAD;
     } else if status_text == "no ping reply"
         && let Some(ping_state) = state.scanners.get("ping")
         && let Some(ScanResult::Ping(ping)) = &ping_state.result
@@ -501,11 +502,11 @@ fn status_line(state: &AppState, ipv4_state: &ConnectivityState, ipv6_state: &Co
 
     // Status line
     let mut status_spans = vec![
-        Span::styled("🌐 Status: ", Style::default().fg(Color::Cyan)),
+        Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
         Span::styled(status_text, Style::default().fg(status_color)),
     ];
     if let Some(failure) = scan_failure {
-        status_spans.push(Span::styled(format!(", {failure}"), Style::default().fg(Color::Red)));
+        status_spans.push(Span::styled(format!(", {failure}"), Style::default().fg(theme::BAD)));
     }
     Line::from(status_spans)
 }
@@ -621,13 +622,13 @@ impl Pane for ConnectivityPane {
                     let max_us = scale_max_us(&visible);
                     let state_text = family_state_text(state, view, &visible, StateForm::Full, checking_text);
                     let mut spans = vec![
-                        Span::styled(format!("{} ", view.family), Style::default().fg(Color::White)),
+                        Span::styled(format!("{} ", view.family), Style::default().fg(theme::LABEL)),
                         Span::styled(state_text, Style::default().fg(view.title_color())),
                     ];
                     if detail == Detail::Zoomed {
                         spans.push(Span::styled(
                             format!(" │ {}", loss_and_jitter(&view.data.all())),
-                            Style::default().fg(Color::Gray),
+                            Style::default().fg(theme::MUTED),
                         ));
                     }
                     if !visible.is_empty() {
@@ -639,7 +640,7 @@ impl Pane for ConnectivityPane {
                         };
                         spans.push(Span::styled(
                             format!(" │ {scale}← {}s", span(&visible).as_secs_f64().round() as u64),
-                            Style::default().fg(Color::Gray),
+                            Style::default().fg(theme::MUTED),
                         ));
                     }
                     Paragraph::new(crate::tui::text::fit_line(Line::from(spans), title_area.width))
@@ -959,6 +960,19 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_ping_label_renders_in_the_bad_color() {
+        let pane = ConnectivityPane::new();
+        let mut state = state_with_ping(failed_ping_with(PingFailure::NoReply));
+        for _ in 0..5 {
+            state = state_with_ping(failed_ping_with(PingFailure::NoReply));
+            pane.ingest(&state);
+        }
+        let buffer = crate::tui::testing::render_buffer(&pane, &state, 100, 20, false);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "no echo reply"), Color::LightRed);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "no ping reply"), Color::LightRed);
+    }
+
+    #[test]
     fn no_route_renders_the_missing_route_on_this_host() {
         let out = render_failures(|| {
             let mut ping = failed_ping_with(PingFailure::NoReply);
@@ -1127,7 +1141,10 @@ mod tests {
         assert_eq!(overall_status(&Connected, &NoAddress), ("ipv4", Color::Green));
         assert_eq!(overall_status(&NoAddress, &Connected), ("ipv6", Color::Green));
         assert_eq!(overall_status(&Connected, &Disabled), ("ipv4", Color::Green));
-        assert_eq!(overall_status(&Disconnected, &NoAddress), ("no ping reply", Color::Red));
+        assert_eq!(
+            overall_status(&Disconnected, &NoAddress),
+            ("no ping reply", Color::LightRed)
+        );
         assert_eq!(overall_status(&Checking, &NoAddress).1, Color::Gray);
         assert_eq!(overall_status(&Connected, &Disconnected), ("ipv4 only", Color::Yellow));
     }
