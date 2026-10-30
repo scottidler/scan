@@ -12,8 +12,8 @@
 //! cargo test --release --lib -- --ignored --exact scan::observatory::live::scan_matches_the_live_observatory_api
 //! ```
 //!
-//! Hosts that flap (neverssl.com answers on port 80 or 443 from one vantage and not the other, run
-//! to run) are retried as a pair, a fresh POST and a fresh local grade, until the two sides agree.
+//! Hosts that flap (neverssl.com answered on port 80 or 443 from one vantage and not the other, run
+//! to run, and left the list for that) are retried as a pair, a fresh POST and a fresh local grade, until the two sides agree.
 //! Only a graded pair agrees: the same 12 test results and modifiers, score, grade and algorithm
 //! version. A pair where both sides report the site down compares none of those, so it is a retry,
 //! never agreement; a host with no graded agreement in `PAIR_ATTEMPTS` pairs fails with the last
@@ -35,7 +35,7 @@ const HOSTS: [&str; 6] = [
     "github.com",
     "example.com",
     "mozilla.org",
-    "neverssl.com",
+    "httpforever.com",
 ];
 /// Fresh POST plus local grade pairs per host before a disagreement fails the test.
 const PAIR_ATTEMPTS: usize = 4;
