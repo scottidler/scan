@@ -142,7 +142,7 @@ mod tests {
         let state = AppState::new("example.com".to_string());
         let out = render_pane(pane, &state, 80, 24, false);
         assert!(
-            out.contains(&pane.title().to_uppercase()),
+            out.contains(&format!("┐{}┌", pane.title())),
             "{} pane render missing title:\n{}",
             pane.title(),
             out

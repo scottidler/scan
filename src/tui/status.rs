@@ -89,7 +89,7 @@ mod tests {
     fn running_with_result_is_refreshing() {
         let (label, color) = status_label(&scan_state(ScanStatus::Running, true), "scanning...", "done");
         assert_eq!(label, REFRESHING_LABEL);
-        assert_eq!(color, Color::Yellow);
+        assert_eq!(color, crate::tui::theme::WARN);
     }
 
     #[test]
@@ -110,7 +110,7 @@ mod tests {
         state.error = Some(eyre::eyre!("timed out after 30s"));
         let (label, color) = status_label(&state, "r", "done");
         assert_eq!(label, "failed: timed out after 30s");
-        assert_eq!(color, Color::LightRed);
+        assert_eq!(color, crate::tui::theme::BAD);
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
             let (label, color) = status_label(&state, "scanning...", "done");
             assert!(label.contains("failed:"), "{label}");
             assert_eq!(label, "failed: timed out after 30s · ↻ retrying");
-            assert_eq!(color, Color::LightRed);
+            assert_eq!(color, crate::tui::theme::BAD);
         }
     }
 

@@ -366,7 +366,6 @@ impl Pane for WhoisPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
 
     #[test]
     fn test_whois_pane_creation() {
@@ -468,11 +467,17 @@ mod tests {
             crate::tui::testing::render_buffer(&WhoisPane::new(), &state_with_whois(result), width, height, false);
         assert_eq!(
             crate::tui::testing::fg_of(&buffer, "client transfer prohibited"),
-            Color::Green
+            crate::tui::theme::GOOD
         );
-        assert_eq!(crate::tui::testing::fg_of(&buffer, "ok"), Color::Green);
-        assert_eq!(crate::tui::testing::fg_of(&buffer, "pendingDelete"), Color::Yellow);
-        assert_eq!(crate::tui::testing::fg_of(&buffer, "serverHold"), Color::LightRed);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "ok"), crate::tui::theme::GOOD);
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "pendingDelete"),
+            crate::tui::theme::WARN
+        );
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "serverHold"),
+            crate::tui::theme::BAD
+        );
     }
 
     #[test]

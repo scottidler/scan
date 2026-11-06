@@ -289,7 +289,6 @@ impl Pane for TraceroutePane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
 
     #[test]
     fn test_traceroute_pane_creation() {
@@ -569,8 +568,8 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         for number in ["12:", "14:", "1:"] {
             let color = crate::tui::testing::fg_of(&buffer, number);
-            assert_eq!(color, Color::White, "hop {number}");
-            assert_ne!(color, Color::LightRed, "hop {number}");
+            assert_eq!(color, crate::tui::theme::LABEL, "hop {number}");
+            assert_ne!(color, crate::tui::theme::BAD, "hop {number}");
         }
     }
 

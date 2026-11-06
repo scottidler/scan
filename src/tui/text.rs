@@ -183,7 +183,6 @@ pub fn to_rows(lines: Vec<Line<'_>>, width: u16, detail: Detail, wrapped: &[usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
 
     fn text(line: &Line<'_>) -> String {
         line.spans.iter().map(|span| span.content.as_ref()).collect()
@@ -191,8 +190,8 @@ mod tests {
 
     fn two_spans() -> Line<'static> {
         Line::from(vec![
-            Span::styled("Domain: ", Style::default().fg(Color::White)),
-            Span::styled("example.com", Style::default().fg(Color::Cyan)),
+            Span::styled("Domain: ", Style::default().fg(crate::tui::theme::LABEL)),
+            Span::styled("example.com", Style::default().fg(crate::tui::theme::VALUE)),
         ])
     }
 
@@ -210,10 +209,16 @@ mod tests {
         assert_eq!(fitted.width(), 12);
         assert_eq!(
             fitted.spans[0],
-            Span::styled("Domain: ", Style::default().fg(Color::White))
+            Span::styled("Domain: ", Style::default().fg(crate::tui::theme::LABEL))
         );
-        assert_eq!(fitted.spans[1], Span::styled("exa", Style::default().fg(Color::Cyan)));
-        assert_eq!(fitted.spans[2], Span::styled("…", Style::default().fg(Color::Cyan)));
+        assert_eq!(
+            fitted.spans[1],
+            Span::styled("exa", Style::default().fg(crate::tui::theme::VALUE))
+        );
+        assert_eq!(
+            fitted.spans[2],
+            Span::styled("…", Style::default().fg(crate::tui::theme::VALUE))
+        );
     }
 
     #[test]
@@ -221,7 +226,7 @@ mod tests {
         let fitted = fit_line(two_spans(), 5);
         assert_eq!(text(&fitted), "Doma…");
         assert_eq!(fitted.spans.len(), 2);
-        assert_eq!(fitted.spans[1].style, Style::default().fg(Color::White));
+        assert_eq!(fitted.spans[1].style, Style::default().fg(crate::tui::theme::LABEL));
     }
 
     #[test]
@@ -256,9 +261,11 @@ mod tests {
 
     #[test]
     fn line_style_and_alignment_survive_the_cut() {
-        let line = two_spans().style(Style::default().fg(Color::LightRed)).centered();
+        let line = two_spans()
+            .style(Style::default().fg(crate::tui::theme::BAD))
+            .centered();
         let fitted = fit_line(line, 6);
-        assert_eq!(fitted.style, Style::default().fg(Color::LightRed));
+        assert_eq!(fitted.style, Style::default().fg(crate::tui::theme::BAD));
         assert_eq!(fitted.alignment, Some(ratatui::layout::Alignment::Center));
     }
 
@@ -290,13 +297,19 @@ mod tests {
         let rows = wrap_line(two_spans(), 10);
         assert_eq!(
             rows[0].spans,
-            [Span::styled("Domain: ", Style::default().fg(Color::White))]
+            [Span::styled("Domain: ", Style::default().fg(crate::tui::theme::LABEL))]
         );
         assert_eq!(
             rows[1].spans,
-            [Span::styled("example.co", Style::default().fg(Color::Cyan))]
+            [Span::styled(
+                "example.co",
+                Style::default().fg(crate::tui::theme::VALUE)
+            )]
         );
-        assert_eq!(rows[2].spans, [Span::styled("m", Style::default().fg(Color::Cyan))]);
+        assert_eq!(
+            rows[2].spans,
+            [Span::styled("m", Style::default().fg(crate::tui::theme::VALUE))]
+        );
     }
 
     #[test]
@@ -330,9 +343,11 @@ mod tests {
 
     #[test]
     fn wrap_line_keeps_line_style_and_alignment_on_every_row() {
-        let line = two_spans().style(Style::default().fg(Color::LightRed)).centered();
+        let line = two_spans()
+            .style(Style::default().fg(crate::tui::theme::BAD))
+            .centered();
         for row in wrap_line(line, 10) {
-            assert_eq!(row.style, Style::default().fg(Color::LightRed));
+            assert_eq!(row.style, Style::default().fg(crate::tui::theme::BAD));
             assert_eq!(row.alignment, Some(ratatui::layout::Alignment::Center));
         }
     }

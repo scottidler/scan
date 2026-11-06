@@ -1,5 +1,5 @@
-//! Ping latency history for the connectivity sparklines, and the pure math that turns a visible
-//! window of it into bars: the stepped scale, the sub-row floor, and newest-first order.
+//! Ping latency history for the connectivity graphs, and the pure math that turns a visible
+//! window of it into braille dots: the stepped scale, the one-dot floor, and newest at the right.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 /// Scale ceilings in ms. 5000 is the ping timeout (`scan/ping.rs`), so no reply exceeds it.
 const SCALE_STEPS_MS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
 const MICROS_PER_MS: u64 = 1000;
-/// ratatui draws a bar `value * rows * 8 / max` eighths tall.
-const EIGHTHS_PER_ROW: u64 = 8;
+/// A braille cell is 2 dots wide and 4 dots tall, so each cell column holds two samples.
+pub const SAMPLES_PER_CELL: usize = 2;
+const DOTS_PER_ROW: u64 = 4;
+const BRAILLE_BASE: u32 = 0x2800;
+/// Dot bits per column, bottom dot first: left column dots 7,3,2,1; right column dots 8,6,5,4.
+const DOT_BITS: [[u8; 4]; 2] = [[0x40, 0x04, 0x02, 0x01], [0x80, 0x20, 0x10, 0x08]];
 
 /// One ping cycle: when it ran, and its round trip in µs, `None` when the ping failed.
 pub type Sample = (Instant, Option<u64>);
@@ -115,27 +119,47 @@ pub fn span(samples: &[Sample]) -> Duration {
     }
 }
 
-/// Bar values for a `RightToLeft` sparkline `rows` tall at scale `max_us`: newest first, so the
-/// newest bar is at the right edge. A reply too small to draw is raised to one eighth of a row.
-pub fn bars_newest_first(samples: &[Sample], rows: u16, max_us: u64) -> Vec<Option<u64>> {
-    let eighths = u64::from(rows) * EIGHTHS_PER_ROW;
-    let smallest_visible = if eighths == 0 { 0 } else { max_us.div_ceil(eighths) };
-    samples
-        .iter()
-        .rev()
-        .map(|(_, micros)| micros.map(|value| value.max(smallest_visible)))
+/// How many dots tall a reply of `micros` is at scale `max_us` in a graph `total` dots tall. A
+/// reply too small to draw is raised to one dot, and none is taller than the graph.
+fn dot_height(micros: u64, max_us: u64, total: u64) -> u64 {
+    if total == 0 || max_us == 0 {
+        return 0;
+    }
+    (micros.saturating_mul(total).div_ceil(max_us)).clamp(1, total)
+}
+
+/// `samples` as a `rows` x `cols` braille grid against a 0..`max_us` scale, top row first. Each
+/// sample is a bar of dots rising from the bottom, two samples per cell, the newest in the
+/// rightmost dot column. A failed ping draws nothing: its slot on the time axis stays a gap.
+pub fn braille_grid(samples: &[Sample], rows: u16, cols: u16, max_us: u64) -> Vec<Vec<char>> {
+    let rows = usize::from(rows);
+    let cols = usize::from(cols);
+    let total = rows as u64 * DOTS_PER_ROW;
+    let mut bits = vec![vec![0u8; cols]; rows];
+    let dot_columns = cols * SAMPLES_PER_CELL;
+    let shown = samples.len().min(dot_columns);
+    let first = dot_columns - shown;
+    for (index, (_, micros)) in samples[samples.len() - shown..].iter().enumerate() {
+        let dot_column = first + index;
+        let (col, side) = (dot_column / SAMPLES_PER_CELL, dot_column % SAMPLES_PER_CELL);
+        let height = micros.map_or(0, |micros| dot_height(micros, max_us, total));
+        for dot in 0..height {
+            let row = rows - 1 - (dot / DOTS_PER_ROW) as usize;
+            bits[row][col] |= DOT_BITS[side][(dot % DOTS_PER_ROW) as usize];
+        }
+    }
+    bits.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| char::from_u32(BRAILLE_BASE + u32::from(cell)).unwrap_or(' '))
+                .collect()
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{
-        Terminal,
-        backend::TestBackend,
-        widgets::{RenderDirection, Sparkline},
-    };
-
     fn samples(values: &[Option<u64>]) -> Vec<Sample> {
         let start = Instant::now();
         values
@@ -143,23 +167,6 @@ mod tests {
             .enumerate()
             .map(|(i, micros)| (start + Duration::from_secs(i as u64), *micros))
             .collect()
-    }
-
-    /// The glyphs a one-row `RightToLeft` sparkline draws for `data`, left to right.
-    fn draw_one_row(data: &[Option<u64>], width: u16, max_us: u64) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("TestBackend terminal");
-        terminal
-            .draw(|frame| {
-                let sparkline = Sparkline::default()
-                    .data(data)
-                    .max(max_us)
-                    .direction(RenderDirection::RightToLeft)
-                    .absent_value_symbol("░");
-                frame.render_widget(sparkline, frame.area());
-            })
-            .expect("draw sparkline");
-        let buffer = terminal.backend().buffer();
-        (0..width).map(|x| buffer[(x, 0)].symbol().to_string()).collect()
     }
 
     #[test]
@@ -227,47 +234,56 @@ mod tests {
         assert_eq!(span(&[]), Duration::ZERO);
     }
 
-    #[test]
-    fn bars_are_newest_first_and_keep_failures_absent() {
-        let bars = bars_newest_first(&samples(&[Some(1_000), None, Some(3_000)]), 1, 5_000);
-        assert_eq!(bars, vec![Some(3_000), None, Some(1_000)]);
+    fn glyphs(grid: &[Vec<char>]) -> Vec<String> {
+        grid.iter().map(|row| row.iter().collect()).collect()
     }
 
     #[test]
-    fn a_reply_too_small_to_draw_is_raised_to_one_eighth_of_a_row() {
-        // 50µs at 1ms in one row is 50 * 8 / 1000 = 0 eighths: blank without the floor.
-        assert_eq!(bars_newest_first(&samples(&[Some(50)]), 1, 1_000), vec![Some(125)]);
-        assert_eq!(bars_newest_first(&samples(&[Some(0)]), 2, 1_000), vec![Some(63)]);
-        assert_eq!(bars_newest_first(&samples(&[Some(800)]), 1, 1_000), vec![Some(800)]);
-        let drawn = draw_one_row(&bars_newest_first(&samples(&[Some(50)]), 1, 1_000), 1, 1_000);
-        assert_eq!(drawn, "▁");
+    fn a_full_scale_reply_fills_its_dot_column_to_the_top() {
+        // One cell, two rows: 8 dots tall. The newest sample is the right dot column.
+        let grid = braille_grid(&samples(&[Some(10_000)]), 2, 1, 10_000);
+        assert_eq!(glyphs(&grid), vec!["⢸", "⢸"]);
     }
 
     #[test]
-    fn half_millisecond_reply_at_one_millisecond_scale_draws_a_bar() {
-        let mut data = SparklineData::new(5);
-        data.add_sample(Instant::now(), Some(Duration::from_micros(500)));
-        let visible = data.visible(1);
-        let drawn = draw_one_row(&bars_newest_first(&visible, 1, scale_max_us(&visible)), 1, 1_000);
-        // 500 * 8 / 1000 = 4 eighths. A ms-truncated 0 would show only the floor's one eighth.
-        assert_eq!(drawn, "▄", "500µs at max 1ms is not a half-row bar");
+    fn two_samples_share_a_cell_oldest_on_the_left() {
+        // 2.5ms of 10ms in 4 dots is 1 dot; 10ms is 4 dots.
+        let grid = braille_grid(&samples(&[Some(2_500), Some(10_000)]), 1, 1, 10_000);
+        assert_eq!(glyphs(&grid), vec!["⣸"]);
     }
 
     #[test]
-    fn newest_sample_is_drawn_in_the_rightmost_column() {
-        let visible = samples(&[Some(1_000), Some(8_000)]);
-        let drawn = draw_one_row(&bars_newest_first(&visible, 1, 10_000), 5, 10_000);
-        assert_eq!(
-            drawn.chars().last(),
-            Some('▆'),
-            "newest bar not at the right edge: {drawn:?}"
-        );
-        assert_eq!(drawn.chars().take(3).collect::<String>(), "   ", "{drawn:?}");
-        assert_eq!(
-            drawn.chars().nth(3),
-            Some('▁'),
-            "older sample not left of newest: {drawn:?}"
-        );
+    fn a_reply_too_small_to_draw_is_raised_to_one_dot() {
+        let grid = braille_grid(&samples(&[Some(1)]), 2, 1, 1_000);
+        assert_eq!(glyphs(&grid), vec!["\u{2800}", "⢀"]);
+    }
+
+    #[test]
+    fn half_millisecond_reply_at_one_millisecond_scale_is_half_the_height() {
+        let grid = braille_grid(&samples(&[Some(500)]), 1, 1, 1_000);
+        assert_eq!(glyphs(&grid), vec!["⢠"]);
+    }
+
+    #[test]
+    fn newest_samples_sit_at_the_right_edge_and_older_ones_drop_off_the_left() {
+        let values: Vec<Option<u64>> = (1..=7).map(|ms| Some(ms * 1_000)).collect();
+        let grid = braille_grid(&samples(&values), 1, 3, 4_000);
+        // 6 dot columns show samples 2..=7; 4ms+ fill all 4 dots.
+        assert_eq!(glyphs(&grid), vec!["⣴⣿⣿"]);
+    }
+
+    #[test]
+    fn a_failed_ping_leaves_its_dot_column_empty() {
+        let grid = braille_grid(&samples(&[Some(1_000), None, Some(1_000), Some(1_000)]), 1, 2, 4_000);
+        assert_eq!(glyphs(&grid), vec!["⡀⣀"]);
+        let all_failed = braille_grid(&samples(&[None, None, None, None]), 2, 2, 4_000);
+        assert_eq!(glyphs(&all_failed), vec!["\u{2800}\u{2800}", "\u{2800}\u{2800}"]);
+    }
+
+    #[test]
+    fn fewer_samples_than_columns_leave_the_left_blank() {
+        let grid = braille_grid(&samples(&[Some(4_000)]), 1, 3, 4_000);
+        assert_eq!(glyphs(&grid), vec!["\u{2800}\u{2800}⢸"]);
     }
 
     #[test]

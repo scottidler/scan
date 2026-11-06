@@ -998,15 +998,15 @@ mod tests {
     use tokio::sync::watch;
 
     const PANE_TITLES: [&str; 9] = [
-        "TARGET",
-        "CONNECTIVITY",
-        "WHOIS",
-        "HTTP",
-        "PORTS",
-        "GEOIP",
-        "DNS",
-        "TRACEROUTE",
-        "SECURITY",
+        "target",
+        "connectivity",
+        "whois",
+        "http",
+        "ports",
+        "geoip",
+        "dns",
+        "traceroute",
+        "security",
     ];
 
     /// The app with `focus`, over `state`, with a protocol channel nobody listens on.
@@ -1035,7 +1035,7 @@ mod tests {
     fn titles(text: &str) -> Vec<&'static str> {
         PANE_TITLES
             .into_iter()
-            .filter(|title| text.contains(&format!("┌{title}")))
+            .filter(|title| text.contains(&format!("┐{title}┌")))
             .collect()
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
 
         key(&mut app, &state, &tx, KeyCode::Enter);
         let zoomed = frame_text(&mut app, &state, 80, 24);
-        assert_eq!(titles(&zoomed), vec!["SECURITY"], "{zoomed}");
+        assert_eq!(titles(&zoomed), vec!["security"], "{zoomed}");
         let footer = zoomed.lines().last().expect("footer row");
         assert!(footer.starts_with(ZOOM_FOOTER), "footer: `{footer}`");
     }
@@ -1092,7 +1092,7 @@ mod tests {
         key(&mut app, &state, &tx, KeyCode::Right);
         let text = frame_text(&mut app, &state, 80, 24);
         assert!(app.layout.is_zoomed());
-        assert_eq!(titles(&text), vec!["TRACEROUTE"], "{text}");
+        assert_eq!(titles(&text), vec!["traceroute"], "{text}");
         assert_eq!(app.layout.scroll_offset("traceroute", Detail::Zoomed), 0);
         let first_row = text.lines().nth(1).expect("first content row");
         assert!(first_row.contains("Status:"), "not at row 0: `{first_row}`");
@@ -1119,7 +1119,7 @@ mod tests {
 
         let text = frame_text(&mut app, &state, 80, 40);
         assert!(app.layout.is_zoomed(), "a resize left zoom");
-        assert_eq!(titles(&text), vec!["DNS"], "{text}");
+        assert_eq!(titles(&text), vec!["dns"], "{text}");
         assert!(rows > 37, "fixture must still overflow at 80x40");
         assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), rows - 37);
     }
@@ -1204,7 +1204,7 @@ mod tests {
         let (mut app, tx) = app_on("connectivity");
         key(&mut app, &state, &tx, KeyCode::Enter);
         let text = frame_text(&mut app, &state, 80, 24);
-        assert_eq!(titles(&text), vec!["CONNECTIVITY"], "{text}");
+        assert_eq!(titles(&text), vec!["connectivity"], "{text}");
         let guard = state.lock().unwrap();
         assert!(
             !app.layout

@@ -271,7 +271,9 @@ impl TuiApp {
         let size = frame.area();
         log::trace!("[tui] ui_render: area={}x{}", size.width, size.height);
 
-        // Render the layout with all panes
+        frame
+            .buffer_mut()
+            .set_style(size, ratatui::style::Style::default().bg(theme::BACKGROUND));
         let state_guard = state.lock().unwrap();
         self.layout.render(frame, size, &state_guard);
     }
@@ -515,6 +517,28 @@ mod tests {
         app.ingest(&state);
         app.ingest(&state);
         assert_eq!(connectivity_samples(&mut app), (N, N));
+    }
+
+    #[test]
+    fn every_cell_of_the_frame_is_painted_with_the_theme_background() {
+        let mut app = TuiApp::new().expect("app");
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|frame| app.ui(frame, &state)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let unpainted: Vec<ratatui::layout::Position> = buffer
+            .area
+            .positions()
+            .filter(|&position| buffer[position].bg != theme::BACKGROUND)
+            // The cell behind a double-width glyph is never drawn: the glyph covers it.
+            .filter(|position| {
+                position.x == 0 || ratatui::text::Span::raw(buffer[(position.x - 1, position.y)].symbol()).width() < 2
+            })
+            .collect();
+        assert!(
+            unpainted.is_empty(),
+            "cells left on the terminal background: {unpainted:?}"
+        );
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};

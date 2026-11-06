@@ -3,28 +3,88 @@
 
 use ratatui::style::Color;
 
-/// A fault: failure, error, 5xx, expired, closed-by-error. ANSI 9 so it reads as red on any palette.
-pub const BAD: Color = Color::LightRed;
+// A btop-style palette: gray labels, bright values, status hues from btop's cpu gradient
+// (green -> yellow -> red), and graphs shaded deep-to-bright. Truecolor throughout.
+
+/// Painted under every cell, as btop does, so the terminal's own background never shows through.
+pub const BACKGROUND: Color = Color::Rgb(0x00, 0x00, 0x00);
+/// A fault: failure, error, 5xx, expired, closed-by-error.
+pub const BAD: Color = Color::Rgb(0xdc, 0x4c, 0x4c);
 /// Degraded but not failed: slow, short TTL, many open ports, missing header.
-pub const WARN: Color = Color::Yellow;
+pub const WARN: Color = Color::Rgb(0xcb, 0xc0, 0x6c);
 /// Healthy or hardened: success, locks, passing checks.
-pub const GOOD: Color = Color::Green;
+pub const GOOD: Color = Color::Rgb(0x77, 0xca, 0x9b);
 /// A data value shown to the user: addresses, names, records.
-pub const VALUE: Color = Color::Cyan;
+pub const VALUE: Color = Color::Rgb(0xe6, 0xe6, 0xe6);
 /// A field label or neutral text.
-pub const LABEL: Color = Color::White;
+pub const LABEL: Color = Color::Rgb(0x9a, 0x9a, 0x9a);
 /// De-emphasised text: pending, not applicable, hints.
-pub const MUTED: Color = Color::Gray;
+pub const MUTED: Color = Color::Rgb(0x5c, 0x5c, 0x5c);
 /// Decorative emphasis for body text that is neither a value nor a status.
-pub const ACCENT: Color = Color::Magenta;
+pub const ACCENT: Color = Color::Rgb(0xb0, 0xa9, 0xde);
+/// A pane title on its top border.
+pub const TITLE: Color = Color::Rgb(0xee, 0xee, 0xee);
+/// The focused pane's title, btop's hotkey red.
+pub const TITLE_FOCUSED: Color = Color::Rgb(0xff, 0x6a, 0x6a);
 /// Border of the focused pane.
-pub const BORDER_FOCUSED: Color = Color::Yellow;
-/// Border of an unfocused pane.
-pub const BORDER_UNFOCUSED: Color = Color::Gray;
+pub const BORDER_FOCUSED: Color = Color::Rgb(0xee, 0xee, 0xee);
+/// Border of a pane with no box color of its own.
+pub const BORDER_UNFOCUSED: Color = Color::Rgb(0x50, 0x50, 0x50);
+
+/// Fraction of `base` a graph's bottom row keeps: deep, nearly the background.
+const GRAPH_FLOOR: f32 = 0.3;
+/// How far a graph's top row is washed from `base` toward white.
+const GRAPH_CREST: f32 = 0.45;
+
+/// The color of a graph row `t` of the way up (0 bottom, 1 top) in `base`'s hue: deep at the
+/// floor, `base` at mid-height, washed toward white at the top, as btop shades its net graph.
+pub fn graph_shade(base: Color, t: f32) -> Color {
+    let Color::Rgb(r, g, b) = base else {
+        return base;
+    };
+    let t = t.clamp(0.0, 1.0);
+    let channel = |c: u8| {
+        let c = f32::from(c);
+        let shaded = if t < 0.5 {
+            c * (GRAPH_FLOOR + (1.0 - GRAPH_FLOOR) * t * 2.0)
+        } else {
+            c + (255.0 - c) * GRAPH_CREST * (t - 0.5) * 2.0
+        };
+        shaded.round().clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(channel(r), channel(g), channel(b))
+}
+
+/// Each pane's box color, so neighbouring panes read as separate boxes the way btop's cpu, mem,
+/// net and proc boxes do.
+pub fn pane_border(id: &str) -> Color {
+    match id {
+        "target" => Color::Rgb(0x3d, 0x7b, 0x46),
+        "connectivity" => Color::Rgb(0x42, 0x3b, 0xa5),
+        "whois" => Color::Rgb(0x8a, 0x88, 0x2e),
+        "http" => Color::Rgb(0x2e, 0x6f, 0x8a),
+        "ports" => Color::Rgb(0x92, 0x35, 0x35),
+        "geoip" => Color::Rgb(0x7d, 0x41, 0x80),
+        "dns" => Color::Rgb(0x2e, 0x7a, 0x6a),
+        "traceroute" => Color::Rgb(0x8a, 0x5a, 0x2e),
+        "security" => Color::Rgb(0x3b, 0x5b, 0xa5),
+        _ => BORDER_UNFOCUSED,
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::path::Path;
+
+    #[test]
+    fn graph_shade_runs_deep_to_base_to_washed() {
+        let base = Color::Rgb(100, 200, 50);
+        assert_eq!(graph_shade(base, 0.0), Color::Rgb(30, 60, 15));
+        assert_eq!(graph_shade(base, 0.5), base);
+        assert_eq!(graph_shade(base, 1.0), Color::Rgb(170, 225, 142));
+        assert_eq!(graph_shade(Color::Reset, 0.7), Color::Reset);
+    }
 
     /// `mod <name> {` or `pub mod <name> {`: an inline module body opens on this line.
     fn opens_inline_module(line: &str) -> bool {

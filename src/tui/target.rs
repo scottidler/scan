@@ -313,18 +313,18 @@ mod tests {
         };
         let (icon, color) = TargetPane::status_icon_and_color(&scan_state(ScanStatus::Running, None));
         assert_eq!(icon, "🔄");
-        assert_eq!(color, Color::Yellow);
+        assert_eq!(color, crate::tui::theme::WARN);
 
         let (icon, color) = TargetPane::status_icon_and_color(&scan_state(ScanStatus::Complete, None));
         assert_eq!(icon, "✅");
-        assert_eq!(color, Color::Green);
+        assert_eq!(color, crate::tui::theme::GOOD);
 
         let (icon, color) = TargetPane::status_icon_and_color(&scan_state(
             ScanStatus::Failed,
             Some(eyre::eyre!("IPv6: operation timed out")),
         ));
         assert_eq!(icon, "❌");
-        assert_eq!(color, Color::LightRed);
+        assert_eq!(color, crate::tui::theme::BAD);
 
         let (icon, color) = TargetPane::status_icon_and_color(&scan_state(
             ScanStatus::Failed,

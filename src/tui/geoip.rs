@@ -382,7 +382,7 @@ mod tests {
         let x = (0..80)
             .find(|&x| buffer[(x, row)].symbol() == "(")
             .expect("label start");
-        assert_eq!(buffer[(x, row)].fg, Color::Gray);
+        assert_eq!(buffer[(x, row)].fg, crate::tui::theme::MUTED);
     }
 
     #[test]

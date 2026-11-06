@@ -4,9 +4,9 @@ use log;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Style,
-    text::Line,
-    widgets::{Block, Borders, Paragraph, Widget},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
 use std::any::Any;
 
@@ -76,18 +76,37 @@ pub trait Pane {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-/// Helper function to create a standard bordered block for panes
+/// A btop-style box: rounded border in the pane's own color, and the title set into the top
+/// border between `┐` and `┌`. Focus brightens the border and turns the title red.
 pub fn create_block(title: &str, focused: bool) -> Block<'_> {
     log::trace!("[tui::pane] create_block: title={} focused={}", title, focused);
-
+    let border = if focused { theme::BORDER_FOCUSED } else { theme::pane_border(title) };
+    let title_style = if focused {
+        Style::default().fg(theme::TITLE_FOCUSED).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TITLE).add_modifier(Modifier::BOLD)
+    };
     Block::default()
-        .title(title.to_uppercase())
         .borders(Borders::ALL)
-        .border_style(if focused {
-            Style::default().fg(theme::WARN)
-        } else {
-            Style::default().fg(theme::MUTED)
-        })
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(vec![
+            Span::styled("─┐", Style::default().fg(border)),
+            Span::styled(title.to_string(), title_style),
+            Span::styled("┌", Style::default().fg(border)),
+        ]))
+}
+
+/// A bottom-border label set between `┘` and `└` in the border's color, as btop draws its key
+/// hints.
+fn bottom_label(text: String, focused: bool, title: &str) -> Line<'static> {
+    let border = if focused { theme::BORDER_FOCUSED } else { theme::pane_border(title) };
+    Line::from(vec![
+        Span::styled("┘", Style::default().fg(border)),
+        Span::styled(text, Style::default().fg(theme::LABEL)),
+        Span::styled("└─", Style::default().fg(border)),
+    ])
+    .right_aligned()
 }
 
 /// Where a pane's rows stand in its rect: the clamped first row shown, and how many rows sit
@@ -154,7 +173,7 @@ pub fn draw_rows<P: Pane + ?Sized>(
         view.below
     );
     let block = match view.marker() {
-        Some(marker) => block.title_bottom(Line::from(marker).right_aligned()),
+        Some(marker) => block.title_bottom(bottom_label(marker, focused, pane.title())),
         None => block,
     };
     block.render(area, frame.buffer_mut());

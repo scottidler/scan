@@ -3,7 +3,7 @@ use crate::scan::ping::{PingResult, PingStatus};
 use crate::target::Protocol;
 use crate::tui::pane::{Detail, Pane, create_block};
 use crate::tui::sparkline::{
-    Sample, SparklineData, average_us, bars_newest_first, jitter_us, loss_percent, scale_max_us, span,
+    SAMPLES_PER_CELL, Sample, SparklineData, average_us, braille_grid, jitter_us, loss_percent, scale_max_us, span,
 };
 use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, RenderDirection, Sparkline, Widget},
+    widgets::{Paragraph, Widget},
 };
 use std::any::Any;
 use std::collections::VecDeque;
@@ -22,8 +22,8 @@ use std::time::Instant;
 
 const MIN_CONNECTIVITY_PANE_WIDTH: u16 = 25;
 const NO_REPLY_LABEL: &str = "no echo reply";
-/// Ping cycles kept per family, enough for the widest pane.
-const SPARKLINE_CAPACITY: usize = 200;
+/// Ping cycles kept per family, enough for the widest pane at two samples per cell.
+const SPARKLINE_CAPACITY: usize = 512;
 const MIN_CONNECTIVITY_PANE_HEIGHT: u16 = 12; // Double-height sparklines like btop
 
 /// The label for a family's latest ping failure, or `no ping reply` when none is on record.
@@ -79,8 +79,6 @@ const STATE_WINDOW: usize = 10;
 /// How many of the newest results decide the state.
 const STATE_RECENT: usize = 5;
 
-/// Drawn, in red, for a ping cycle that got no reply.
-const FAILED_SAMPLE_SYMBOL: &str = "░";
 /// Average latency, in µs, above which a family's graph turns yellow, then red.
 const SLOW_LATENCY_US: u64 = 50_000;
 const VERY_SLOW_LATENCY_US: u64 = 150_000;
@@ -200,16 +198,25 @@ impl FamilyView {
     }
 }
 
-/// Draw `visible` newest at the right edge, against a 0..`max_us` scale, failures in red.
+/// Draw `visible` as a braille graph, newest at the right edge, against a 0..`max_us` scale.
+/// Rows are shaded deep at the floor to bright at the top in `color`; a failed ping is a gap.
 fn render_graph(frame: &mut Frame, area: Rect, visible: &[Sample], max_us: u64, color: Color) {
-    Sparkline::default()
-        .data(bars_newest_first(visible, area.height, max_us))
-        .max(max_us)
-        .direction(RenderDirection::RightToLeft)
-        .style(Style::default().fg(color))
-        .absent_value_symbol(FAILED_SAMPLE_SYMBOL)
-        .absent_value_style(Style::default().fg(theme::BAD))
-        .render(area, frame.buffer_mut());
+    let grid = braille_grid(visible, area.height, area.width, max_us);
+    let rows = grid.len();
+    let buffer = frame.buffer_mut();
+    for (row_index, row) in grid.iter().enumerate() {
+        let t = if rows > 1 { (rows - 1 - row_index) as f32 / (rows - 1) as f32 } else { 0.5 };
+        let shade = theme::graph_shade(color, t);
+        for (col_index, glyph) in row.iter().enumerate() {
+            let position = (area.x + col_index as u16, area.y + row_index as u16);
+            buffer[position].set_char(*glyph).set_fg(shade);
+        }
+    }
+}
+
+/// How many samples a graph `width` cells wide shows.
+fn graph_samples(width: u16) -> usize {
+    usize::from(width) * SAMPLES_PER_CELL
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -618,7 +625,7 @@ impl Pane for ConnectivityPane {
                 families: family_rows, ..
             } => {
                 for (view, (title_area, graph_area)) in families.iter().zip(family_rows) {
-                    let visible = view.data.visible(usize::from(graph_area.width));
+                    let visible = view.data.visible(graph_samples(graph_area.width));
                     let max_us = scale_max_us(&visible);
                     let state_text = family_state_text(state, view, &visible, StateForm::Full, checking_text);
                     let mut spans = vec![
@@ -678,7 +685,7 @@ impl Pane for ConnectivityPane {
                     let label = Line::from(Span::styled(label, Style::default().fg(view.title_color())));
                     Paragraph::new(crate::tui::text::fit_line(label, label_area.width))
                         .render(label_area, frame.buffer_mut());
-                    let visible = view.data.visible(usize::from(graph_area.width));
+                    let visible = view.data.visible(graph_samples(graph_area.width));
                     let max_us = scale_max_us(&visible);
                     render_graph(frame, graph_area, &visible, max_us, view.graph_color(&visible));
                 }
@@ -788,19 +795,13 @@ mod tests {
     }
 
     fn has_bar_glyph(row: &str) -> bool {
-        row.chars().any(|glyph| ('▁'..='█').contains(&glyph))
+        row.chars().any(|glyph| ('\u{2801}'..='\u{28FF}').contains(&glyph))
     }
 
     fn row_containing<'a>(out: &'a str, needle: &str) -> &'a str {
         out.lines()
             .find(|row| row.contains(needle))
             .unwrap_or_else(|| panic!("no row contains {needle:?}:\n{out}"))
-    }
-
-    /// The glyph in the last column inside the right border.
-    fn last_inner_glyph(row: &str) -> char {
-        let glyphs: Vec<char> = row.chars().collect();
-        glyphs[glyphs.len() - 2]
     }
 
     #[test]
@@ -821,21 +822,30 @@ mod tests {
         let mut failed_v4 = ok_ping(12, 14);
         failed_v4.ipv4_status = PingStatus::Failed(PingFailure::NoReply);
         pings.push(failed_v4);
-        let out = render_cycles(&pane, &pings, 56, 6);
-        let ipv4_row = row_containing(&out, "v4 ✗");
-        assert_eq!(
-            last_inner_glyph(ipv4_row),
-            '░',
-            "newest (failed) sample not at the right:\n{out}"
-        );
-        let ipv6_row = row_containing(&out, "v6 14ms");
-        assert!(('▁'..='█').contains(&last_inner_glyph(ipv6_row)), "{out}");
+        let states = states_for(&pings, Protocol::Both);
+        for state in &states {
+            pane.ingest(state);
+        }
+        let buffer = crate::tui::testing::render_buffer(&pane, states.last().expect("a state"), 56, 6, false);
+        let out = render_pane(&pane, states.last().expect("a state"), 56, 6, false);
+        let row_of = |needle: &str| {
+            out.lines()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("no row contains {needle:?}:\n{out}")) as u16
+        };
+        let last_inner = buffer.area.width - 2;
+        // 12ms and 14ms at a 0-20ms scale are 3 of 4 dots. The newest IPv4 ping failed, so the
+        // right dot column of its last cell is empty and only the older reply on the left shows.
+        let ipv4 = &buffer[(last_inner, row_of("v4 ✗"))];
+        assert_eq!(ipv4.symbol(), "⡆", "newest (failed) sample not at the right:\n{out}");
+        let ipv6 = &buffer[(last_inner, row_of("v6 14ms"))];
+        assert_eq!(ipv6.symbol(), "⣶", "{out}");
     }
 
     #[test]
-    fn failed_sample_renders_the_absent_symbol_with_no_scale() {
+    fn failed_samples_draw_no_dots_and_no_scale() {
         let out = render_failures(|| failed_ping_with(PingFailure::NoReply));
-        assert!(out.contains('░'), "failed samples not drawn:\n{out}");
+        assert!(!has_bar_glyph(&out), "failed samples drew dots:\n{out}");
         assert!(!out.contains("scale 0-"), "scale printed with no reply sampled:\n{out}");
         assert!(out.contains("← "), "span dropped:\n{out}");
     }
@@ -968,8 +978,14 @@ mod tests {
             pane.ingest(&state);
         }
         let buffer = crate::tui::testing::render_buffer(&pane, &state, 100, 20, false);
-        assert_eq!(crate::tui::testing::fg_of(&buffer, "no echo reply"), Color::LightRed);
-        assert_eq!(crate::tui::testing::fg_of(&buffer, "no ping reply"), Color::LightRed);
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "no echo reply"),
+            crate::tui::theme::BAD
+        );
+        assert_eq!(
+            crate::tui::testing::fg_of(&buffer, "no ping reply"),
+            crate::tui::theme::BAD
+        );
     }
 
     #[test]
@@ -1117,9 +1133,17 @@ mod tests {
             let buffer = five_cycles_buffer(&pings, 100, height);
             let out = buffer_text(&buffer);
             assert!(out.contains("no IPv6 address"), "{mode}:\n{out}");
-            assert_eq!(fg_of(&buffer, "no IPv6 address"), Color::Gray, "{mode}: not MUTED");
+            assert_eq!(
+                fg_of(&buffer, "no IPv6 address"),
+                crate::tui::theme::MUTED,
+                "{mode}: not MUTED"
+            );
             assert!(out.contains("Status: ipv4 "), "{mode}:\n{out}");
-            assert_eq!(fg_of(&buffer, "ipv4 "), Color::Green, "{mode}: status not GOOD");
+            assert_eq!(
+                fg_of(&buffer, "ipv4 "),
+                crate::tui::theme::GOOD,
+                "{mode}: status not GOOD"
+            );
             for wrong in ["no ping reply", "ipv4 only", "no echo reply"] {
                 assert!(!out.contains(wrong), "{mode}: shows `{wrong}`:\n{out}");
             }
@@ -1138,15 +1162,24 @@ mod tests {
     #[test]
     fn no_address_never_makes_the_status_a_warning() {
         use ConnectivityState::*;
-        assert_eq!(overall_status(&Connected, &NoAddress), ("ipv4", Color::Green));
-        assert_eq!(overall_status(&NoAddress, &Connected), ("ipv6", Color::Green));
-        assert_eq!(overall_status(&Connected, &Disabled), ("ipv4", Color::Green));
+        assert_eq!(
+            overall_status(&Connected, &NoAddress),
+            ("ipv4", crate::tui::theme::GOOD)
+        );
+        assert_eq!(
+            overall_status(&NoAddress, &Connected),
+            ("ipv6", crate::tui::theme::GOOD)
+        );
+        assert_eq!(overall_status(&Connected, &Disabled), ("ipv4", crate::tui::theme::GOOD));
         assert_eq!(
             overall_status(&Disconnected, &NoAddress),
-            ("no ping reply", Color::LightRed)
+            ("no ping reply", crate::tui::theme::BAD)
         );
-        assert_eq!(overall_status(&Checking, &NoAddress).1, Color::Gray);
-        assert_eq!(overall_status(&Connected, &Disconnected), ("ipv4 only", Color::Yellow));
+        assert_eq!(overall_status(&Checking, &NoAddress).1, crate::tui::theme::MUTED);
+        assert_eq!(
+            overall_status(&Connected, &Disconnected),
+            ("ipv4 only", crate::tui::theme::WARN)
+        );
     }
 
     /// Rows of the IPv6 graph in a full-mode render: those after the `IPv6` title row.
@@ -1175,7 +1208,7 @@ mod tests {
         let buffer = render_buffer(&pane, &state, 100, 20, false);
         let out = buffer_text(&buffer);
         assert!(out.contains("IPv6 disabled (p)"), "{out}");
-        assert_eq!(fg_of(&buffer, "disabled (p)"), Color::Gray, "not MUTED");
+        assert_eq!(fg_of(&buffer, "disabled (p)"), crate::tui::theme::MUTED, "not MUTED");
         assert!(
             rows_after(&out, "IPv6 disabled").iter().all(|row| !has_bar_glyph(row)),
             "disabled family drew bars:\n{out}"
