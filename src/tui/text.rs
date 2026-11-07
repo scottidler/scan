@@ -15,6 +15,26 @@ where
     if n == N::from(1) { format!("{n} {noun}") } else { format!("{n} {noun}s") }
 }
 
+/// `secs` as `h`, `m` and `s` with no spaces, zero units dropped: `1h5s`, `2h50m14s`, and `0s` for
+/// zero. Hours do not roll into days: two days read `48h`.
+pub fn compact_duration(secs: u64) -> String {
+    const SECONDS_PER_MINUTE: u64 = 60;
+    const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+    if secs == 0 {
+        return "0s".to_string();
+    }
+    let units = [
+        (secs / SECONDS_PER_HOUR, "h"),
+        (secs % SECONDS_PER_HOUR / SECONDS_PER_MINUTE, "m"),
+        (secs % SECONDS_PER_MINUTE, "s"),
+    ];
+    units
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect()
+}
+
 /// Marks a line cut short by `fit_line`.
 pub const ELLIPSIS: &str = "…";
 
@@ -182,6 +202,22 @@ pub fn to_rows(lines: Vec<Line<'_>>, width: u16, detail: Detail, wrapped: &[usiz
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_duration_drops_zero_units_and_has_no_day_unit() {
+        for (secs, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (3600, "1h"),
+            (3605, "1h5s"),
+            (3661, "1h1m1s"),
+            (10214, "2h50m14s"),
+            (172800, "48h"),
+        ] {
+            assert_eq!(compact_duration(secs), expected, "{secs}s");
+        }
+    }
+
     use super::*;
 
     fn text(line: &Line<'_>) -> String {

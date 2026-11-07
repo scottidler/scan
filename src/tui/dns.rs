@@ -1,5 +1,5 @@
 use crate::tui::pane::{Detail, Pane};
-use crate::tui::text::plural;
+use crate::tui::text::{compact_duration, plural};
 use crate::tui::theme;
 use crate::types::AppState;
 use log;
@@ -14,8 +14,6 @@ const TTL_WARNING_THRESHOLD: u32 = 60;
 const MAX_AAAA_RECORDS_DISPLAYED: usize = 1000;
 const MAX_MX_RECORDS_DISPLAYED: usize = 1000;
 const MAX_TXT_RECORDS_DISPLAYED: usize = 1000;
-const MS_RECORD_PREVIEW_LENGTH: usize = 10;
-const MS_RECORD_PREFIX_LENGTH: usize = 3;
 const MAX_NS_RECORDS_DISPLAYED: usize = 1000;
 const MAX_CNAME_RECORDS_DISPLAYED: usize = 1000;
 const MAX_CAA_RECORDS_DISPLAYED: usize = 1000;
@@ -90,11 +88,10 @@ impl DnsPane {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
-        // An IP target has only reverse DNS, so PTR leads.
+        // PTR leads: an IP target has only reverse DNS, and a name target's reverse lookup is
+        // the first thing worth knowing about its address.
         let reverse_only = dns_result.is_reverse_only();
-        if reverse_only {
-            lines.extend(ptr_lines(&dns_result, detail, refreshing));
-        }
+        lines.extend(ptr_lines(&dns_result, detail, refreshing));
 
         // A and AAAA: an IP target has no forward records to query, so it lists neither.
         if !reverse_only {
@@ -185,40 +182,32 @@ impl DnsPane {
 
         // TXT records (basic display, security analysis goes to security pane)
         if !dns_result.TXT.is_empty() {
-            let ttl = ttl_span(dns_result.TXT[0].ttl_remaining(), refreshing);
+            let count = plural(dns_result.TXT.len(), "record");
+            if detail == Detail::Zoomed {
+                lines.push(Line::from(vec![
+                    Span::styled("TXT: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(count, Style::default().fg(theme::GOOD)),
+                    Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
+                    ttl_span(dns_result.TXT[0].ttl_remaining(), refreshing),
+                ]));
+            } else {
+                // The grid counts the records; zoom (Enter) lists them.
+                lines.push(Line::from(vec![
+                    Span::styled("TXT: ", Style::default().fg(theme::LABEL)),
+                    Span::styled(count, Style::default().fg(theme::GOOD)),
+                    Span::styled(" (Enter)", Style::default().fg(theme::MUTED)),
+                ]));
+            }
 
-            lines.push(Line::from(vec![
-                Span::styled("TXT: ", Style::default().fg(theme::LABEL)),
-                Span::styled(plural(dns_result.TXT.len(), "record"), Style::default().fg(theme::GOOD)),
-                Span::styled(", TTL: ", Style::default().fg(theme::LABEL)),
-                ttl,
-            ]));
-
-            for record in dns_result.TXT.iter().take(MAX_TXT_RECORDS_DISPLAYED) {
-                let value = record.value.clone();
-                // The grid abbreviates verification tokens; zoom shows every record whole.
-                let display_value = if detail == Detail::Zoomed {
-                    value
-                } else if value.starts_with("google-site-verification") {
-                    "google-site-verification=...".to_string()
-                } else if value.starts_with("MS=") {
-                    format!(
-                        "MS={}...",
-                        value[MS_RECORD_PREFIX_LENGTH..]
-                            .chars()
-                            .take(MS_RECORD_PREVIEW_LENGTH)
-                            .collect::<String>()
-                    )
-                } else {
-                    value
-                };
-
-                lines.push(record_line(
-                    vec![Span::styled(display_value, Style::default().fg(theme::WARN))],
-                    record.ttl_remaining(),
-                    detail,
-                    refreshing,
-                ));
+            if detail == Detail::Zoomed {
+                for record in dns_result.TXT.iter().take(MAX_TXT_RECORDS_DISPLAYED) {
+                    lines.push(record_line(
+                        vec![Span::styled(record.value.clone(), Style::default().fg(theme::WARN))],
+                        record.ttl_remaining(),
+                        detail,
+                        refreshing,
+                    ));
+                }
             }
         }
 
@@ -307,10 +296,10 @@ impl DnsPane {
                 if detail == Detail::Zoomed {
                     let fields = [
                         ("Email", soa.value.responsible_email.clone()),
-                        ("Refresh", format!("{}s", soa.value.refresh)),
-                        ("Retry", format!("{}s", soa.value.retry)),
-                        ("Expire", format!("{}s", soa.value.expire)),
-                        ("Minimum TTL", format!("{}s", soa.value.minimum_ttl)),
+                        ("Refresh", compact_duration(u64::from(soa.value.refresh))),
+                        ("Retry", compact_duration(u64::from(soa.value.retry))),
+                        ("Expire", compact_duration(u64::from(soa.value.expire))),
+                        ("Minimum TTL", compact_duration(u64::from(soa.value.minimum_ttl))),
                     ];
                     for (label, value) in fields {
                         lines.push(Line::from(vec![
@@ -350,10 +339,6 @@ impl DnsPane {
                     refreshing,
                 ));
             }
-        }
-
-        if !reverse_only {
-            lines.extend(ptr_lines(&dns_result, detail, refreshing));
         }
 
         lines
@@ -424,7 +409,10 @@ fn ttl_span(ttl: u32, refreshing: bool) -> Span<'static> {
         return Span::styled(text, Style::default().fg(theme::MUTED));
     }
     let color = if ttl > TTL_WARNING_THRESHOLD { theme::GOOD } else { theme::WARN };
-    Span::styled(format!("{}s (cached)", ttl), Style::default().fg(color))
+    Span::styled(
+        format!("{} (cached)", compact_duration(u64::from(ttl))),
+        Style::default().fg(color),
+    )
 }
 
 /// `<label>: Failed` or `Timeout` for a lookup that did not answer; nothing otherwise, since most
@@ -549,10 +537,36 @@ mod tests {
         state
     }
 
+    /// Zoomed, the pane fills the terminal and wraps a long value instead of clipping it: no row
+    /// is wider than the pane, and the rows together carry the whole value.
+    fn assert_zoomed_value_wraps_whole_in_narrow_terminals(state: &AppState, value: &str) {
+        for (cols, rows) in crate::tui::testing::NARROW_TERMINALS {
+            let inner = cols - 2;
+            assert!(
+                ratatui::text::Span::raw(value).width() > usize::from(inner),
+                "{cols}x{rows}: fixture fits {inner} cells, so it cannot test wrapping"
+            );
+            let zoomed = crate::tui::testing::content_rows(&DnsPane::new(), state, inner, Detail::Zoomed);
+            for row in &zoomed {
+                assert!(
+                    ratatui::text::Span::raw(row.as_str()).width() <= usize::from(inner),
+                    "{cols}x{rows}: `{row}` overflows {inner} cells"
+                );
+            }
+            let squashed: String = zoomed.concat().split_whitespace().collect();
+            let wanted: String = value.split_whitespace().collect();
+            assert!(
+                squashed.contains(&wanted),
+                "{cols}x{rows}: value cut short:\n{zoomed:#?}"
+            );
+            assert!(!squashed.contains('…'), "{cols}x{rows}: zoom clipped with an ellipsis");
+        }
+    }
+
     #[test]
-    fn long_txt_record_is_fit_with_ellipsis_in_narrow_terminals() {
+    fn long_txt_record_wraps_whole_when_zoomed_in_narrow_terminals() {
         use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
-        let txt = "v=spf1 include:_spf.a-very-long-mail-provider.example.com include:_spf.another.example.net -all";
+        let txt = "v=spf1 include:_spf.a-very-long-mail-provider.example.com include:_spf.another.example.net include:_spf.third-party-sender.example.org -all";
         let mut result = DnsResult::new();
         result.TXT = vec![DnsRecord {
             value: txt.to_string(),
@@ -560,19 +574,16 @@ mod tests {
             queried_at: std::time::Instant::now(),
         }];
         result.TXT_status = QueryStatus::Success(1);
-        crate::tui::testing::assert_clipped_in_narrow_terminals(
-            &DnsPane::new(),
+        assert_zoomed_value_wraps_whole_in_narrow_terminals(
             &complete_state("dns", crate::types::ScanResult::Dns(result)),
-            2,
-            0,
-            &format!("  {txt}"),
+            txt,
         );
     }
 
     #[test]
-    fn long_multibyte_txt_record_is_fit_by_display_width() {
+    fn long_multibyte_txt_record_wraps_by_display_width_when_zoomed() {
         use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
-        let txt = format!("v{}", "é".repeat(60));
+        let txt = format!("v{}", "é".repeat(120));
         let mut result = DnsResult::new();
         result.TXT = vec![DnsRecord {
             value: txt.clone(),
@@ -580,12 +591,9 @@ mod tests {
             queried_at: std::time::Instant::now(),
         }];
         result.TXT_status = QueryStatus::Success(1);
-        crate::tui::testing::assert_clipped_in_narrow_terminals(
-            &DnsPane::new(),
+        assert_zoomed_value_wraps_whole_in_narrow_terminals(
             &complete_state("dns", crate::types::ScanResult::Dns(result)),
-            2,
-            0,
-            &format!("  {txt}"),
+            &txt,
         );
     }
 
@@ -703,9 +711,9 @@ mod tests {
         assert_eq!(crate::tui::testing::fg_of(&buffer, "Failed"), theme::BAD);
     }
 
-    /// A name target keeps A first and shows PTR after the forward records.
+    /// A name target shows PTR before the forward records.
     #[test]
-    fn name_target_renders_ptr_after_the_forward_records() {
+    fn name_target_renders_ptr_before_the_forward_records() {
         let mut result = DnsResult::new();
         result.MX_status = QueryStatus::NoRecords;
         result.A = vec![DnsRecord::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 300)];
@@ -713,9 +721,60 @@ mod tests {
         result.PTR = vec![DnsRecord::new("host.example.".to_string(), 300)];
         result.PTR_status = QueryStatus::Success(1);
         let out = render_dns(result, "example.com");
-        let a = out.find("A: 1 record").unwrap();
-        let ptr = out.find("PTR: 1 record").unwrap();
-        assert!(a < ptr, "{out}");
+        let rows = rows(&out);
+        let row_of = |prefix: &str| rows.iter().position(|r| r.starts_with(prefix)).expect(prefix);
+        assert!(row_of("PTR:") < row_of("A:"), "{out}");
+    }
+
+    /// The grid counts TXT records and shows no value; zoom lists every one.
+    #[test]
+    fn txt_is_a_count_row_in_the_grid_and_listed_in_zoom() {
+        let values = ["v=spf1 -all", "google-site-verification=abc", "MS=ms12345678901234"];
+        let mut result = DnsResult::new();
+        result.TXT = values.iter().map(|v| DnsRecord::new(v.to_string(), 300)).collect();
+        result.TXT_status = QueryStatus::Success(3);
+        let state = complete_state("dns", crate::types::ScanResult::Dns(result));
+        let grid = crate::tui::testing::content_rows(&DnsPane::new(), &state, 80, Detail::Normal).join("\n");
+        assert!(grid.contains("TXT: 3 records (Enter)"), "{grid}");
+        for value in values {
+            assert!(!grid.contains(value), "{value} leaked into the grid:\n{grid}");
+            assert!(!grid.contains(&value[..8]), "{value} leaked into the grid:\n{grid}");
+        }
+        let zoom = crate::tui::testing::content_rows(&DnsPane::new(), &state, 80, Detail::Zoomed).join("\n");
+        for value in values {
+            assert!(zoom.contains(value), "{value} missing from zoom:\n{zoom}");
+        }
+    }
+
+    /// A TTL row ticks down one second per second: rendered 1s later it reads one second less.
+    #[test]
+    fn ttl_row_counts_down_by_the_second() {
+        let render_at_age = |age_secs: u64| {
+            let mut result = DnsResult::new();
+            result.MX_status = QueryStatus::NoRecords;
+            let mut record = DnsRecord::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 300);
+            record.queried_at = std::time::Instant::now() - std::time::Duration::from_secs(age_secs);
+            result.A = vec![record];
+            result.A_status = QueryStatus::Success(1);
+            render_dns(result, "example.com")
+        };
+        let before = render_at_age(292);
+        let after = render_at_age(293);
+        assert!(before.contains("TTL: 8s (cached)"), "{before}");
+        assert!(after.contains("TTL: 7s (cached)"), "{after}");
+    }
+
+    #[test]
+    fn long_ttls_and_soa_timers_read_in_compact_units() {
+        let mut result = DnsResult::new();
+        result.MX_status = QueryStatus::NoRecords;
+        result.A = vec![DnsRecord::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 10214)];
+        result.A_status = QueryStatus::Success(1);
+        let out = render_dns(result, "example.com");
+        assert!(
+            out.contains("TTL: 2h50m14s (cached)") || out.contains("TTL: 2h50m13s (cached)"),
+            "{out}"
+        );
     }
 
     /// Item B: a TTL is the stub resolver's countdown, so it says `cached`. Item 1 (v0.5.8): at 0
@@ -729,7 +788,7 @@ mod tests {
         result.A_status = QueryStatus::Success(1);
         let fresh = render_dns(result.clone(), "example.com");
         assert!(
-            fresh.contains("TTL: 300s (cached)") || fresh.contains("TTL: 299s (cached)"),
+            fresh.contains("TTL: 5m (cached)") || fresh.contains("TTL: 4m59s (cached)"),
             "{fresh}"
         );
 
@@ -843,14 +902,14 @@ mod tests {
         let state = complete_state("dns", crate::types::ScanResult::Dns(result));
         let pane = DnsPane::new();
         let zoomed = crate::tui::testing::content_rows(&pane, &state, 100, Detail::Zoomed).join("\n");
-        assert!(zoomed.contains("192.0.2.1  TTL: 300s (cached)"), "{zoomed}");
-        assert!(zoomed.contains("192.0.2.2  TTL: 1200s (cached)"), "{zoomed}");
+        assert!(zoomed.contains("192.0.2.1  TTL: 5m (cached)"), "{zoomed}");
+        assert!(zoomed.contains("192.0.2.2  TTL: 20m (cached)"), "{zoomed}");
         for field in [
             "Email: hostmaster.example.com",
-            "Refresh: 7200s",
-            "Retry: 3600s",
-            "Expire: 1209600s",
-            "Minimum TTL: 300s",
+            "Refresh: 2h",
+            "Retry: 1h",
+            "Expire: 336h",
+            "Minimum TTL: 5m",
         ] {
             assert!(zoomed.contains(field), "{field}: {zoomed}");
         }
@@ -871,7 +930,8 @@ mod tests {
         let out = render_dns(result, "example.com");
         assert!(out.contains("A: 1 record, TTL: "), "{out}");
         assert!(out.contains("NS: 1 record, TTL: "), "{out}");
-        assert!(out.contains("TXT: 1 record, TTL: "), "{out}");
+        assert!(out.contains("TXT: 1 record (Enter)"), "{out}");
+        assert!(!out.contains("v=spf1"), "{out}");
         assert!(!out.contains("1 records"), "{out}");
     }
 
@@ -889,7 +949,7 @@ mod tests {
         let rows = rows(&out);
         for label in ["A: ", "AAAA: ", "MX: "] {
             let header = rows.iter().find(|r| r.starts_with(label)).expect(label);
-            assert!(header.contains(", TTL: 300s (cached)"), "{header}\n{out}");
+            assert!(header.contains(", TTL: 5m (cached)"), "{header}\n{out}");
         }
         assert!(
             !rows.iter().any(|r| r.starts_with("TTL: ")),

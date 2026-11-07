@@ -9,8 +9,6 @@ use ratatui::{
 use std::any::Any;
 use std::net::IpAddr;
 
-const SECONDS_PER_MINUTE: u64 = 60;
-const SECONDS_PER_HOUR: u64 = 60 * 60; // 3600
 const MIN_TARGET_PANE_WIDTH: u16 = 25;
 const MIN_TARGET_PANE_HEIGHT: u16 = 12;
 /// Display order of the scanner rows, matching `create_default_scanners`.
@@ -66,18 +64,7 @@ impl TargetPane {
 
     /// Format elapsed time in a human-readable way
     fn format_elapsed(elapsed: std::time::Duration) -> String {
-        let secs = elapsed.as_secs();
-        if secs < SECONDS_PER_MINUTE {
-            format!("{}s", secs)
-        } else if secs < SECONDS_PER_HOUR {
-            format!("{}m {}s", secs / SECONDS_PER_MINUTE, secs % SECONDS_PER_MINUTE)
-        } else {
-            format!(
-                "{}h {}m",
-                secs / SECONDS_PER_HOUR,
-                (secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE
-            )
-        }
+        crate::tui::text::compact_duration(elapsed.as_secs())
     }
 
     /// Status icon and color for a scanner row. A failed attempt with no target address in the
@@ -298,8 +285,8 @@ mod tests {
         use std::time::Duration;
 
         assert_eq!(TargetPane::format_elapsed(Duration::from_secs(30)), "30s");
-        assert_eq!(TargetPane::format_elapsed(Duration::from_secs(90)), "1m 30s");
-        assert_eq!(TargetPane::format_elapsed(Duration::from_secs(3661)), "1h 1m");
+        assert_eq!(TargetPane::format_elapsed(Duration::from_secs(90)), "1m30s");
+        assert_eq!(TargetPane::format_elapsed(Duration::from_secs(3661)), "1h1m1s");
     }
 
     #[test]
