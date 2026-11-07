@@ -900,7 +900,7 @@ mod tests {
                 assert!(border.contains(&format!("↑ {step}")), "{id}: `{border}`");
             }
             let buffer = draw(&mut layout, &state, 80, 24);
-            assert!(!bottom_border(&buffer, rect).contains('↓'), "{id}: rows still below");
+            assert!(!bottom_border(&buffer, rect).contains("↓ "), "{id}: rows still below");
         }
     }
 
@@ -1478,29 +1478,41 @@ mod tests {
         assert_eq!(app.layout.scroll_offset("dns", Detail::Normal), 1);
     }
 
-    /// The target pane's top border row, as drawn in a `width` x `height` frame.
-    fn target_top_border(width: u16, height: u16) -> String {
+    /// Row `row_of(rect)` of the `pane` rect, as drawn in a `width` x `height` frame.
+    fn pane_border(pane: &str, width: u16, height: u16, row_of: fn(Rect) -> u16) -> String {
         let state = shared(overflowing_state());
         let (mut app, _) = app_on("security");
         let text = frame_text(&mut app, &state, width, height);
         let rect = app
             .layout
-            .pane_area("target", Rect::new(0, 0, width, height))
+            .pane_area(pane, Rect::new(0, 0, width, height))
             .expect("rect");
-        let top = text.lines().nth(usize::from(rect.y)).expect("top row");
-        top.chars().take(usize::from(rect.width)).collect()
+        let row = text.lines().nth(usize::from(row_of(rect))).expect("border row");
+        row.chars()
+            .skip(usize::from(rect.x))
+            .take(usize::from(rect.width))
+            .collect()
+    }
+
+    fn security_bottom_border(width: u16, height: u16) -> String {
+        pane_border("security", width, height, |rect| rect.y + rect.height - 1)
     }
 
     #[test]
-    fn target_top_border_carries_the_key_legend_and_keeps_the_question_mark_when_narrow() {
-        let wide = target_top_border(200, 56);
-        assert!(wide.contains("┐target┌"), "`{wide}`");
-        assert!(wide.contains("┐←↓↑→ hjkl ? help┌"), "`{wide}`");
+    fn security_bottom_border_carries_the_key_legend_and_keeps_the_question_mark_when_narrow() {
+        let wide = security_bottom_border(200, 56);
+        assert!(wide.ends_with("┘←↓↑→ hjkl ? help└─╯"), "`{wide}`");
 
-        let narrow = target_top_border(80, 24);
-        assert!(narrow.contains("┐target┌"), "`{narrow}`");
+        let narrow = security_bottom_border(80, 24);
         assert!(narrow.contains('?'), "`{narrow}`");
         assert!(!narrow.contains("help"), "`{narrow}`");
+    }
+
+    #[test]
+    fn target_top_border_no_longer_carries_the_key_legend() {
+        let top = pane_border("target", 200, 56, |rect| rect.y);
+        assert!(top.contains("┐target┌"), "`{top}`");
+        assert!(!top.contains('?'), "`{top}`");
     }
 
     #[test]

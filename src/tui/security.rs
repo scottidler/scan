@@ -429,6 +429,10 @@ impl Pane for SecurityPane {
         true
     }
 
+    fn shows_key_legend(&self) -> bool {
+        true
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }

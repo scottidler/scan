@@ -260,10 +260,6 @@ impl Pane for TargetPane {
     fn is_focusable(&self) -> bool {
         true
     }
-
-    fn shows_key_legend(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

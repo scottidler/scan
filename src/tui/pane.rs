@@ -14,10 +14,10 @@ const DEFAULT_MIN_PANE_WIDTH: u16 = 20;
 const DEFAULT_MIN_PANE_HEIGHT: u16 = 6;
 const DEFAULT_SPAN_ROWS: usize = 1;
 const DEFAULT_SPAN_COLS: usize = 1;
-/// The key legend on the target pane's top border, longest first. Each shorter form drops one
-/// part (` help`, then ` hjkl`, then the arrows); `?` is in every form.
 /// The cells around a bottom-border marker: the two corners, `┘`, and `└─`.
 const MARKER_DECORATION_CELLS: usize = 5;
+/// The key legend on the security pane's bottom border, longest first. Each shorter form drops
+/// one part (` help`, then ` hjkl`, then the arrows); `?` is in every form.
 const KEY_LEGENDS: [&str; 4] = ["←↓↑→ hjkl ? help", "←↓↑→ hjkl ?", "←↓↑→ ?", "?"];
 
 /// How much of a pane's data its content shows: the dashboard cell, or the pane zoomed to the
@@ -72,7 +72,7 @@ pub trait Pane {
         (DEFAULT_MIN_PANE_WIDTH, DEFAULT_MIN_PANE_HEIGHT)
     }
 
-    /// Whether the key legend is drawn right-aligned on this pane's top border.
+    /// Whether the key legend is drawn right-aligned on this pane's bottom border.
     fn shows_key_legend(&self) -> bool {
         false
     }
@@ -128,29 +128,19 @@ pub(crate) fn bottom_label(text: String, focused: bool, title: &str) -> Line<'st
     .right_aligned()
 }
 
-/// A right-aligned top-border label set between `┐` and `┌`, styled as `bottom_label`.
-fn top_label(text: &str, focused: bool, title: &str) -> Line<'static> {
-    let border = border_color(title, focused);
-    Line::from(vec![
-        Span::styled("┐", Style::default().fg(border)),
-        Span::styled(text.to_string(), Style::default().fg(theme::LABEL)),
-        Span::styled("┌─", Style::default().fg(border)),
-    ])
-    .right_aligned()
-}
-
-/// The longest key legend that fits on the top border of a `width`-cell box beside its title,
-/// with one cell between them, or `None` when not even `?` fits.
-pub(crate) fn key_legend(width: u16, title: &str, focused: bool) -> Option<Line<'static>> {
+/// The longest key legend that fits on the bottom border of a `width`-cell box beside the
+/// `taken` cells another bottom label already uses (the overflow marker, plus one gap), or `None`
+/// when not even `?` fits.
+pub(crate) fn key_legend(width: u16, taken: usize, focused: bool, title: &str) -> Option<Line<'static>> {
     let room = usize::from(width.saturating_sub(2));
-    let taken = title_line(title, focused).width() + 1;
     let legend = KEY_LEGENDS
         .iter()
-        .map(|text| top_label(text, focused, title))
+        .map(|text| bottom_label(text.to_string(), focused, title))
         .find(|line| taken + line.width() <= room);
     log::trace!(
-        "[tui::pane] key_legend: width={} title={} fits={}",
+        "[tui::pane] key_legend: width={} taken={} title={} fits={}",
         width,
+        taken,
         title,
         legend.is_some()
     );
@@ -231,16 +221,20 @@ pub fn draw_rows<P: Pane + ?Sized>(
         view.offset,
         view.below
     );
-    let block = match view.marker_within(area.width) {
-        Some(marker) => block.title_bottom(bottom_label(marker, focused, pane.title())),
-        None => block,
-    };
+    let marker = view
+        .marker_within(area.width)
+        .map(|marker| bottom_label(marker, focused, pane.title()));
+    let taken = marker.as_ref().map_or(0, |line| line.width() + 1);
     let legend = pane
         .shows_key_legend()
-        .then(|| key_legend(area.width, pane.title(), focused))
+        .then(|| key_legend(area.width, taken, focused, pane.title()))
         .flatten();
+    let block = match marker {
+        Some(marker) => block.title_bottom(marker),
+        None => block,
+    };
     let block = match legend {
-        Some(legend) => block.title_top(legend),
+        Some(legend) => block.title_bottom(legend),
         None => block,
     };
     block.render(area, frame.buffer_mut());
@@ -333,22 +327,28 @@ mod tests {
         assert_eq!(RowView::new(4, 5, 0).marker_within(10), None);
     }
 
-    fn legend_text(width: u16) -> Option<String> {
-        key_legend(width, "target", false).map(|line| line.spans[1].content.to_string())
+    fn legend_text(width: u16, taken: usize) -> Option<String> {
+        key_legend(width, taken, false, "security").map(|line| line.spans[1].content.to_string())
     }
 
     #[test]
     fn key_legend_drops_help_then_hjkl_then_the_arrows_and_keeps_the_question_mark() {
-        // `─┐target┌` is 9 cells, plus one gap and the two corners: 12 cells before the legend.
-        assert_eq!(legend_text(60).as_deref(), Some("←↓↑→ hjkl ? help"));
-        assert_eq!(legend_text(12 + 19).as_deref(), Some("←↓↑→ hjkl ? help"));
-        assert_eq!(legend_text(12 + 18).as_deref(), Some("←↓↑→ hjkl ?"));
-        assert_eq!(legend_text(12 + 14).as_deref(), Some("←↓↑→ hjkl ?"));
-        assert_eq!(legend_text(12 + 13).as_deref(), Some("←↓↑→ ?"));
-        assert_eq!(legend_text(12 + 9).as_deref(), Some("←↓↑→ ?"));
-        assert_eq!(legend_text(12 + 8).as_deref(), Some("?"));
-        assert_eq!(legend_text(12 + 4).as_deref(), Some("?"));
-        assert_eq!(legend_text(12 + 3), None);
+        // The two corners plus `┘` and `└─`: 5 cells around the legend.
+        assert_eq!(legend_text(60, 0).as_deref(), Some("←↓↑→ hjkl ? help"));
+        assert_eq!(legend_text(5 + 16, 0).as_deref(), Some("←↓↑→ hjkl ? help"));
+        assert_eq!(legend_text(5 + 15, 0).as_deref(), Some("←↓↑→ hjkl ?"));
+        assert_eq!(legend_text(5 + 11, 0).as_deref(), Some("←↓↑→ hjkl ?"));
+        assert_eq!(legend_text(5 + 10, 0).as_deref(), Some("←↓↑→ ?"));
+        assert_eq!(legend_text(5 + 6, 0).as_deref(), Some("←↓↑→ ?"));
+        assert_eq!(legend_text(5 + 5, 0).as_deref(), Some("?"));
+        assert_eq!(legend_text(5 + 1, 0).as_deref(), Some("?"));
+        assert_eq!(legend_text(5, 0), None);
+    }
+
+    #[test]
+    fn key_legend_leaves_room_for_the_overflow_marker() {
+        assert_eq!(legend_text(5 + 16 + 10, 10).as_deref(), Some("←↓↑→ hjkl ? help"));
+        assert_eq!(legend_text(5 + 16 + 9, 10).as_deref(), Some("←↓↑→ hjkl ?"));
     }
 
     #[test]
