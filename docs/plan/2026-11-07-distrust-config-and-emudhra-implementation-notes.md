@@ -63,3 +63,20 @@ Design doc: `docs/plan/2026-11-07-distrust-config-and-emudhra.md`
 
 ### Open questions
 - None.
+
+## Implementation audit (review panel, run O6SFJdbK)
+
+Supersedes Phase 2's "Deviations: None" on one point. Verdict: no plan bullet missing, no regression against v0.6.1, AC1 to AC5 re-run green on 44e5646.
+
+### Design decisions
+- None.
+
+### Deviations
+- `Cargo.lock` in 44e5646 also moves `rustix` 1.0.7 -> 1.1.6 and `linux-raw-sys` 0.9.4 -> 0.12.1. It comes from the `tempfile` 3.27.0 dev-dependency, but Cargo unifies the version, so it also reaches the shipped binary through crossterm (`cargo tree -i rustix@1.1.6 -e normal`). The panel's TUI probes against google.com and www.purdue.edu rendered correctly.
+
+### Tradeoffs
+- None.
+
+### Open questions
+- User-written `organizations` values are not trimmed. Only the certificate's `O=` is trimmed; both `issuer-common-names` sides are. This rule predates the plan, so it is not a deviation, but a user can now write the value. `" Foo "` would never match. Not fixed in this plan.
+- After the release, re-run AC2 and AC3 with `BIN=$(command -v scan)` (Rollout Plan, done means live).
