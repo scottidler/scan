@@ -3,6 +3,7 @@ pub mod dns;
 pub mod geoip;
 pub mod http;
 pub mod layout;
+pub mod overlay;
 pub mod pane;
 pub mod ports;
 pub mod security;
@@ -21,6 +22,7 @@ pub use dns::DnsPane;
 pub use geoip::GeoIpPane;
 pub use http::HttpPane;
 pub use layout::PaneLayout;
+pub use overlay::{KEY_HELP, MenuItem, Overlay};
 pub use pane::{Detail, Pane, PaneConfig, PanePosition};
 pub use ports::PortsPane;
 pub use security::SecurityPane;
@@ -41,6 +43,7 @@ use log;
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
+    layout::Rect,
 };
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -94,6 +97,10 @@ pub struct TuiApp {
     tick_rate: Duration,
     /// When the process started, so the first-render log reports startup latency.
     startup: Instant,
+    /// The menu or help box drawn over the dashboard, if one is open.
+    overlay: Overlay,
+    /// The frame area last drawn, so help's scroll keys clamp against the box as it was drawn.
+    frame_area: Rect,
 }
 
 impl TuiApp {
@@ -127,6 +134,8 @@ impl TuiApp {
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(TUI_TICK_RATE_MS), // 4 FPS
             startup: Instant::now(),
+            overlay: Overlay::None,
+            frame_area: Rect::default(),
         })
     }
 
@@ -213,9 +222,8 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Act on one key press. Esc leaves zoom, and quits only from the grid; `q` and Ctrl-C always
-    /// quit. Enter zooms the focused pane; Tab/Right and BackTab/Left move focus, which carries the
-    /// zoom with it.
+    /// Act on one key press. `q` and Ctrl-C always quit. Otherwise an open menu or help box takes
+    /// the key; with none open, the dashboard does.
     fn handle_key(
         &mut self,
         key: event::KeyEvent,
@@ -223,30 +231,43 @@ impl TuiApp {
         protocol_tx: &watch::Sender<Protocol>,
     ) {
         log::debug!(
-            "[tui] key_event: key={:?} modifiers={:?} zoomed={}",
+            "[tui] key_event: key={:?} modifiers={:?} zoomed={} overlay={:?}",
             key.code,
             key.modifiers,
-            self.layout.is_zoomed()
+            self.layout.is_zoomed(),
+            self.overlay
         );
+        let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Char('q') || ctrl_c {
+            log::debug!("[tui] quit_requested: key={:?} ctrl_c={}", key.code, ctrl_c);
+            self.should_quit = true;
+            return;
+        }
+        match self.overlay {
+            Overlay::Menu { selected } => self.handle_menu_key(key, selected),
+            Overlay::Help { scroll } => self.handle_help_key(key, scroll),
+            Overlay::None => self.handle_dashboard_key(key, state, protocol_tx),
+        }
+    }
+
+    /// A key with no box open. Esc leaves zoom, or opens the menu from the grid; `?` opens help;
+    /// Enter zooms the focused pane; Tab/Right/l and BackTab/Left/h move focus, which carries the
+    /// zoom with it. `?` is matched on its code alone: crossterm reports it with SHIFT set.
+    fn handle_dashboard_key(
+        &mut self,
+        key: event::KeyEvent,
+        state: &Arc<Mutex<AppState>>,
+        protocol_tx: &watch::Sender<Protocol>,
+    ) {
         match key.code {
-            KeyCode::Char('q') => {
-                log::debug!("[tui] quit_requested: key={:?}", key.code);
-                self.should_quit = true;
-            }
             KeyCode::Esc if self.layout.is_zoomed() => self.layout.unzoom(),
-            KeyCode::Esc => {
-                log::debug!("[tui] quit_requested: key={:?}", key.code);
-                self.should_quit = true;
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                log::debug!("[tui] quit_requested: ctrl_c");
-                self.should_quit = true;
-            }
+            KeyCode::Esc => self.open(Overlay::Menu { selected: 0 }),
+            KeyCode::Char('?') => self.open(Overlay::Help { scroll: 0 }),
             KeyCode::Enter => {
                 self.layout.zoom();
             }
-            KeyCode::Tab | KeyCode::Right => self.focus_next_pane(),
-            KeyCode::BackTab | KeyCode::Left => self.focus_prev_pane(),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.focus_next_pane(),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.focus_prev_pane(),
             KeyCode::Char('p') => {
                 switch_protocol(state, protocol_tx);
             }
@@ -257,6 +278,62 @@ impl TuiApp {
                 log::trace!("[tui] key_handled_by_pane: key={:?} handled={}", key.code, handled);
             }
         }
+    }
+
+    /// A key with the menu open: Up/k and Down/j move the selection, Home selects the first entry,
+    /// Enter activates it, `?` goes to help, Esc closes. Every other key is ignored.
+    fn handle_menu_key(&mut self, key: event::KeyEvent, selected: usize) {
+        let last = overlay::MENU_ITEMS.len() - 1;
+        match key.code {
+            KeyCode::Esc => self.open(Overlay::None),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay = Overlay::Menu {
+                    selected: selected.saturating_sub(1),
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.overlay = Overlay::Menu {
+                    selected: (selected + 1).min(last),
+                }
+            }
+            KeyCode::Home => self.overlay = Overlay::Menu { selected: 0 },
+            KeyCode::Char('?') => self.open(Overlay::Help { scroll: 0 }),
+            KeyCode::Enter => match overlay::MENU_ITEMS[selected.min(last)] {
+                MenuItem::Help => self.open(Overlay::Help { scroll: 0 }),
+                MenuItem::Quit => {
+                    log::debug!("[tui] quit_requested: menu");
+                    self.should_quit = true;
+                }
+            },
+            _ => log::trace!("[tui] menu_key_ignored: key={:?}", key.code),
+        }
+    }
+
+    /// A key with help open: Up/k, Down/j and Home scroll it, Esc or `?` closes it. Every other
+    /// key is ignored. Down stops at the last row of the box as it was last drawn.
+    fn handle_help_key(&mut self, key: event::KeyEvent, scroll: u16) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => self.open(Overlay::None),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay = Overlay::Help {
+                    scroll: scroll.saturating_sub(1),
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = overlay::help_max_scroll(self.frame_area);
+                self.overlay = Overlay::Help {
+                    scroll: scroll.saturating_add(1).min(max),
+                };
+            }
+            KeyCode::Home => self.overlay = Overlay::Help { scroll: 0 },
+            _ => log::trace!("[tui] help_key_ignored: key={:?}", key.code),
+        }
+    }
+
+    /// Open `overlay` in place of the current one; `Overlay::None` closes it.
+    fn open(&mut self, overlay: Overlay) {
+        log::debug!("[tui] overlay_changed: old={:?} new={:?}", self.overlay, overlay);
+        self.overlay = overlay;
     }
 
     /// The per-tick step that feeds every pane new scanner data, separate from drawing so a pane
@@ -274,8 +351,10 @@ impl TuiApp {
         frame
             .buffer_mut()
             .set_style(size, ratatui::style::Style::default().bg(theme::BACKGROUND));
+        self.frame_area = size;
         let state_guard = state.lock().unwrap();
         self.layout.render(frame, size, &state_guard);
+        overlay::render(frame, size, &mut self.overlay);
     }
 
     /// Check if the application should quit

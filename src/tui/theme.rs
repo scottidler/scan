@@ -55,6 +55,19 @@ pub fn graph_shade(base: Color, t: f32) -> Color {
     Color::Rgb(channel(r), channel(g), channel(b))
 }
 
+/// Fraction of each channel a cell keeps under an open menu or help box.
+const DIM_FACTOR: f32 = 0.35;
+
+/// `color` as drawn behind an open menu or help box: each channel scaled toward black. A color
+/// that is not RGB has no channels to scale and dims to `MUTED`.
+pub fn dimmed(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return MUTED;
+    };
+    let channel = |c: u8| (f32::from(c) * DIM_FACTOR).round() as u8;
+    Color::Rgb(channel(r), channel(g), channel(b))
+}
+
 /// Each pane's box color, so neighbouring panes read as separate boxes the way btop's cpu, mem,
 /// net and proc boxes do.
 pub fn pane_border(id: &str) -> Color {
@@ -84,6 +97,13 @@ mod tests {
         assert_eq!(graph_shade(base, 0.5), base);
         assert_eq!(graph_shade(base, 1.0), Color::Rgb(170, 225, 142));
         assert_eq!(graph_shade(Color::Reset, 0.7), Color::Reset);
+    }
+
+    #[test]
+    fn dimmed_scales_rgb_toward_black_and_mutes_the_rest() {
+        assert_eq!(dimmed(Color::Rgb(200, 100, 0)), Color::Rgb(70, 35, 0));
+        assert_eq!(dimmed(BACKGROUND), BACKGROUND);
+        assert_eq!(dimmed(Color::Reset), MUTED);
     }
 
     /// `mod <name> {` or `pub mod <name> {`: an inline module body opens on this line.

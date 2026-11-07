@@ -21,7 +21,7 @@ const SCROLL_STEP: u16 = 1;
 /// Rows under the zoomed pane for the key footer.
 const ZOOM_FOOTER_ROWS: u16 = 1;
 /// The keys that act while a pane is zoomed.
-pub const ZOOM_FOOTER: &str = "Esc back · ←/→ pane · ↑/↓ scroll";
+pub const ZOOM_FOOTER: &str = "Esc back · ←/→ h/l pane · ↑/↓ j/k scroll · ? help";
 // Row 0 widths (2 columns)
 const TARGET_PANE_WIDTH_PERCENT: u16 = 30;
 const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 70;
@@ -287,7 +287,6 @@ impl PaneLayout {
         );
         if let Some(footer) = footer_rect(area) {
             Paragraph::new(crate::tui::text::fit_line(
-                // MUTED: Gray until the theme lands (Phase 2).
                 Line::styled(ZOOM_FOOTER, Style::default().fg(theme::MUTED)),
                 footer.width,
             ))
@@ -993,7 +992,7 @@ mod tests {
     }
 
     use crate::target::Protocol;
-    use crate::tui::TuiApp;
+    use crate::tui::{KEY_HELP, Overlay, TuiApp};
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
 
@@ -1137,11 +1136,12 @@ mod tests {
     }
 
     #[test]
-    fn esc_while_not_zoomed_quits_and_q_quits_from_zoom() {
+    fn esc_while_not_zoomed_opens_the_menu_and_q_quits_from_zoom() {
         let state = shared(overflowing_state());
         let (mut app, tx) = app_on("security");
         key(&mut app, &state, &tx, KeyCode::Esc);
-        assert!(app.should_quit(), "Esc in the grid did not quit");
+        assert!(!app.should_quit(), "Esc in the grid quit");
+        assert_eq!(app.overlay, Overlay::Menu { selected: 0 });
 
         let (mut app, tx) = app_on("security");
         key(&mut app, &state, &tx, KeyCode::Enter);
@@ -1210,5 +1210,222 @@ mod tests {
             !app.layout
                 .handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &guard)
         );
+    }
+
+    fn focused(app: &TuiApp) -> Option<&str> {
+        app.layout.focused_pane().map(String::as_str)
+    }
+
+    #[test]
+    fn h_and_l_move_focus_exactly_as_left_and_right_in_the_grid_and_zoomed() {
+        let state = shared(overflowing_state());
+        for zoom in [false, true] {
+            let (mut by_arrow, tx) = app_on("http");
+            let (mut by_letter, _) = app_on("http");
+            if zoom {
+                key(&mut by_arrow, &state, &tx, KeyCode::Enter);
+                key(&mut by_letter, &state, &tx, KeyCode::Enter);
+            }
+            for (arrow, letter) in [
+                (KeyCode::Right, 'l'),
+                (KeyCode::Right, 'l'),
+                (KeyCode::Left, 'h'),
+                (KeyCode::Left, 'h'),
+                (KeyCode::Left, 'h'),
+            ] {
+                let before = focused(&by_letter).map(str::to_string);
+                key(&mut by_arrow, &state, &tx, arrow);
+                key(&mut by_letter, &state, &tx, KeyCode::Char(letter));
+                assert_ne!(
+                    focused(&by_letter).map(str::to_string),
+                    before,
+                    "`{letter}` did not move"
+                );
+                assert_eq!(
+                    focused(&by_letter),
+                    focused(&by_arrow),
+                    "zoom={zoom} `{letter}` vs {arrow:?}"
+                );
+                assert_eq!(by_letter.layout.is_zoomed(), zoom);
+            }
+        }
+    }
+
+    #[test]
+    fn j_and_k_scroll_the_focused_pane_as_down_and_up() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("dns");
+        frame_text(&mut app, &state, 80, 24);
+        key(&mut app, &state, &tx, KeyCode::Char('j'));
+        key(&mut app, &state, &tx, KeyCode::Char('j'));
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Normal), 2);
+        key(&mut app, &state, &tx, KeyCode::Char('k'));
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Normal), 1);
+        assert_eq!(focused(&app), Some("dns"), "j/k moved focus");
+    }
+
+    #[test]
+    fn esc_in_the_grid_shows_a_menu_whose_quit_quits_and_esc_closes_it() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        let text = frame_text(&mut app, &state, 80, 24);
+        assert!(text.contains("Help") && text.contains("Quit"), "{text}");
+
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        assert!(!app.should_quit(), "Esc in the menu quit");
+        assert_eq!(app.overlay, Overlay::None);
+        let text = frame_text(&mut app, &state, 80, 24);
+        assert!(!text.contains("┐menu┌"), "menu still drawn:\n{text}");
+
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        key(&mut app, &state, &tx, KeyCode::Char('j'));
+        assert_eq!(app.overlay, Overlay::Menu { selected: 1 });
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        assert!(app.should_quit(), "Enter on Quit did not quit");
+    }
+
+    #[test]
+    fn enter_on_help_in_the_menu_opens_help_and_esc_closes_straight_to_the_grid() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        assert_eq!(app.overlay, Overlay::Help { scroll: 0 });
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None, "help closed back to the menu");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn question_mark_shows_every_key_help_entry_and_closes_help() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        // crossterm reports `?` with SHIFT set.
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT), &state, &tx);
+        let text = frame_text(&mut app, &state, 80, 24);
+        for (keys, action) in KEY_HELP {
+            assert!(text.contains(keys), "`{keys}` missing:\n{text}");
+            assert!(text.contains(action), "`{action}` missing:\n{text}");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT), &state, &tx);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn help_scrolls_in_a_short_frame_without_scrolling_the_pane() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("dns");
+        key(&mut app, &state, &tx, KeyCode::Char('?'));
+        let text = frame_text(&mut app, &state, 80, 8);
+        assert!(text.contains("more"), "no overflow marker on a short help:\n{text}");
+        for _ in 0..KEY_HELP.len() + 3 {
+            key(&mut app, &state, &tx, KeyCode::Char('j'));
+        }
+        let Overlay::Help { scroll } = app.overlay else {
+            panic!("help closed: {:?}", app.overlay);
+        };
+        assert_eq!(scroll, (KEY_HELP.len() - 6) as u16, "Down stops at the last row");
+        key(&mut app, &state, &tx, KeyCode::Char('k'));
+        assert_eq!(app.overlay, Overlay::Help { scroll: scroll - 1 }, "first Up moves");
+        assert_eq!(
+            app.layout.scroll_offset("dns", Detail::Normal),
+            0,
+            "help keys scrolled the pane"
+        );
+    }
+
+    #[test]
+    fn h_l_and_p_are_ignored_while_a_box_is_open() {
+        let state = shared(overflowing_state());
+        let (mut app, tx) = app_on("security");
+        let protocol = state.lock().unwrap().protocol;
+        for open in [KeyCode::Esc, KeyCode::Char('?')] {
+            key(&mut app, &state, &tx, open);
+            let overlay = app.overlay;
+            for code in [KeyCode::Char('h'), KeyCode::Char('l'), KeyCode::Char('p'), KeyCode::Tab] {
+                key(&mut app, &state, &tx, code);
+            }
+            assert_eq!(app.overlay, overlay);
+            assert_eq!(focused(&app), Some("security"));
+            assert_eq!(state.lock().unwrap().protocol, protocol);
+            key(&mut app, &state, &tx, KeyCode::Esc);
+            assert_eq!(app.overlay, Overlay::None);
+        }
+    }
+
+    #[test]
+    fn opening_and_closing_a_box_keeps_zoom_focus_and_scroll() {
+        let state = overflowing_state();
+        state.scanners.insert(
+            "dns".to_string(),
+            scan_state(Some(ScanResult::Dns(dns_fixture(40))), None, ScanStatus::Complete),
+        );
+        let state = shared(state);
+        let (mut app, tx) = app_on("dns");
+        frame_text(&mut app, &state, 80, 24);
+        key(&mut app, &state, &tx, KeyCode::Down);
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        frame_text(&mut app, &state, 80, 24);
+        for _ in 0..3 {
+            key(&mut app, &state, &tx, KeyCode::Down);
+        }
+        frame_text(&mut app, &state, 80, 24);
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), 3);
+
+        key(&mut app, &state, &tx, KeyCode::Char('?'));
+        frame_text(&mut app, &state, 80, 24);
+        key(&mut app, &state, &tx, KeyCode::Char('j'));
+        key(&mut app, &state, &tx, KeyCode::Char('?'));
+        let text = frame_text(&mut app, &state, 80, 24);
+        assert!(app.layout.is_zoomed(), "help left zoom");
+        assert_eq!(titles(&text), vec!["dns"], "{text}");
+        assert_eq!(focused(&app), Some("dns"));
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), 3);
+
+        // The menu opens from the grid; it keeps the grid offset.
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        frame_text(&mut app, &state, 80, 24);
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        frame_text(&mut app, &state, 80, 24);
+        key(&mut app, &state, &tx, KeyCode::Char('j'));
+        key(&mut app, &state, &tx, KeyCode::Esc);
+        frame_text(&mut app, &state, 80, 24);
+        assert!(!app.layout.is_zoomed());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(focused(&app), Some("dns"));
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Normal), 1);
+    }
+
+    /// The target pane's top border row, as drawn in a `width` x `height` frame.
+    fn target_top_border(width: u16, height: u16) -> String {
+        let state = shared(overflowing_state());
+        let (mut app, _) = app_on("security");
+        let text = frame_text(&mut app, &state, width, height);
+        let rect = app
+            .layout
+            .pane_area("target", Rect::new(0, 0, width, height))
+            .expect("rect");
+        let top = text.lines().nth(usize::from(rect.y)).expect("top row");
+        top.chars().take(usize::from(rect.width)).collect()
+    }
+
+    #[test]
+    fn target_top_border_carries_the_key_legend_and_keeps_the_question_mark_when_narrow() {
+        let wide = target_top_border(200, 56);
+        assert!(wide.contains("┐target┌"), "`{wide}`");
+        assert!(wide.contains("┐←↓↑→ hjkl ? help┌"), "`{wide}`");
+
+        let narrow = target_top_border(80, 24);
+        assert!(narrow.contains("┐target┌"), "`{narrow}`");
+        assert!(narrow.contains('?'), "`{narrow}`");
+        assert!(!narrow.contains("help"), "`{narrow}`");
+    }
+
+    #[test]
+    fn zoom_footer_names_hjkl_and_help() {
+        for part in ["h/l", "j/k", "? help"] {
+            assert!(ZOOM_FOOTER.contains(part), "`{ZOOM_FOOTER}` lacks `{part}`");
+        }
     }
 }

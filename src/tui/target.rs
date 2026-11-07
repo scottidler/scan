@@ -260,6 +260,10 @@ impl Pane for TargetPane {
     fn is_focusable(&self) -> bool {
         true
     }
+
+    fn shows_key_legend(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -462,7 +466,7 @@ mod tests {
             );
         }
         assert!(out.contains("Status: 8/8 ✅"), "{out}");
-        assert!(!out.contains('↓'), "{out}");
+        assert!(!out.contains("↓ "), "overflow marker drawn:\n{out}");
     }
 
     #[test]
@@ -631,7 +635,7 @@ mod tests {
         let state = state_with_scanners(&SCANNER_DISPLAY_ORDER, ScanStatus::Running);
         let (width, height) = crate::tui::testing::dashboard_pane_size(0, 0, 200, 55);
         let out = crate::tui::testing::render_pane(&TargetPane::new(), &state, width, height, false);
-        assert!(!out.contains('↓'), "a row is hidden:\n{out}");
+        assert!(!out.contains("↓ "), "a row is hidden:\n{out}");
         assert!(!out.contains('…'), "nothing here is too long:\n{out}");
         assert!(out.contains("Status: 0/8 ✅ 8 🔄 · IPv4+IPv6 (p)"), "{out}");
         assert!(!out.contains("Protocol:"), "the protocol row is gone:\n{out}");

@@ -14,6 +14,9 @@ const DEFAULT_MIN_PANE_WIDTH: u16 = 20;
 const DEFAULT_MIN_PANE_HEIGHT: u16 = 6;
 const DEFAULT_SPAN_ROWS: usize = 1;
 const DEFAULT_SPAN_COLS: usize = 1;
+/// The key legend on the target pane's top border, longest first. Each shorter form drops one
+/// part (` help`, then ` hjkl`, then the arrows); `?` is in every form.
+const KEY_LEGENDS: [&str; 4] = ["←↓↑→ hjkl ? help", "←↓↑→ hjkl ?", "←↓↑→ ?", "?"];
 
 /// How much of a pane's data its content shows: the dashboard cell, or the pane zoomed to the
 /// full frame.
@@ -67,6 +70,11 @@ pub trait Pane {
         (DEFAULT_MIN_PANE_WIDTH, DEFAULT_MIN_PANE_HEIGHT)
     }
 
+    /// Whether the key legend is drawn right-aligned on this pane's top border.
+    fn shows_key_legend(&self) -> bool {
+        false
+    }
+
     /// Whether this pane can be focused/selected
     fn is_focusable(&self) -> bool {
         false
@@ -80,33 +88,71 @@ pub trait Pane {
 /// border between `┐` and `┌`. Focus brightens the border and turns the title red.
 pub fn create_block(title: &str, focused: bool) -> Block<'_> {
     log::trace!("[tui::pane] create_block: title={} focused={}", title, focused);
-    let border = if focused { theme::BORDER_FOCUSED } else { theme::pane_border(title) };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color(title, focused)))
+        .title(title_line(title, focused))
+}
+
+fn border_color(title: &str, focused: bool) -> ratatui::style::Color {
+    if focused { theme::BORDER_FOCUSED } else { theme::pane_border(title) }
+}
+
+/// The left top-border title, `─┐title┌`.
+fn title_line(title: &str, focused: bool) -> Line<'static> {
+    let border = border_color(title, focused);
     let title_style = if focused {
         Style::default().fg(theme::TITLE_FOCUSED).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme::TITLE).add_modifier(Modifier::BOLD)
     };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
-        .title(Line::from(vec![
-            Span::styled("─┐", Style::default().fg(border)),
-            Span::styled(title.to_string(), title_style),
-            Span::styled("┌", Style::default().fg(border)),
-        ]))
+    Line::from(vec![
+        Span::styled("─┐", Style::default().fg(border)),
+        Span::styled(title.to_string(), title_style),
+        Span::styled("┌", Style::default().fg(border)),
+    ])
 }
 
 /// A bottom-border label set between `┘` and `└` in the border's color, as btop draws its key
 /// hints.
-fn bottom_label(text: String, focused: bool, title: &str) -> Line<'static> {
-    let border = if focused { theme::BORDER_FOCUSED } else { theme::pane_border(title) };
+pub(crate) fn bottom_label(text: String, focused: bool, title: &str) -> Line<'static> {
+    let border = border_color(title, focused);
     Line::from(vec![
         Span::styled("┘", Style::default().fg(border)),
         Span::styled(text, Style::default().fg(theme::LABEL)),
         Span::styled("└─", Style::default().fg(border)),
     ])
     .right_aligned()
+}
+
+/// A right-aligned top-border label set between `┐` and `┌`, styled as `bottom_label`.
+fn top_label(text: &str, focused: bool, title: &str) -> Line<'static> {
+    let border = border_color(title, focused);
+    Line::from(vec![
+        Span::styled("┐", Style::default().fg(border)),
+        Span::styled(text.to_string(), Style::default().fg(theme::LABEL)),
+        Span::styled("┌─", Style::default().fg(border)),
+    ])
+    .right_aligned()
+}
+
+/// The longest key legend that fits on the top border of a `width`-cell box beside its title,
+/// with one cell between them, or `None` when not even `?` fits.
+pub(crate) fn key_legend(width: u16, title: &str, focused: bool) -> Option<Line<'static>> {
+    let room = usize::from(width.saturating_sub(2));
+    let taken = title_line(title, focused).width() + 1;
+    let legend = KEY_LEGENDS
+        .iter()
+        .map(|text| top_label(text, focused, title))
+        .find(|line| taken + line.width() <= room);
+    log::trace!(
+        "[tui::pane] key_legend: width={} title={} fits={}",
+        width,
+        title,
+        legend.is_some()
+    );
+    legend
 }
 
 /// Where a pane's rows stand in its rect: the clamped first row shown, and how many rows sit
@@ -174,6 +220,14 @@ pub fn draw_rows<P: Pane + ?Sized>(
     );
     let block = match view.marker() {
         Some(marker) => block.title_bottom(bottom_label(marker, focused, pane.title())),
+        None => block,
+    };
+    let legend = pane
+        .shows_key_legend()
+        .then(|| key_legend(area.width, pane.title(), focused))
+        .flatten();
+    let block = match legend {
+        Some(legend) => block.title_top(legend),
         None => block,
     };
     block.render(area, frame.buffer_mut());
@@ -254,6 +308,31 @@ mod tests {
         assert_eq!(RowView::new(10, 4, 0).marker().as_deref(), Some("↓ 6 more"));
         assert_eq!(RowView::new(10, 4, 2).marker().as_deref(), Some("↑ 2 ↓ 4 more"));
         assert_eq!(RowView::new(10, 4, 6).marker().as_deref(), Some("↑ 6"));
+    }
+
+    fn legend_text(width: u16) -> Option<String> {
+        key_legend(width, "target", false).map(|line| line.spans[1].content.to_string())
+    }
+
+    #[test]
+    fn key_legend_drops_help_then_hjkl_then_the_arrows_and_keeps_the_question_mark() {
+        // `─┐target┌` is 9 cells, plus one gap and the two corners: 12 cells before the legend.
+        assert_eq!(legend_text(60).as_deref(), Some("←↓↑→ hjkl ? help"));
+        assert_eq!(legend_text(12 + 19).as_deref(), Some("←↓↑→ hjkl ? help"));
+        assert_eq!(legend_text(12 + 18).as_deref(), Some("←↓↑→ hjkl ?"));
+        assert_eq!(legend_text(12 + 14).as_deref(), Some("←↓↑→ hjkl ?"));
+        assert_eq!(legend_text(12 + 13).as_deref(), Some("←↓↑→ ?"));
+        assert_eq!(legend_text(12 + 9).as_deref(), Some("←↓↑→ ?"));
+        assert_eq!(legend_text(12 + 8).as_deref(), Some("?"));
+        assert_eq!(legend_text(12 + 4).as_deref(), Some("?"));
+        assert_eq!(legend_text(12 + 3), None);
+    }
+
+    #[test]
+    fn every_key_legend_form_carries_the_question_mark() {
+        assert!(KEY_LEGENDS.iter().all(|text| text.contains('?')));
+        let widths: Vec<usize> = KEY_LEGENDS.iter().map(|text| Span::raw(*text).width()).collect();
+        assert!(widths.windows(2).all(|pair| pair[0] > pair[1]), "{widths:?}");
     }
 
     #[test]
