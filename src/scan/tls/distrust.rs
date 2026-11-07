@@ -51,6 +51,18 @@ pub static DISTRUSTED_CAS: &[DistrustedCa] = &[
         distrusted_after: None,
         source: "https://security.googleblog.com/2017/09/chromes-plan-to-distrust-symantec.html",
     },
+    // The same Symantec action, for the TC TrustCenter roots the post does not name by brand.
+    // Chromium's net/data/ssl/symantec README applies the policy to every root in roots/, by SPKI;
+    // ten of them are TC TrustCenter's, under these two O= spellings (read from the certificates).
+    DistrustedCa {
+        name: "Symantec (TC TrustCenter)",
+        organizations: &[
+            "TC TrustCenter GmbH",
+            "TC TrustCenter for Security in Data Networks GmbH",
+        ],
+        distrusted_after: None,
+        source: "https://chromium.googlesource.com/chromium/src/+/refs/tags/100.0.4896.60/net/data/ssl/symantec/README.md",
+    },
     // Chrome 56 dropped certificates issued after 2016-10-21, "culminating in the full distrust
     // of these CAs"; Chromium's net/data/ssl/blocklist lists their roots under "WoSign/StartCom".
     // O= values from those blocklisted roots.
@@ -170,6 +182,20 @@ mod tests {
             distrust_of(Some("AC CAMERFIRMA S.A."), at(2026, 1, 1, 0)).map(|ca| ca.name),
             Some("Camerfirma")
         );
+    }
+
+    #[test]
+    fn both_tc_trustcenter_spellings_are_covered_for_every_leaf() {
+        for organization in [
+            "TC TrustCenter GmbH",
+            "TC TrustCenter for Security in Data Networks GmbH",
+        ] {
+            assert_eq!(
+                distrust_of(Some(organization), at(2026, 1, 1, 0)).map(|ca| ca.name),
+                Some("Symantec (TC TrustCenter)"),
+                "{organization}"
+            );
+        }
     }
 
     #[test]
