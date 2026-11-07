@@ -417,7 +417,7 @@ impl SecurityPane {
         {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
-                "🌐 HTTP Security",
+                "🧱 HTTP Security",
                 Style::default().fg(theme::VALUE),
             )]));
 
@@ -517,7 +517,7 @@ impl SecurityPane {
         } else if let Some(observatory) = http_grade_only {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
-                "🌐 HTTP Security",
+                "🧱 HTTP Security",
                 Style::default().fg(theme::VALUE),
             )]));
             lines.push(crate::tui::http::grade_line("📊 HTTP Grade: ", &observatory));

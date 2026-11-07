@@ -164,7 +164,7 @@ impl Pane for WhoisPane {
                     wrapped.push(lines.len());
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                    Span::styled("🔖 Domain: ", Style::default().fg(theme::LABEL)),
                     Span::styled(whois_result.domain_label(), Style::default().fg(theme::VALUE)),
                 ]));
 
@@ -301,7 +301,7 @@ impl Pane for WhoisPane {
                 match whois_state.status {
                     crate::types::ScanStatus::Running => {
                         lines.push(Line::from(vec![
-                            Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("🔖 Domain: ", Style::default().fg(theme::LABEL)),
                             Span::styled("querying...", Style::default().fg(theme::WARN)),
                         ]));
 
@@ -312,13 +312,13 @@ impl Pane for WhoisPane {
                     }
                     crate::types::ScanStatus::Failed => {
                         lines.push(Line::from(vec![
-                            Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("🔖 Domain: ", Style::default().fg(theme::LABEL)),
                             Span::styled("query failed", Style::default().fg(theme::BAD)),
                         ]));
                     }
                     _ => {
                         lines.push(Line::from(vec![
-                            Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                            Span::styled("🔖 Domain: ", Style::default().fg(theme::LABEL)),
                             Span::styled("waiting to query...", Style::default().fg(theme::MUTED)),
                         ]));
                     }
@@ -332,7 +332,7 @@ impl Pane for WhoisPane {
             ]);
 
             lines.push(Line::from(vec![
-                Span::styled("🌐 Domain: ", Style::default().fg(theme::LABEL)),
+                Span::styled("🔖 Domain: ", Style::default().fg(theme::LABEL)),
                 Span::styled("WHOIS scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }
@@ -420,7 +420,7 @@ mod tests {
             &state_with_whois(result),
             1,
             0,
-            &format!("🌐 Domain: {LONG_DOMAIN}"),
+            &format!("🔖 Domain: {LONG_DOMAIN}"),
         );
     }
 

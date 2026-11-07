@@ -152,12 +152,12 @@ fn lens_lines(lenses: &Lenses, observatory: &ObservatoryOutcome) -> Vec<Line<'st
     )];
     lines.push(match &lenses.timing {
         LensOutcome::Present(timing) => lens_row(
-            "⏱ ",
+            "🕒 ",
             Span::styled(timing_text(timing), Style::default().fg(theme::VALUE)),
         ),
-        LensOutcome::Absent => lens_row("⏱ Timing: ", Span::styled("none", Style::default().fg(theme::MUTED))),
+        LensOutcome::Absent => lens_row("🕒 Timing: ", Span::styled("none", Style::default().fg(theme::MUTED))),
         LensOutcome::Failed(reason) => lens_row(
-            "⏱ Timing: ",
+            "🕒 Timing: ",
             Span::styled(format!("failed: {reason}"), Style::default().fg(theme::BAD)),
         ),
     });
@@ -346,7 +346,7 @@ impl Pane for HttpPane {
 
         // HTTP status header
         lines.push(Line::from(vec![
-            Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+            Span::styled("📨 Status: ", Style::default().fg(theme::VALUE)),
             Span::styled("scanning...", Style::default().fg(theme::MUTED)),
         ]));
 
@@ -358,7 +358,7 @@ impl Pane for HttpPane {
             // Update header with current status
             let (label, label_color) = crate::tui::status_label(&http_state, "scanning...", "completed");
             lines[0] = Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("📨 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]);
 
@@ -508,7 +508,7 @@ impl Pane for HttpPane {
         } else {
             // No HTTP scanner available
             lines[0] = Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("📨 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled("unavailable", Style::default().fg(theme::BAD)),
             ]);
 

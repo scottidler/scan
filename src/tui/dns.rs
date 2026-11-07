@@ -49,12 +49,12 @@ impl DnsPane {
         if let Some(dns_state) = state.scanners.get("dns") {
             let (label, label_color) = crate::tui::status_label(&dns_state, "resolving...", "resolved");
             lines.push(Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("🔎 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+                Span::styled("🔎 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled("scanner not available", Style::default().fg(theme::BAD)),
             ]));
         }

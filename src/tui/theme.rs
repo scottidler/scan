@@ -256,4 +256,29 @@ fn after_tests() { Color::Green }
             offenders.join("\n")
         );
     }
+
+    #[test]
+    fn no_pane_source_uses_a_text_rendered_glyph() {
+        let banned = [
+            // FiraCode Nerd Font Mono carries a monochrome globe, which the terminal draws in place of the color emoji.
+            '\u{1F310}',
+            // Text presentation by default; only U+FE0F makes it an emoji, and the FE0F lint bans that.
+            '\u{23F1}',
+        ];
+        let offenders: Vec<String> = tui_sources()
+            .iter()
+            .flat_map(|(name, source)| {
+                source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.chars().any(|c| banned.contains(&c)))
+                    .map(move |(index, _)| format!("src/tui/{name}:{}", index + 1))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these glyphs render as text in FiraCode Nerd Font Mono:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

@@ -9,3 +9,14 @@
 - Default features vs `dnssec-ring` — not needed, so no new crates.
 ### Open questions
 - None.
+
+## Phase 1: Glyph swap and lint
+### Design decisions
+- Each of the 15 🌐 and 3 ⏱ mapped by pane to the doc's table (whois 6 -> 🔖, dns 2 -> 🔎, security 2 -> 🧱, connectivity 2 -> 📶, http 3 status -> 📨, http 3 timing ⏱ -> 🕒) — src/tui/*.rs — every occurrence fit a row, none ambiguous.
+- Lint bans the glyphs by `char` escapes (`'\u{1F310}'`, `'\u{23F1}'`) — src/tui/theme.rs:no_pane_source_uses_a_text_rendered_glyph — so theme.rs, which is scanned by `tui_sources()`, does not trip itself.
+### Deviations
+- None. (The 15-count in the doc covers 🌐 only; the 3 http ⏱ occurrences are the additional zoom-timing row.)
+### Tradeoffs
+- Reason comments inline per banned entry vs a shared doc comment — matches the doc's "each entry carries its own reason".
+### Open questions
+- None.

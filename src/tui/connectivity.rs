@@ -509,7 +509,7 @@ fn status_line(state: &AppState, ipv4_state: &ConnectivityState, ipv6_state: &Co
 
     // Status line
     let mut status_spans = vec![
-        Span::styled("🌐 Status: ", Style::default().fg(theme::VALUE)),
+        Span::styled("📶 Status: ", Style::default().fg(theme::VALUE)),
         Span::styled(status_text, Style::default().fg(status_color)),
     ];
     if let Some(failure) = scan_failure {
@@ -1091,7 +1091,7 @@ mod tests {
             &state,
             0,
             1,
-            &format!("🌐 Status: failed: {reason}"),
+            &format!("📶 Status: failed: {reason}"),
         );
     }
 
