@@ -1,6 +1,6 @@
 mod distrust;
 
-pub use distrust::{DISTRUSTED_CAS, DistrustedCa, distrust_of};
+pub use distrust::{DistrustedCa, builtin_distrusted_cas, distrust_of, validate};
 
 use super::connect::TcpConnector;
 use super::{Family, classify_route_error, family_failure};

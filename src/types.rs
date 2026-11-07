@@ -1,3 +1,4 @@
+use crate::scan::tls::{DistrustedCa, builtin_distrusted_cas};
 use crate::target::Protocol;
 use dashmap::DashMap;
 use std::collections::VecDeque;
@@ -10,6 +11,8 @@ pub struct AppState {
     pub protocol: Protocol,
     /// Addresses from `Target` resolution: the literal for an IP target, the system resolver's answer for a name.
     pub resolved_ips: Vec<IpAddr>,
+    /// The distrust entries the cert pane checks: the built-ins, then any the user added.
+    pub distrusted_cas: Vec<DistrustedCa>,
 }
 
 impl AppState {
@@ -19,6 +22,7 @@ impl AppState {
             scanners: DashMap::new(),
             protocol: Protocol::Both, // Default to scanning both IPv4 and IPv6
             resolved_ips: Vec::new(),
+            distrusted_cas: builtin_distrusted_cas(),
         }
     }
 

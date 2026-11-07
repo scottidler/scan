@@ -271,7 +271,6 @@ mod tests {
     use super::*;
     use crate::target::Protocol;
     use crate::types::{ScanState, ScanStatus};
-    use dashmap::DashMap;
     use std::time::Instant;
 
     #[test]
@@ -327,12 +326,7 @@ mod tests {
 
     #[test]
     fn test_calculate_stats() {
-        let state = AppState {
-            target: "example.com".to_string(),
-            scanners: DashMap::new(),
-            protocol: Protocol::Both,
-            resolved_ips: Vec::new(),
-        };
+        let state = AppState::new("example.com".to_string());
 
         // Add some test scanner states
         state.scanners.insert(

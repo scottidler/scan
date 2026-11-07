@@ -3,7 +3,7 @@
 //! chain is what the server sent, not a verified path: the root is usually not sent, so the pane
 //! never claims to show it.
 
-use crate::scan::tls::{CertificateInfo, TlsData, distrust_of};
+use crate::scan::tls::{CertificateInfo, DistrustedCa, TlsData, distrust_of};
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::text::plural;
 use crate::tui::theme;
@@ -67,7 +67,7 @@ impl CertPane {
 
         let mut lines = vec![
             status_line(status),
-            ca_line(leaf, &data.certificate_chain),
+            ca_line(&state.distrusted_cas, leaf, &data.certificate_chain),
             validity_line(data),
         ];
         lines.push(row("Subject: ", common_name_display(&leaf.subject), theme::WARN));
@@ -82,7 +82,12 @@ impl CertPane {
         if !leaf.san_domains.is_empty() {
             lines.push(row("SAN: ", plural(leaf.san_domains.len(), "domain"), theme::GOOD));
         }
-        lines.extend(chain_lines(&data.certificate_chain, leaf, detail));
+        lines.extend(chain_lines(
+            &state.distrusted_cas,
+            &data.certificate_chain,
+            leaf,
+            detail,
+        ));
         lines
     }
 }
@@ -125,10 +130,10 @@ fn ca_text(cert: &CertificateInfo) -> String {
 /// `CA: Google Trust Services (WE2)`, the leaf's issuer. It reads `BAD` with `(distrusted CA)`
 /// when any presented certificate's issuer is under a distrust action, judged by the leaf's
 /// `notBefore`, so a distrusted intermediate's issuer marks the CA row as well as its chain row.
-fn ca_line(leaf: &CertificateInfo, chain: &[CertificateInfo]) -> Line<'static> {
+fn ca_line(cas: &[DistrustedCa], leaf: &CertificateInfo, chain: &[CertificateInfo]) -> Line<'static> {
     let distrusted = chain
         .iter()
-        .any(|cert| distrust_of(cert.issuer_organization.as_deref(), leaf.not_before).is_some());
+        .any(|cert| distrust_of(cas, cert, leaf.not_before).is_some());
     let mut spans = vec![
         Span::styled("CA: ", Style::default().fg(theme::LABEL)),
         Span::styled(
@@ -168,9 +173,13 @@ fn validity_line(data: &TlsData) -> Line<'static> {
 /// The chain as the server sent it. The grid shows one row per certificate, its subject's CN;
 /// zoom shows each certificate's full detail. A certificate whose issuer is under a distrust
 /// action, judged by the leaf's `notBefore`, reads `BAD` with `(distrusted CA)`.
-fn chain_lines(chain: &[CertificateInfo], leaf: &CertificateInfo, detail: Detail) -> Vec<Line<'static>> {
-    let distrusted =
-        |cert: &CertificateInfo| distrust_of(cert.issuer_organization.as_deref(), leaf.not_before).is_some();
+fn chain_lines(
+    cas: &[DistrustedCa],
+    chain: &[CertificateInfo],
+    leaf: &CertificateInfo,
+    detail: Detail,
+) -> Vec<Line<'static>> {
+    let distrusted = |cert: &CertificateInfo| distrust_of(cas, cert, leaf.not_before).is_some();
     let mut lines = Vec::new();
     if detail == Detail::Normal {
         lines.push(Line::from(Span::styled(
@@ -449,6 +458,55 @@ mod tests {
         assert!(!out.contains("  www.example.hu (distrusted CA)"), "{out}");
         let buffer = render_buffer(&pane, &state, 120, 20, false);
         assert_eq!(fg_of(&buffer, "Example Issuing CA Kft. (Example CA)"), theme::BAD);
+    }
+
+    /// The chain www.purdue.edu served on 2026-11-07: leaf, `InCommon Intermediate CA - OVG2C`
+    /// (`O=Internet2`), then `emSign Root TLS CA - G1`, under `emSign Root CA - G1`.
+    fn purdue_state(not_before: chrono::DateTime<Utc>) -> AppState {
+        let mut leaf = cert(
+            "CN=www.purdue.edu",
+            Some("Internet2"),
+            Some("InCommon Intermediate CA - OVG2C"),
+        );
+        leaf.not_before = not_before;
+        let incommon = cert(
+            "C=US, O=Internet2, CN=InCommon Intermediate CA - OVG2C",
+            Some("eMudhra Technologies Limited"),
+            Some("emSign Root TLS CA - G1"),
+        );
+        let root_tls = cert(
+            "C=IN, O=eMudhra Technologies Limited, CN=emSign Root TLS CA - G1",
+            Some("eMudhra Technologies Limited"),
+            Some("emSign Root CA - G1"),
+        );
+        state_with(tls_data(vec![leaf, incommon, root_tls]), ScanStatus::Complete)
+    }
+
+    /// Chrome's G1 action covers leaves whose earliest SCT is after 2026-11-16: Purdue's
+    /// 2026-11-02 leaf is still trusted, and the same chain on a 2026-11-17 leaf is not.
+    #[test]
+    fn a_purdue_shaped_chain_is_marked_only_after_the_g1_cutoff() {
+        let pane = CertPane::new();
+        let before = purdue_state(Utc.with_ymd_and_hms(2026, 11, 2, 21, 3, 10).unwrap());
+        let out = render_pane(&pane, &before, 120, 20, false);
+        assert!(!out.contains("distrusted"), "{out}");
+        assert!(
+            out.contains("CA: Internet2 (InCommon Intermediate CA - OVG2C)"),
+            "{out}"
+        );
+
+        let after = purdue_state(Utc.with_ymd_and_hms(2026, 11, 17, 0, 0, 0).unwrap());
+        let out = render_pane(&pane, &after, 120, 20, false);
+        assert!(
+            out.contains("CA: Internet2 (InCommon Intermediate CA - OVG2C) (distrusted CA)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  InCommon Intermediate CA - OVG2C (distrusted CA)"),
+            "{out}"
+        );
+        assert!(out.contains("  emSign Root TLS CA - G1 (distrusted CA)"), "{out}");
+        assert!(!out.contains("  www.purdue.edu (distrusted CA)"), "{out}");
     }
 
     /// Phase 4 criterion: a failed scan with a kept older result says so on the status row.
