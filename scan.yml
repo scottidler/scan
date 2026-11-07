@@ -1,0 +1,14 @@
+# scan config: copy to ~/.config/scan/scan.yml (or $XDG_CONFIG_HOME/scan/scan.yml).
+# distrusted-cas: entries ADDED to scan's built-in list; they never replace it.
+# An entry matches a presented certificate when every list it fills matches:
+#   organizations: the issuer O= CONTAINS one of these (case-insensitive)
+#   issuer-common-names: the issuer CN= EQUALS one of these (case-insensitive)
+#   distrusted-after: only leaves whose notBefore day is after this date (omit = every leaf)
+# A bad file stops scan with an error naming this file; it is never ignored.
+#
+# distrusted-cas:
+#   - name: Example CA
+#     organizations: ["Example CA Ltd."]
+#     issuer-common-names: ["Example Root CA - R1"]
+#     distrusted-after: 2026-12-31
+#     source: https://example.com/announcement

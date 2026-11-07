@@ -71,6 +71,7 @@ async fn run() -> Result<()> {
     log::info!("================================================================================");
 
     let args = Args::parse();
+    let config = scan::config::load()?;
     log::debug!(
         "[main] main: target={} debug={} no_tui={}",
         args.target,
@@ -112,6 +113,7 @@ async fn run() -> Result<()> {
     // Create shared application state (wrapped in Mutex for protocol changes)
     let mut app_state = scan::types::AppState::new(args.target.clone());
     app_state.resolved_ips = target.all_ips().to_vec();
+    app_state.distrusted_cas.extend(config.distrusted_cas);
     log::debug!(
         "[main] app_state_created: target={} resolved_ips={:?}",
         args.target,

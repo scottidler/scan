@@ -30,3 +30,36 @@ Design doc: `docs/plan/2026-11-07-distrust-config-and-emudhra.md`
 
 ### Open questions
 - None.
+
+## Phase 2: `scan.yml` overlay
+
+### Design decisions
+- `load_from` matches `ErrorKind::NotFound` only for "no file"; every other read error returns `Err` with the path (`src/config.rs:load_from`). A directory at the path reads as an error, not as missing.
+- A comment-only or blank file parses as `Option<Config>`, `None` becoming `Config::default()` (`src/config.rs:load_from`).
+- Validation failures read `invalid config <path>: distrusted-cas entry <index>: <validate() message naming the entry and key>` via `wrap_err_with` over Phase 1's `validate()` (`src/config.rs:load_from`). `{:#}` prints the chain.
+- `xdg_config_dir` is the `rules/rust.md` template, private; `config_path` is public (`src/config.rs`).
+- `load()` runs right after `Args::parse()`, before target resolution, and its error propagates out of `run()` (`src/main.rs`); the user entries are appended with `extend` onto the built-ins `AppState::new` filled.
+- `cargo add --dev tempfile` for the tests (the `rules/rust.md` env test template and temp config files use it). `serde_yaml` added with `cargo add` (0.9.34+deprecated, as the doc expects).
+- `the_shipped_example_entry_is_valid_once_uncommented` locates the example block with `"\n# distrusted-cas:\n"`, not the bare key, because the prose line `# distrusted-cas: entries ADDED ...` earlier in the file would match first.
+- Extra tests beyond the list: blank file, unknown top-level key, entry missing `name`.
+
+### Deviations
+- None. One observation: for AC2's `Broken` entry (only `name`), serde fails first on the missing required `source` field, so the error reads `distrusted-cas[0]: missing field source` and does not name the entry. The path is named, which is what AC2 requires. `validate()`'s entry-name message is reached only for entries that parse (the no-matcher test supplies `source`).
+
+### Tradeoffs
+- `tempfile` as a dev-dependency vs hand-rolled temp dirs: the `rules/rust.md` test template uses it, and cleanup is automatic.
+
+### Acceptance criteria observed (2026-11-07, `cargo build`, `BIN=target/debug/scan`, scratch dir with the doc's exact YAML)
+- AC2: `XDG_CONFIG_HOME=$D/bad timeout 8 $BIN --no-tui example.com` -> `AC2 exit=1`. stderr:
+  ```
+  Error: invalid config <D>/bad/scan/scan.yml
+
+  Caused by:
+      distrusted-cas[0]: missing field `source` at line 2 column 5
+  ```
+- AC3: `bin/snap.py google.com --bin "env XDG_CONFIG_HOME=$D/gts $BIN" --cols 200 --rows 56 --wait 10 --ansi ...`: CA row reads `CA: Google Trust Services (WE2) (distrusted CA)`; chain rows `*.google.com (distrusted CA)` and `WE2 (distrusted CA)`. Control with `$D/empty`: 0 lines match `distrusted`.
+- AC4: `bin/snap.py www.purdue.edu --bin "env XDG_CONFIG_HOME=$D/empty $BIN" ...`: `emSign Root TLS CA - G1` on 1 line, 0 lines match `distrusted`, CA row `CA: Internet2 (InCommon Intermediate CA - OVG2C)`. Leaf `notBefore=Nov  2 21:03:10 2026 GMT`, on or before the cutoff, so no mark is correct (date-bound note holds).
+- `cargo test --lib config`: 16 passed. `otto ci`: green.
+
+### Open questions
+- None.

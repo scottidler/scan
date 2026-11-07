@@ -1,6 +1,19 @@
 # scan
 scan url/domain/ip
 
+## Config
+
+scan reads an optional `~/.config/scan/scan.yml` (or `$XDG_CONFIG_HOME/scan/scan.yml`). Its
+`distrusted-cas` list adds entries to the built-in list of CA owners that browsers distrust; it
+never replaces the built-ins. Each entry takes `name`, `source` (an `https://` URL),
+`organizations` (issuer `O=` contains), `issuer-common-names` (issuer `CN=` equals) and an
+optional `distrusted-after` date. At least one of `organizations` and `issuer-common-names` is
+required.
+
+A file that cannot be read, parsed or validated stops scan with an error naming the file; it is
+never treated as empty. The `(distrusted CA)` mark is shown only in the TUI, not in `--no-tui` or
+`--debug` output. See `scan.yml` at the repo root for an annotated example.
+
 ## License
 
 scan is MIT licensed (`LICENSE`), except `src/scan/observatory/` and its test fixtures under
