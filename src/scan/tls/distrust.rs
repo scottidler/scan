@@ -10,7 +10,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 pub struct DistrustedCa {
     /// The CA owner, for logs.
     pub name: &'static str,
-    /// Every issuer `O=` value the distrust covers, compared ASCII-case-insensitively.
+    /// The issuer `O=` values the distrust covers: an `O=` containing any of them matches,
+    /// ASCII-case-insensitively, as Chrome's own guidance reads the field.
     pub organizations: &'static [&'static str],
     /// Certificates whose leaf `notBefore` falls on a later UTC day are covered; `None` covers
     /// every certificate.
@@ -23,7 +24,9 @@ const fn date(year: i32, month: u32, day: u32) -> Option<NaiveDate> {
     Some(NaiveDate::from_ymd_opt(year, month, day).expect("valid date"))
 }
 
-/// Each entry was read from its `source` on 2026-11-07. `organizations` are the `O=` values of
+/// Each entry was read from its `source` on 2026-11-07. Where the source names the `O=` values
+/// that need action (Entrust, Chunghwa Telecom, NetLock), those are listed verbatim; otherwise
+/// `organizations` are the `O=` values of
 /// the roots the action names, read from the certificates themselves.
 pub static DISTRUSTED_CAS: &[DistrustedCa] = &[
     // Chrome 70 "fully remove[d] trust in Symantec's old infrastructure and all of the
@@ -67,24 +70,26 @@ pub static DISTRUSTED_CAS: &[DistrustedCa] = &[
     },
     // Chrome 131: certificates "whose earliest Signed Certificate Timestamp (SCT) is dated after
     // November 11, 2024 (11:59:59 PM UTC)", under the Entrust and AffirmTrust roots it lists.
+    // Its FAQ: action is required if the Issued By `O=` "contains "Entrust" or "AffirmTrust"".
     DistrustedCa {
         name: "Entrust",
-        organizations: &["Entrust, Inc.", "Entrust.net", "AffirmTrust"],
+        organizations: &["Entrust", "AffirmTrust"],
         distrusted_after: date(2024, 11, 11),
         source: "https://security.googleblog.com/2024/06/sustaining-digital-certificate-security.html",
     },
     // Chrome 139: earliest SCT "dated after July 31, 2025 11:59:59 PM UTC", under the ePKI and
-    // HiPKI roots.
+    // HiPKI roots. Its FAQ: action is required if the Issued By `O=` contains "Chunghwa
+    // Telecom", "行政院", "NETLOCK Ltd.", or "NETLOCK Kft.".
     DistrustedCa {
         name: "Chunghwa Telecom",
-        organizations: &["Chunghwa Telecom Co., Ltd."],
+        organizations: &["Chunghwa Telecom", "行政院"],
         distrusted_after: date(2025, 7, 31),
         source: "https://security.googleblog.com/2025/05/sustaining-digital-certificate-security-chrome-root-store-changes.html",
     },
     // The same action and date, under the NetLock Arany (Class Gold) root.
     DistrustedCa {
         name: "NetLock",
-        organizations: &["NetLock Kft."],
+        organizations: &["NETLOCK Ltd.", "NETLOCK Kft."],
         distrusted_after: date(2025, 7, 31),
         source: "https://security.googleblog.com/2025/05/sustaining-digital-certificate-security-chrome-root-store-changes.html",
     },
@@ -97,7 +102,7 @@ pub fn distrust_of(issuer_organization: Option<&str>, leaf_not_before: DateTime<
     let found = DISTRUSTED_CAS.iter().find(|ca| {
         ca.organizations
             .iter()
-            .any(|listed| listed.eq_ignore_ascii_case(organization))
+            .any(|listed| organization.to_ascii_lowercase().contains(&listed.to_ascii_lowercase()))
             && ca
                 .distrusted_after
                 .is_none_or(|after| leaf_not_before.date_naive() > after)
@@ -133,6 +138,26 @@ mod tests {
             distrust_of(Some("AffirmTrust"), at(2025, 1, 1, 0)).map(|ca| ca.name),
             Some("Entrust")
         );
+    }
+
+    /// Every `O=` spelling the Chunghwa/NetLock and Entrust posts name, contained in the field.
+    #[test]
+    fn every_spelling_the_sources_name_is_matched_by_containment() {
+        for (organization, ca) in [
+            ("行政院", "Chunghwa Telecom"),
+            ("Chunghwa Telecom Co., Ltd.", "Chunghwa Telecom"),
+            ("NETLOCK Ltd.", "NetLock"),
+            ("NetLock Kft.", "NetLock"),
+            ("Entrust Limited", "Entrust"),
+            ("Entrust.net", "Entrust"),
+        ] {
+            assert_eq!(
+                distrust_of(Some(organization), at(2025, 8, 1, 0)).map(|ca| ca.name),
+                Some(ca),
+                "{organization}"
+            );
+        }
+        assert_eq!(distrust_of(Some("NETLOCK Ltd."), at(2025, 7, 31, 23)), None);
     }
 
     #[test]

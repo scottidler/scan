@@ -1251,6 +1251,27 @@ mod tests {
         );
     }
 
+    /// The key table: Enter while zoomed does nothing, so the zoomed scroll stays where it was.
+    #[test]
+    fn enter_while_zoomed_keeps_the_zoom_and_its_scroll() {
+        let state = overflowing_state();
+        state.scanners.insert(
+            "dns".to_string(),
+            scan_state(Some(ScanResult::Dns(dns_fixture(40))), None, ScanStatus::Complete),
+        );
+        let state = shared(state);
+        let (mut app, tx) = app_on("dns");
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        frame_text(&mut app, &state, 80, 24);
+        for _ in 0..3 {
+            key(&mut app, &state, &tx, KeyCode::Down);
+        }
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), 3);
+        key(&mut app, &state, &tx, KeyCode::Enter);
+        assert!(app.layout.is_zoomed());
+        assert_eq!(app.layout.scroll_offset("dns", Detail::Zoomed), 3, "Enter re-zoomed");
+    }
+
     #[test]
     fn enter_with_no_focused_pane_stays_in_the_grid() {
         let mut layout = crate::tui::create_default_layout();

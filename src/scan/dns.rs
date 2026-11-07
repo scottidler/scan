@@ -588,16 +588,13 @@ impl DnsScanner {
         txt: &[DnsRecord<String>],
         mx: &[DnsRecord<MxRecord>],
     ) -> Option<EmailSecurityAnalysis> {
-        let host = target.domain.as_deref()?;
-        if host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok()
-        {
-            log::debug!("[scan::dns] email_security_skipped: host={} is an IP address", host);
+        let Some(host) = target.dns_name() else {
+            log::debug!(
+                "[scan::dns] email_security_skipped: target={} has an IP host",
+                target.display_name()
+            );
             return None;
-        }
+        };
         log::debug!("[scan::dns] email_security: host={}", host);
         let ((dmarc_txt, zone, dnssec, dkim), (mta_sts, tls_rpt)) = tokio::join!(
             async {
@@ -649,8 +646,8 @@ impl DnsScanner {
             }
         };
 
-        // Forward DNS lookups (for domains)
-        if let Some(domain) = &target.domain {
+        // Forward DNS lookups, for a name only: an IP host, bare or in a URL, gets none.
+        if let Some(domain) = target.dns_name() {
             log::debug!(
                 "[scan::dns] starting_forward_lookups: domain={} protocol={}",
                 domain,
@@ -2245,6 +2242,18 @@ mod tests {
                 registrable: false
             }
         );
+    }
+
+    /// An IP host in a URL gets no forward lookups (no MX, TXT, DS or DKIM): the result is
+    /// reverse-only, like a bare IP target's.
+    #[tokio::test]
+    async fn an_ip_url_target_gets_no_forward_lookups() {
+        let scanner = test_scanner().await;
+        let target = Target::parse("https://192.0.2.1/").expect("target");
+        let result = scanner.perform_dns_lookup(&target, Protocol::Both).await.expect("scan");
+        assert!(result.is_reverse_only(), "MX was asked: {:?}", result.MX_status);
+        assert!(!result.A_status.was_attempted(), "{:?}", result.A_status);
+        assert!(result.email_security.is_none());
     }
 
     /// Phase 4 criterion: an IP target gets no email posture and sends no DS or DKIM query; a

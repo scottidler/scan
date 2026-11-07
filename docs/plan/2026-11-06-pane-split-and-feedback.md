@@ -108,7 +108,7 @@ security after the split keeps:
 - the HTTP security headers;
 - the grade and issue count.
 
-Only rendering moves. The grade (Observatory, via the `http` scanner) and the issue list (the `tls` scanner) are computed as today.
+Only rendering moves. The grade folded into the status row is the TLS grade (`TlsResult::get_best_security_grade`, the `tls` scanner), and the issue list is the `tls` scanner's; both are computed as today. Observatory's HTTP grade (via the `http` scanner) keeps its own `HTTP Grade:` row in the HTTP security section.
 
 | step | rows |
 |---|---|
@@ -156,6 +156,7 @@ Zoom keeps the long form of everything.
 - Why it is a heuristic: Chrome's actions key on the root and, for Entrust, the leaf's earliest SCT date. scan verifies no path and parses no SCTs. `notBefore` stands in for the SCT date, since a cert is logged when it is issued. The doc and the label say "distrusted CA", never "browser-rejected".
 - A match renders the CA row and the matching chain row in `theme::BAD`, with ` (distrusted CA)`.
 - The entries are browser distrust actions: Symantec, WoSign/StartCom, Camerfirma, Entrust, Chunghwa Telecom, NetLock. Each one is verified against the Chrome Root Program / Mozilla bug before it goes in, with its URL in `source`. Dates from memory are not accepted.
+  - Exception: Camerfirma has no dated Chrome post, so its `source` is Chromium's blocklist README (`net/data/ssl/blocklist/README.md`), which records that trust was fully removed (`distrusted_after: None`).
 
 **Issuer organization:**
 

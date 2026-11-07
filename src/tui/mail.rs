@@ -47,7 +47,7 @@ impl MailPane {
             return lines;
         };
         let Some(email) = dns.email_security.as_ref() else {
-            if dns.is_reverse_only() {
+            if dns.is_reverse_only() || has_ip_host(&state.target) {
                 lines.push(Line::from(Span::styled(
                     "not applicable (IP target)",
                     Style::default().fg(theme::MUTED),
@@ -140,6 +140,11 @@ fn zone_differs_from_host(zone: &str, target: &str) -> bool {
     !zone.eq_ignore_ascii_case(host.trim_end_matches('.'))
 }
 
+/// Whether the raw target's host is an IP address, bare or in a URL.
+fn has_ip_host(target: &str) -> bool {
+    crate::target::Target::parse(target).is_ok_and(|target| target.dns_name().is_none())
+}
+
 /// The WHOIS RDAP DNSSEC flag for the same registrable domain, when WHOIS has one.
 fn rdap_dnssec(state: &AppState) -> Option<bool> {
     let whois = state.scanners.get("whois")?;
@@ -154,7 +159,7 @@ fn rdap_dnssec(state: &AppState) -> Option<bool> {
 /// reads `unknown (no suffix list)`, never `no DS`.
 fn dnssec_line(email: &EmailSecurityAnalysis, rdap: Option<bool>) -> Line<'static> {
     let absent = if email.zone_is_registrable {
-        ("no DS".to_string(), theme::WARN)
+        ("no DS".to_string(), theme::MUTED)
     } else {
         ("unknown (no suffix list)".to_string(), theme::MUTED)
     };
@@ -301,12 +306,24 @@ mod tests {
         assert_eq!(rows, ["📧 Status: resolved", "not applicable (IP target)"]);
     }
 
+    /// An IP host in a URL is an IP target too, whatever the DNS result's shape.
+    #[test]
+    fn an_ip_url_target_reads_not_applicable() {
+        for target in ["https://1.1.1.1/", "http://[2001:db8::1]:8080/"] {
+            let mut dns = DnsResult::new();
+            // The shape a scan left before IP-URL hosts skipped forward lookups: MX was tried.
+            dns.MX_status = QueryStatus::NoRecords;
+            let rows = rows(&dns_state(target, dns), Detail::Normal);
+            assert_eq!(rows, ["📧 Status: resolved", "not applicable (IP target)"], "{target}");
+        }
+    }
+
     /// Phase 4 criterion: each DNSSEC state, one fixture each.
     #[test]
     fn dnssec_renders_published_no_ds_failed_and_unknown_without_a_suffix_list() {
         for (dnssec, registrable, text, color) in [
             (LensOutcome::Present(2), true, "DS published", theme::GOOD),
-            (LensOutcome::Absent, true, "no DS", theme::WARN),
+            (LensOutcome::Absent, true, "no DS", theme::MUTED),
             (
                 LensOutcome::Failed("timed out".to_string()),
                 true,

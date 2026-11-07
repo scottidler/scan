@@ -127,3 +127,35 @@
 - TC TrustCenter (Symantec-acquired, in Chromium's Symantec roots set) is not in the table. Add it?
 - The table matches on issuer `O=` only. If Entrust or another distrusted owner issues new certificates under its own `O=` via a cross-signed path to a trusted root, scan marks them anyway. That is the heuristic the doc accepts. I have not verified whether such intermediates exist today.
 - `no DS` renders WARN. Should an unsigned zone be MUTED instead? It is common, and google.com is unsigned.
+
+## Phase 4 (audit follow-up)
+### Design decisions
+- `Target::dns_name` — src/target.rs — returns the host as a DNS name, or `None` for an IP host, bare or in a URL. The dns scanner's forward branch and `email_security` both key on it. Before, `https://1.1.1.1/` ran A/MX/TXT/… lookups on the literal `1.1.1.1` and got a non-reverse-only result, so mail showed only its status row. Now an IP-URL target is reverse-only, like a bare IP: no MX, TXT, DMARC, DS or DKIM query goes out (`scan::dns::tests::an_ip_url_target_gets_no_forward_lookups`).
+- The mail pane's `not applicable (IP target)` row also keys on the target's host — src/tui/mail.rs:has_ip_host — not only on the result's shape.
+- Distrust matching is now ASCII-case-insensitive *containment* of a listed value in the issuer `O=` — src/scan/tls/distrust.rs:distrust_of. That is how both dated Chrome posts word their own guidance ("Organization (O) ... contains"). I re-fetched the sources on 2026-11-07 and copied their named values verbatim:
+  - Entrust: `Entrust`, `AffirmTrust`;
+  - Chunghwa Telecom: `Chunghwa Telecom`, `行政院`;
+  - NetLock: `NETLOCK Ltd.`, `NETLOCK Kft.`.
+  - Symantec, WoSign/StartCom and Camerfirma: their posts name no `O=` values, so they keep the root `O=` values read from Chromium's certificates.
+- The CA row reads `(distrusted CA)` when *any* presented certificate's issuer matches, judged by the leaf's `notBefore` — src/tui/cert.rs:ca_line — per the doc's "the issuer_organization of each presented certificate".
+- `DNSSEC: no DS` is MUTED, like the other "nothing there" mail rows.
+- Enter while zoomed is a no-op — src/tui/mod.rs:handle_dashboard_key — per the key table. Before, it re-zoomed and reset the zoomed scroll.
+- I broke each fix on purpose, saw its test fail, then restored it:
+  - mail IP-URL gate removed;
+  - the dns forward branch back on `target.domain` (the test then queried the system resolver);
+  - `dns_name`'s URL arm removed;
+  - `NETLOCK Ltd.` dropped from the table;
+  - containment reverted to equality;
+  - the CA row checking only the leaf;
+  - `no DS` back to WARN;
+  - the zoomed-Enter guard removed.
+### Deviations
+- The doc says `organizations` lists every O= value; it is now a list of values an `O=` must contain. This matches the cited sources' own wording. The struct and field names are unchanged.
+- Doc edits (Status stays Implemented):
+  - The Bad CA bullet gains the Camerfirma source exception.
+  - The row-budget sentence now says the folded grade is the TLS grade, and Observatory's grade keeps its own `HTTP Grade:` row.
+### Tradeoffs
+- Containment vs exact equality: containment follows Chrome's FAQ and catches spellings such as `Entrust Limited` or `Chunghwa Telecom Co. Ltd`. Short root values (`Thawte`, `Equifax`) now also match any `O=` that contains them; I judged that acceptable for a labelled heuristic.
+- Skipping forward lookups for an IP-URL host vs only hiding its mail rows: the literal's forward answers were never meaningful, and skipping them is what makes "no MX/DS/DKIM query" true.
+### Open questions
+- TC TrustCenter (from Phase 4) is still out of the table, pending your call.

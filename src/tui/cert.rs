@@ -65,7 +65,11 @@ impl CertPane {
             return vec![status_line(status)];
         };
 
-        let mut lines = vec![status_line(status), ca_line(leaf), validity_line(data)];
+        let mut lines = vec![
+            status_line(status),
+            ca_line(leaf, &data.certificate_chain),
+            validity_line(data),
+        ];
         lines.push(row("Subject: ", common_name_display(&leaf.subject), theme::WARN));
         lines.push(Line::from(vec![
             Span::styled("Key: ", Style::default().fg(theme::LABEL)),
@@ -118,10 +122,13 @@ fn ca_text(cert: &CertificateInfo) -> String {
     }
 }
 
-/// `CA: Google Trust Services (WE2)`, in `BAD` with `(distrusted CA)` when the leaf's issuer is
-/// under a distrust action.
-fn ca_line(leaf: &CertificateInfo) -> Line<'static> {
-    let distrusted = distrust_of(leaf.issuer_organization.as_deref(), leaf.not_before).is_some();
+/// `CA: Google Trust Services (WE2)`, the leaf's issuer. It reads `BAD` with `(distrusted CA)`
+/// when any presented certificate's issuer is under a distrust action, judged by the leaf's
+/// `notBefore`, so a distrusted intermediate's issuer marks the CA row as well as its chain row.
+fn ca_line(leaf: &CertificateInfo, chain: &[CertificateInfo]) -> Line<'static> {
+    let distrusted = chain
+        .iter()
+        .any(|cert| distrust_of(cert.issuer_organization.as_deref(), leaf.not_before).is_some());
     let mut spans = vec![
         Span::styled("CA: ", Style::default().fg(theme::LABEL)),
         Span::styled(
@@ -418,6 +425,30 @@ mod tests {
         assert!(!out.contains("distrusted"), "{out}");
         let buffer = render_buffer(&pane, &google, 120, 20, false);
         assert_eq!(fg_of(&buffer, "Google Trust Services (WE2)"), theme::GOOD);
+    }
+
+    /// An intermediate issued under a distrusted `O=` marks the CA row too, even when the leaf's
+    /// own issuer is not on the list; `NETLOCK Ltd.` is one of the spellings Chrome's post names.
+    #[test]
+    fn a_distrusted_intermediate_issuer_marks_the_ca_row() {
+        let mut leaf = cert("CN=www.example.hu", Some("Example Issuing CA Kft."), Some("Example CA"));
+        leaf.not_before = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+        let intermediate = cert(
+            "O=Example Issuing CA Kft., CN=Example CA",
+            Some("NETLOCK Ltd."),
+            Some("NetLock Arany (Class Gold) Főtanúsítvány"),
+        );
+        let state = state_with(tls_data(vec![leaf, intermediate]), ScanStatus::Complete);
+        let pane = CertPane::new();
+        let out = render_pane(&pane, &state, 120, 20, false);
+        assert!(
+            out.contains("CA: Example Issuing CA Kft. (Example CA) (distrusted CA)"),
+            "{out}"
+        );
+        assert!(out.contains("  Example CA (distrusted CA)"), "{out}");
+        assert!(!out.contains("  www.example.hu (distrusted CA)"), "{out}");
+        let buffer = render_buffer(&pane, &state, 120, 20, false);
+        assert_eq!(fg_of(&buffer, "Example Issuing CA Kft. (Example CA)"), theme::BAD);
     }
 
     /// Phase 4 criterion: a failed scan with a kept older result says so on the status row.

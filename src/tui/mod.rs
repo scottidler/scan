@@ -245,7 +245,7 @@ impl TuiApp {
     }
 
     /// A key with no box open. Esc leaves zoom, or opens the menu from the grid; `?` opens help;
-    /// Enter zooms the focused pane; Tab/Right/l and BackTab/Left/h move focus, which carries the
+    /// Enter zooms the focused pane from the grid and is ignored while zoomed; Tab/Right/l and BackTab/Left/h move focus, which carries the
     /// zoom with it. `?` is matched on its code alone: crossterm reports it with SHIFT set.
     fn handle_dashboard_key(
         &mut self,
@@ -257,6 +257,9 @@ impl TuiApp {
             KeyCode::Esc if self.layout.is_zoomed() => self.layout.unzoom(),
             KeyCode::Esc => self.open(Overlay::Menu { selected: 0 }),
             KeyCode::Char('?') => self.open(Overlay::Help { scroll: 0 }),
+            // The key table: Enter zooms from the grid and does nothing while zoomed, so it never
+            // resets the zoomed pane's scroll.
+            KeyCode::Enter if self.layout.is_zoomed() => log::trace!("[tui] enter_ignored: already zoomed"),
             KeyCode::Enter => {
                 self.layout.zoom();
             }

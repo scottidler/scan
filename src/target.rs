@@ -245,6 +245,17 @@ impl Target {
         ipv6_addrs
     }
 
+    /// The host as a DNS name: `domain`, or `None` when the host is an IP address, bare
+    /// (`1.1.1.1`) or in a URL (`https://1.1.1.1/`). Forward lookups and the email posture are
+    /// asked only for a name.
+    pub fn dns_name(&self) -> Option<&str> {
+        match &self.target_type {
+            TargetType::IpAddress(_) => None,
+            TargetType::Url(url) if !matches!(url.host(), Some(url::Host::Domain(_))) => None,
+            _ => self.domain.as_deref(),
+        }
+    }
+
     /// Get the hostname/domain for display purposes
     pub fn display_name(&self) -> &str {
         let name = match &self.target_type {
@@ -618,6 +629,25 @@ mod tests {
         assert_eq!(target.domain, Some("google.com".to_string()));
         assert_eq!(target.port, Some(443));
         assert_eq!(target.scheme, Some("https".to_string()));
+    }
+
+    #[test]
+    fn dns_name_is_none_for_an_ip_host_bare_or_in_a_url() {
+        for ip in [
+            "1.1.1.1",
+            "2001:db8::1",
+            "https://1.1.1.1/",
+            "http://[2001:db8::1]:8080/x",
+        ] {
+            assert_eq!(Target::parse(ip).unwrap().dns_name(), None, "{ip}");
+        }
+        for (name, expected) in [
+            ("google.com", "google.com"),
+            ("google.com:8080", "google.com"),
+            ("https://www.google.com/x", "www.google.com"),
+        ] {
+            assert_eq!(Target::parse(name).unwrap().dns_name(), Some(expected), "{name}");
+        }
     }
 
     #[test]
