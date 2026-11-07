@@ -70,3 +70,60 @@
 - Menu entries carry no key hints (`Help`, `Quit` only). That matches the doc and avoids a second source of key names beside `KEY_HELP`.
 ### Open questions
 - At 0.35 the dimmed dashboard is darker in the raw ANSI (e.g. `119,202,155` -> `42,71,54`). Color emoji are glyphs and cannot be dimmed, so they stay bright behind the box. Confirm the strength on your terminal.
+
+## Phase 4: Single pane table, cert and mail panes, grid rebalance
+### Design decisions
+- One pane table — src/tui/mod.rs:panes — `create_default_layout` iterates it and `TuiApp::new` calls `create_default_layout`, so the panes are listed once. Table order is focus order: cert follows connectivity, mail follows geoip, and traceroute's Left is still dns.
+- The DNS email posture moved behind one seam — src/scan/dns.rs:DnsScanner::email_security — which takes the resolver and returns `None` before any query when the target has no domain or its URL host is an IP literal. `mail_zone` resolves the registrable domain once, under DMARC's old deadline; `lookup_dmarc` now takes the registrable domain as a parameter instead of resolving it. One `tokio::join!` branch runs zone, then DMARC + DS + the 9 DKIM probes concurrently; `lookup_mail_transport` is the other branch.
+- `mail_zone` treats "suffix list names no registrable domain" (`Ok(None)`: localhost, a bare suffix) like "suffix list unavailable": zone = host, `zone_is_registrable = false` — src/scan/dns.rs:mail_zone — so a DS miss at a name that is not a delegation point never reads `no DS`.
+- DS is counted by `record_type() == DS` on the answer, rdata left opaque — src/scan/dns.rs:lookup_ds — per the Phase 0 path (`RecordType::DS`, default features).
+- DKIM probes run through `futures::future::join_all` — src/scan/dns.rs:lookup_dkim — and `dkim_outcome` is pure. A failure reads `<first reason> (N of 9 selectors)`, so one timed-out selector is not read as all of them.
+- `tls.rs` declares `mod distrust;` (private) and re-exports `distrust_of`, `DistrustedCa`, `DISTRUSTED_CAS` — src/scan/tls/distrust.rs. Matching is ASCII-case-insensitive equality on the issuer `O=`, and `leaf.not_before` (UTC date) `> distrusted_after`.
+- cert rows — src/tui/cert.rs — Status, CA, `Valid: yes · N days`, Subject, Key, SAN, `Chain (as sent):` + one row per presented certificate (its subject CN). Status and CA rows wrap rather than clip, so a long CA name stays whole in the 30% column. A chain row reads `(distrusted CA)` when that certificate's issuer `O=` matches, judged by the leaf's `notBefore`. Zoom replaces the short chain with the full per-certificate detail moved from security.
+- Empty chain: the status row reads `analyzed · no certificate[: <first certificate error> | handshake failed]` and nothing else draws.
+- mail rows — src/tui/mail.rs — Status, [`not applicable (IP target)`], [`Zone:`], SPF, DMARC, (zoom: MTA-STS, TLS-RPT), DNSSEC, DKIM, (zoom: one `selector:` row per key), MX, then the SPF and DMARC record text. `no DS` is WARN, `unknown (no suffix list)` MUTED. A failed DS lookup appends ` · RDAP: signed|unsigned` from the whois result when it has one.
+- security — src/tui/security.rs — the status row is `🔒 Status: analyzed · <grade> · N issues`, the issue bullets sit directly under it, and PFS/OCSP share `🔰 PFS: yes · OCSP: not checked`. The `📜 Cert: validating...` pending row went with the certificate block.
+- New glyphs: `📜` (cert status), `📧` (mail status), `🔰` (PFS row). All are default-emoji-presentation, and the theme lints pass. New border colors: cert `#a53b7a`, mail `#5a8a2e`.
+- The overflow marker drops ` more` when `┘↑ N ↓ M more└─` does not fit the box — src/tui/pane.rs:RowView::marker_within. Without it, 16-column row-1 cells at 80x24 cut `↑ N` off the left edge.
+- I broke each success-criterion test on purpose, saw it fail, then restored the code:
+  - CA row moved after Valid;
+  - `distrust_of` forced to `None`;
+  - cert status hard-coded `analyzed`;
+  - the IP-literal guard in `email_security` disabled (the URL-IP case then queried);
+  - the `not applicable (IP target)` text changed;
+  - `no DS` and `(revoked)` text changed;
+  - `mail_zone` returning the host;
+  - `DEFAULT_GRID_COLS` back to 4.
+### Deviations
+- `lens_value_or(outcome, present, absent)` added in src/tui/http.rs, and `lens_value` delegates to it. DNSSEC and DKIM need their own Absent text (`no DS`, `none at common selectors`). Same effect, correct seam.
+- `EmailSecurityAnalysis::fixture()` (`#[cfg(test)]`) replaces repeated literals in tests now that the struct has 10 fields.
+- The `Zone:` row compares the zone with the host parsed from `AppState.target` (`Target::parse`). This adds no field to the Data Model.
+- Tests moved out of security.rs, not copied:
+  - cert.rs took the CN, expiry, SAN and chain-zoom tests;
+  - mail.rs took the MTA-STS/TLS-RPT tests;
+  - `Expires: N days` is now cert's `Valid: yes · N days`;
+  - `Issues: N` assertions now read the status row's `N issue(s)`.
+- `dkim_reads_not_checked_and_dmarc_reads_configured` (security.rs) pinned DKIM as `not checked`. It is removed, and `mail.rs:dkim_renders_a_selector_none_failed_and_revoked` covers the probed states in its place.
+- `whois.rs:domain_from_host_is_intact_at_200x55` is renamed to `domain_from_host_leads_its_row_at_200x55_and_is_whole_in_zoom`.
+  - At 20% width (40 cols) `Domain: tatari.tv (from www.tatari.tv)` no longer fits, so the test now asserts the row's lead and the whole text in zoom.
+  - The doc only checked that `client transfer prohibited` fits.
+  - Wrapping the Domain row would break `long_domain_is_fit_with_ellipsis_in_narrow_terminals`, so I left it as is.
+- `http.rs:long_redirect_target_url_is_fit_on_its_own_row` now asserts the redirect source row as clipped. The 108x40 http cell is narrower.
+- The overflow-marker change (pane.rs) is not in the doc. It is forced by the 5-column row.
+- `scan/tls.rs:chain_of_leaf_and_two_intermediates_counts_three_certificates` now reads the cert pane's `Chain (as sent): 3 certificates`.
+- Distrust entries that are in the doc's list but scoped down from what was fetched:
+  - Symantec: `O=` values are those of the brands Chrome's post names (Symantec, VeriSign, GeoTrust, thawte/Thawte, Equifax), checked against the roots in Chromium's `net/data/ssl/symantec/roots` (tag 100.0.4896.60). Left out from that same directory:
+    - `TC TrustCenter GmbH` / `TC TrustCenter for Security in Data Networks GmbH`: the post does not name the brand;
+    - `RSA Data Security, Inc.`: not a Symantec name;
+    - `The USERTRUST Network`: Sectigo's root, cross-signed, and including it would mark every Sectigo chain.
+  - WoSign/StartCom: `distrusted_after: None`. The post's 2016-10-21 cutoff was the first stage, it says the stages culminate "in the full distrust", and Chromium's blocklist lists the roots outright. `Certplus` (a cross-signed root in that blocklist group) is left out.
+  - Camerfirma: the source is Chromium's blocklist README ("trust ... was fully removed"), not a Google blog post; I found no Chrome blog post to fetch for it.
+### Tradeoffs
+- Exact `O=` match vs Chrome's own "Organization contains Entrust or AffirmTrust" guidance: exact values come straight from the fetched root names and cannot match an unrelated org that happens to contain the word.
+- `Target::parse` on every frame for the Zone row vs adding a `host` field: parse is pure and already in-house, and its debug log is off at the default level.
+- Wrapping the CA row (one extra row at 80x24) vs clipping: the CA row is G5's point, and a clipped CA name hides the issuing CA's CN.
+- DS presence only vs decoding: no `dnssec-*` feature, no new crates, per Phase 0.
+### Open questions
+- TC TrustCenter (Symantec-acquired, in Chromium's Symantec roots set) is not in the table. Add it?
+- The table matches on issuer `O=` only. If Entrust or another distrusted owner issues new certificates under its own `O=` via a cross-signed path to a trusted root, scan marks them anyway. That is the heuristic the doc accepts. I have not verified whether such intermediates exist today.
+- `no DS` renders WARN. Should an unsigned zone be MUTED instead? It is common, and google.com is unsigned.

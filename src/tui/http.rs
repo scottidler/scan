@@ -64,9 +64,18 @@ fn header_line(label: &str, value: Option<&str>) -> Line<'static> {
 
 /// A lens's value, `none` in `MUTED` when there is nothing there, or `failed: <reason>` in `BAD`.
 pub(crate) fn lens_value<T>(outcome: &LensOutcome<T>, present: impl FnOnce(&T) -> (String, Color)) -> Span<'static> {
+    lens_value_or(outcome, present, ("none".to_string(), theme::MUTED))
+}
+
+/// As [`lens_value`], with `absent` as the text and color for nothing there.
+pub(crate) fn lens_value_or<T>(
+    outcome: &LensOutcome<T>,
+    present: impl FnOnce(&T) -> (String, Color),
+    absent: (String, Color),
+) -> Span<'static> {
     let (text, color) = match outcome {
         LensOutcome::Present(value) => present(value),
-        LensOutcome::Absent => ("none".to_string(), theme::MUTED),
+        LensOutcome::Absent => absent,
         LensOutcome::Failed(reason) => (format!("failed: {reason}"), theme::BAD),
     };
     Span::styled(text, Style::default().fg(color))
@@ -821,9 +830,10 @@ mod tests {
         // The middle row is too short at 80x24 to reach the redirect rows; 108x40 shows them.
         let (width, height) = crate::tui::testing::dashboard_pane_size(1, 1, 108, 40);
         let expected = crate::tui::testing::expected_clip(&format!("    → {LONG_REDIRECT_TO}"), width - 2);
+        let source = crate::tui::testing::expected_clip("  301 http://example.com/", width - 2);
         let out = render_pane(&HttpPane::new(), &state_with_http(data), width, height, false);
         assert!(
-            out.contains("301 http://example.com/"),
+            out.contains(&format!("│{source}│")),
             "redirect source row missing:\n{out}"
         );
         assert!(out.contains(&format!("│{expected}│")), "`{expected}` missing:\n{out}");

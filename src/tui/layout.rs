@@ -13,7 +13,7 @@ use ratatui::{
 use std::collections::HashMap;
 
 const DEFAULT_GRID_ROWS: usize = 3;
-const DEFAULT_GRID_COLS: usize = 4;
+const DEFAULT_GRID_COLS: usize = 5;
 const TOP_ROW_HEIGHT_PERCENT: u16 = 25;
 const MIDDLE_ROW_HEIGHT_PERCENT: u16 = 35;
 const BOTTOM_ROW_HEIGHT_PERCENT: u16 = 40;
@@ -22,15 +22,17 @@ const SCROLL_STEP: u16 = 1;
 const ZOOM_FOOTER_ROWS: u16 = 1;
 /// The keys that act while a pane is zoomed.
 pub const ZOOM_FOOTER: &str = "Esc back · ←/→ h/l pane · ↑/↓ j/k scroll · ? help";
-// Row 0 widths (2 columns)
+// Row 0 widths (3 columns)
 const TARGET_PANE_WIDTH_PERCENT: u16 = 30;
-const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 70;
+const CONNECTIVITY_PANE_WIDTH_PERCENT: u16 = 40;
+const CERT_PANE_WIDTH_PERCENT: u16 = 30;
 
-// Row 1 widths (4 columns - 25% each)
-const WHOIS_PANE_WIDTH_PERCENT: u16 = 25;
-const HTTP_PANE_WIDTH_PERCENT: u16 = 25;
-const PORTS_PANE_WIDTH_PERCENT: u16 = 25;
-const GEOIP_PANE_WIDTH_PERCENT: u16 = 25;
+// Row 1 widths (5 columns - 20% each)
+const WHOIS_PANE_WIDTH_PERCENT: u16 = 20;
+const HTTP_PANE_WIDTH_PERCENT: u16 = 20;
+const PORTS_PANE_WIDTH_PERCENT: u16 = 20;
+const GEOIP_PANE_WIDTH_PERCENT: u16 = 20;
+const MAIL_PANE_WIDTH_PERCENT: u16 = 20;
 
 // Row 2 widths (3 columns)
 const DNS_PANE_WIDTH_PERCENT: u16 = 33;
@@ -73,9 +75,13 @@ impl PaneLayout {
         }
     }
 
-    /// Create the default 3x3 layout for our dashboard
+    /// An empty dashboard grid: 3 rows, up to 5 cells per row.
     pub fn default_dashboard() -> Self {
-        log::debug!("[tui::layout] default_dashboard: creating 3x3 layout");
+        log::debug!(
+            "[tui::layout] default_dashboard: creating {}x{} layout",
+            DEFAULT_GRID_ROWS,
+            DEFAULT_GRID_COLS
+        );
         Self::new(DEFAULT_GRID_ROWS, DEFAULT_GRID_COLS)
     }
 
@@ -515,8 +521,8 @@ fn footer_rect(area: Rect) -> Option<Rect> {
 /// The dashboard grid over `area`: one rect per cell, row by row, with custom proportions.
 pub(crate) fn grid_layout(area: Rect) -> Vec<Vec<Rect>> {
     // Create custom row constraints for better space allocation
-    // Row 0: Smaller for summary info (target, connectivity)
-    // Row 1: Medium for WHOIS, HTTP, Ports, GeoIP
+    // Row 0: Smaller for summary info (target, connectivity, cert)
+    // Row 1: Medium for WHOIS, HTTP, Ports, GeoIP, mail
     // Row 2: Larger for detailed info (DNS, traceroute, security)
     let row_constraints = vec![
         Constraint::Percentage(TOP_ROW_HEIGHT_PERCENT),
@@ -538,12 +544,14 @@ pub(crate) fn grid_layout(area: Rect) -> Vec<Vec<Rect>> {
             0 => vec![
                 Constraint::Percentage(TARGET_PANE_WIDTH_PERCENT),
                 Constraint::Percentage(CONNECTIVITY_PANE_WIDTH_PERCENT),
+                Constraint::Percentage(CERT_PANE_WIDTH_PERCENT),
             ],
             1 => vec![
                 Constraint::Percentage(WHOIS_PANE_WIDTH_PERCENT),
                 Constraint::Percentage(HTTP_PANE_WIDTH_PERCENT),
                 Constraint::Percentage(PORTS_PANE_WIDTH_PERCENT),
                 Constraint::Percentage(GEOIP_PANE_WIDTH_PERCENT),
+                Constraint::Percentage(MAIL_PANE_WIDTH_PERCENT),
             ],
             2 => vec![
                 Constraint::Percentage(DNS_PANE_WIDTH_PERCENT),
@@ -650,12 +658,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// Every pane the layout scrolls: all but Connectivity, which draws sparklines.
-    const SCROLLING_PANES: [&str; 8] = [
+    const SCROLLING_PANES: [&str; 10] = [
         "target",
+        "cert",
         "whois",
         "http",
         "ports",
         "geoip",
+        "mail",
         "dns",
         "traceroute",
         "security",
@@ -687,6 +697,11 @@ mod tests {
 
     fn dns_fixture(records: u8) -> DnsResult {
         let mut dns = DnsResult::new();
+        dns.email_security = Some(crate::scan::dns::EmailSecurityAnalysis {
+            spf_record: Some("v=spf1 include:_spf.web.dev ~all".to_string()),
+            dmarc_record: Some("v=DMARC1; p=reject".to_string()),
+            ..crate::scan::dns::EmailSecurityAnalysis::fixture()
+        });
         for n in 0..records {
             dns.A
                 .push(DnsRecord::new(format!("192.0.2.{n}").parse().expect("ip"), 300));
@@ -727,6 +742,24 @@ mod tests {
         result
     }
 
+    fn tls_cert(subject: &str, issuer_common_name: &str) -> crate::scan::tls::CertificateInfo {
+        crate::scan::tls::CertificateInfo {
+            subject: subject.to_string(),
+            issuer: format!("O=Google Trust Services, CN={issuer_common_name}"),
+            issuer_organization: Some("Google Trust Services".to_string()),
+            issuer_common_name: Some(issuer_common_name.to_string()),
+            serial_number: "1".to_string(),
+            not_before: chrono::Utc::now(),
+            not_after: chrono::Utc::now() + chrono::Duration::days(90),
+            signature_algorithm: "ecdsa-with-SHA256".to_string(),
+            public_key_algorithm: "EC".to_string(),
+            key_size: Some(256),
+            san_domains: vec!["web.dev".to_string()],
+            is_self_signed: false,
+            is_ca: false,
+        }
+    }
+
     fn tls_fixture() -> TlsResult {
         let mut result = TlsResult::new();
         result.ipv4_result = Some(TlsData {
@@ -734,9 +767,9 @@ mod tests {
             handshake_time: Duration::from_millis(100),
             supported_versions: vec![TlsVersion::V1_3],
             negotiated_version: Some(TlsVersion::V1_3),
-            certificate_chain: vec![],
+            certificate_chain: vec![tls_cert("CN=web.dev", "WR1"), tls_cert("CN=WR1", "GTS Root R1")],
             certificate_valid: true,
-            certificate_errors: vec![],
+            certificate_errors: (1..=5).map(|n| format!("certificate problem {n}")).collect(),
             expiry_date: None,
             days_until_expiry: Some(90),
             supported_ciphers: vec![],
@@ -996,13 +1029,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
 
-    const PANE_TITLES: [&str; 9] = [
+    const PANE_TITLES: [&str; 11] = [
         "target",
         "connectivity",
+        "cert",
         "whois",
         "http",
         "ports",
         "geoip",
+        "mail",
         "dns",
         "traceroute",
         "security",
@@ -1052,13 +1087,38 @@ mod tests {
         let state = shared(overflowing_state());
         let (mut app, tx) = app_on("security");
         let grid = frame_text(&mut app, &state, 80, 24);
-        assert_eq!(titles(&grid).len(), 9, "the grid draws every pane:\n{grid}");
+        assert_eq!(titles(&grid).len(), 11, "the grid draws every pane:\n{grid}");
 
         key(&mut app, &state, &tx, KeyCode::Enter);
         let zoomed = frame_text(&mut app, &state, 80, 24);
         assert_eq!(titles(&zoomed), vec!["security"], "{zoomed}");
         let footer = zoomed.lines().last().expect("footer row");
         assert!(footer.starts_with(ZOOM_FOOTER), "footer: `{footer}`");
+    }
+
+    /// Phase 4 criterion: the grid draws all 11 titles, at 200x56 and still at 80x24.
+    #[test]
+    fn the_grid_draws_all_eleven_pane_titles_at_200x56_and_80x24() {
+        let state = shared(overflowing_state());
+        for (width, height) in [(200, 56), (80, 24)] {
+            let (mut app, _) = app_on("security");
+            let text = frame_text(&mut app, &state, width, height);
+            assert_eq!(titles(&text), PANE_TITLES, "{width}x{height}:\n{text}");
+        }
+    }
+
+    /// Each pane has its own box color, cert and mail included.
+    #[test]
+    fn every_pane_has_its_own_border_color() {
+        let colors: Vec<_> = PANE_TITLES.iter().map(|id| theme::pane_border(id)).collect();
+        for (id, color) in PANE_TITLES.iter().zip(&colors) {
+            assert_ne!(*color, theme::BORDER_UNFOCUSED, "{id}");
+            assert_eq!(
+                colors.iter().filter(|c| *c == color).count(),
+                1,
+                "{id} shares its color"
+            );
+        }
     }
 
     #[test]
@@ -1132,7 +1192,7 @@ mod tests {
         key(&mut app, &state, &tx, KeyCode::Esc);
         assert!(!app.layout.is_zoomed(), "Esc did not leave zoom");
         assert!(!app.should_quit(), "Esc quit from zoom");
-        assert_eq!(titles(&frame_text(&mut app, &state, 80, 24)).len(), 9);
+        assert_eq!(titles(&frame_text(&mut app, &state, 80, 24)).len(), 11);
     }
 
     #[test]

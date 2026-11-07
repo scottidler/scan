@@ -125,10 +125,17 @@ mod tests {
 
     #[test]
     fn dashboard_pane_sizes_follow_the_layout_percentages() {
-        // 80 cols: target 30% = 24, connectivity 70% = 56; the four middle panes 20 each.
+        // 80 cols: target 30% = 24, connectivity 40% = 32, cert 30% = 24; the five middle panes
+        // 16 each.
         assert_eq!(dashboard_pane_size(0, 0, 80, 24).0, 24);
-        assert_eq!(dashboard_pane_size(0, 1, 80, 24), (56, 6));
-        assert_eq!(dashboard_pane_size(1, 0, 80, 24).0, 20);
+        assert_eq!(dashboard_pane_size(0, 1, 80, 24), (32, 6));
+        assert_eq!(dashboard_pane_size(0, 2, 80, 24).0, 24);
+        for col in 0..5 {
+            assert_eq!(dashboard_pane_size(1, col, 80, 24).0, 16, "row 1 col {col}");
+        }
+        // 200 cols: row 0 is 60 | 80 | 60, row 1 five cells of 40.
+        assert_eq!(dashboard_pane_size(0, 2, 200, 56).0, 60);
+        assert_eq!(dashboard_pane_size(1, 4, 200, 56).0, 40);
     }
 
     #[test]
@@ -157,6 +164,16 @@ mod tests {
     #[test]
     fn render_connectivity_title() {
         assert_renders_title(&ConnectivityPane::new());
+    }
+
+    #[test]
+    fn render_cert_title() {
+        assert_renders_title(&CertPane::new());
+    }
+
+    #[test]
+    fn render_mail_title() {
+        assert_renders_title(&MailPane::new());
     }
 
     #[test]
@@ -221,7 +238,9 @@ mod tests {
         let panes: Vec<(&str, Box<dyn Pane>)> = vec![
             ("ping", Box::new(ConnectivityPane::new())),
             ("dns", Box::new(DnsPane::new())),
+            ("dns", Box::new(MailPane::new())),
             ("tls", Box::new(SecurityPane::new())),
+            ("tls", Box::new(CertPane::new())),
             ("http", Box::new(HttpPane::new())),
             ("whois", Box::new(WhoisPane::new())),
             ("traceroute", Box::new(TraceroutePane::new())),
@@ -271,6 +290,7 @@ mod tests {
         let state = no_ipv6_address_state();
         let panes: Vec<(&str, Box<dyn Pane>)> = vec![
             ("tls", Box::new(SecurityPane::new())),
+            ("tls", Box::new(CertPane::new())),
             ("http", Box::new(HttpPane::new())),
             ("traceroute", Box::new(TraceroutePane::new())),
             ("geoip", Box::new(GeoIpPane::new())),

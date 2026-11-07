@@ -441,16 +441,21 @@ mod tests {
         assert!(!out.contains('…'), "reason row was fit, not wrapped:\n{out}");
     }
 
+    /// The 20% column at 200x55 cuts the `(from <host>)` source with `…`, but the registrable
+    /// domain leads the row and zoom shows the whole of it.
     #[test]
-    fn domain_from_host_is_intact_at_200x55() {
+    fn domain_from_host_leads_its_row_at_200x55_and_is_whole_in_zoom() {
         use crate::scan::whois::{DataSource, NotApplicableReason, WhoisResult};
         let mut result = WhoisResult::not_applicable("www.tatari.tv".to_string(), NotApplicableReason::IpTarget);
         result.data_source = DataSource::Rdap;
         result.queried_domain = "tatari.tv".to_string();
+        let state = state_with_whois(result);
         let (width, height) = crate::tui::testing::dashboard_pane_size(1, 0, 200, 55);
-        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state_with_whois(result), width, height, false);
-        assert!(out.contains("Domain: tatari.tv (from www.tatari.tv)"), "{out}");
+        let out = crate::tui::testing::render_pane(&WhoisPane::new(), &state, width, height, false);
+        assert!(out.contains("Domain: tatari.tv (from www.tatari"), "{out}");
         assert!(out.contains("Source: RDAP"), "{out}");
+        let zoomed = crate::tui::testing::content_rows(&WhoisPane::new(), &state, 108, Detail::Zoomed).join("\n");
+        assert!(zoomed.contains("Domain: tatari.tv (from www.tatari.tv)"), "{zoomed}");
     }
 
     #[test]

@@ -1,8 +1,10 @@
+pub mod cert;
 pub mod connectivity;
 pub mod dns;
 pub mod geoip;
 pub mod http;
 pub mod layout;
+pub mod mail;
 pub mod overlay;
 pub mod pane;
 pub mod ports;
@@ -17,11 +19,13 @@ pub mod theme;
 pub mod traceroute;
 pub mod whois;
 
+pub use cert::CertPane;
 pub use connectivity::ConnectivityPane;
 pub use dns::DnsPane;
 pub use geoip::GeoIpPane;
 pub use http::HttpPane;
 pub use layout::PaneLayout;
+pub use mail::MailPane;
 pub use overlay::{KEY_HELP, MenuItem, Overlay};
 pub use pane::{Detail, Pane, PaneConfig, PanePosition};
 pub use ports::PortsPane;
@@ -108,26 +112,16 @@ impl TuiApp {
     pub fn new() -> io::Result<Self> {
         log::debug!("[tui] new: creating TUI application with default layout");
 
-        // Initialize layout with default dashboard
-        let mut layout = PaneLayout::default_dashboard();
-
-        // Add panes to the layout
-        log::trace!("[tui] adding_panes: setting up 3x4 dashboard layout");
-        layout.add_pane(Box::new(TargetPane::new()), PaneConfig::new(0, 0));
-        layout.add_pane(Box::new(ConnectivityPane::new()), PaneConfig::new(0, 1));
-        layout.add_pane(Box::new(WhoisPane::new()), PaneConfig::new(1, 0));
-        layout.add_pane(Box::new(HttpPane::new()), PaneConfig::new(1, 1));
-        layout.add_pane(Box::new(PortsPane::new()), PaneConfig::new(1, 2));
-        layout.add_pane(Box::new(GeoIpPane::new()), PaneConfig::new(1, 3));
-        layout.add_pane(Box::new(DnsPane::new()), PaneConfig::new(2, 0));
-        layout.add_pane(Box::new(TraceroutePane::new()), PaneConfig::new(2, 1));
-        layout.add_pane(Box::new(SecurityPane::new()), PaneConfig::new(2, 2));
+        let mut layout = create_default_layout();
 
         // Set initial focus on the security pane
         layout.set_focus(Some("security".to_string()));
         log::debug!("[tui] initial_focus_set: pane=security");
 
-        log::debug!("[tui] tui_app_created: tick_rate=250ms panes=9");
+        log::debug!(
+            "[tui] tui_app_created: tick_rate=250ms panes={}",
+            layout.pane_ids().len()
+        );
         Ok(Self {
             layout,
             should_quit: false,
@@ -419,33 +413,33 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -
     Ok(())
 }
 
-/// Create the default pane layout for the dashboard
+/// Every dashboard pane and its grid cell, in focus order: the one pane table.
+fn panes() -> Vec<(Box<dyn Pane>, PaneConfig)> {
+    vec![
+        // Row 0: target 30, connectivity 40, cert 30
+        (Box::new(TargetPane::new()), PaneConfig::new(0, 0)),
+        (Box::new(ConnectivityPane::new()), PaneConfig::new(0, 1)),
+        (Box::new(CertPane::new()), PaneConfig::new(0, 2)),
+        // Row 1: whois, http, ports, geoip, mail, 20 each
+        (Box::new(WhoisPane::new()), PaneConfig::new(1, 0)),
+        (Box::new(HttpPane::new()), PaneConfig::new(1, 1)),
+        (Box::new(PortsPane::new()), PaneConfig::new(1, 2)),
+        (Box::new(GeoIpPane::new()), PaneConfig::new(1, 3)),
+        (Box::new(MailPane::new()), PaneConfig::new(1, 4)),
+        // Row 2: dns 33, traceroute 33, security 34
+        (Box::new(DnsPane::new()), PaneConfig::new(2, 0)),
+        (Box::new(TraceroutePane::new()), PaneConfig::new(2, 1)),
+        (Box::new(SecurityPane::new()), PaneConfig::new(2, 2)),
+    ]
+}
+
+/// The dashboard layout with every pane from [`panes`] placed in its cell.
 pub fn create_default_layout() -> PaneLayout {
-    // This function is deprecated - use TuiApp::new() instead
-    // Kept for test compatibility
     let mut layout = PaneLayout::default_dashboard();
-
-    // Row 0: TARGET, CONNECTIVITY
-    layout.add_pane(Box::new(TargetPane::new()), PaneConfig::new(0, 0));
-
-    layout.add_pane(Box::new(ConnectivityPane::new()), PaneConfig::new(0, 1));
-
-    // Row 1: WHOIS, HTTP, PORTS, GEOIP
-    layout.add_pane(Box::new(WhoisPane::new()), PaneConfig::new(1, 0));
-
-    layout.add_pane(Box::new(HttpPane::new()), PaneConfig::new(1, 1));
-
-    layout.add_pane(Box::new(PortsPane::new()), PaneConfig::new(1, 2));
-
-    layout.add_pane(Box::new(GeoIpPane::new()), PaneConfig::new(1, 3));
-
-    // Row 2: DNS, TRACEROUTE, SECURITY
-    layout.add_pane(Box::new(DnsPane::new()), PaneConfig::new(2, 0));
-
-    layout.add_pane(Box::new(TraceroutePane::new()), PaneConfig::new(2, 1));
-
-    layout.add_pane(Box::new(SecurityPane::new()), PaneConfig::new(2, 2));
-
+    for (pane, config) in panes() {
+        layout.add_pane(pane, config);
+    }
+    log::debug!("[tui] create_default_layout: panes={}", layout.pane_ids().len());
     layout
 }
 
@@ -453,23 +447,28 @@ pub fn create_default_layout() -> PaneLayout {
 mod tests {
     use super::*;
 
+    /// Every pane in grid order, focus order and the one table.
+    const PANE_IDS: [&str; 11] = [
+        "target",
+        "connectivity",
+        "cert",
+        "whois",
+        "http",
+        "ports",
+        "geoip",
+        "mail",
+        "dns",
+        "traceroute",
+        "security",
+    ];
+
     #[test]
     fn test_tui_app_creation() {
         let app = TuiApp::new().expect("Failed to create TuiApp");
         assert!(!app.should_quit());
         assert_eq!(app.tick_rate, Duration::from_millis(TUI_TICK_RATE_MS));
-
-        // Check that panes were added
-        let pane_ids = app.layout.pane_ids();
-        assert!(pane_ids.contains(&"target".to_string()));
-        assert!(pane_ids.contains(&"connectivity".to_string()));
-        assert!(pane_ids.contains(&"security".to_string()));
-        assert!(pane_ids.contains(&"whois".to_string()));
-        assert!(pane_ids.contains(&"dns".to_string()));
-        assert!(pane_ids.contains(&"http".to_string()));
-        assert!(pane_ids.contains(&"ports".to_string()));
-        assert!(pane_ids.contains(&"traceroute".to_string()));
-        assert!(pane_ids.contains(&"geoip".to_string()));
+        assert_eq!(app.layout.pane_ids(), PANE_IDS);
+        assert_eq!(app.layout.focused_pane().map(String::as_str), Some("security"));
     }
 
     #[test]
@@ -481,22 +480,26 @@ mod tests {
         assert!(app.should_quit());
     }
 
+    /// The app and the default layout are both built from the one pane table.
     #[test]
-    fn test_default_layout_creation() {
+    fn the_app_and_the_default_layout_place_the_same_panes_in_the_same_cells() {
+        let app = TuiApp::new().expect("app");
         let layout = create_default_layout();
-        let pane_ids = layout.pane_ids();
-
-        // Should have the implemented panes
-        assert!(!pane_ids.is_empty());
-        assert!(pane_ids.contains(&"target".to_string()));
-        assert!(pane_ids.contains(&"connectivity".to_string()));
-        assert!(pane_ids.contains(&"security".to_string()));
-        assert!(pane_ids.contains(&"whois".to_string()));
-        assert!(pane_ids.contains(&"dns".to_string()));
-        assert!(pane_ids.contains(&"http".to_string()));
-        assert!(pane_ids.contains(&"ports".to_string()));
-        assert!(pane_ids.contains(&"traceroute".to_string()));
-        assert!(pane_ids.contains(&"geoip".to_string()));
+        assert_eq!(layout.pane_ids(), PANE_IDS);
+        for id in PANE_IDS {
+            let (a, b) = (app.layout.get_config(id).expect(id), layout.get_config(id).expect(id));
+            assert_eq!(
+                (a.position.row, a.position.col),
+                (b.position.row, b.position.col),
+                "{id}"
+            );
+        }
+        let cell = |id: &str| {
+            let config = layout.get_config(id).expect(id);
+            (config.position.row, config.position.col)
+        };
+        assert_eq!(cell("cert"), (0, 2));
+        assert_eq!(cell("mail"), (1, 4));
     }
 
     #[test]

@@ -1,3 +1,7 @@
+mod distrust;
+
+pub use distrust::{DISTRUSTED_CAS, DistrustedCa, distrust_of};
+
 use super::connect::TcpConnector;
 use super::{Family, classify_route_error, family_failure};
 use crate::scanner::Scanner;
@@ -8,6 +12,7 @@ use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use log;
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
+use openssl::nid::Nid;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::{X509, X509Ref};
 use rustls::pki_types::ServerName;
@@ -46,7 +51,12 @@ impl TlsVersion {
 #[derive(Debug, Clone)]
 pub struct CertificateInfo {
     pub subject: String,
+    /// Every issuer name entry joined, `C=US, O=Google Trust Services, CN=WE2`, for the CLI.
     pub issuer: String,
+    /// The issuer's first `O=` entry, read by its NID so `O=Entrust, Inc.` stays whole.
+    pub issuer_organization: Option<String>,
+    /// The issuer's first `CN=` entry.
+    pub issuer_common_name: Option<String>,
     pub serial_number: String,
     pub not_before: DateTime<Utc>,
     pub not_after: DateTime<Utc>,
@@ -778,6 +788,16 @@ impl TlsScanner {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let issuer_entry = |nid: Nid| {
+            cert.issuer_name()
+                .entries_by_nid(nid)
+                .next()
+                .and_then(|entry| entry.data().as_utf8().ok())
+                .map(|text| text.to_string())
+        };
+        let issuer_organization = issuer_entry(Nid::ORGANIZATIONNAME);
+        let issuer_common_name = issuer_entry(Nid::COMMONNAME);
+
         let serial_number = cert
             .serial_number()
             .to_bn()
@@ -830,6 +850,8 @@ impl TlsScanner {
         Ok(CertificateInfo {
             subject,
             issuer,
+            issuer_organization,
+            issuer_common_name,
             serial_number,
             not_before,
             not_after,
@@ -1231,7 +1253,6 @@ pub(crate) mod fixtures {
     use super::*;
     use openssl::ec::{EcGroup, EcKey};
     use openssl::hash::MessageDigest;
-    use openssl::nid::Nid;
     use openssl::pkey::{PKey, Private};
     use openssl::x509::{X509Builder, X509Name, X509NameBuilder};
 
@@ -1250,12 +1271,26 @@ pub(crate) mod fixtures {
 
     /// A leaf for `fixture.test` signed by a separate CA key, so it is not self-signed.
     pub(crate) fn leaf_certificate(not_before_unix: i64, not_after_unix: i64) -> X509 {
+        leaf_issued_by(&name("Fixture CA"), not_before_unix, not_after_unix)
+    }
+
+    /// An issuer name of `entries`, each a NID and its value, in order.
+    pub(crate) fn issuer_name(entries: &[(Nid, &str)]) -> X509Name {
+        let mut builder = X509NameBuilder::new().expect("name builder");
+        for (nid, value) in entries {
+            builder.append_entry_by_nid(*nid, value).expect("name entry");
+        }
+        builder.build()
+    }
+
+    /// A leaf for `fixture.test` issued under `issuer`, signed by a separate CA key.
+    pub(crate) fn leaf_issued_by(issuer: &X509Name, not_before_unix: i64, not_after_unix: i64) -> X509 {
         let ca_key = key();
         let leaf_key = key();
         let mut builder = X509Builder::new().expect("x509 builder");
         builder.set_version(2).expect("version");
         builder.set_subject_name(&name("fixture.test")).expect("subject");
-        builder.set_issuer_name(&name("Fixture CA")).expect("issuer");
+        builder.set_issuer_name(issuer).expect("issuer");
         builder.set_pubkey(&leaf_key).expect("pubkey");
         builder
             .set_not_before(&Asn1Time::from_unix(not_before_unix).expect("not_before"))
@@ -1531,11 +1566,46 @@ mod tests {
         }
     }
 
+    /// `O=Entrust, Inc.` carries a comma, so the organization is read by NID, never split from
+    /// the joined `issuer` string; the joined string stays for the CLI.
+    #[test]
+    fn parse_certificate_reads_the_issuer_organization_and_common_name_by_nid() {
+        let issuer = fixtures::issuer_name(&[
+            (Nid::COUNTRYNAME, "US"),
+            (Nid::ORGANIZATIONNAME, "Entrust, Inc."),
+            (Nid::COMMONNAME, "Entrust Certification Authority - L1K"),
+        ]);
+        let now = Utc::now().timestamp();
+        let leaf = fixtures::leaf_issued_by(&issuer, now - 86_400, now + 86_400);
+        let info = TlsScanner::parse_certificate(&leaf).expect("parse");
+        assert_eq!(info.issuer_organization.as_deref(), Some("Entrust, Inc."));
+        assert_eq!(
+            info.issuer_common_name.as_deref(),
+            Some("Entrust Certification Authority - L1K")
+        );
+        assert_eq!(
+            info.issuer,
+            "C=US, O=Entrust, Inc., CN=Entrust Certification Authority - L1K"
+        );
+    }
+
+    #[test]
+    fn parse_certificate_leaves_absent_issuer_entries_none() {
+        let issuer = fixtures::issuer_name(&[(Nid::ORGANIZATIONALUNITNAME, "Fixture Unit")]);
+        let now = Utc::now().timestamp();
+        let info = TlsScanner::parse_certificate(&fixtures::leaf_issued_by(&issuer, now, now + 86_400)).expect("parse");
+        assert_eq!(info.issuer_organization, None);
+        assert_eq!(info.issuer_common_name, None);
+        assert_eq!(info.issuer, "OU=Fixture Unit");
+    }
+
     #[test]
     fn test_certificate_info_structure() {
         let cert_info = CertificateInfo {
             subject: "CN=example.com".to_string(),
             issuer: "CN=Let's Encrypt Authority X3".to_string(),
+            issuer_organization: None,
+            issuer_common_name: Some("Let's Encrypt Authority X3".to_string()),
             serial_number: "123456789".to_string(),
             not_before: chrono::Utc::now() - chrono::Duration::days(30),
             not_after: chrono::Utc::now() + chrono::Duration::days(60),
@@ -1984,10 +2054,9 @@ mod tests {
                 history: Default::default(),
             },
         );
-        let zoomed =
-            crate::tui::testing::content_rows(&crate::tui::security::SecurityPane::new(), &state, 80, Detail::Zoomed)
-                .join("\n");
-        assert!(zoomed.contains("Certificate Chain: 3 certificates"), "{zoomed}");
+        let zoomed = crate::tui::testing::content_rows(&crate::tui::cert::CertPane::new(), &state, 80, Detail::Zoomed)
+            .join("\n");
+        assert!(zoomed.contains("Chain (as sent): 3 certificates"), "{zoomed}");
     }
 
     #[tokio::test]

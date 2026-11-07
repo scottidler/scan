@@ -9,9 +9,6 @@ use ratatui::{
 use std::any::Any;
 
 const MAX_TLS_VULNERABILITIES_DISPLAYED: usize = 5;
-const CN_EXTRACT_PREFIX_LENGTH: usize = 3;
-const CERT_EXPIRY_WARNING_DAYS: i64 = 30;
-const CERT_EXPIRY_CRITICAL_DAYS: i64 = 7;
 const MIN_SECURITY_PANE_WIDTH: u16 = 50;
 const MIN_SECURITY_PANE_HEIGHT: u16 = 35;
 
@@ -48,7 +45,8 @@ fn observatory_row(
     ])
 }
 
-/// SECURITY pane displays TLS/SSL certificate information and security analysis
+/// SECURITY pane: the TLS handshake, its grade and issues, and the HTTP security headers. The
+/// certificate is the cert pane's and the email posture the mail pane's.
 pub struct SecurityPane {
     title: &'static str,
     id: &'static str,
@@ -69,62 +67,71 @@ impl SecurityPane {
         // The grid caps each list to keep the pane short; zoom shows every entry.
         let cap = |grid_cap: usize| if detail == Detail::Zoomed { usize::MAX } else { grid_cap };
 
-        let mut lines = Vec::new();
+        let tls_state = state.scanners.get("tls");
+        let tls_scanner_present = tls_state.is_some();
+        let tls_failed = tls_state
+            .as_ref()
+            .is_some_and(|tls_state| matches!(tls_state.status, crate::types::ScanStatus::Failed));
+        let (label, label_color) = match tls_state.as_ref() {
+            Some(tls_state) => crate::tui::status_label(tls_state, "analyzing...", "analyzed"),
+            None => ("unavailable".to_string(), theme::BAD),
+        };
+        let tls_result = tls_state
+            .as_ref()
+            .and_then(|tls_state| match tls_state.result.as_ref() {
+                Some(crate::types::ScanResult::Tls(tls_result)) => Some(tls_result.clone()),
+                _ => None,
+            });
+        drop(tls_state);
+        let primary = tls_result
+            .as_ref()
+            .and_then(|tls_result| tls_result.get_primary_result());
 
-        // Security status header
-        lines.push(Line::from(vec![
+        // The status row carries the grade and the issue count: `Status: analyzed · A+ · 0 issues`.
+        let mut status = vec![
             Span::styled("🔒 Status: ", Style::default().fg(theme::VALUE)),
-            Span::styled("analyzing...", Style::default().fg(theme::WARN)),
-        ]));
+            Span::styled(label, Style::default().fg(label_color)),
+        ];
+        if let (Some(tls_result), Some(primary_data)) = (tls_result.as_ref(), primary) {
+            let grade = tls_result
+                .get_best_security_grade()
+                .map(|g| g.as_str().to_string())
+                .unwrap_or_else(|| "F".to_string());
+            let grade_color = match grade.as_str() {
+                "A+" | "A" => theme::GOOD,
+                "B" => theme::WARN,
+                _ => theme::BAD,
+            };
+            let issue_count = primary_data.issue_count();
+            status.push(Span::styled(" · ", Style::default().fg(theme::MUTED)));
+            status.push(Span::styled(grade, Style::default().fg(grade_color)));
+            status.push(Span::styled(" · ", Style::default().fg(theme::MUTED)));
+            status.push(Span::styled(
+                crate::tui::text::plural(issue_count, "issue"),
+                Style::default().fg(if issue_count == 0 { theme::GOOD } else { theme::BAD }),
+            ));
+        }
+        let mut lines = vec![Line::from(status)];
+
+        // The reasons the issue count counts sit right under it, so a failed handshake's cause is
+        // above the fold.
+        if let Some(primary_data) = primary {
+            for issue in primary_data
+                .vulnerabilities
+                .iter()
+                .map(|vuln| vuln.description())
+                .chain(primary_data.certificate_errors.iter().cloned())
+                .take(cap(MAX_TLS_VULNERABILITIES_DISPLAYED))
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", Style::default().fg(theme::BAD)),
+                    Span::styled(issue, Style::default().fg(theme::BAD)),
+                ]));
+            }
+        }
 
         // Empty line for spacing
         lines.push(Line::from(""));
-
-        let tls_failed = state
-            .scanners
-            .get("tls")
-            .is_some_and(|tls_state| matches!(tls_state.status, crate::types::ScanStatus::Failed));
-        if let Some(tls_state) = state.scanners.get("tls") {
-            let (label, color) = crate::tui::status_label(&tls_state, "analyzing...", "analyzed");
-            lines[0] = Line::from(vec![
-                Span::styled("🔒 Status: ", Style::default().fg(theme::VALUE)),
-                Span::styled(label, Style::default().fg(color)),
-            ]);
-        }
-
-        // Extract TLS data upfront
-        let tls_data = if let Some(tls_state) = state.scanners.get("tls") {
-            if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                tls_result.get_primary_result().map(|primary_data| {
-                    (
-                        primary_data.connection_successful,
-                        primary_data.negotiated_version.as_ref().map(|v| v.as_str().to_string()),
-                        primary_data.negotiated_cipher.as_ref().map(|c| c.name.clone()),
-                        primary_data.perfect_forward_secrecy,
-                        primary_data.certificate_valid,
-                        primary_data.days_until_expiry,
-                        tls_result
-                            .get_best_security_grade()
-                            .map(|g| g.as_str().to_string())
-                            .unwrap_or_else(|| "F".to_string()),
-                        primary_data.issue_count(),
-                        primary_data.certificate_chain.first().map(|cert| {
-                            (
-                                cert.subject.clone(),
-                                cert.issuer.clone(),
-                                cert.public_key_algorithm.clone(),
-                                cert.key_size,
-                                cert.san_domains.len(),
-                            )
-                        }),
-                    )
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         // Extract HTTP data upfront: the target's own headers, displayed; every verdict on them is
         // the host's Observatory result.
@@ -174,57 +181,8 @@ impl SecurityPane {
                 _ => None,
             });
 
-        // Extract DNS data upfront
-        let dns_data = if let Some(dns_state) = state.scanners.get("dns") {
-            if let Some(crate::types::ScanResult::Dns(dns_result)) = dns_state.result.as_ref() {
-                dns_result.email_security.as_ref().map(|email_security| {
-                    (
-                        email_security.spf_record.clone(),
-                        email_security.dmarc_record.clone(),
-                        email_security.mx_count,
-                        email_security.has_mx,
-                        (email_security.mta_sts.clone(), email_security.tls_rpt.clone()),
-                    )
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Extract TLS issue details: the same primary result and lists that `Issues:` counts
-        let tls_issues = if let Some(tls_state) = state.scanners.get("tls") {
-            if let Some(crate::types::ScanResult::Tls(tls_result)) = tls_state.result.as_ref() {
-                tls_result.get_primary_result().map(|primary_data| {
-                    primary_data
-                        .vulnerabilities
-                        .iter()
-                        .map(|vuln| vuln.description())
-                        .chain(primary_data.certificate_errors.iter().cloned())
-                        .take(cap(MAX_TLS_VULNERABILITIES_DISPLAYED))
-                        .collect::<Vec<_>>()
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Now build the UI with owned data
-        if let Some((
-            connection_successful,
-            negotiated_version,
-            negotiated_cipher,
-            pfs,
-            cert_valid,
-            days_until_expiry,
-            security_grade,
-            vuln_count,
-            cert_info,
-        )) = tls_data
-        {
+        if let Some(primary_data) = primary {
+            let connection_successful = primary_data.connection_successful;
             // TLS Connection
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
@@ -234,31 +192,24 @@ impl SecurityPane {
                 ),
             ]));
 
-            // TLS Version
-            if let Some(version) = negotiated_version {
+            if let Some(version) = &primary_data.negotiated_version {
                 lines.push(Line::from(vec![
                     Span::styled("🔐 Version: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(version, Style::default().fg(theme::GOOD)),
+                    Span::styled(version.as_str(), Style::default().fg(theme::GOOD)),
                 ]));
             }
 
-            // Cipher Suite
-            if let Some(cipher) = negotiated_cipher {
+            if let Some(cipher) = &primary_data.negotiated_cipher {
                 lines.push(Line::from(vec![
                     Span::styled("🔑 Cipher: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(cipher, Style::default().fg(theme::WARN)),
+                    Span::styled(cipher.name.clone(), Style::default().fg(theme::WARN)),
                 ]));
             }
 
-            // Security Features
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(
-                "🔰 Security Features",
-                Style::default().fg(theme::VALUE),
-            )]));
-
+            // PFS and OCSP share one row.
+            let pfs = primary_data.perfect_forward_secrecy;
             lines.push(Line::from(vec![
-                Span::styled("  PFS: ", Style::default().fg(theme::LABEL)),
+                Span::styled("🔰 PFS: ", Style::default().fg(theme::LABEL)),
                 if !connection_successful {
                     Span::styled("n/a", Style::default().fg(theme::MUTED))
                 } else {
@@ -267,113 +218,15 @@ impl SecurityPane {
                         Style::default().fg(if pfs { theme::GOOD } else { theme::BAD }),
                     )
                 },
-            ]));
-
-            lines.push(Line::from(vec![
-                Span::styled("  OCSP: ", Style::default().fg(theme::LABEL)),
+                Span::styled(" · ", Style::default().fg(theme::MUTED)),
+                Span::styled("OCSP: ", Style::default().fg(theme::LABEL)),
                 // Stapling is never collected, so `no` would claim a check that did not happen.
                 Span::styled("not checked", Style::default().fg(theme::MUTED)),
             ]));
-
-            // Certificate Details
-            if let Some((subject, issuer, key_algo, key_size, san_count)) = cert_info {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![Span::styled(
-                    "📜 Certificate Details",
-                    Style::default().fg(theme::VALUE),
-                )]));
-
-                let cert_color = if cert_valid { theme::GOOD } else { theme::BAD };
-
-                lines.push(Line::from(vec![
-                    Span::styled("  Valid: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(if cert_valid { "yes" } else { "no" }, Style::default().fg(cert_color)),
-                ]));
-
-                lines.push(Line::from(vec![
-                    Span::styled("  Subject: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(common_name_display(&subject), Style::default().fg(theme::WARN)),
-                ]));
-
-                lines.push(Line::from(vec![
-                    Span::styled("  Issuer: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(common_name_display(&issuer), Style::default().fg(theme::GOOD)),
-                ]));
-
-                // Certificate expiry
-                if let Some(days_until_expiry) = days_until_expiry {
-                    let expiry_color = if days_until_expiry > CERT_EXPIRY_WARNING_DAYS {
-                        theme::GOOD
-                    } else if days_until_expiry > CERT_EXPIRY_CRITICAL_DAYS {
-                        theme::WARN
-                    } else {
-                        theme::BAD
-                    };
-
-                    lines.push(Line::from(vec![
-                        Span::styled("  Expires: ", Style::default().fg(theme::LABEL)),
-                        Span::styled(
-                            crate::tui::text::plural(days_until_expiry, "day"),
-                            Style::default().fg(expiry_color),
-                        ),
-                    ]));
-                }
-
-                // Key algorithm and size
-                lines.push(Line::from(vec![
-                    Span::styled("  Key: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(key_algo, Style::default().fg(theme::WARN)),
-                    Span::styled(
-                        key_size.map_or(String::new(), |size| format!(" {}bit", size)),
-                        Style::default().fg(theme::MUTED),
-                    ),
-                ]));
-
-                // SAN domains count
-                if san_count > 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("  SAN: ", Style::default().fg(theme::LABEL)),
-                        Span::styled(
-                            crate::tui::text::plural(san_count, "domain"),
-                            Style::default().fg(theme::GOOD),
-                        ),
-                    ]));
-                }
-            }
-
-            // Grade and vulnerabilities
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("📊 Grade: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    security_grade.clone(),
-                    Style::default().fg(match security_grade.as_str() {
-                        "A+" | "A" => theme::GOOD,
-                        "B" => theme::WARN,
-                        _ => theme::BAD,
-                    }),
-                ),
-            ]));
-
-            lines.push(Line::from(vec![
-                Span::styled("❗ Issues: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    format!("{}", vuln_count),
-                    Style::default().fg(if vuln_count == 0 { theme::GOOD } else { theme::BAD }),
-                ),
-            ]));
-
-            // The reasons `Issues:` counts sit right under it, so a failed handshake's cause is above the fold.
-            for issue in tls_issues.into_iter().flatten() {
-                lines.push(Line::from(vec![
-                    Span::styled("  • ", Style::default().fg(theme::BAD)),
-                    Span::styled(issue, Style::default().fg(theme::BAD)),
-                ]));
-            }
         } else if tls_failed {
             // The first scan failed: the header's `Status:` row carries the reason and is the only
             // status row; a second `🔗 Status:` row would say the same thing again.
-        } else if state.scanners.contains_key("tls") {
+        } else if tls_scanner_present {
             // TLS scanner exists but no result yet
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
@@ -384,18 +237,7 @@ impl SecurityPane {
                 Span::styled("🔐 Version: ", Style::default().fg(theme::LABEL)),
                 Span::styled("detecting...", Style::default().fg(theme::MUTED)),
             ]));
-
-            lines.push(Line::from(vec![
-                Span::styled("📜 Cert: ", Style::default().fg(theme::LABEL)),
-                Span::styled("validating...", Style::default().fg(theme::MUTED)),
-            ]));
         } else {
-            // No TLS scanner available
-            lines[0] = Line::from(vec![
-                Span::styled("🔒 Status: ", Style::default().fg(theme::VALUE)),
-                Span::styled("unavailable", Style::default().fg(theme::BAD)),
-            ]);
-
             lines.push(Line::from(vec![
                 Span::styled("🔗 Status: ", Style::default().fg(theme::LABEL)),
                 Span::styled("TLS scanner not available", Style::default().fg(theme::BAD)),
@@ -523,73 +365,6 @@ impl SecurityPane {
             lines.push(crate::tui::http::grade_line("📊 HTTP Grade: ", &observatory));
         }
 
-        // DNS Security Records
-        if let Some((spf_record, dmarc_record, mx_count, has_mx, (mta_sts, tls_rpt))) = dns_data {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(
-                "📧 Email Security",
-                Style::default().fg(theme::VALUE),
-            )]));
-
-            // SPF Record
-            lines.push(Line::from(vec![
-                Span::styled("  SPF: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    if spf_record.is_some() { "configured" } else { "missing" },
-                    Style::default().fg(if spf_record.is_some() { theme::GOOD } else { theme::BAD }),
-                ),
-            ]));
-
-            // DMARC Record
-            lines.push(Line::from(vec![
-                Span::styled("  DMARC: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    if dmarc_record.is_some() { "configured" } else { "missing" },
-                    Style::default().fg(if dmarc_record.is_some() { theme::GOOD } else { theme::BAD }),
-                ),
-            ]));
-
-            // Zoomed only, under DMARC: the MTA-STS policy id and the TLS-RPT report address.
-            if detail == Detail::Zoomed {
-                for (label, outcome) in [("  MTA-STS: ", &mta_sts), ("  TLS-RPT: ", &tls_rpt)] {
-                    lines.push(Line::from(vec![
-                        Span::styled(label, Style::default().fg(theme::LABEL)),
-                        crate::tui::http::lens_value(outcome, |value| (value.clone(), theme::GOOD)),
-                    ]));
-                }
-            }
-
-            // DKIM keys sit at `<selector>._domainkey`; without a selector there is nothing to query.
-            lines.push(Line::from(vec![
-                Span::styled("  DKIM: ", Style::default().fg(theme::LABEL)),
-                Span::styled("not checked (needs selector)", Style::default().fg(theme::MUTED)),
-            ]));
-
-            // MX Records
-            lines.push(Line::from(vec![
-                Span::styled("  MX: ", Style::default().fg(theme::LABEL)),
-                Span::styled(
-                    crate::tui::text::plural(mx_count, "record"),
-                    Style::default().fg(if has_mx { theme::GOOD } else { theme::MUTED }),
-                ),
-            ]));
-
-            // Show actual record contents
-            if let Some(spf) = &spf_record {
-                lines.push(Line::from(vec![
-                    Span::styled("    SPF: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(spf.clone(), Style::default().fg(theme::MUTED)),
-                ]));
-            }
-
-            if let Some(dmarc) = &dmarc_record {
-                lines.push(Line::from(vec![
-                    Span::styled("    DMARC: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(dmarc.clone(), Style::default().fg(theme::MUTED)),
-                ]));
-            }
-        }
-
         if detail == Detail::Zoomed {
             lines.extend(zoomed_tls_lines(state));
         }
@@ -598,8 +373,8 @@ impl SecurityPane {
     }
 }
 
-/// Zoomed only, after everything the grid shows: the negotiated family's supported TLS versions
-/// and its full certificate chain.
+/// Zoomed only, after everything the grid shows: the negotiated family's supported TLS versions.
+/// The certificate chain is the cert pane's.
 fn zoomed_tls_lines(state: &AppState) -> Vec<Line<'static>> {
     let Some(tls_state) = state.scanners.get("tls") else {
         return Vec::new();
@@ -609,12 +384,6 @@ fn zoomed_tls_lines(state: &AppState) -> Vec<Line<'static>> {
     };
     let Some(data) = tls_result.get_primary_result() else {
         return Vec::new();
-    };
-    let field = |label: &str, value: String| {
-        Line::from(vec![
-            Span::styled(format!("    {label}: "), Style::default().fg(theme::LABEL)),
-            Span::styled(value, Style::default().fg(theme::MUTED)),
-        ])
     };
     let mut lines = vec![Line::from("")];
     let versions: Vec<&str> = data.supported_versions.iter().map(|version| version.as_str()).collect();
@@ -629,42 +398,6 @@ fn zoomed_tls_lines(state: &AppState) -> Vec<Line<'static>> {
             Style::default().fg(theme::MUTED),
         ),
     ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("📜 Certificate Chain: ", Style::default().fg(theme::VALUE)),
-        Span::styled(
-            crate::tui::text::plural(data.certificate_chain.len(), "certificate"),
-            Style::default().fg(theme::MUTED),
-        ),
-    ]));
-    for (index, cert) in data.certificate_chain.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  [{index}] "), Style::default().fg(theme::LABEL)),
-            Span::styled(common_name_display(&cert.subject), Style::default().fg(theme::WARN)),
-        ]));
-        lines.push(field("Subject", cert.subject.clone()));
-        lines.push(field("Issuer", cert.issuer.clone()));
-        lines.push(field("Serial", cert.serial_number.clone()));
-        lines.push(field(
-            "Valid",
-            format!(
-                "{} to {}",
-                cert.not_before.format("%Y-%m-%d"),
-                cert.not_after.format("%Y-%m-%d")
-            ),
-        ));
-        lines.push(field("Signature", cert.signature_algorithm.clone()));
-        lines.push(field(
-            "Key",
-            match cert.key_size {
-                Some(size) => format!("{} {}bit", cert.public_key_algorithm, size),
-                None => cert.public_key_algorithm.clone(),
-            },
-        ));
-        if !cert.san_domains.is_empty() {
-            lines.push(field("SAN", cert.san_domains.join(", ")));
-        }
-    }
     lines
 }
 
@@ -699,17 +432,6 @@ impl Pane for SecurityPane {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-}
-
-/// The `CN=` value of a distinguished name, cut at the next `,`. Never cut by length: the line is
-/// fit to the pane width, which marks the cut with `…`.
-fn common_name_display(distinguished_name: &str) -> String {
-    let Some(cn_start) = distinguished_name.find("CN=") else {
-        return "unknown".to_string();
-    };
-    let cn_part = &distinguished_name[cn_start + CN_EXTRACT_PREFIX_LENGTH..];
-    let cn = cn_part.split(',').next().unwrap_or_default();
-    cn.to_string()
 }
 
 #[cfg(test)]
@@ -747,6 +469,8 @@ mod tests {
         let cert = CertificateInfo {
             subject: "CN=example.com,O=Example Corp,C=US".to_string(),
             issuer: "CN=Let's Encrypt Authority X3,O=Let's Encrypt,C=US".to_string(),
+            issuer_organization: Some("Let's Encrypt".to_string()),
+            issuer_common_name: Some("Let's Encrypt Authority X3".to_string()),
             serial_number: "123456789".to_string(),
             not_before: Utc::now(),
             not_after: Utc::now() + chrono::Duration::days(90),
@@ -953,40 +677,6 @@ mod tests {
         }
     }
 
-    /// Item 4: DKIM cannot be found without a selector, so the pane says it was not checked.
-    #[test]
-    fn dkim_reads_not_checked_and_dmarc_reads_configured() {
-        let state = AppState::new("google.com".to_string());
-        let mut dns_result = DnsResult::new();
-        dns_result.email_security = Some(EmailSecurityAnalysis {
-            spf_record: Some("v=spf1 -all".to_string()),
-            dmarc_record: Some("v=DMARC1; p=reject".to_string()),
-            has_mx: true,
-            mx_count: 1,
-            mta_sts: crate::scan::lens::LensOutcome::Absent,
-            tls_rpt: crate::scan::lens::LensOutcome::Absent,
-        });
-        state.scanners.insert(
-            "dns".to_string(),
-            ScanState {
-                result: Some(ScanResult::Dns(dns_result)),
-                error: None,
-                status: ScanStatus::Complete,
-                last_updated: Instant::now(),
-                history: std::collections::VecDeque::new(),
-            },
-        );
-        let pane = SecurityPane::new();
-        let out = crate::tui::testing::render_pane(&pane, &state, 120, 80, false);
-        assert!(out.contains("DKIM: not checked (needs selector)"), "{out}");
-        assert!(out.contains("DMARC: configured"), "{out}");
-        let buffer = crate::tui::testing::render_buffer(&pane, &state, 120, 80, false);
-        assert_eq!(
-            crate::tui::testing::fg_of(&buffer, "not checked (needs selector)"),
-            theme::MUTED
-        );
-    }
-
     #[test]
     fn test_dns_data_extraction() {
         // False positive: mut is required for state.scanners.insert() calls
@@ -998,8 +688,7 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com".to_string()),
             has_mx: true,
             mx_count: 2,
-            mta_sts: crate::scan::lens::LensOutcome::Absent,
-            tls_rpt: crate::scan::lens::LensOutcome::Absent,
+            ..EmailSecurityAnalysis::fixture()
         };
 
         let dns_result = DnsResult {
@@ -1069,6 +758,8 @@ mod tests {
         let cert = CertificateInfo {
             subject: "CN=comprehensive.com".to_string(),
             issuer: "CN=DigiCert".to_string(),
+            issuer_organization: None,
+            issuer_common_name: Some("DigiCert".to_string()),
             serial_number: "123".to_string(),
             not_before: Utc::now(),
             not_after: Utc::now() + chrono::Duration::days(365),
@@ -1160,8 +851,7 @@ mod tests {
                 dmarc_record: Some("v=DMARC1; p=reject".to_string()),
                 has_mx: true,
                 mx_count: 1,
-                mta_sts: crate::scan::lens::LensOutcome::Absent,
-                tls_rpt: crate::scan::lens::LensOutcome::Absent,
+                ..EmailSecurityAnalysis::fixture()
             }),
             A_status: crate::scan::dns::QueryStatus::NoRecords,
             AAAA_status: crate::scan::dns::QueryStatus::NoRecords,
@@ -1361,14 +1051,12 @@ mod tests {
             },
         );
         let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
-        assert!(out.contains("Issues: 1"), "expected one issue:\n{}", out);
-        assert!(out.contains("Certificate expired"), "missing expiry issue:\n{}", out);
         assert!(
-            out.contains("Expires: -30 days"),
-            "missing certificate expiry:\n{}",
+            out.contains("Status: analyzed · F · 1 issue "),
+            "expected one issue:\n{}",
             out
         );
-        assert!(out.contains("Valid: no"), "expired cert shown valid:\n{}", out);
+        assert!(out.contains("Certificate expired"), "missing expiry issue:\n{}", out);
     }
 
     #[test]
@@ -1397,7 +1085,7 @@ mod tests {
         );
         let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
         assert!(
-            out.contains("Issues: 3"),
+            out.contains(" · 3 issues"),
             "expected expiry + two unmapped errors:\n{}",
             out
         );
@@ -1480,53 +1168,8 @@ mod tests {
         );
         // The Security pane at a 200x55 terminal: 68 wide, 20 inner lines plus borders.
         let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 68, 22, true);
-        assert!(out.contains("Issues: 1"), "missing issue count:\n{}", out);
+        assert!(out.contains(" · 1 issue "), "missing issue count:\n{}", out);
         assert!(out.contains("Certificate expired"), "reason below the fold:\n{}", out);
-    }
-
-    fn state_with_cert(subject: &str, issuer: &str) -> AppState {
-        let state = state_with_tls(ScanStatus::Complete);
-        if let Some(mut tls_state) = state.scanners.get_mut("tls")
-            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
-            && let Some(data) = tls_result.ipv4_result.as_mut()
-        {
-            data.certificate_chain = vec![CertificateInfo {
-                subject: subject.to_string(),
-                issuer: issuer.to_string(),
-                serial_number: "1".to_string(),
-                not_before: Utc::now(),
-                not_after: Utc::now() + chrono::Duration::days(90),
-                signature_algorithm: "SHA256withRSA".to_string(),
-                public_key_algorithm: "RSA".to_string(),
-                key_size: Some(2048),
-                san_domains: vec![],
-                is_self_signed: false,
-                is_ca: false,
-            }];
-        }
-        state
-    }
-
-    #[test]
-    fn render_multibyte_cn_is_fit_by_width_without_panic() {
-        let cn = "é".repeat(30);
-        let state = state_with_cert(&format!("CN={cn}"), &format!("CN={cn},O=Example"));
-        let wide = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
-        assert!(wide.contains(&format!("Subject: {cn}")), "subject CN cut:\n{wide}");
-        assert!(wide.contains(&format!("Issuer: {cn}")), "issuer CN cut:\n{wide}");
-        // Narrow panes still cut on a char boundary, with an ellipsis.
-        let narrow = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 40, 40, false);
-        assert!(narrow.contains('…'), "narrow CN not marked:\n{narrow}");
-    }
-
-    #[test]
-    fn forty_char_cn_renders_in_full_at_200x55() {
-        let cn = "Sectigo Public Server Authentication CA DV R36";
-        assert!(cn.chars().count() > 40);
-        let state = state_with_cert("CN=example.com", &format!("CN={cn},O=Sectigo Limited"));
-        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 2, 200, 55);
-        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, width, height, false);
-        assert!(out.contains(&format!("Issuer: {cn}")), "CN cut:\n{out}");
     }
 
     #[test]
@@ -1538,8 +1181,7 @@ mod tests {
             80,
             false,
         );
-        assert!(out.contains("PFS: yes"), "{out}");
-        assert!(out.contains("OCSP: not checked"), "{out}");
+        assert!(out.contains("PFS: yes · OCSP: not checked"), "{out}");
         assert!(!out.contains("OCSP: no\n") && !out.contains("OCSP: yes"), "{out}");
     }
 
@@ -1773,14 +1415,6 @@ mod tests {
         assert!(out.contains("HTTP Grade: C- (45) · google.com"), "{out}");
     }
 
-    #[test]
-    fn render_ascii_cn_stops_at_comma() {
-        let state = state_with_cert("CN=example.com,O=Example Corp", "CN=R3,O=Let's Encrypt");
-        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
-        assert!(out.contains("Subject: example.com "), "subject CN wrong:\n{}", out);
-        assert!(out.contains("Issuer: R3 "), "issuer CN wrong:\n{}", out);
-    }
-
     fn failed_tls_state(with_result: bool) -> AppState {
         let state = if with_result {
             state_with_tls(ScanStatus::Failed)
@@ -1826,17 +1460,6 @@ mod tests {
     }
 
     #[test]
-    fn common_name_display_cases() {
-        assert_eq!(common_name_display("O=Example,CN=host.example,C=US"), "host.example");
-        assert_eq!(common_name_display("O=No Common Name"), "unknown");
-        assert_eq!(
-            common_name_display(&format!("CN={}", "ü".repeat(40))).chars().count(),
-            40
-        );
-        assert_eq!(common_name_display("CN="), "");
-    }
-
-    #[test]
     fn long_cipher_is_fit_with_ellipsis_in_narrow_terminals() {
         let cipher = "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256_AND_A_LONG_VENDOR_SUFFIX";
         let state = state_with_tls(ScanStatus::Complete);
@@ -1864,133 +1487,6 @@ mod tests {
     }
 
     #[test]
-    fn zoomed_content_lists_the_certificate_chain_and_dmarc_in_full() {
-        let state = state_with_cert("CN=www.example.com, O=Example", "CN=Example Issuing CA, O=Example");
-        if let Some(mut tls_state) = state.scanners.get_mut("tls")
-            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
-            && let Some(data) = tls_result.ipv4_result.as_mut()
-        {
-            data.certificate_chain[0].serial_number = "0a:1b:2c".to_string();
-            data.certificate_chain[0].san_domains = vec!["www.example.com".to_string(), "example.com".to_string()];
-            data.supported_versions = vec![TlsVersion::V1_2, TlsVersion::V1_3];
-        }
-        let dmarc = "v=DMARC1; p=reject; rua=mailto:mailauth-reports@example.com; ruf=mailto:forensics@example.com";
-        let mut dns_result = DnsResult::new();
-        dns_result.email_security = Some(EmailSecurityAnalysis {
-            spf_record: Some("v=spf1 include:_spf.example.com ~all".to_string()),
-            dmarc_record: Some(dmarc.to_string()),
-            has_mx: true,
-            mx_count: 1,
-            mta_sts: crate::scan::lens::LensOutcome::Absent,
-            tls_rpt: crate::scan::lens::LensOutcome::Absent,
-        });
-        state.scanners.insert(
-            "dns".to_string(),
-            ScanState {
-                result: Some(ScanResult::Dns(dns_result)),
-                error: None,
-                status: ScanStatus::Complete,
-                last_updated: Instant::now(),
-                history: std::collections::VecDeque::new(),
-            },
-        );
-        let pane = SecurityPane::new();
-        let rows = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Zoomed);
-        let text = rows.join("\n");
-        for expected in [
-            "Certificate Chain: 1 certificate",
-            "Serial: 0a:1b:2c",
-            "Subject: CN=www.example.com, O=Example",
-            "Signature: SHA256withRSA",
-            "SAN: www.example.com, example.com",
-            "Supported Versions: TLSv1.2, TLSv1.3",
-            "DMARC: configured",
-        ] {
-            assert!(text.contains(expected), "{expected}:\n{text}");
-        }
-        assert!(rows.concat().contains(dmarc), "DMARC text not whole:\n{text}");
-        // Item 9: a one-certificate chain and one MX record read singular.
-        for wrong in ["1 certificates", "MX: 1 records"] {
-            assert!(!text.contains(wrong), "{wrong}:\n{text}");
-        }
-        assert!(text.contains("MX: 1 record"), "{text}");
-
-        let normal = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Normal).join("\n");
-        assert!(!normal.contains("Certificate Chain"), "{normal}");
-        assert!(!normal.contains("0a:1b:2c"), "{normal}");
-    }
-
-    fn state_with_mail_transport(
-        mta_sts: crate::scan::lens::LensOutcome<String>,
-        tls_rpt: crate::scan::lens::LensOutcome<String>,
-    ) -> AppState {
-        let state = AppState::new("google.com".to_string());
-        let mut dns_result = DnsResult::new();
-        dns_result.email_security = Some(EmailSecurityAnalysis {
-            spf_record: Some("v=spf1 -all".to_string()),
-            dmarc_record: Some("v=DMARC1; p=reject".to_string()),
-            has_mx: true,
-            mx_count: 1,
-            mta_sts,
-            tls_rpt,
-        });
-        state.scanners.insert(
-            "dns".to_string(),
-            ScanState {
-                result: Some(ScanResult::Dns(dns_result)),
-                error: None,
-                status: ScanStatus::Complete,
-                last_updated: Instant::now(),
-                history: std::collections::VecDeque::new(),
-            },
-        );
-        state
-    }
-
-    /// AC6's lines: the MTA-STS id and the TLS-RPT address under DMARC, zoomed only.
-    #[test]
-    fn zoom_shows_mta_sts_and_tls_rpt_under_dmarc() {
-        use crate::scan::lens::LensOutcome;
-        let state = state_with_mail_transport(
-            LensOutcome::Present("20210803T010101".to_string()),
-            LensOutcome::Present("mailto:sts-reports@google.com".to_string()),
-        );
-        let pane = SecurityPane::new();
-        let rows = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed);
-        let at = |needle: &str| rows.iter().position(|row| row.contains(needle));
-        let (dmarc, mta_sts, tls_rpt, dkim) = (
-            at("DMARC: configured").expect("DMARC row"),
-            at("MTA-STS: 20210803T010101").expect("MTA-STS row"),
-            at("TLS-RPT: mailto:sts-reports@google.com").expect("TLS-RPT row"),
-            at("DKIM:").expect("DKIM row"),
-        );
-        assert!(dmarc < mta_sts && mta_sts < tls_rpt && tls_rpt < dkim, "{rows:#?}");
-        let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
-        assert!(!normal.contains("MTA-STS"), "{normal}");
-    }
-
-    /// A resolver error reads `failed`, never `none`; no record reads `none`.
-    #[test]
-    fn a_failed_mail_transport_query_reads_failed_not_none() {
-        use crate::scan::lens::LensOutcome;
-        let state = state_with_mail_transport(LensOutcome::Failed("timed out".to_string()), LensOutcome::Absent);
-        let pane = SecurityPane::new();
-        let text = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Zoomed).join("\n");
-        assert!(text.contains("MTA-STS: failed: timed out"), "{text}");
-        assert!(text.contains("TLS-RPT: none"), "{text}");
-        let lines = pane.content(&state, 80, Detail::Zoomed);
-        let color_of = |text: &str| {
-            lines
-                .iter()
-                .flat_map(|line| line.spans.iter())
-                .find(|span| span.content == text)
-                .and_then(|span| span.style.fg)
-        };
-        assert_eq!(color_of("failed: timed out"), Some(theme::BAD));
-        assert_eq!(color_of("none"), Some(theme::MUTED));
-    }
-
-    #[test]
     fn zoomed_content_lists_every_tls_issue_past_the_grid_cap() {
         let state = state_with_tls(ScanStatus::Complete);
         if let Some(mut tls_state) = state.scanners.get_mut("tls")
@@ -2007,44 +1503,6 @@ mod tests {
         assert!(zoomed.contains(&last), "{zoomed}");
         let normal = crate::tui::testing::content_rows(&pane, &state, 80, Detail::Normal).join("\n");
         assert!(!normal.contains(&last), "{normal}");
-    }
-
-    /// Item 9: a one-name certificate reads `1 domain`.
-    /// Item 9: a certificate one day from expiry reads `1 day`.
-    #[test]
-    fn expiry_of_one_day_reads_day() {
-        let state = state_with_cert("CN=example.com", "CN=R3");
-        if let Some(mut tls_state) = state.scanners.get_mut("tls")
-            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
-            && let Some(data) = tls_result.ipv4_result.as_mut()
-        {
-            data.days_until_expiry = Some(1);
-        }
-        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 80, false);
-        assert!(out.contains("Expires: 1 day "), "{out}");
-    }
-
-    #[test]
-    fn san_count_of_one_reads_domain() {
-        let state = AppState::new("example.com".to_string());
-        let mut tls_result = TlsResult::new();
-        let mut data = crate::scan::tls::fixtures::expired_handshake_result();
-        data.certificate_chain[0].san_domains = vec!["example.com".to_string()];
-        tls_result.ipv4_status = TlsStatus::Success(data.security_grade.clone());
-        tls_result.ipv4_result = Some(data);
-        state.scanners.insert(
-            "tls".to_string(),
-            ScanState {
-                result: Some(ScanResult::Tls(tls_result)),
-                error: None,
-                status: ScanStatus::Complete,
-                last_updated: Instant::now(),
-                history: std::collections::VecDeque::new(),
-            },
-        );
-        let out = crate::tui::testing::render_pane(&SecurityPane::new(), &state, 100, 40, false);
-        assert!(out.contains("SAN: 1 domain"), "{out}");
-        assert!(!out.contains("1 domains"), "{out}");
     }
 
     /// Item 11: a failed TLS scan says so once, in the header; no second `🔗 Status:` row.
@@ -2065,5 +1523,81 @@ mod tests {
         assert!(out.contains("Status: failed: connection refused"), "{out}");
         assert_eq!(out.matches("Status:").count(), 1, "{out}");
         assert!(!out.contains("🔗"), "{out}");
+    }
+
+    /// The grade and the issue count fold into the status row; the features header and the
+    /// separate grade and issue rows are gone.
+    #[test]
+    fn status_row_carries_the_grade_and_issue_count() {
+        let rows = crate::tui::testing::content_rows(
+            &SecurityPane::new(),
+            &state_with_tls(ScanStatus::Complete),
+            80,
+            Detail::Normal,
+        );
+        assert_eq!(rows[0].trim_end(), "🔒 Status: analyzed · A · 0 issues", "{rows:#?}");
+        let text = rows.join("\n");
+        for gone in ["Security Features", "📊 Grade:", "Issues:"] {
+            assert!(!text.contains(gone), "{gone}:\n{text}");
+        }
+        let buffer = crate::tui::testing::render_buffer(
+            &SecurityPane::new(),
+            &state_with_tls(ScanStatus::Complete),
+            80,
+            20,
+            false,
+        );
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "0 issues"), theme::GOOD);
+    }
+
+    /// The certificate and the email posture are the cert and mail panes' now.
+    #[test]
+    fn certificate_and_email_rows_are_not_securitys() {
+        let state = state_with_tls(ScanStatus::Complete);
+        let mut dns_result = DnsResult::new();
+        dns_result.email_security = Some(EmailSecurityAnalysis {
+            spf_record: Some("v=spf1 -all".to_string()),
+            dmarc_record: Some("v=DMARC1; p=reject".to_string()),
+            ..EmailSecurityAnalysis::fixture()
+        });
+        state.scanners.insert(
+            "dns".to_string(),
+            ScanState {
+                result: Some(ScanResult::Dns(dns_result)),
+                error: None,
+                status: ScanStatus::Complete,
+                last_updated: Instant::now(),
+                history: std::collections::VecDeque::new(),
+            },
+        );
+        for detail in [Detail::Normal, Detail::Zoomed] {
+            let text = crate::tui::testing::content_rows(&SecurityPane::new(), &state, 100, detail).join("\n");
+            for gone in [
+                "Email Security",
+                "SPF:",
+                "DMARC:",
+                "DKIM:",
+                "Certificate",
+                "Issuer:",
+                "Chain",
+            ] {
+                assert!(!text.contains(gone), "{detail:?} {gone}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_lists_the_supported_versions() {
+        let state = state_with_tls(ScanStatus::Complete);
+        if let Some(mut tls_state) = state.scanners.get_mut("tls")
+            && let Some(ScanResult::Tls(tls_result)) = tls_state.result.as_mut()
+            && let Some(data) = tls_result.ipv4_result.as_mut()
+        {
+            data.supported_versions = vec![TlsVersion::V1_2, TlsVersion::V1_3];
+        }
+        let zoomed = crate::tui::testing::content_rows(&SecurityPane::new(), &state, 80, Detail::Zoomed).join("\n");
+        assert!(zoomed.contains("Supported Versions: TLSv1.2, TLSv1.3"), "{zoomed}");
+        let normal = crate::tui::testing::content_rows(&SecurityPane::new(), &state, 80, Detail::Normal).join("\n");
+        assert!(!normal.contains("Supported Versions"), "{normal}");
     }
 }

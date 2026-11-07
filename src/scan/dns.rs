@@ -38,6 +38,20 @@ const MTA_STS_VERSION: &str = "STSv1";
 /// RFC 8460 §3: the TLS-RPT TXT record sits at `_smtp._tls.<domain>` and names where reports go.
 const TLS_RPT_PREFIX: &str = "_smtp._tls";
 const TLS_RPT_VERSION: &str = "TLSRPTv1";
+/// RFC 6376 §3.6.2.1: a DKIM key sits at `<selector>._domainkey.<domain>`. Selectors are chosen
+/// by the sender, so only these common ones are asked; a miss is not proof DKIM is absent.
+const DKIM_INFIX: &str = "_domainkey";
+pub const DKIM_SELECTORS: [&str; 9] = [
+    "google",
+    "selector1",
+    "selector2",
+    "default",
+    "k1",
+    "s1",
+    "s2",
+    "dkim",
+    "mail",
+];
 
 #[derive(Debug, Clone)]
 pub struct DnsRecord<T> {
@@ -104,8 +118,8 @@ pub struct SrvRecord {
 }
 
 /// SPF from the apex TXT records, DMARC from `_dmarc.` (RFC 7489), MTA-STS and TLS-RPT from their
-/// TXT records at the host itself. DKIM is not here: its records sit at `<selector>._domainkey`,
-/// and without a selector there is nothing to query.
+/// TXT records at the host itself. DS and DKIM are asked at `zone`, the host's registrable domain:
+/// DS records sit only at delegation points, so a miss at a subdomain says nothing.
 #[derive(Debug, Clone)]
 pub struct EmailSecurityAnalysis {
     pub spf_record: Option<String>,
@@ -116,6 +130,49 @@ pub struct EmailSecurityAnalysis {
     pub mta_sts: LensOutcome<String>,
     /// The TLS-RPT record's `rua`, where reports are sent.
     pub tls_rpt: LensOutcome<String>,
+    /// Where DS and DKIM were asked: the registrable domain, or the host when there is none.
+    pub zone: String,
+    /// False when `zone` is the host because the suffix list named no registrable domain, so a DS
+    /// miss there says nothing about the domain.
+    pub zone_is_registrable: bool,
+    /// The DS records published for `zone` in its parent: their count.
+    pub dnssec: LensOutcome<usize>,
+    /// The DKIM keys found at the common selectors under `zone`.
+    pub dkim: LensOutcome<Vec<DkimKey>>,
+}
+
+#[cfg(test)]
+impl EmailSecurityAnalysis {
+    /// No records and every lens `Absent`, asked at the registrable `example.com`.
+    pub(crate) fn fixture() -> Self {
+        Self {
+            spf_record: None,
+            dmarc_record: None,
+            has_mx: false,
+            mx_count: 0,
+            mta_sts: LensOutcome::Absent,
+            tls_rpt: LensOutcome::Absent,
+            zone: "example.com".to_string(),
+            zone_is_registrable: true,
+            dnssec: LensOutcome::Absent,
+            dkim: LensOutcome::Absent,
+        }
+    }
+}
+
+/// A DKIM key record found at `<selector>._domainkey.<zone>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkimKey {
+    pub selector: String,
+    /// The record's `p=` is empty: the key was revoked (RFC 6376 §3.6.1).
+    pub revoked: bool,
+}
+
+/// Where DS and DKIM are asked for a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailZone {
+    name: String,
+    registrable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,17 +485,18 @@ impl DnsScanner {
         outcomes
     }
 
-    /// The `_dmarc.` TXT answer for `host`: `_dmarc.<host>` first, then `_dmarc.<registrable
-    /// domain>` (RFC 7489 organizational fallback). Without the suffix list only the host is asked.
-    async fn lookup_dmarc(&self, resolver: &TokioResolver, host: &str) -> Vec<String> {
-        log::debug!("[scan::dns] lookup_dmarc: host={}", host);
+    /// Where DS, DKIM and DMARC's fallback look for `host`: its registrable domain under the
+    /// suffix list, resolved once under the per-query timeout. Without one (the list is
+    /// unavailable, or names none) it is the host itself, marked not registrable.
+    async fn mail_zone(&self, host: &str) -> MailZone {
+        log::debug!("[scan::dns] mail_zone: host={}", host);
         let deadline = tokio::time::Instant::now() + self.timeout;
         let registrable =
             match tokio::time::timeout_at(deadline, self.suffix_list.registrable_domain(host, deadline)).await {
                 Ok(Ok(domain)) => domain,
                 Ok(Err(e)) => {
                     log::warn!(
-                        "[scan::dns] suffix_list_unavailable_dmarc_host_only: host={} error={:#}",
+                        "[scan::dns] suffix_list_unavailable_zone_is_host: host={} error={:#}",
                         host,
                         e
                     );
@@ -446,14 +504,32 @@ impl DnsScanner {
                 }
                 Err(_) => {
                     log::warn!(
-                        "[scan::dns] suffix_list_timeout_dmarc_host_only: host={} timeout={}ms",
+                        "[scan::dns] suffix_list_timeout_zone_is_host: host={} timeout={}ms",
                         host,
                         self.timeout.as_millis()
                     );
                     None
                 }
             };
-        let names = dmarc_names(host, registrable.as_deref());
+        let zone = match registrable {
+            Some(name) => MailZone {
+                name,
+                registrable: true,
+            },
+            None => MailZone {
+                name: host.trim_end_matches('.').to_string(),
+                registrable: false,
+            },
+        };
+        log::debug!("[scan::dns] mail_zone_resolved: host={} zone={:?}", host, zone);
+        zone
+    }
+
+    /// The `_dmarc.` TXT answer for `host`: `_dmarc.<host>` first, then `_dmarc.<registrable>`
+    /// (RFC 7489 organizational fallback). With no registrable domain only the host is asked.
+    async fn lookup_dmarc(&self, resolver: &TokioResolver, host: &str, registrable: Option<&str>) -> Vec<String> {
+        log::debug!("[scan::dns] lookup_dmarc: host={} registrable={:?}", host, registrable);
+        let names = dmarc_names(host, registrable);
         for name in &names {
             // DMARC keeps its configured/missing reading: a failed query counts as no record here.
             let answer = self.txt_at(resolver, name).await.unwrap_or_default();
@@ -464,6 +540,84 @@ impl DnsScanner {
         }
         log::debug!("[scan::dns] dmarc_not_found: host={} asked={:?}", host, names);
         Vec::new()
+    }
+
+    /// Whether `zone`'s parent publishes DS records for it: their count. Presence only; the
+    /// records are not decoded or validated.
+    async fn lookup_ds(&self, resolver: &TokioResolver, zone: &str) -> LensOutcome<usize> {
+        log::debug!("[scan::dns] lookup_ds: zone={}", zone);
+        let outcome = match self.timed_lookup(resolver, zone, RecordType::DS).await {
+            Ok(Some(lookup)) => {
+                let count = lookup
+                    .record_iter()
+                    .filter(|record| record.record_type() == RecordType::DS)
+                    .count();
+                if count == 0 { LensOutcome::Absent } else { LensOutcome::Present(count) }
+            }
+            Ok(None) => LensOutcome::Absent,
+            Err(status) => failed_lens(status),
+        };
+        log::debug!("[scan::dns] lookup_ds_done: zone={} outcome={:?}", zone, outcome);
+        outcome
+    }
+
+    /// The DKIM keys at each of [`DKIM_SELECTORS`] under `zone`, asked concurrently.
+    async fn lookup_dkim(&self, resolver: &TokioResolver, zone: &str) -> LensOutcome<Vec<DkimKey>> {
+        log::debug!(
+            "[scan::dns] lookup_dkim: zone={} selectors={}",
+            zone,
+            DKIM_SELECTORS.len()
+        );
+        let answers = futures::future::join_all(DKIM_SELECTORS.iter().map(|selector| async move {
+            let name = format!("{selector}.{DKIM_INFIX}.{zone}");
+            (*selector, self.txt_at(resolver, &name).await)
+        }))
+        .await;
+        let outcome = dkim_outcome(answers);
+        log::debug!("[scan::dns] lookup_dkim_done: zone={} outcome={:?}", zone, outcome);
+        outcome
+    }
+
+    /// The email posture of `target`, `None` for an IP target: no DMARC, DS or DKIM query is sent
+    /// for one. One branch resolves the zone and then asks DMARC, DS and every DKIM selector at
+    /// once; MTA-STS and TLS-RPT run beside it.
+    async fn email_security(
+        &self,
+        resolver: &TokioResolver,
+        target: &Target,
+        txt: &[DnsRecord<String>],
+        mx: &[DnsRecord<MxRecord>],
+    ) -> Option<EmailSecurityAnalysis> {
+        let host = target.domain.as_deref()?;
+        if host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok()
+        {
+            log::debug!("[scan::dns] email_security_skipped: host={} is an IP address", host);
+            return None;
+        }
+        log::debug!("[scan::dns] email_security: host={}", host);
+        let ((dmarc_txt, zone, dnssec, dkim), (mta_sts, tls_rpt)) = tokio::join!(
+            async {
+                let zone = self.mail_zone(host).await;
+                let registrable = zone.registrable.then(|| zone.name.clone());
+                let (dmarc_txt, dnssec, dkim) = tokio::join!(
+                    self.lookup_dmarc(resolver, host, registrable.as_deref()),
+                    self.lookup_ds(resolver, &zone.name),
+                    self.lookup_dkim(resolver, &zone.name)
+                );
+                (dmarc_txt, zone, dnssec, dkim)
+            },
+            self.lookup_mail_transport(resolver, host)
+        );
+        let mut email_security = analyze_email_security(txt, mx, &dmarc_txt, zone);
+        email_security.mta_sts = mta_sts;
+        email_security.tls_rpt = tls_rpt;
+        email_security.dnssec = dnssec;
+        email_security.dkim = dkim;
+        Some(email_security)
     }
 
     async fn perform_dns_lookup(&self, target: &Target, protocol: Protocol) -> Result<DnsResult> {
@@ -876,14 +1030,7 @@ impl DnsScanner {
             result.CAA = caa;
             result.CAA_status = caa_status;
 
-            let (dmarc_txt, (mta_sts, tls_rpt)) = tokio::join!(
-                self.lookup_dmarc(&resolver, domain),
-                self.lookup_mail_transport(&resolver, domain)
-            );
-            let mut email_security = analyze_email_security(&result.TXT, &result.MX, &dmarc_txt);
-            email_security.mta_sts = mta_sts;
-            email_security.tls_rpt = tls_rpt;
-            result.email_security = Some(email_security);
+            result.email_security = self.email_security(&resolver, target, &result.TXT, &result.MX).await;
             log::trace!(
                 "[scan::dns] email_security_analyzed: domain={} protocol={}",
                 domain,
@@ -1112,9 +1259,7 @@ fn tagged_value(
 ) -> LensOutcome<String> {
     let records = match answer {
         Ok(records) => records,
-        Err(QueryStatus::Timeout) => return LensOutcome::Failed("timed out".to_string()),
-        Err(QueryStatus::Failed(reason)) => return LensOutcome::Failed(reason),
-        Err(other) => return LensOutcome::Failed(format!("{other:?}")),
+        Err(status) => return failed_lens(status),
     };
     let tags = |record: &str| -> Vec<(String, String)> {
         record
@@ -1135,13 +1280,68 @@ fn tagged_value(
         .map_or(LensOutcome::Absent, LensOutcome::Present)
 }
 
+/// Why a query got no answer, as a lens shows it.
+fn failure_reason(status: QueryStatus) -> String {
+    match status {
+        QueryStatus::Timeout => "timed out".to_string(),
+        QueryStatus::Failed(reason) => reason,
+        other => format!("{other:?}"),
+    }
+}
+
+/// A failed query as a lens outcome: `Failed`, never `Absent`.
+fn failed_lens<T>(status: QueryStatus) -> LensOutcome<T> {
+    LensOutcome::Failed(failure_reason(status))
+}
+
+/// Whether a TXT record is a DKIM key, and if so whether it is revoked: it carries a `p=` tag,
+/// and an empty `p=` is a revoked key.
+fn dkim_key_revoked(record: &str) -> Option<bool> {
+    record
+        .split(';')
+        .filter_map(|tag| tag.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("p"))
+        .map(|(_, value)| value.trim().is_empty())
+}
+
+/// The DKIM outcome over every selector's answer: `Present` with each selector that has a key,
+/// `Absent` when every selector answered with none, `Failed` when none has a key and at least one
+/// query failed.
+fn dkim_outcome(answers: Vec<(&str, std::result::Result<Vec<String>, QueryStatus>)>) -> LensOutcome<Vec<DkimKey>> {
+    let total = answers.len();
+    let mut keys = Vec::new();
+    let mut failures = Vec::new();
+    for (selector, answer) in answers {
+        match answer {
+            Ok(records) => {
+                if let Some(revoked) = records.iter().find_map(|record| dkim_key_revoked(record)) {
+                    keys.push(DkimKey {
+                        selector: selector.to_string(),
+                        revoked,
+                    });
+                }
+            }
+            Err(status) => failures.push(status),
+        }
+    }
+    if !keys.is_empty() {
+        return LensOutcome::Present(keys);
+    }
+    let failed = failures.len();
+    match failures.into_iter().next() {
+        None => LensOutcome::Absent,
+        Some(first) => LensOutcome::Failed(format!("{} ({failed} of {total} selectors)", failure_reason(first))),
+    }
+}
+
 /// SPF from the apex TXT records; DMARC only from the `_dmarc.` answer, since a `v=DMARC1` record
-/// at the apex is not where receivers look. MTA-STS and TLS-RPT start `Absent` and are filled in
-/// from their own queries.
+/// at the apex is not where receivers look. MTA-STS, TLS-RPT, DS and DKIM start `Absent` and are
+/// filled in from their own queries.
 fn analyze_email_security(
     txt_records: &[DnsRecord<String>],
     mx_records: &[DnsRecord<MxRecord>],
     dmarc_answer: &[String],
+    zone: MailZone,
 ) -> EmailSecurityAnalysis {
     log::debug!(
         "[scan::dns] analyze_email_security: txt_count={} mx_count={} dmarc_answer_count={}",
@@ -1160,6 +1360,10 @@ fn analyze_email_security(
         mx_count: mx_records.len(),
         mta_sts: LensOutcome::Absent,
         tls_rpt: LensOutcome::Absent,
+        zone: zone.name,
+        zone_is_registrable: zone.registrable,
+        dnssec: LensOutcome::Absent,
+        dkim: LensOutcome::Absent,
     };
     log::debug!(
         "[scan::dns] email_security_analysis: spf={} dmarc={} mx_count={}",
@@ -1187,6 +1391,13 @@ mod tests {
         }
     }
 
+    fn zone(name: &str) -> MailZone {
+        MailZone {
+            name: name.to_string(),
+            registrable: true,
+        }
+    }
+
     fn txt(values: &[&str]) -> Vec<DnsRecord<String>> {
         values.iter().map(|v| DnsRecord::new(v.to_string(), 300)).collect()
     }
@@ -1195,7 +1406,7 @@ mod tests {
     #[test]
     fn email_security_takes_dmarc_from_the_dmarc_answer() {
         let answer = vec!["v=DMARC1; p=reject; rua=mailto:d@example.com".to_string()];
-        let analysis = analyze_email_security(&txt(&["v=spf1 -all"]), &[], &answer);
+        let analysis = analyze_email_security(&txt(&["v=spf1 -all"]), &[], &answer, zone("example.com"));
         assert_eq!(
             analysis.dmarc_record.as_deref(),
             Some("v=DMARC1; p=reject; rua=mailto:d@example.com")
@@ -1206,7 +1417,12 @@ mod tests {
     /// Item 4: a `v=DMARC1` string among the apex TXT records is not where receivers look.
     #[test]
     fn apex_only_dmarc_txt_is_not_dmarc() {
-        let analysis = analyze_email_security(&txt(&["v=DMARC1; p=none", "v=spf1 -all"]), &[], &[]);
+        let analysis = analyze_email_security(
+            &txt(&["v=DMARC1; p=none", "v=spf1 -all"]),
+            &[],
+            &[],
+            zone("example.com"),
+        );
         assert!(analysis.dmarc_record.is_none(), "{analysis:?}");
     }
 
@@ -1214,7 +1430,11 @@ mod tests {
     #[test]
     fn dmarc_answer_without_a_policy_record_is_not_dmarc() {
         let answer = vec!["some-verification=abc".to_string()];
-        assert!(analyze_email_security(&[], &[], &answer).dmarc_record.is_none());
+        assert!(
+            analyze_email_security(&[], &[], &answer, zone("example.com"))
+                .dmarc_record
+                .is_none()
+        );
     }
 
     /// RFC 7489 organizational fallback: the host first, then its registrable domain when different.
@@ -1531,8 +1751,7 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=quarantine;".to_string()),
             has_mx: true,
             mx_count: 2,
-            mta_sts: LensOutcome::Absent,
-            tls_rpt: LensOutcome::Absent,
+            ..EmailSecurityAnalysis::fixture()
         };
 
         assert!(analysis.spf_record.is_some());
@@ -1649,8 +1868,7 @@ mod tests {
             dmarc_record: None,
             has_mx: false,
             mx_count: 0,
-            mta_sts: LensOutcome::Absent,
-            tls_rpt: LensOutcome::Absent,
+            ..EmailSecurityAnalysis::fixture()
         };
 
         assert!(empty_analysis.spf_record.is_none());
@@ -1664,8 +1882,7 @@ mod tests {
             dmarc_record: Some("v=DMARC1; p=none;".to_string()),
             has_mx: true,
             mx_count: 1,
-            mta_sts: LensOutcome::Absent,
-            tls_rpt: LensOutcome::Absent,
+            ..EmailSecurityAnalysis::fixture()
         };
 
         assert!(malformed_analysis.spf_record.is_some());
@@ -1746,17 +1963,37 @@ mod tests {
     /// A DNS server on loopback that answers TXT queries for `records` (name, TXT string) and
     /// NXDOMAIN for everything else.
     async fn fake_dns(records: Vec<(&'static str, &'static str)>) -> u16 {
+        fake_dns_logged(records, vec![]).await.0
+    }
+
+    /// Every question a fake DNS server was asked: the name without its trailing dot, and the type.
+    type AskedLog = std::sync::Arc<std::sync::Mutex<Vec<(String, RecordType)>>>;
+
+    /// As [`fake_dns`], also answering one opaque DS record for each of `ds_zones`, and logging
+    /// every question it is asked.
+    async fn fake_dns_logged(
+        records: Vec<(&'static str, &'static str)>,
+        ds_zones: Vec<&'static str>,
+    ) -> (u16, AskedLog) {
         use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
-        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::rdata::{NULL, TXT};
         use hickory_resolver::proto::rr::{RData, Record};
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = socket.local_addr().unwrap().port();
+        let asked: AskedLog = Default::default();
+        let log = asked.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
                 let Ok(query) = Message::from_vec(&buf[..n]) else {
                     continue;
                 };
+                for question in query.queries() {
+                    log.lock().unwrap().push((
+                        question.name().to_ascii().trim_end_matches('.').to_string(),
+                        question.query_type(),
+                    ));
+                }
                 let mut response = Message::new();
                 response
                     .set_id(query.id())
@@ -1767,9 +2004,10 @@ mod tests {
                     .add_queries(query.queries().to_vec());
                 for question in query.queries() {
                     let name = question.name().to_ascii();
-                    let answers: Vec<_> = records
+                    let owner_is = |owner: &str| name.trim_end_matches('.').eq_ignore_ascii_case(owner);
+                    let mut answers: Vec<_> = records
                         .iter()
-                        .filter(|(owner, _)| name.trim_end_matches('.').eq_ignore_ascii_case(owner))
+                        .filter(|(owner, _)| owner_is(owner))
                         .filter(|_| question.query_type() == RecordType::TXT)
                         .map(|(_, text)| {
                             Record::from_rdata(
@@ -1779,6 +2017,16 @@ mod tests {
                             )
                         })
                         .collect();
+                    if question.query_type() == RecordType::DS && ds_zones.iter().any(|zone| owner_is(zone)) {
+                        answers.push(Record::from_rdata(
+                            question.name().clone(),
+                            300,
+                            RData::Unknown {
+                                code: RecordType::DS,
+                                rdata: NULL::with(vec![9, 67, 13, 2, 201]),
+                            },
+                        ));
+                    }
                     if answers.is_empty() {
                         response.set_response_code(ResponseCode::NXDomain);
                     }
@@ -1787,7 +2035,7 @@ mod tests {
                 let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
             }
         });
-        port
+        (port, asked)
     }
 
     /// A resolver that asks only the server on `port` at 127.0.0.1.
@@ -1883,5 +2131,160 @@ mod tests {
             tagged_value(Err(QueryStatus::Timeout), "TLSRPTv1", "rua"),
             LensOutcome::Failed("timed out".to_string())
         );
+    }
+
+    /// DS presence, DKIM keys and a revoked key from a DNS fixture; a zone with neither reads
+    /// `Absent`.
+    #[tokio::test]
+    async fn ds_and_dkim_read_present_and_absent_from_a_dns_fixture() {
+        let (port, _) = fake_dns_logged(
+            vec![
+                ("google._domainkey.site.test", "v=DKIM1; k=rsa; p=MIIBIjANBgkq"),
+                ("s1._domainkey.site.test", "v=DKIM1; p="),
+                ("other._domainkey.site.test", "v=DKIM1; p=MIIB"),
+            ],
+            vec!["site.test"],
+        )
+        .await;
+        let scanner = test_scanner().await;
+        let resolver = resolver_at(port);
+
+        assert_eq!(scanner.lookup_ds(&resolver, "site.test").await, LensOutcome::Present(1));
+        assert_eq!(scanner.lookup_ds(&resolver, "plain.test").await, LensOutcome::Absent);
+        assert_eq!(
+            scanner.lookup_dkim(&resolver, "site.test").await,
+            LensOutcome::Present(vec![
+                DkimKey {
+                    selector: "google".to_string(),
+                    revoked: false
+                },
+                DkimKey {
+                    selector: "s1".to_string(),
+                    revoked: true
+                },
+            ])
+        );
+        assert_eq!(scanner.lookup_dkim(&resolver, "plain.test").await, LensOutcome::Absent);
+    }
+
+    /// A resolver that never answers: DS and DKIM read `Failed`, never `Absent`.
+    #[tokio::test]
+    async fn a_silent_resolver_fails_ds_and_dkim_never_absent() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resolver = resolver_at(silent.local_addr().unwrap().port());
+        let scanner = DnsScanner {
+            timeout: Duration::from_millis(300),
+            ..test_scanner().await
+        };
+        assert_eq!(
+            scanner.lookup_ds(&resolver, "site.test").await,
+            LensOutcome::Failed("timed out".to_string())
+        );
+        assert_eq!(
+            scanner.lookup_dkim(&resolver, "site.test").await,
+            LensOutcome::Failed("timed out (9 of 9 selectors)".to_string())
+        );
+        drop(silent);
+    }
+
+    #[test]
+    fn dkim_outcome_is_present_on_any_key_absent_on_all_misses_failed_otherwise() {
+        let key = |selector: &str, revoked: bool| DkimKey {
+            selector: selector.to_string(),
+            revoked,
+        };
+        let records = |values: &[&str]| Ok(values.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            dkim_outcome(vec![
+                ("google", records(&["v=DKIM1; p=abc"])),
+                ("k1", Err(QueryStatus::Timeout)),
+            ]),
+            LensOutcome::Present(vec![key("google", false)])
+        );
+        assert_eq!(
+            dkim_outcome(vec![("google", records(&[])), ("k1", records(&["not a key"]))]),
+            LensOutcome::Absent
+        );
+        assert_eq!(
+            dkim_outcome(vec![
+                ("google", records(&[])),
+                ("k1", Err(QueryStatus::Failed("refused".to_string()))),
+            ]),
+            LensOutcome::Failed("refused (1 of 2 selectors)".to_string())
+        );
+        assert_eq!(dkim_key_revoked(" v=DKIM1 ; P = ; k=rsa"), Some(true));
+        assert_eq!(dkim_key_revoked("v=DKIM1; k=rsa"), None);
+    }
+
+    /// Phase 4 criterion: the DS zone for `www.tatari.tv` is `tatari.tv` under a fixture suffix
+    /// list; with no list it falls back to the host, marked not registrable.
+    #[tokio::test]
+    async fn the_mail_zone_is_the_registrable_domain_and_falls_back_to_the_host() {
+        let fake =
+            crate::scan::testing::FakeHttp::start(vec![("/psl", 200, crate::scan::psl::PSL_FIXTURE.to_string())]).await;
+        let scanner = DnsScanner {
+            suffix_list: SuffixList {
+                client: Client::builder().no_proxy().build().unwrap(),
+                url: fake.url("/psl"),
+                cache_dir: Some(crate::scan::testing::temp_dir("dns-zone")),
+                fetch_timeout: crate::scan::cache::FETCH_TIMEOUT,
+            },
+            ..DnsScanner::new()
+        };
+        assert_eq!(
+            scanner.mail_zone("www.tatari.tv").await,
+            MailZone {
+                name: "tatari.tv".to_string(),
+                registrable: true
+            }
+        );
+        assert_eq!(
+            test_scanner().await.mail_zone("www.tatari.tv.").await,
+            MailZone {
+                name: "www.tatari.tv".to_string(),
+                registrable: false
+            }
+        );
+    }
+
+    /// Phase 4 criterion: an IP target gets no email posture and sends no DS or DKIM query; a
+    /// name target sends both, at its zone.
+    #[tokio::test]
+    async fn an_ip_target_sends_no_ds_or_dkim_query() {
+        let (port, asked) = fake_dns_logged(vec![], vec![]).await;
+        let resolver = resolver_at(port);
+        let scanner = test_scanner().await;
+        for ip in [
+            "192.0.2.1",
+            "2001:db8::1",
+            "https://192.0.2.1/",
+            "https://[2001:db8::1]/",
+        ] {
+            let target = Target::parse(ip).expect("target");
+            assert!(
+                scanner.email_security(&resolver, &target, &[], &[]).await.is_none(),
+                "{ip}"
+            );
+        }
+        assert!(asked.lock().unwrap().is_empty(), "{:?}", asked.lock().unwrap());
+
+        let target = Target::parse("www.site.test").expect("target");
+        let email = scanner
+            .email_security(&resolver, &target, &[], &[])
+            .await
+            .expect("name target");
+        assert_eq!(
+            (email.zone.as_str(), email.zone_is_registrable),
+            ("www.site.test", false)
+        );
+        let asked = asked.lock().unwrap().clone();
+        assert!(
+            asked.contains(&("www.site.test".to_string(), RecordType::DS)),
+            "{asked:?}"
+        );
+        for selector in DKIM_SELECTORS {
+            let name = format!("{selector}._domainkey.www.site.test");
+            assert!(asked.contains(&(name.clone(), RecordType::TXT)), "{name}: {asked:?}");
+        }
     }
 }

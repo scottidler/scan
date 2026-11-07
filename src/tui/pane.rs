@@ -16,6 +16,8 @@ const DEFAULT_SPAN_ROWS: usize = 1;
 const DEFAULT_SPAN_COLS: usize = 1;
 /// The key legend on the target pane's top border, longest first. Each shorter form drops one
 /// part (` help`, then ` hjkl`, then the arrows); `?` is in every form.
+/// The cells around a bottom-border marker: the two corners, `┘`, and `└─`.
+const MARKER_DECORATION_CELLS: usize = 5;
 const KEY_LEGENDS: [&str; 4] = ["←↓↑→ hjkl ? help", "←↓↑→ hjkl ?", "←↓↑→ ?", "?"];
 
 /// How much of a pane's data its content shows: the dashboard cell, or the pane zoomed to the
@@ -190,6 +192,17 @@ impl RowView {
         }
         if parts.is_empty() { None } else { Some(parts.join(" ")) }
     }
+
+    /// The marker for a box `width` cells wide. When the full marker and its `┘ └─` decoration do
+    /// not fit between the corners, ` more` is dropped, so a narrow box keeps both counts rather
+    /// than losing `↑ N` off its left edge.
+    pub fn marker_within(&self, width: u16) -> Option<String> {
+        let marker = self.marker()?;
+        if Span::raw(marker.as_str()).width() + MARKER_DECORATION_CELLS <= usize::from(width) {
+            return Some(marker);
+        }
+        Some(marker.replace(" more", ""))
+    }
 }
 
 /// Draw `pane`'s `content` rows for `detail` in a bordered block at `area`, starting at row
@@ -218,7 +231,7 @@ pub fn draw_rows<P: Pane + ?Sized>(
         view.offset,
         view.below
     );
-    let block = match view.marker() {
+    let block = match view.marker_within(area.width) {
         Some(marker) => block.title_bottom(bottom_label(marker, focused, pane.title())),
         None => block,
     };
@@ -308,6 +321,16 @@ mod tests {
         assert_eq!(RowView::new(10, 4, 0).marker().as_deref(), Some("↓ 6 more"));
         assert_eq!(RowView::new(10, 4, 2).marker().as_deref(), Some("↑ 2 ↓ 4 more"));
         assert_eq!(RowView::new(10, 4, 6).marker().as_deref(), Some("↑ 6"));
+    }
+
+    /// A box too narrow for `↑ 1 ↓ 14 more` drops ` more` and keeps both counts.
+    #[test]
+    fn a_narrow_box_drops_more_from_the_marker_and_keeps_both_counts() {
+        let view = RowView::new(20, 5, 1);
+        assert_eq!(view.marker_within(18).as_deref(), Some("↑ 1 ↓ 14 more"));
+        assert_eq!(view.marker_within(17).as_deref(), Some("↑ 1 ↓ 14"));
+        assert_eq!(RowView::new(20, 5, 0).marker_within(14).as_deref(), Some("↓ 15 more"));
+        assert_eq!(RowView::new(4, 5, 0).marker_within(10), None);
     }
 
     fn legend_text(width: u16) -> Option<String> {
