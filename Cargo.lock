@@ -250,6 +250,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-version"
+version = "0.1.0"
+source = "git+https://github.com/tatari-tv/build-version-rs?tag=v0.1.0#06411938a54d50b035784b4bb6d9ffb9a187acc7"
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2158,6 +2163,7 @@ name = "scan"
 version = "0.6.3"
 dependencies = [
  "async-trait",
+ "build-version",
  "chrono",
  "clap",
  "colored",

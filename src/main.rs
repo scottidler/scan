@@ -3,7 +3,7 @@ use eyre::Result;
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, Instant, sleep};
 
-// Built-in version from build.rs via env!("GIT_DESCRIBE")
+// Built-in version from build.rs via env!("BUILD_VERSION")
 
 const DEBUG_REFRESH_INTERVAL_SECS: u64 = 5;
 
@@ -18,7 +18,7 @@ fn get_after_help() -> String {
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(about = "A comprehensive network scanner")]
-#[command(version = env!("GIT_DESCRIBE"))]
+#[command(version = env!("BUILD_VERSION"))]
 #[command(after_help = get_after_help())]
 struct Args {
     /// Target to scan (domain, IP, or URL)
