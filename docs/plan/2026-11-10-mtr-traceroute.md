@@ -158,7 +158,9 @@ pub struct TracerouteHop {
 
 - **Helpers move to the aggregate fields** (panel round 1: an empty `responses` reads as silent):
   - `is_silent()` = `replied == 0`
-  - `destination_hop()` = the hop whose `current_address == target_ip` (with trimming, the last hop)
+  - `destination_hop()` follows the engine (implementation audit round 1, M2):
+    - traceroute engine: the hop whose `addresses` contain `target_ip`, i.e. the target answered any of one run's 3 probes (the v0.6.4 rule). The parser's `destination_reached` uses the same check, so the two cannot disagree.
+    - mtr engine: the hop whose `current_address == target_ip` (with trimming, the last hop). `addresses` is cumulative over the session, so an address seen once long ago does not count.
   - `last_reply_hop()` and `silent_hops()` keep their meaning through `is_silent()`
 - The traceroute parser fills the new fields from its 3 probes: `sent = 3`, `replied` = answered probes, `last_rtt` = last answered probe, `stddev_rtt` from the answered RTTs, `addresses` = distinct response IPs, `current_address` = last answering IP. `engine = Traceroute { reason }`. Existing traceroute output therefore keeps today's silent/destination answers.
 - `responses` stays empty in mtr mode: it describes individual probes of one run, which a cumulative view does not have. Nothing reads it for silence or destination after this change.
@@ -194,9 +196,9 @@ Every failure and what it does (panel round 1: "classifies via" picked no branch
 | Failure | Detected by | Effect on that family | Effect on the engine |
 |---|---|---|---|
 | `mtr` not on PATH | spawn `ErrorKind::NotFound` | n/a | fall back, reason `mtr not installed` |
-| network condition: stderr mentions errno 101, 99 (IPv6) or 113 | `classify_route_error` returns `NoRoute`, or `Other("host unreachable")` | `TracerouteStatus::Failed(<classified text>)`, as today's traceroute reports it | stays mtr; other family keeps streaming; that family retries after `MTR_RESPAWN_SECS` (5s) |
+| network condition: stderr mentions errno 101, 99 (IPv6) or 113 | `classify_route_error` returns `NoRoute`, or `Other("host unreachable")`, on the child's exit or, if it hangs, at `MTR_STARTUP_GRACE` (the hung child is killed) | `TracerouteStatus::Failed(<classified text>)`, as today's traceroute reports it | stays mtr; other family keeps streaming; that family retries after `MTR_RESPAWN_SECS` (5s) |
 | child exits before any parseable line, any other stderr | exit status + captured stderr | n/a | fall back, reason `mtr: <first stderr line>` (`mtr exited <code>` when stderr is empty) |
-| no parseable line within `MTR_STARTUP_GRACE` | timer | n/a | fall back, reason `mtr: no output` |
+| no parseable line within `MTR_STARTUP_GRACE`, stderr not a network condition | timer | n/a | fall back, reason `mtr: no output`; the first `traceroute` runs on the next scan so the grace does not eat its deadline |
 | child exits after good output (the `-c` limit, or killed) | exit after at least one parseable line | keeps its counters | respawn after `MTR_RESPAWN_SECS`; pending and recent-lost seqs are cleared because the new child restarts seqs at 33000 |
 | no stdout line for `MTR_STALL_SECS` (10s) | timer | `Failed("mtr stalled: no output for 10s")` | kill and respawn after `MTR_RESPAWN_SECS` |
 
@@ -216,9 +218,10 @@ Panel round 1: `next_delay` applies only to successful results, and the 1s ticke
 
 ### TUI
 
-- **Grid** (`src/tui/traceroute.rs`, pane is 33% wide): `Status: mtr · 42 cycles` (or `Status: traceroute (mtr not installed)` in WARN), reach line, then one row per hop: hop, `current_address` (`+N` when more than one address was seen), `Loss%`, `Avg`. Silent runs still collapse to `3-9: no reply (7 hops)`.
+- **Grid** (`src/tui/traceroute.rs`, pane is 33% wide): `Status: mtr · 42 cycles` (or `Status: traceroute (mtr not installed)` in WARN), reach line, then one row per hop: hop, `current_address` (`+N` when more than one address was seen), `Loss%`, `Avg`. The mtr destination row has the same `+N` and colored Loss%. Silent runs still collapse to `3-9: no reply (7 hops)`.
+- When the Status header clips the fallback reason (the 80x24 dashboard pane), the reason is drawn on the pane's bottom border, so G4 holds at any width. When every fallback family fails, the error names the reason too: `IPv4: no IPv4 route on this host (traceroute: mtr not installed)`.
 - **Zoom:** per family, an mtr table: `Hop  Host  Loss%  Snt  Last  Avg  Best  Wrst  StDev`, then each extra ECMP address on its own indented row under its hop.
-- Loss% colored with the connectivity pane's loss thresholds (`GOOD` at 0, `WARN` under the BAD threshold, `BAD` above).
+- Loss% colored by `BAD_LOSS_PERCENT = 10` (`src/tui/traceroute.rs`): `GOOD` at 0, `WARN` under 10%, `BAD` at 10% and above. The connectivity pane has no loss thresholds to reuse.
 
 ### `--no-tui`
 

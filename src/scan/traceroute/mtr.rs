@@ -381,12 +381,24 @@ impl MtrSession {
                     return SessionPoll::Unusable(reason);
                 }
             } else if !self.parsed_any && run_age >= self.timings.startup_grace {
-                log::warn!(
-                    "[scan::traceroute::mtr] no_output: family={} grace={}ms",
-                    self.family,
-                    self.timings.startup_grace.as_millis()
-                );
-                return SessionPoll::Unusable("mtr: no output".to_string());
+                // A child that reported a network condition and then hung is that family's
+                // failure, not a broken mtr: end it and retry, as if it had exited.
+                if let Some(text) = network_failure(&stderr.join("\n"), self.family) {
+                    log::warn!(
+                        "[scan::traceroute::mtr] network_failure_hung: family={} failure={text} retry_in={}ms",
+                        self.family,
+                        self.timings.respawn.as_millis()
+                    );
+                    self.end_run();
+                    self.failure = Some(text);
+                } else {
+                    log::warn!(
+                        "[scan::traceroute::mtr] no_output: family={} grace={}ms",
+                        self.family,
+                        self.timings.startup_grace.as_millis()
+                    );
+                    return SessionPoll::Unusable("mtr: no output".to_string());
+                }
             } else if last_line.elapsed() >= self.timings.stall {
                 let text = format!("mtr stalled: no output for {}", display_duration(self.timings.stall));
                 log::warn!("[scan::traceroute::mtr] stalled: family={} failure={text}", self.family);
@@ -572,6 +584,34 @@ mod tests {
             "{poll:?}"
         );
         assert!(waited >= fast().startup_grace, "waited {waited:?}");
+    }
+
+    #[tokio::test]
+    async fn a_hung_child_with_a_network_error_fails_the_family_and_is_retried() {
+        let dir = temp_dir("mtr-hung-no-route");
+        let starts = dir.join("starts");
+        let script = dir.join("fake-mtr");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\necho start >> {}\necho 'mtr: connect: Network is unreachable' >&2\nexec sleep 5\n",
+                starts.display()
+            ),
+        );
+        let mut session = MtrSession::new(script.to_string_lossy(), v4(), 30, fast());
+        let first = session.poll().await;
+        assert!(
+            matches!(&first, SessionPoll::Failed(text) if text == "no IPv4 route on this host"),
+            "{first:?}"
+        );
+
+        tokio::time::sleep(fast().respawn + Duration::from_millis(20)).await;
+        let retried = session.poll().await;
+        let started = std::fs::read_to_string(&starts).unwrap_or_default().lines().count();
+        drop(session);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(&retried, SessionPoll::Failed(_)), "{retried:?}");
+        assert_eq!(started, 2, "the hung child was replaced");
     }
 
     #[tokio::test]

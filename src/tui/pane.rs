@@ -16,6 +16,8 @@ const DEFAULT_SPAN_ROWS: usize = 1;
 const DEFAULT_SPAN_COLS: usize = 1;
 /// The cells around a bottom-border marker: the two corners, `┘`, and `└─`.
 const MARKER_DECORATION_CELLS: usize = 5;
+/// The cells around a bottom-border note inside the corners: `─┘` and `└`.
+const NOTE_DECORATION_CELLS: usize = 3;
 /// The key legend on the security pane's bottom border, longest first. Each shorter form drops
 /// one part (` help`, then ` hjkl`, then the arrows); `?` is in every form.
 const KEY_LEGENDS: [&str; 4] = ["←↓↑→ hjkl ? help", "←↓↑→ hjkl ?", "←↓↑→ ?", "?"];
@@ -77,6 +79,13 @@ pub trait Pane {
         false
     }
 
+    /// Text drawn left-aligned on the bottom border, for a pane whose `width`-cell rows had to
+    /// clip something the reader needs. Clipped to the room the overflow marker and key legend
+    /// leave; `None` draws nothing.
+    fn border_note(&self, _state: &AppState, _width: u16) -> Option<String> {
+        None
+    }
+
     /// Whether this pane can be focused/selected
     fn is_focusable(&self) -> bool {
         false
@@ -126,6 +135,25 @@ pub(crate) fn bottom_label(text: String, focused: bool, title: &str) -> Line<'st
         Span::styled("└─", Style::default().fg(border)),
     ])
     .right_aligned()
+}
+
+/// A left bottom-border note, `─┘text└`, with `text` clipped so the note fits `room` cells.
+/// `None` when not even one cell of text fits.
+pub(crate) fn border_note_line(text: &str, room: usize, focused: bool, title: &str) -> Option<Line<'static>> {
+    let text_room = room.checked_sub(NOTE_DECORATION_CELLS).filter(|cells| *cells > 0)?;
+    let border = border_color(title, focused);
+    let text = crate::tui::text::fit_line(
+        Line::from(text.to_string()),
+        u16::try_from(text_room).unwrap_or(u16::MAX),
+    );
+    let mut spans = vec![Span::styled("─┘", Style::default().fg(border))];
+    spans.extend(
+        text.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), Style::default().fg(theme::WARN))),
+    );
+    spans.push(Span::styled("└", Style::default().fg(border)));
+    Some(Line::from(spans).left_aligned())
 }
 
 /// The longest key legend that fits on the bottom border of a `width`-cell box beside the
@@ -233,8 +261,17 @@ pub fn draw_rows<P: Pane + ?Sized>(
         Some(marker) => block.title_bottom(marker),
         None => block,
     };
+    let right_taken = taken + legend.as_ref().map_or(0, |line| line.width() + 1);
+    let note = pane.border_note(state, inner.width).and_then(|text| {
+        let room = usize::from(area.width.saturating_sub(2)).saturating_sub(right_taken);
+        border_note_line(&text, room, focused, pane.title())
+    });
     let block = match legend {
         Some(legend) => block.title_bottom(legend),
+        None => block,
+    };
+    let block = match note {
+        Some(note) => block.title_bottom(note),
         None => block,
     };
     block.render(area, frame.buffer_mut());
@@ -295,6 +332,25 @@ impl PaneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn note_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn border_note_fits_whole_or_clipped_to_its_room() {
+        let whole = border_note_line("mtr not installed", 25, false, "traceroute").expect("fits");
+        assert_eq!(note_text(&whole), "─┘mtr not installed└");
+        let clipped = border_note_line("mtr not installed", 10, false, "traceroute").expect("fits");
+        assert_eq!(note_text(&clipped), "─┘mtr no…└");
+        assert_eq!(clipped.width(), 10);
+    }
+
+    #[test]
+    fn border_note_with_no_room_for_text_is_none() {
+        assert!(border_note_line("mtr not installed", 3, false, "traceroute").is_none());
+        assert!(border_note_line("mtr not installed", 0, false, "traceroute").is_none());
+    }
 
     #[test]
     fn row_view_that_fits_has_no_marker() {

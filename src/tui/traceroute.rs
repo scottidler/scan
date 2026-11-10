@@ -1,4 +1,6 @@
-use crate::scan::traceroute::{TraceEngine, TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus};
+use crate::scan::traceroute::{
+    FallbackFailure, TraceEngine, TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus,
+};
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
@@ -110,22 +112,38 @@ fn tracing_line() -> Line<'static> {
     ])
 }
 
-/// `→ <target ip> (<rtt>)`, or `(no reply)` when the target never answered. Under mtr the note is
-/// the destination hop's average and loss.
+/// `→ <target ip> (<rtt>)`, or `(no reply)` when the target never answered. Under mtr the row
+/// reads like a hop row: `+N` for the other addresses the hop answered from, then the average and
+/// the loss, colored by the same thresholds.
 fn destination_line(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> Line<'static> {
-    let note = match destination_hop {
-        Some(hop) if is_mtr(data) => format!(" ({} {})", whole_ms(hop.avg_rtt), loss_text(hop)),
-        _ => match destination_hop.and_then(|hop| target_rtt(hop, data.target_ip)) {
-            Some(rtt) => format!(" ({rtt})"),
-            None if data.destination_reached => String::new(),
-            None => " (no reply)".to_string(),
-        },
-    };
-    Line::from(vec![
+    let target = vec![
         Span::styled("→ ", Style::default().fg(theme::MUTED)),
         Span::styled(data.target_ip.to_string(), Style::default().fg(theme::VALUE)),
-        Span::styled(note, Style::default().fg(theme::MUTED)),
-    ])
+    ];
+    if let Some(hop) = destination_hop.filter(|_| is_mtr(data)) {
+        let others = hop.addresses.len().saturating_sub(1);
+        let mut spans = target;
+        if others > 0 {
+            spans.push(Span::styled(format!(" +{others}"), Style::default().fg(theme::VALUE)));
+        }
+        spans.extend([
+            Span::styled(
+                format!(" ({} ", whole_ms(hop.avg_rtt)),
+                Style::default().fg(theme::MUTED),
+            ),
+            Span::styled(loss_text(hop), Style::default().fg(loss_color(hop.loss_percent()))),
+            Span::styled(")", Style::default().fg(theme::MUTED)),
+        ]);
+        return Line::from(spans);
+    }
+    let note = match destination_hop.and_then(|hop| target_rtt(hop, data.target_ip)) {
+        Some(rtt) => format!(" ({rtt})"),
+        None if data.destination_reached => String::new(),
+        None => " (no reply)".to_string(),
+    };
+    let mut spans = target;
+    spans.push(Span::styled(note, Style::default().fg(theme::MUTED)));
+    Line::from(spans)
 }
 
 /// One row per answering hop, and one per run of silent hops: `3-9: no reply (7 hops)`, or
@@ -342,36 +360,56 @@ fn zoomed_route_lines(result: &TracerouteResult) -> Vec<Line<'static>> {
     lines
 }
 
-impl Pane for TraceroutePane {
-    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
-        log::trace!("[tui::traceroute] content: width={} detail={:?}", width, detail);
-
-        // Prepare content lines
-        let mut lines = Vec::new();
-
-        // Traceroute status header
-        lines.push(Line::from(vec![
-            Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
-            Span::styled("tracing...", Style::default().fg(theme::MUTED)),
-        ]));
-
-        // Get traceroute results and render them
-        if let Some(traceroute_state) = state.scanners.get("traceroute") {
-            // Update header with current status
-            let (label, label_color) = crate::tui::status_label(&traceroute_state, "tracing...", "traced");
-            // A finished scan names its prober where "traced" would be.
+/// `🧭 Status: <label>`: the scanner's status, and once a scan is Complete, the prober that
+/// produced it where "traced" would be.
+fn header_line(state: &AppState) -> Line<'static> {
+    let (label, label_color) = match state.scanners.get("traceroute") {
+        Some(traceroute_state) => {
+            let status = crate::tui::status_label(&traceroute_state, "tracing...", "traced");
             let engine = match (&traceroute_state.status, &traceroute_state.result) {
                 (crate::types::ScanStatus::Complete, Some(ScanResult::Traceroute(result))) => {
                     result.get_primary_result().map(|data| engine_status(&data.engine))
                 }
                 _ => None,
             };
-            let (label, label_color) = engine.unwrap_or((label, label_color));
-            lines[0] = Line::from(vec![
-                Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
-                Span::styled(label, Style::default().fg(label_color)),
-            ]);
+            engine.unwrap_or(status)
+        }
+        None => ("unavailable".to_string(), theme::BAD),
+    };
+    Line::from(vec![
+        Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
+        Span::styled(label, Style::default().fg(label_color)),
+    ])
+}
 
+/// Why `traceroute` is in use: from a fallback failure when every family failed, else from the
+/// shown route's engine. `None` under mtr.
+fn fallback_reason(state: &AppState) -> Option<String> {
+    let traceroute_state = state.scanners.get("traceroute")?;
+    if let Some(failure) = traceroute_state
+        .error
+        .as_ref()
+        .and_then(|error| error.downcast_ref::<FallbackFailure>())
+    {
+        return Some(failure.reason.clone());
+    }
+    match &traceroute_state.result {
+        Some(ScanResult::Traceroute(result)) => match &result.get_primary_result()?.engine {
+            TraceEngine::Traceroute { reason } => Some(reason.clone()),
+            TraceEngine::Mtr { .. } => None,
+        },
+        _ => None,
+    }
+}
+
+impl Pane for TraceroutePane {
+    fn content(&self, state: &AppState, width: u16, detail: Detail) -> Vec<Line<'static>> {
+        log::trace!("[tui::traceroute] content: width={} detail={:?}", width, detail);
+
+        let mut lines = vec![header_line(state)];
+
+        // Get traceroute results and render them
+        if let Some(traceroute_state) = state.scanners.get("traceroute") {
             if let Some(ScanResult::Traceroute(traceroute_result)) = &traceroute_state.result {
                 if detail == Detail::Zoomed {
                     lines.extend(zoomed_route_lines(traceroute_result));
@@ -415,12 +453,6 @@ impl Pane for TraceroutePane {
                 }
             }
         } else {
-            // No traceroute scanner available
-            lines[0] = Line::from(vec![
-                Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
-                Span::styled("unavailable", Style::default().fg(theme::BAD)),
-            ]);
-
             lines.push(Line::from(vec![
                 Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
                 Span::styled("Traceroute scanner not available", Style::default().fg(theme::BAD)),
@@ -428,6 +460,12 @@ impl Pane for TraceroutePane {
         }
 
         crate::tui::text::to_rows(lines, width, detail, &[])
+    }
+
+    /// The fallback reason, when the Status header is too wide for the pane to show it.
+    fn border_note(&self, state: &AppState, width: u16) -> Option<String> {
+        let reason = fallback_reason(state)?;
+        (header_line(state).width() > usize::from(width)).then_some(reason)
     }
 
     fn title(&self) -> &'static str {
@@ -969,6 +1007,129 @@ mod tests {
         let scan_state = state.scanners.get("traceroute").expect("traceroute state");
         let summary = crate::pretty::format_scan_state("traceroute", &scan_state);
         assert!(summary.contains("7 no reply"), "{summary}");
+    }
+
+    #[test]
+    fn mtr_destination_row_colors_its_loss_and_counts_extra_addresses() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut data = tatari_route();
+        data.hops[10] = mtr_hop(
+            11,
+            &["216.150.16.9", "216.150.16.10", "216.150.16.193"],
+            100,
+            50,
+            [3000; 5],
+        );
+        let state = state_of(data, std::time::Duration::ZERO);
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("terminal");
+        let pane = TraceroutePane::new();
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let text = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Normal).join("\n");
+        assert!(text.contains("→ 216.150.16.193 +2 (3ms 50%)"), "{text}");
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "50%"), crate::tui::theme::BAD);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "+2"), crate::tui::theme::VALUE);
+    }
+
+    #[test]
+    fn mtr_destination_row_with_no_loss_reads_good_and_has_no_extras() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let state = state_of(tatari_route(), std::time::Duration::ZERO);
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("terminal");
+        let pane = TraceroutePane::new();
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let text = crate::tui::testing::content_rows(&pane, &state, 60, Detail::Normal).join("\n");
+        assert!(text.contains("→ 216.150.16.193 (3ms 0%)"), "{text}");
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "0%)"), crate::tui::theme::GOOD);
+    }
+
+    /// The bottom border row of a rendered pane.
+    fn bottom_border(out: &str) -> &str {
+        out.lines().last().expect("bottom border")
+    }
+
+    #[test]
+    fn fallback_reason_is_on_the_border_when_the_80x24_header_clips_it() {
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let state = state_of(tatari_fallback_route(), std::time::Duration::from_millis(3200));
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, width, height, false);
+        assert!(
+            out.lines().next().is_some_and(|row| !row.contains("mtr not installed")),
+            "the header row clips the reason:\n{out}"
+        );
+        assert!(bottom_border(&out).contains("┘mtr not installed└"), "{out}");
+        assert!(out.contains("Duration: 3200ms"), "{out}");
+        assert!(!out.contains("more"), "{out}");
+
+        let wide = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, 80, 24, false);
+        assert!(wide.contains("🧭 Status: traceroute (mtr not installed)"), "{wide}");
+        assert!(
+            !bottom_border(&wide).contains("mtr not installed"),
+            "no note when the header shows the reason:\n{wide}"
+        );
+    }
+
+    #[test]
+    fn mtr_pane_has_no_border_note_at_80x24() {
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let out = tatari_pane(width, height);
+        assert!(!bottom_border(&out).contains('┘'), "{out}");
+    }
+
+    #[test]
+    fn a_long_fallback_reason_is_clipped_on_the_border() {
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let mut data = tatari_fallback_route();
+        data.engine = TraceEngine::Traceroute {
+            reason: "mtr: Failure to open IPv4 sockets: Permission denied".to_string(),
+        };
+        let state = state_of(data, std::time::Duration::from_millis(3200));
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, width, height, false);
+        let border = bottom_border(&out);
+        assert!(border.contains("┘mtr: Failure"), "{out}");
+        assert!(border.contains("…└"), "{out}");
+    }
+
+    /// Every family failed under the fallback: no route, only the error.
+    fn fallback_failed_state() -> AppState {
+        let state = AppState::new("www.tatari.tv".to_string());
+        state.scanners.insert(
+            "traceroute".to_string(),
+            crate::types::ScanState {
+                result: None,
+                error: Some(eyre::Report::new(FallbackFailure {
+                    failure: "IPv4: no IPv4 route on this host".to_string(),
+                    reason: "mtr not installed".to_string(),
+                })),
+                status: crate::types::ScanStatus::Failed,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn every_fallback_family_failing_still_says_why_traceroute_is_in_use() {
+        let state = fallback_failed_state();
+        let pane = TraceroutePane::new();
+        let wide = crate::tui::testing::content_rows(&pane, &state, 120, Detail::Normal).join("\n");
+        assert!(
+            wide.contains("failed: IPv4: no IPv4 route on this host (traceroute: mtr not installed)"),
+            "{wide}"
+        );
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let narrow = crate::tui::testing::render_pane(&pane, &state, width, height, false);
+        assert!(bottom_border(&narrow).contains("┘mtr not installed└"), "{narrow}");
+
+        let scan_state = state.scanners.get("traceroute").expect("traceroute state");
+        let line = crate::pretty::format_scan_state("traceroute", &scan_state);
+        assert!(line.contains("(traceroute: mtr not installed)"), "{line}");
     }
 
     #[test]
