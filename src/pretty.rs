@@ -283,13 +283,29 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
             let protocol = if primary_data.ipv6 { "IPv6" } else { "IPv4" };
             let reached = primary_data.reach_label();
 
-            // Calculate average RTT from last hop
-            let last_hop_rtt = primary_data
-                .hops
-                .last()
+            // Show protocol status if both were attempted
+            let protocol_info = if traceroute.ipv4_result.is_some() && traceroute.ipv6_result.is_some() {
+                format!("{} (dual)", protocol)
+            } else {
+                protocol.to_string()
+            };
+
+            if matches!(primary_data.engine, crate::scan::traceroute::TraceEngine::Mtr { .. })
+                && primary_data.hops.is_empty()
+            {
+                return (Outcome::Ok, format!("{protocol_info} tracing route..."));
+            }
+
+            // Average RTT and loss of the last hop
+            let last_hop = primary_data.destination_hop().or(primary_data.hops.last());
+            let last_hop_rtt = last_hop
                 .and_then(|hop| hop.avg_rtt)
                 .map(|rtt| format!("{}ms", rtt.as_millis()))
                 .unwrap_or_else(|| "timeout".to_string());
+            let loss_str = last_hop
+                .and_then(crate::scan::traceroute::TracerouteHop::loss_percent)
+                .map(|percent| format!(", loss {percent}%"))
+                .unwrap_or_default();
 
             // Hops that never answered
             let timeout_hops = primary_data.silent_hops();
@@ -300,23 +316,24 @@ fn describe_result(result: &ScanResult) -> (Outcome, String) {
                 String::new()
             };
 
-            // Show protocol status if both were attempted
-            let protocol_info = if traceroute.ipv4_result.is_some() && traceroute.ipv6_result.is_some() {
-                format!("{} (dual)", protocol)
-            } else {
-                protocol.to_string()
+            let tail = match &primary_data.engine {
+                crate::scan::traceroute::TraceEngine::Mtr { cycles } => format!(", mtr {cycles} cycles"),
+                crate::scan::traceroute::TraceEngine::Traceroute { reason } => {
+                    format!(", {}ms, traceroute: {reason}", traceroute.total_duration.as_millis())
+                }
             };
 
             (
                 Outcome::Ok,
                 format!(
-                    "{} {}, {} ({}{}, {}ms)",
+                    "{} {}, {} ({}{}{}{})",
                     protocol_info,
                     crate::tui::text::plural(traceroute.total_hops(), "hop"),
                     reached,
                     last_hop_rtt,
+                    loss_str,
                     timeout_str,
-                    traceroute.total_duration.as_millis()
+                    tail
                 ),
             )
         }
@@ -795,6 +812,95 @@ mod tests {
             &state(ScanStatus::Complete, Some(ScanResult::Traceroute(traceroute)), None),
         );
         assert!(out.contains(" 1 hop, "), "{out}");
+    }
+
+    fn traceroute_line(
+        engine: crate::scan::traceroute::TraceEngine,
+        hops: Vec<crate::scan::traceroute::TracerouteHop>,
+    ) -> String {
+        let target: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let mut traceroute = crate::scan::traceroute::TracerouteResult::new();
+        traceroute.ipv4_result = Some(crate::scan::traceroute::TracerouteData {
+            total_hops: hops.len() as u8,
+            hops,
+            destination_reached: true,
+            max_hops: 30,
+            target_ip: target,
+            scan_duration: Duration::from_millis(5),
+            ipv6: false,
+            engine,
+        });
+        traceroute.total_duration = Duration::from_millis(7);
+        let out = format_scan_state(
+            "traceroute",
+            &state(ScanStatus::Complete, Some(ScanResult::Traceroute(traceroute)), None),
+        );
+        out.lines().next().expect("a line").to_string()
+    }
+
+    fn mtr_hop(number: u8, ip: Option<&str>, sent: u32, replied: u32) -> crate::scan::traceroute::TracerouteHop {
+        let ip = ip.map(|ip| ip.parse().unwrap());
+        let rtt = ip.map(|_| Duration::from_millis(6));
+        crate::scan::traceroute::TracerouteHop {
+            hop_number: number,
+            responses: vec![],
+            best_rtt: rtt,
+            avg_rtt: rtt,
+            worst_rtt: rtt,
+            packet_loss: 0.0,
+            sent,
+            replied,
+            last_rtt: rtt,
+            stddev_rtt: None,
+            addresses: ip.into_iter().collect(),
+            current_address: ip,
+        }
+    }
+
+    #[test]
+    fn traceroute_line_carries_mtr_cycles_and_destination_loss() {
+        use crate::scan::traceroute::TraceEngine;
+        let hops = vec![
+            mtr_hop(1, Some("10.0.0.1"), 3, 3),
+            mtr_hop(2, None, 3, 0),
+            mtr_hop(3, Some("192.0.2.1"), 3, 3),
+        ];
+        let out = traceroute_line(TraceEngine::Mtr { cycles: 3 }, hops);
+        assert_eq!(
+            out,
+            "✅ TRACEROUTE: IPv4 3 hops, reached (6ms, loss 0%, 1 no reply, mtr 3 cycles)"
+        );
+    }
+
+    #[test]
+    fn traceroute_line_shows_the_destination_hops_loss_not_a_transit_hops() {
+        use crate::scan::traceroute::TraceEngine;
+        let hops = vec![mtr_hop(1, Some("10.0.0.1"), 4, 1), mtr_hop(2, Some("192.0.2.1"), 4, 3)];
+        let out = traceroute_line(TraceEngine::Mtr { cycles: 4 }, hops);
+        assert!(out.contains("loss 25%"), "{out}");
+    }
+
+    #[test]
+    fn traceroute_line_says_tracing_route_before_any_hop_settles() {
+        use crate::scan::traceroute::TraceEngine;
+        let out = traceroute_line(TraceEngine::Mtr { cycles: 0 }, vec![]);
+        assert!(out.contains("IPv4 tracing route..."), "{out}");
+        assert!(!out.contains("target silent"), "{out}");
+    }
+
+    #[test]
+    fn traceroute_line_names_why_the_fallback_is_in_use() {
+        use crate::scan::traceroute::{TraceEngine, TracerouteHop};
+        let hops = vec![TracerouteHop {
+            replied: 1,
+            sent: 1,
+            current_address: Some("192.0.2.1".parse().unwrap()),
+            ..mtr_hop(1, Some("192.0.2.1"), 1, 1)
+        }];
+        let reason = "mtr not installed".to_string();
+        let out = traceroute_line(TraceEngine::Traceroute { reason }, hops);
+        assert!(out.ends_with(", 7ms, traceroute: mtr not installed)"), "{out}");
+        assert!(!out.contains("mtr 0 cycles"), "{out}");
     }
 
     /// The URL failed but the host graded: both show, the failure first.

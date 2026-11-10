@@ -650,9 +650,7 @@ mod tests {
 
     use crate::scan::dns::{DnsRecord, DnsResult, QueryStatus};
     use crate::scan::tls::{SecurityGrade, TlsData, TlsResult, TlsStatus, TlsVersion};
-    use crate::scan::traceroute::{
-        HopResponse, TraceEngine, TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus,
-    };
+    use crate::scan::traceroute::{TraceEngine, TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus};
     use crate::scan::whois::{DataSource, NotApplicableReason, WhoisResult};
     use crate::types::{ScanResult, ScanState, ScanStatus};
     use crossterm::event::KeyModifiers;
@@ -716,20 +714,22 @@ mod tests {
 
     fn traceroute_fixture(hops: u8) -> TracerouteResult {
         let ip: std::net::IpAddr = "192.0.2.1".parse().expect("ip");
+        let rtt = Some(Duration::from_millis(5));
         let data = TracerouteData {
             hops: (1..=hops)
                 .map(|hop_number| TracerouteHop {
-                    best_rtt: None,
-                    avg_rtt: None,
-                    worst_rtt: None,
-                    ..TracerouteHop::from_probes(
-                        hop_number,
-                        vec![HopResponse {
-                            ip_address: Some(ip),
-                            rtt: Some(Duration::from_millis(5)),
-                            timeout: false,
-                        }],
-                    )
+                    hop_number,
+                    responses: vec![],
+                    best_rtt: rtt,
+                    avg_rtt: rtt,
+                    worst_rtt: rtt,
+                    packet_loss: 0.0,
+                    sent: 10,
+                    replied: 10,
+                    last_rtt: rtt,
+                    stddev_rtt: Some(Duration::from_micros(300)),
+                    addresses: vec![ip],
+                    current_address: Some(ip),
                 })
                 .collect(),
             destination_reached: true,
@@ -738,9 +738,7 @@ mod tests {
             target_ip: ip,
             scan_duration: Duration::from_millis(100),
             ipv6: false,
-            engine: TraceEngine::Traceroute {
-                reason: "mtr not installed".to_string(),
-            },
+            engine: TraceEngine::Mtr { cycles: 10 },
         };
         let mut result = TracerouteResult::new();
         result.ipv4_status = TracerouteStatus::Success(hops);

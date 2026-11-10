@@ -234,6 +234,13 @@ impl TracerouteHop {
     pub fn is_silent(&self) -> bool {
         self.replied == 0
     }
+
+    /// Lost share of the settled probes, rounded to a whole percent; `None` before any settled.
+    pub fn loss_percent(&self) -> Option<u64> {
+        let sent = u64::from(self.sent);
+        let lost = u64::from(self.sent.saturating_sub(self.replied));
+        (lost * 100 + sent / 2).checked_div(sent)
+    }
 }
 
 /// Sample standard deviation (n-1 denominator, as mtr reports) of `count` RTTs from their sum
@@ -1835,6 +1842,24 @@ exit 0"#;
         assert!(hop.addresses.is_empty());
         assert_eq!(hop.current_address, None);
         assert!(hop.is_silent());
+    }
+
+    #[test]
+    fn loss_percent_rounds_settled_probes_and_is_none_before_any() {
+        let scanner = TracerouteScanner::new();
+        let hop = |line: &str| scanner.parse_hop_line(line).unwrap().unwrap();
+        assert_eq!(
+            hop(" 1  10.0.0.1  1.0 ms 10.0.0.1  1.0 ms 10.0.0.1  1.0 ms").loss_percent(),
+            Some(0)
+        );
+        assert_eq!(hop(" 3  10.0.0.1  1.0 ms * *").loss_percent(), Some(67));
+        assert_eq!(hop(" 4  * * *").loss_percent(), Some(100));
+        let unsent = TracerouteHop {
+            sent: 0,
+            replied: 0,
+            ..hop(" 4  * * *")
+        };
+        assert_eq!(unsent.loss_percent(), None);
     }
 
     #[test]

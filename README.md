@@ -1,6 +1,15 @@
 # scan
 scan url/domain/ip
 
+## Traceroute
+
+scan keeps tracing the route while it runs, like `mtr`: each hop shows Loss%, Snt, Last, Avg,
+Best, Wrst and StDev accumulated since the trace started, and a hop that answers from several
+addresses lists them all. This needs `mtr` on the PATH; it is optional. When `mtr` is missing or
+cannot run unprivileged, scan falls back to a `traceroute` snapshot every five minutes and says
+why: the traceroute pane's status line and the `--no-tui` TRACEROUTE line both carry the reason
+(for example `traceroute: mtr not installed`). The fallback lasts until scan restarts.
+
 ## Config
 
 scan reads an optional `~/.config/scan/scan.yml` (or `$XDG_CONFIG_HOME/scan/scan.yml`). Its

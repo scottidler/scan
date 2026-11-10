@@ -108,3 +108,43 @@ Design doc: `docs/plan/2026-11-10-mtr-traceroute.md`
 
 ### Open questions
 - A family whose mtr fails with a network error before ever streaming retries every `MTR_RESPAWN_SECS`, and each retry's first scan waits for that child (it exits fast on ripr's IPv6 error, under 100ms). A network error that hangs instead of exiting would stall the scan up to the 5s grace on each retry and then fall back as `mtr: no output`. That matches the table, but it would turn a slow route failure into a sticky fallback. Flagging it, not changing it.
+
+## Phase 3: TUI pane and `--no-tui` line
+
+### Design decisions
+- `TracerouteHop::loss_percent` (`src/scan/traceroute.rs`) is the one Loss% both renderers read: lost / settled, rounded to a whole percent, `None` before any probe settled. The pane and `pretty.rs` cannot disagree, and the traceroute fallback's hops get it free (`sent = 3`).
+- Rendering branches on `TracerouteData.engine`, not on whether `responses` is empty (`src/tui/traceroute.rs:is_mtr`). Fallback data keeps the old per-probe grid and zoom byte for byte; mtr data gets the new rows and table.
+- Normal grid row under mtr: `mtr_hop_row` writes `<hop>: <current_address> +N <loss> <avg>`, single-space separated so a hop fits the 80x24 dashboard pane (25 inner columns). The destination hop keeps its own `->` row, now `(avg loss)`.
+- Zoom (`mtr_table_lines`): `Hop Host Loss% Snt Last Avg Best Wrst StDev`, host column sized to the longest address, one-decimal ms so sub-millisecond hops do not read `0ms`, and an indented row for each address other than `current_address`. A hop with no reply shows `???` and `-` cells.
+- Before the first settled probe (mtr engine, no hops) the pane and the `--no-tui` line both read `tracing route...` instead of `target silent`.
+- The status header names the engine once the scan is Complete: `Status: mtr · 42 cycles` (GOOD) or `Status: traceroute (mtr not installed)` (WARN). Running, refreshing and failed labels still win, so a failure is never hidden behind the engine name.
+- `--no-tui`: `IPv4 8 hops, reached (6ms, loss 0%, 1 no reply, mtr 42 cycles)`; fallback `... (5ms, loss 0%, 4 no reply, 3003ms, traceroute: mtr not installed)`. Loss and RTT come from the destination hop (last hop when not reached).
+- Fixtures: `traceroute_fixture` (`src/tui/layout.rs`) and `tatari_route` (`src/tui/traceroute.rs`) now carry mtr-mode data (empty `responses`, aggregates filled). The old probe-level `tatari_route` is `tatari_fallback_route`, used by the tests that read `responses` (destination RTT, zoomed probes, 80x24 fallback fit, variation selector); `ipv6_route` and `route_with_silent_hops` stay fallback.
+
+### Deviations
+- No Loss% threshold exists in the connectivity pane: it colors by connection state and latency (`SLOW_LATENCY_US`, `VERY_SLOW_LATENCY_US`), never by loss percent. The doc says to reuse its thresholds, so I added `BAD_LOSS_PERCENT = 10` (`src/tui/traceroute.rs`): 0% GOOD, below 10% WARN, 10% and above BAD. Colors are the shared theme constants.
+- The engine is the Status header text, not a separate line: the doc's `Status: mtr · 42 cycles`. A separate engine row pushed the fallback pane's Duration row off the 80x24 dashboard ("1 more"), so the header carries it. At that width the narrow pane clips it (`mtr · 42 cycl...`); zoom shows it in full.
+- The `Duration:` row is omitted under mtr: a snapshot of live counters is instant, so the figure (0ms) would be a lie, and `--no-tui` drops the duration for the same reason. The fallback keeps both. The 80x24 fit test was split: an mtr test (no Duration) and a fallback test (Duration last row).
+- Destination row under mtr reads `(3ms 0%)` rather than `(3ms, loss 0%)`, to stay inside the 25-column dashboard pane.
+- Test renamed/split by name: `tatari_route_fits_the_80x24_dashboard_with_destination_and_duration` became `tatari_route_fits_the_80x24_dashboard_with_engine_and_destination` (mtr) plus `fallback_route_fits_the_80x24_dashboard_with_destination_and_duration`.
+
+### Tradeoffs
+- Branch on engine vs one renderer for both: the fallback's per-probe detail (every probe's address and RTT) has no mtr equivalent, and dropping it would change shipped fallback output for no gain.
+- Fixed 10% BAD threshold vs inventing a config key: the doc excludes new config; a constant is the smallest honest choice.
+
+### Bite checks (2026-11-10; each break applied by a script in the session scratchpad, run with `cargo test --lib`, file restored after)
+- `loss_percent` without rounding: 1 failed (`loss_percent_rounds_settled_probes_and_is_none_before_any`).
+- `StDev` header renamed: 1 failed (`zoomed_mtr_table_has_every_column_and_ecmp_rows`).
+- `BAD_LOSS_PERCENT` 10 -> 30: 1 failed (`mtr_loss_is_colored_good_warn_bad_by_threshold`); 0% colored WARN: same test.
+- `tracing route...` branch disabled: 1 failed (`mtr_pane_says_tracing_route_before_any_hop_settles`).
+- `+N` count forced to 0: 1 failed (`mtr_grid_row_shows_address_extras_loss_and_average`).
+- ECMP extra rows dropped: 1 failed (`zoomed_mtr_table_has_every_column_and_ecmp_rows`).
+- Duration always shown: 2 failed (the mtr fit test and the zoom test).
+- Cycle count not shown: 3 failed (incl. the mtr fit test).
+- mtr destination note disabled: 1 failed (the mtr fit test).
+- `--no-tui` cycles off by one: 1 failed (`traceroute_line_carries_mtr_cycles_and_destination_loss`); loss off by one: 2 failed; loss from the first hop: 1 failed (`traceroute_line_shows_the_destination_hops_loss_not_a_transit_hops`); `tracing route...` removed: 1 failed.
+- Fallback reason text dropped from the pane header: 1 failed (`zoomed_fallback_names_the_engine_reason`); from the `--no-tui` line: 1 failed (`traceroute_line_names_why_the_fallback_is_in_use`); Duration hidden for the fallback: 3 failed.
+
+### Open questions
+- Is the 10% BAD loss threshold right? It is a judgment call; the connectivity pane gave nothing to reuse.
+- The shakedown the doc lists (release build on ripr, TUI over tmux, a run past 15s, macOS) is not part of this phase and has not been run; AC1-AC3's long-run commands were not executed here beyond the single 8s debug run in the report.

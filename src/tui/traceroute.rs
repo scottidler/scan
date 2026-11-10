@@ -1,14 +1,20 @@
-use crate::scan::traceroute::{TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus};
+use crate::scan::traceroute::{TraceEngine, TracerouteData, TracerouteHop, TracerouteResult, TracerouteStatus};
 use crate::tui::pane::{Detail, Pane};
 use crate::tui::theme;
 use crate::types::{AppState, ScanResult};
 use log;
+use ratatui::style::Color;
 use ratatui::{
     style::Style,
     text::{Line, Span},
 };
 use std::any::Any;
+use std::net::IpAddr;
+use std::time::Duration;
 
+/// A hop at or above this loss reads BAD; any loss below it reads WARN, none reads GOOD.
+const BAD_LOSS_PERCENT: u64 = 10;
+const NO_ADDRESS_HOST: &str = "???";
 const MIN_TRACEROUTE_PANE_WIDTH: u16 = 35;
 const MIN_TRACEROUTE_PANE_HEIGHT: u16 = 20;
 
@@ -58,12 +64,62 @@ fn target_rtt(hop: &TracerouteHop, target_ip: std::net::IpAddr) -> Option<String
     )
 }
 
-/// `→ <target ip> (<rtt>)`, or `(no reply)` when the target never answered.
+fn loss_color(percent: Option<u64>) -> Color {
+    match percent {
+        None => theme::MUTED,
+        Some(0) => theme::GOOD,
+        Some(percent) if percent < BAD_LOSS_PERCENT => theme::WARN,
+        Some(_) => theme::BAD,
+    }
+}
+
+fn loss_text(hop: &TracerouteHop) -> String {
+    hop.loss_percent()
+        .map_or_else(|| "---".to_string(), |percent| format!("{percent}%"))
+}
+
+/// Whole milliseconds, `-` for a column with no reply behind it.
+fn whole_ms(rtt: Option<Duration>) -> String {
+    rtt.map_or_else(|| "-".to_string(), |rtt| format!("{}ms", rtt.as_millis()))
+}
+
+/// One decimal, so a sub-millisecond hop does not read `0ms`.
+fn tenth_ms(rtt: Option<Duration>) -> String {
+    rtt.map_or_else(|| "-".to_string(), |rtt| format!("{:.1}ms", rtt.as_secs_f64() * 1000.0))
+}
+
+fn is_mtr(data: &TracerouteData) -> bool {
+    matches!(data.engine, TraceEngine::Mtr { .. })
+}
+
+/// Which prober produced the route, and the reason when it is the fallback.
+fn engine_status(engine: &TraceEngine) -> (String, Color) {
+    match engine {
+        TraceEngine::Mtr { cycles } => (
+            format!("mtr · {}", crate::tui::text::plural(*cycles, "cycle")),
+            theme::GOOD,
+        ),
+        TraceEngine::Traceroute { reason } => (format!("traceroute ({reason})"), theme::WARN),
+    }
+}
+
+fn tracing_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
+        Span::styled("tracing route...", Style::default().fg(theme::WARN)),
+    ])
+}
+
+/// `→ <target ip> (<rtt>)`, or `(no reply)` when the target never answered. Under mtr the note is
+/// the destination hop's average and loss.
 fn destination_line(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> Line<'static> {
-    let note = match destination_hop.and_then(|hop| target_rtt(hop, data.target_ip)) {
-        Some(rtt) => format!(" ({rtt})"),
-        None if data.destination_reached => String::new(),
-        None => " (no reply)".to_string(),
+    let note = match destination_hop {
+        Some(hop) if is_mtr(data) => format!(" ({} {})", whole_ms(hop.avg_rtt), loss_text(hop)),
+        _ => match destination_hop.and_then(|hop| target_rtt(hop, data.target_ip)) {
+            Some(rtt) => format!(" ({rtt})"),
+            None if data.destination_reached => String::new(),
+            None => " (no reply)".to_string(),
+        },
     };
     Line::from(vec![
         Span::styled("→ ", Style::default().fg(theme::MUTED)),
@@ -98,6 +154,11 @@ fn hop_lines(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> 
             index += run;
             continue;
         }
+        if is_mtr(data) {
+            lines.push(mtr_hop_row(hop));
+            index += 1;
+            continue;
+        }
         let (ip, rtt) = first_answer(hop).unwrap_or_else(|| ("*".to_string(), "*".to_string()));
         lines.push(Line::from(vec![
             Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(theme::LABEL)),
@@ -105,6 +166,96 @@ fn hop_lines(data: &TracerouteData, destination_hop: Option<&TracerouteHop>) -> 
             Span::styled(format!(" ({rtt})"), Style::default().fg(theme::MUTED)),
         ]));
         index += 1;
+    }
+    lines
+}
+
+/// `  4: 10.0.0.1 +2 3% 6ms`: the hop's latest address, how many others it has answered from,
+/// then its loss and average.
+fn mtr_hop_row(hop: &TracerouteHop) -> Line<'static> {
+    let host = hop
+        .current_address
+        .map_or_else(|| NO_ADDRESS_HOST.to_string(), |ip| ip.to_string());
+    let others = hop.addresses.len().saturating_sub(1);
+    let host = if others > 0 { format!("{host} +{others}") } else { host };
+    Line::from(vec![
+        Span::styled(format!("  {:2}: ", hop.hop_number), Style::default().fg(theme::LABEL)),
+        Span::styled(host, Style::default().fg(theme::VALUE)),
+        Span::styled(
+            format!(" {}", loss_text(hop)),
+            Style::default().fg(loss_color(hop.loss_percent())),
+        ),
+        Span::styled(format!(" {}", whole_ms(hop.avg_rtt)), Style::default().fg(theme::MUTED)),
+    ])
+}
+
+/// The route under the reach line: the destination row, then the hops above it.
+fn route_lines(data: &TracerouteData) -> Vec<Line<'static>> {
+    if is_mtr(data) && data.hops.is_empty() {
+        return vec![tracing_line()];
+    }
+    let destination_hop = data.destination_hop();
+    let mut lines = vec![reach_line(data), destination_line(data, destination_hop)];
+    lines.extend(hop_lines(data, destination_hop));
+    lines
+}
+
+/// Zoomed mtr table: a row per hop with every column, an indented row per extra ECMP address.
+fn mtr_table_lines(data: &TracerouteData) -> Vec<Line<'static>> {
+    let host_of = |hop: &TracerouteHop| {
+        hop.current_address
+            .map_or_else(|| NO_ADDRESS_HOST.to_string(), |ip| ip.to_string())
+    };
+    let host_width = data
+        .hops
+        .iter()
+        .map(|hop| host_of(hop).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("Host".len());
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "  {:>3}  {:<host_width$}  {:>6}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}",
+            "Hop", "Host", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "StDev"
+        ),
+        Style::default().fg(theme::LABEL),
+    ))];
+    for hop in &data.hops {
+        let host_color = if hop.is_silent() { theme::MUTED } else { theme::VALUE };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:>3}  ", hop.hop_number), Style::default().fg(theme::LABEL)),
+            Span::styled(
+                format!("{:<host_width$}", host_of(hop)),
+                Style::default().fg(host_color),
+            ),
+            Span::styled(
+                format!("  {:>6}", loss_text(hop)),
+                Style::default().fg(loss_color(hop.loss_percent())),
+            ),
+            Span::styled(format!("  {:>4}", hop.sent), Style::default().fg(theme::VALUE)),
+            Span::styled(
+                format!(
+                    "  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}",
+                    tenth_ms(hop.last_rtt),
+                    tenth_ms(hop.avg_rtt),
+                    tenth_ms(hop.best_rtt),
+                    tenth_ms(hop.worst_rtt),
+                    tenth_ms(hop.stddev_rtt)
+                ),
+                Style::default().fg(theme::VALUE),
+            ),
+        ]));
+        let others: Vec<&IpAddr> = hop
+            .addresses
+            .iter()
+            .filter(|ip| Some(**ip) != hop.current_address)
+            .collect();
+        for ip in others {
+            lines.push(Line::from(Span::styled(
+                format!("  {:>3}  {ip}", ""),
+                Style::default().fg(theme::MUTED),
+            )));
+        }
     }
     lines
 }
@@ -165,6 +316,12 @@ fn zoomed_route_lines(result: &TracerouteResult) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (name, data, status) in families {
         match data {
+            Some(data) if is_mtr(data) && data.hops.is_empty() => lines.push(tracing_line()),
+            Some(data) if is_mtr(data) => {
+                lines.push(reach_line(data));
+                lines.push(destination_line(data, data.destination_hop()));
+                lines.extend(mtr_table_lines(data));
+            }
             Some(data) => {
                 lines.push(reach_line(data));
                 lines.push(destination_line(data, data.destination_hop()));
@@ -202,6 +359,14 @@ impl Pane for TraceroutePane {
         if let Some(traceroute_state) = state.scanners.get("traceroute") {
             // Update header with current status
             let (label, label_color) = crate::tui::status_label(&traceroute_state, "tracing...", "traced");
+            // A finished scan names its prober where "traced" would be.
+            let engine = match (&traceroute_state.status, &traceroute_state.result) {
+                (crate::types::ScanStatus::Complete, Some(ScanResult::Traceroute(result))) => {
+                    result.get_primary_result().map(|data| engine_status(&data.engine))
+                }
+                _ => None,
+            };
+            let (label, label_color) = engine.unwrap_or((label, label_color));
             lines[0] = Line::from(vec![
                 Span::styled("🧭 Status: ", Style::default().fg(theme::VALUE)),
                 Span::styled(label, Style::default().fg(label_color)),
@@ -213,10 +378,7 @@ impl Pane for TraceroutePane {
                 } else if let Some(primary_data) = traceroute_result.get_primary_result() {
                     // The primary family only; the destination has its own row, the route above
                     // it is the other hops.
-                    lines.push(reach_line(primary_data));
-                    let destination_hop = primary_data.destination_hop();
-                    lines.push(destination_line(primary_data, destination_hop));
-                    lines.extend(hop_lines(primary_data, destination_hop));
+                    lines.extend(route_lines(primary_data));
                 } else {
                     lines.push(Line::from(vec![
                         Span::styled("📍 Status: ", Style::default().fg(theme::LABEL)),
@@ -224,12 +386,15 @@ impl Pane for TraceroutePane {
                     ]));
                 }
 
-                // Total scan time
-                let scan_time_ms = traceroute_result.total_duration.as_millis();
-                lines.push(Line::from(vec![
-                    Span::styled("⏳ Duration: ", Style::default().fg(theme::LABEL)),
-                    Span::styled(format!("{}ms", scan_time_ms), Style::default().fg(theme::WARN)),
-                ]));
+                // A continuous trace's snapshot is instant: its duration says nothing.
+                let continuous = traceroute_result.get_primary_result().is_some_and(is_mtr);
+                if !continuous {
+                    let scan_time_ms = traceroute_result.total_duration.as_millis();
+                    lines.push(Line::from(vec![
+                        Span::styled("⏳ Duration: ", Style::default().fg(theme::LABEL)),
+                        Span::styled(format!("{}ms", scan_time_ms), Style::default().fg(theme::WARN)),
+                    ]));
+                }
             } else {
                 // No traceroute data available yet - check scanner status
                 match traceroute_state.status {
@@ -419,8 +584,9 @@ mod tests {
         assert!(summary.contains("2 no reply"), "{summary}");
     }
 
-    /// www.tatari.tv from the shakedown: hops 1-2 answer, 3-9 are silent, 10 answers, 11 is the target.
-    fn tatari_route() -> crate::scan::traceroute::TracerouteData {
+    /// www.tatari.tv from the shakedown, as the `traceroute` fallback reports it: hops 1-2 answer,
+    /// 3-9 are silent, 10 answers, 11 is the target.
+    fn tatari_fallback_route() -> crate::scan::traceroute::TracerouteData {
         use crate::scan::traceroute::{HopResponse, TracerouteHop};
         use std::time::Duration;
         let answer = |number: u8, ip: &str, ms: u64| TracerouteHop {
@@ -448,6 +614,60 @@ mod tests {
         data
     }
 
+    /// A hop as mtr accumulates it: no per-probe responses, `rtts_us` is last, avg, best, worst, stddev.
+    fn mtr_hop(number: u8, ips: &[&str], sent: u32, replied: u32, rtts_us: [u64; 5]) -> TracerouteHop {
+        use std::time::Duration;
+        let addresses: Vec<std::net::IpAddr> = ips.iter().map(|ip| ip.parse().expect("ip")).collect();
+        let rtt = |us: u64| (replied > 0).then(|| Duration::from_micros(us));
+        TracerouteHop {
+            hop_number: number,
+            responses: vec![],
+            best_rtt: rtt(rtts_us[2]),
+            avg_rtt: rtt(rtts_us[1]),
+            worst_rtt: rtt(rtts_us[3]),
+            packet_loss: (sent - replied) as f32 / sent as f32,
+            sent,
+            replied,
+            last_rtt: rtt(rtts_us[0]),
+            stddev_rtt: rtt(rtts_us[4]),
+            current_address: addresses.last().copied(),
+            addresses,
+        }
+    }
+
+    /// `tatari_fallback_route` as mtr reports it after 42 cycles.
+    fn tatari_route() -> crate::scan::traceroute::TracerouteData {
+        use crate::scan::traceroute::TraceEngine;
+        let answered =
+            |number: u8, ip: &str, us: u64| mtr_hop(number, &[ip], 42, 42, [us, us, us - 200, us + 400, 150]);
+        let mut hops = vec![answered(1, "192.168.1.1", 1000), answered(2, "10.0.0.1", 2000)];
+        hops.extend((3..=9).map(|n| mtr_hop(n, &[], 42, 0, [0; 5])));
+        hops.push(answered(10, "63.140.62.5", 3000));
+        hops.push(answered(11, "216.150.16.193", 3000));
+        let mut data = tatari_fallback_route();
+        data.hops = hops;
+        data.engine = TraceEngine::Mtr { cycles: 42 };
+        data
+    }
+
+    fn state_of(data: crate::scan::traceroute::TracerouteData, total: std::time::Duration) -> AppState {
+        let mut result = crate::scan::traceroute::TracerouteResult::new();
+        result.ipv4_result = Some(data);
+        result.total_duration = total;
+        let state = AppState::new("www.tatari.tv".to_string());
+        state.scanners.insert(
+            "traceroute".to_string(),
+            crate::types::ScanState {
+                result: Some(ScanResult::Traceroute(result)),
+                error: None,
+                status: crate::types::ScanStatus::Complete,
+                last_updated: std::time::Instant::now(),
+                history: Default::default(),
+            },
+        );
+        state
+    }
+
     fn tatari_pane(width: u16, height: u16) -> String {
         let mut result = crate::scan::traceroute::TracerouteResult::new();
         result.ipv4_result = Some(tatari_route());
@@ -467,9 +687,24 @@ mod tests {
     }
 
     #[test]
-    fn tatari_route_fits_the_80x24_dashboard_with_destination_and_duration() {
+    fn tatari_route_fits_the_80x24_dashboard_with_engine_and_destination() {
         let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
         let out = tatari_pane(width, height);
+        assert!(out.contains("🧭 Status: mtr · 42"), "{out}");
+        assert!(out.contains("📍 IPv4 ✓ reached"), "{out}");
+        assert!(out.contains("→ 216.150.16.193 (3ms 0%)"), "{out}");
+        assert!(out.contains("3-9: no reply (7 hops)"), "{out}");
+        assert!(out.contains("10: 63.140.62.5 0% 3ms"), "{out}");
+        assert!(!out.contains("Duration"), "an instant snapshot has no duration:\n{out}");
+        assert!(!out.contains("more"), "nothing is hidden at 80x24:\n{out}");
+    }
+
+    #[test]
+    fn fallback_route_fits_the_80x24_dashboard_with_destination_and_duration() {
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let state = state_of(tatari_fallback_route(), std::time::Duration::from_millis(3200));
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, width, height, false);
+        assert!(out.contains("🧭 Status: traceroute"), "{out}");
         assert!(out.contains("📍 IPv4 ✓ reached"), "{out}");
         assert!(out.contains("→ 216.150.16.193 (3ms)"), "{out}");
         assert!(out.contains("3-9: no reply (7 hops)"), "{out}");
@@ -483,7 +718,7 @@ mod tests {
     fn destination_row_shows_the_rtt_of_the_target_answer_not_another_router() {
         use crate::scan::traceroute::HopResponse;
         use std::time::Duration;
-        let mut data = tatari_route();
+        let mut data = tatari_fallback_route();
         let last = data.hops.last_mut().expect("destination hop");
         last.responses = vec![
             HopResponse {
@@ -504,7 +739,8 @@ mod tests {
 
     #[test]
     fn rendered_traceroute_pane_has_no_variation_selector() {
-        let out = tatari_pane(80, 24);
+        let state = state_of(tatari_fallback_route(), std::time::Duration::from_millis(3200));
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, 80, 24, false);
         assert!(out.contains('🧭') && out.contains('⏳'), "{out}");
         assert!(!out.contains('\u{FE0F}'), "{out}");
     }
@@ -584,7 +820,7 @@ mod tests {
             rtt: Some(Duration::from_millis(ms)),
             timeout: false,
         };
-        let mut data = tatari_route();
+        let mut data = tatari_fallback_route();
         data.hops[0].responses = vec![probe(5), probe(7), probe(9)];
         let mut result = TracerouteResult::new();
         result.ipv4_status = TracerouteStatus::Success(11);
@@ -632,5 +868,113 @@ mod tests {
         let state = traced_state(route_with_silent_hops());
         let text = crate::tui::testing::content_rows(&TraceroutePane::new(), &state, 120, Detail::Zoomed).join("\n");
         assert!(text.contains(" 3: 192.0.2.1 5ms · * · *  loss 67%"), "{text}");
+    }
+
+    #[test]
+    fn mtr_pane_says_tracing_route_before_any_hop_settles() {
+        let mut data = tatari_route();
+        data.hops.clear();
+        data.total_hops = 0;
+        data.destination_reached = false;
+        let state = state_of(data, std::time::Duration::ZERO);
+        let pane = TraceroutePane::new();
+        for detail in [Detail::Normal, Detail::Zoomed] {
+            let text = crate::tui::testing::content_rows(&pane, &state, 80, detail).join("\n");
+            assert!(text.contains("tracing route..."), "{detail:?}: {text}");
+            assert!(text.contains("mtr · 42 cycles"), "{detail:?}: {text}");
+            assert!(!text.contains("target silent"), "{detail:?}: {text}");
+        }
+    }
+
+    /// Hop 2 answered from three addresses; 2 of its 40 probes were lost.
+    fn ecmp_route() -> crate::scan::traceroute::TracerouteData {
+        let mut data = tatari_route();
+        data.hops[1] = mtr_hop(
+            2,
+            &["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+            40,
+            38,
+            [5200, 6000, 4500, 12300, 1800],
+        );
+        data
+    }
+
+    #[test]
+    fn mtr_grid_row_shows_address_extras_loss_and_average() {
+        let state = state_of(ecmp_route(), std::time::Duration::ZERO);
+        let text = crate::tui::testing::content_rows(&TraceroutePane::new(), &state, 80, Detail::Normal).join("\n");
+        assert!(text.contains(" 2: 10.0.0.3 +2 5% 6ms"), "{text}");
+        assert!(text.contains(" 1: 192.168.1.1 0% 1ms"), "{text}");
+    }
+
+    #[test]
+    fn zoomed_mtr_table_has_every_column_and_ecmp_rows() {
+        let state = state_of(ecmp_route(), std::time::Duration::ZERO);
+        let text = crate::tui::testing::content_rows(&TraceroutePane::new(), &state, 120, Detail::Zoomed).join("\n");
+        let cells = |starts_with: &str| -> Vec<String> {
+            let line = text
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(starts_with))
+                .unwrap_or_else(|| panic!("no row {starts_with}: {text}"));
+            line.split_whitespace().map(str::to_string).collect()
+        };
+        assert_eq!(
+            cells("Hop"),
+            ["Hop", "Host", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "StDev"]
+        );
+        assert_eq!(
+            cells("2"),
+            [
+                "2", "10.0.0.3", "5%", "40", "5.2ms", "6.0ms", "4.5ms", "12.3ms", "1.8ms"
+            ]
+        );
+        assert_eq!(cells("3"), ["3", "???", "100%", "42", "-", "-", "-", "-", "-"]);
+        for extra in ["10.0.0.1", "10.0.0.2"] {
+            let row = text.lines().find(|line| line.trim() == extra).expect(extra);
+            assert!(row.starts_with("       "), "extra address is indented: {row:?}");
+        }
+        assert!(text.contains("mtr · 42 cycles"), "{text}");
+        assert!(!text.contains("Duration"), "{text}");
+    }
+
+    #[test]
+    fn mtr_loss_is_colored_good_warn_bad_by_threshold() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut data = tatari_route();
+        data.hops = vec![
+            mtr_hop(1, &["192.168.1.1"], 100, 100, [1000; 5]),
+            mtr_hop(2, &["10.0.0.1"], 100, 97, [1000; 5]),
+            mtr_hop(3, &["10.0.0.2"], 100, 80, [1000; 5]),
+            mtr_hop(4, &["216.150.16.193"], 100, 50, [1000; 5]),
+        ];
+        let state = state_of(data, std::time::Duration::ZERO);
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("terminal");
+        let pane = TraceroutePane::new();
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(crate::tui::testing::fg_of(&buffer, " 0%"), crate::tui::theme::GOOD);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "3%"), crate::tui::theme::WARN);
+        assert_eq!(crate::tui::testing::fg_of(&buffer, "20%"), crate::tui::theme::BAD);
+    }
+
+    #[test]
+    fn tui_and_no_tui_report_the_same_silent_hop_count_under_mtr() {
+        let data = tatari_route();
+        assert_eq!(data.silent_hops(), 7);
+        let state = state_of(data, std::time::Duration::ZERO);
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, 60, 24, false);
+        assert!(out.contains("3-9: no reply (7 hops)"), "{out}");
+        let scan_state = state.scanners.get("traceroute").expect("traceroute state");
+        let summary = crate::pretty::format_scan_state("traceroute", &scan_state);
+        assert!(summary.contains("7 no reply"), "{summary}");
+    }
+
+    #[test]
+    fn zoomed_fallback_names_the_engine_reason() {
+        let state = state_of(tatari_fallback_route(), std::time::Duration::from_millis(10));
+        let text = crate::tui::testing::content_rows(&TraceroutePane::new(), &state, 120, Detail::Zoomed).join("\n");
+        assert!(text.contains("🧭 Status: traceroute (mtr not installed)"), "{text}");
     }
 }
