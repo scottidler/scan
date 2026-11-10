@@ -43,6 +43,11 @@ impl HopCounters {
         self.pending.push(seq);
     }
 
+    fn forget_seqs(&mut self) {
+        self.pending.clear();
+        self.recent_lost.clear();
+    }
+
     fn host_seen(&mut self, ip: IpAddr) {
         self.latest_host = Some(ip);
         if !self.addresses.contains(&ip) {
@@ -106,6 +111,19 @@ impl Accumulator {
     /// Probe rounds started: the count of `x` records for hop 0.
     pub fn cycles(&self) -> u32 {
         self.cycles
+    }
+
+    /// Drop every in-flight and recently-lost seq, keeping the counters. A respawned mtr restarts
+    /// its seqs at 33000, so a seq from the old child must not match a probe from the new one.
+    pub fn forget_seqs(&mut self) {
+        log::debug!(
+            "[scan::traceroute::accumulator] forget_seqs: hops={} cycles={}",
+            self.hops.len(),
+            self.cycles
+        );
+        for counters in self.hops.values_mut() {
+            counters.forget_seqs();
+        }
     }
 
     pub fn apply(&mut self, record: RawRecord) {
@@ -431,6 +449,33 @@ p 6 7638 33193
             seq: 1,
         });
         assert_eq!(snap(&acc, "192.0.2.1").hops[0].replied, 1, "seq 1 is still retractable");
+    }
+
+    #[test]
+    fn forget_seqs_keeps_counters_and_stops_old_seqs_matching_a_new_child() {
+        let mut acc = Accumulator::new();
+        for line in ["x 0 33000", "h 0 192.0.2.1", "p 0 800 33000", "x 0 33001", "x 0 33002"] {
+            acc.apply_line(line);
+        }
+        let before = snap(&acc, "192.0.2.1");
+        assert_eq!((before.hops[0].sent, before.hops[0].replied), (2, 1));
+
+        acc.forget_seqs();
+        acc.apply_line("p 0 900 33001");
+        acc.apply_line("p 0 900 33002");
+        let after = snap(&acc, "192.0.2.1");
+        assert_eq!(
+            (after.hops[0].sent, after.hops[0].replied),
+            (2, 1),
+            "the old child's lost and pending seqs are gone, its counters stay"
+        );
+
+        acc.apply_line("x 0 33000");
+        acc.apply_line("p 0 700 33000");
+        let respawned = snap(&acc, "192.0.2.1");
+        assert_eq!((respawned.hops[0].sent, respawned.hops[0].replied), (3, 2));
+        assert_eq!(respawned.hops[0].last_rtt, Some(Duration::from_micros(700)));
+        assert_eq!(acc.cycles(), 4);
     }
 
     #[test]

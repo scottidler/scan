@@ -8,11 +8,18 @@ use log;
 use std::fmt;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 
 pub mod accumulator;
+pub mod mtr;
 pub mod raw;
 
-const TRACEROUTE_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes - traceroute is slow and noisy if too frequent
+use mtr::{MTR_PROGRAM, MtrSession, MtrTimings, SessionPoll};
+
+/// The `traceroute` fallback reruns at most this often; slow and noisy if more frequent.
+const TRACEROUTE_INTERVAL_SECS: u64 = 5 * 60;
+/// Every scan returns the mtr snapshot; 1s matches mtr's unprivileged probe interval.
+const SCAN_INTERVAL_SECS: u64 = 1;
 const TRACEROUTE_TIMEOUT_SECS: u64 = 3; // 3 seconds per hop (much faster like your example)
 const MAX_TRACEROUTE_HOPS: u8 = 30;
 const PROBES_PER_HOP: u8 = 3;
@@ -22,16 +29,92 @@ const FULL_PACKET_LOSS: f32 = 1.0;
 /// What Linux `traceroute` prints when the host refuses it an unprivileged ICMP socket
 /// (`net.ipv4.ping_group_range` excludes the user).
 const ICMP_PRIVILEGE_ERROR: &str = "You do not have enough privileges to use this traceroute method";
-/// Fallback reason until engine selection exists: nothing tries mtr yet.
-const MTR_NOT_ATTEMPTED: &str = "mtr not attempted";
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TracerouteScanner {
-    interval: Duration,
+    traceroute_interval: Duration,
     timeout: Duration,
     max_hops: u8,
     probes_per_hop: u8,
     program_override: Option<String>,
+    mtr_program_override: Option<String>,
+    mtr_timings: MtrTimings,
+    engine: AsyncMutex<EngineState>,
+}
+
+/// Which prober the scanner uses; one for the whole scanner, so the pane never mixes modes.
+#[derive(Debug, Default)]
+enum EngineState {
+    /// No scan yet: the first one tries mtr.
+    #[default]
+    Untried,
+    /// One slot per traced family (`None` when the protocol does not trace it); a family with no
+    /// address holds the no-address error and starts no child.
+    Mtr {
+        protocol: Protocol,
+        ipv4: Option<FamilySession>,
+        ipv6: Option<FamilySession>,
+    },
+    /// Sticky for the process once mtr proved unusable.
+    Traceroute {
+        reason: String,
+        last_run: Option<TracerouteRun>,
+    },
+}
+
+type FamilySession = std::result::Result<MtrSession, String>;
+
+/// The last `traceroute` run; `result` is `None` while it runs, and stays `None` when the scan
+/// deadline dropped it.
+#[derive(Debug)]
+struct TracerouteRun {
+    started: Instant,
+    protocol: Protocol,
+    result: Option<TracerouteResult>,
+}
+
+/// `Ok` when any family succeeded, else the per-family failure.
+fn scan_outcome(result: TracerouteResult, protocol: Protocol) -> Result<ScanResult> {
+    if result.has_any_success() {
+        Ok(ScanResult::Traceroute(result))
+    } else {
+        Err(result.failure(protocol))
+    }
+}
+
+/// The address `target` is traced at for one family, or the no-address error `family_outcome`
+/// turns into `TracerouteStatus::NoAddress`.
+fn family_target_ip(target: &Target, protocol: Protocol) -> Result<IpAddr> {
+    if !target.supports_protocol(protocol) {
+        log::warn!(
+            "[scan::traceroute] no_address_for_protocol: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
+        return Err(eyre::eyre!(
+            "No {} address available for target: {}",
+            protocol.as_str(),
+            target.display_name()
+        ));
+    }
+    target.primary_ip_for_protocol(protocol).ok_or_else(|| {
+        log::warn!(
+            "[scan::traceroute] no_ip_for_protocol: target={} protocol={}",
+            target.display_name(),
+            protocol.as_str()
+        );
+        eyre::eyre!(
+            "No {} IP address available for target: {}",
+            protocol.as_str(),
+            target.display_name()
+        )
+    })
+}
+
+async fn poll_session(slot: &mut Option<FamilySession>) -> Option<SessionPoll> {
+    match slot {
+        Some(Ok(session)) => Some(session.poll().await),
+        _ => None,
+    }
 }
 
 /// Program and arguments for one traceroute of `target` on `target_os`.
@@ -356,18 +439,22 @@ impl Default for TracerouteScanner {
 impl TracerouteScanner {
     pub fn new() -> Self {
         log::debug!(
-            "[scan::traceroute] new: interval={}s timeout={}s max_hops={} probes_per_hop={}",
+            "[scan::traceroute] new: interval={}s traceroute_interval={}s timeout={}s max_hops={} probes_per_hop={}",
+            SCAN_INTERVAL_SECS,
             TRACEROUTE_INTERVAL_SECS,
             TRACEROUTE_TIMEOUT_SECS,
             MAX_TRACEROUTE_HOPS,
             PROBES_PER_HOP
         );
         Self {
-            interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS),
+            traceroute_interval: Duration::from_secs(TRACEROUTE_INTERVAL_SECS),
             timeout: Duration::from_secs(TRACEROUTE_TIMEOUT_SECS),
             max_hops: MAX_TRACEROUTE_HOPS,
             probes_per_hop: PROBES_PER_HOP,
             program_override: None,
+            mtr_program_override: None,
+            mtr_timings: MtrTimings::default(),
+            engine: AsyncMutex::new(EngineState::Untried),
         }
     }
 
@@ -375,6 +462,163 @@ impl TracerouteScanner {
     pub fn with_program(mut self, program: impl Into<String>) -> Self {
         self.program_override = Some(program.into());
         self
+    }
+
+    /// Use `program` instead of `mtr`.
+    pub fn with_mtr_program(mut self, program: impl Into<String>) -> Self {
+        self.mtr_program_override = Some(program.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_mtr_timings(mut self, timings: MtrTimings) -> Self {
+        self.mtr_timings = timings;
+        self
+    }
+
+    /// Fresh sessions for every family `protocol` traces; the first poll spawns each child.
+    fn start_mtr(&self, target: &Target, protocol: Protocol) -> EngineState {
+        let program = self.mtr_program_override.as_deref().unwrap_or(MTR_PROGRAM);
+        let session = |family_protocol: Protocol| {
+            let traced = match family_protocol {
+                Protocol::Ipv4 => protocol.includes_ipv4(),
+                _ => protocol.includes_ipv6(),
+            };
+            if !traced {
+                return None;
+            }
+            Some(
+                family_target_ip(target, family_protocol)
+                    .map(|ip| MtrSession::new(program, ip, self.max_hops, self.mtr_timings))
+                    .map_err(|e| e.to_string()),
+            )
+        };
+        log::debug!(
+            "[scan::traceroute] start_mtr: target={} protocol={} program={}",
+            target.display_name(),
+            protocol.as_str(),
+            program
+        );
+        EngineState::Mtr {
+            protocol,
+            ipv4: session(Protocol::Ipv4),
+            ipv6: session(Protocol::Ipv6),
+        }
+    }
+
+    /// The mtr snapshot for every traced family, or the reason mtr cannot run here.
+    async fn poll_mtr(
+        &self,
+        target: &Target,
+        ipv4: &mut Option<FamilySession>,
+        ipv6: &mut Option<FamilySession>,
+    ) -> std::result::Result<TracerouteResult, String> {
+        let (ipv4_poll, ipv6_poll) = tokio::join!(poll_session(ipv4), poll_session(ipv6));
+        let mut result = TracerouteResult::new();
+        for (family, slot, poll) in [(Family::Ipv4, &*ipv4, ipv4_poll), (Family::Ipv6, &*ipv6, ipv6_poll)] {
+            let outcome = match poll {
+                Some(SessionPoll::Unusable(reason)) => return Err(reason),
+                Some(SessionPoll::Streaming(data)) => family_outcome(target, family, Ok(data)),
+                Some(SessionPoll::Failed(text)) => {
+                    log::debug!(
+                        "[scan::traceroute] mtr_family_failed: target={} family={} failure={}",
+                        target.display_name(),
+                        family,
+                        text
+                    );
+                    (TracerouteStatus::Failed(text), None)
+                }
+                None => match slot {
+                    Some(Err(no_address)) => family_outcome(target, family, Err(eyre::eyre!(no_address.clone()))),
+                    _ => continue,
+                },
+            };
+            match family {
+                Family::Ipv4 => (result.ipv4_status, result.ipv4_result) = outcome,
+                Family::Ipv6 => (result.ipv6_status, result.ipv6_result) = outcome,
+            }
+        }
+        Ok(result)
+    }
+
+    /// The `traceroute` fallback, throttled: a run for the same protocol within the traceroute
+    /// interval returns the stored outcome instead of running again.
+    async fn traceroute_engine(
+        &self,
+        target: &Target,
+        protocol: Protocol,
+        reason: &str,
+        last_run: &mut Option<TracerouteRun>,
+    ) -> Result<ScanResult> {
+        if let Some(run) = last_run.as_ref()
+            && run.protocol == protocol
+            && run.started.elapsed() < self.traceroute_interval
+        {
+            log::trace!(
+                "[scan::traceroute] traceroute_throttled: target={} protocol={} age={}ms stored={}",
+                target.display_name(),
+                protocol.as_str(),
+                run.started.elapsed().as_millis(),
+                run.result.is_some()
+            );
+            return match &run.result {
+                Some(result) => scan_outcome(result.clone(), protocol),
+                None => Err(eyre::eyre!("timed out after {}s", self.deadline().as_secs())),
+            };
+        }
+
+        let scan_start = Instant::now();
+        *last_run = Some(TracerouteRun {
+            started: scan_start,
+            protocol,
+            result: None,
+        });
+        let mut result = TracerouteResult::new();
+        let (ipv4_outcome, ipv6_outcome) = match protocol {
+            Protocol::Ipv4 => (
+                Some(self.traceroute_protocol(target, Protocol::Ipv4, reason).await),
+                None,
+            ),
+            Protocol::Ipv6 => (
+                None,
+                Some(self.traceroute_protocol(target, Protocol::Ipv6, reason).await),
+            ),
+            Protocol::Both => {
+                let (ipv4, ipv6) = tokio::join!(
+                    self.traceroute_protocol(target, Protocol::Ipv4, reason),
+                    self.traceroute_protocol(target, Protocol::Ipv6, reason)
+                );
+                (Some(ipv4), Some(ipv6))
+            }
+        };
+        if let Some(outcome) = ipv4_outcome {
+            (result.ipv4_status, result.ipv4_result) = family_outcome(target, Family::Ipv4, outcome);
+        }
+        if let Some(outcome) = ipv6_outcome {
+            (result.ipv6_status, result.ipv6_result) = family_outcome(target, Family::Ipv6, outcome);
+        }
+        result.total_duration = scan_start.elapsed();
+        if let Some(run) = last_run.as_mut() {
+            run.result = Some(result.clone());
+        }
+
+        let outcome = scan_outcome(result, protocol);
+        match &outcome {
+            Ok(_) => log::debug!(
+                "[scan::traceroute] traceroute_engine_completed: target={} protocol={} duration={}ms",
+                target.display_name(),
+                protocol.as_str(),
+                scan_start.elapsed().as_millis()
+            ),
+            Err(error) => log::error!(
+                "[scan::traceroute] scan_failed: target={} protocol={} duration={}ms error={}",
+                target.display_name(),
+                protocol.as_str(),
+                scan_start.elapsed().as_millis(),
+                error
+            ),
+        }
+        outcome
     }
 
     /// One traceroute run; returns stdout, or an error carrying the tool's stderr.
@@ -428,56 +672,28 @@ impl TracerouteScanner {
         Ok(stdout)
     }
 
-    async fn traceroute_protocol(&self, target: &Target, protocol: Protocol) -> Result<TracerouteData> {
+    async fn traceroute_protocol(&self, target: &Target, protocol: Protocol, reason: &str) -> Result<TracerouteData> {
         log::debug!(
             "[scan::traceroute] traceroute_protocol: target={} protocol={}",
             target.display_name(),
             protocol.as_str()
         );
-
-        // Check if target supports this protocol
-        if !target.supports_protocol(protocol) {
-            log::warn!(
-                "[scan::traceroute] no_address_for_protocol: target={} protocol={}",
-                target.display_name(),
-                protocol.as_str()
-            );
-            return Err(eyre::eyre!(
-                "No {} address available for target: {}",
-                protocol.as_str(),
-                target.display_name()
-            ));
-        }
-
-        // Get protocol-specific IP address
-        let target_ip = match target.primary_ip_for_protocol(protocol) {
-            Some(ip) => ip,
-            None => {
-                log::warn!(
-                    "[scan::traceroute] no_ip_for_protocol: target={} protocol={}",
-                    target.display_name(),
-                    protocol.as_str()
-                );
-                return Err(eyre::eyre!(
-                    "No {} IP address available for target: {}",
-                    protocol.as_str(),
-                    target.display_name()
-                ));
-            }
-        };
-
+        let target_ip = family_target_ip(target, protocol)?;
         log::debug!(
             "[scan::traceroute] protocol_target: {} -> {} ({})",
             target.display_name(),
             target_ip,
             protocol.as_str()
         );
-
-        let traceroute_data = self.perform_traceroute_for_ip(target, target_ip).await?;
-        Ok(traceroute_data)
+        self.perform_traceroute_for_ip(target, target_ip, reason).await
     }
 
-    async fn perform_traceroute_for_ip(&self, target: &Target, target_ip: IpAddr) -> Result<TracerouteData> {
+    async fn perform_traceroute_for_ip(
+        &self,
+        target: &Target,
+        target_ip: IpAddr,
+        reason: &str,
+    ) -> Result<TracerouteData> {
         log::debug!(
             "[scan::traceroute] perform_traceroute: target={}",
             target.display_name()
@@ -506,7 +722,7 @@ impl TracerouteScanner {
         };
 
         let parse_start = Instant::now();
-        let result = self.parse_traceroute_output(&stdout, target_ip, ipv6, start_time.elapsed())?;
+        let result = self.parse_traceroute_output(&stdout, target_ip, ipv6, start_time.elapsed(), reason)?;
         let parse_duration = parse_start.elapsed();
 
         log::debug!(
@@ -547,6 +763,7 @@ impl TracerouteScanner {
         target_ip: IpAddr,
         ipv6: bool,
         scan_duration: Duration,
+        reason: &str,
     ) -> Result<TracerouteData> {
         let mut hops = Vec::new();
         let mut destination_reached = false;
@@ -582,7 +799,7 @@ impl TracerouteScanner {
             scan_duration,
             ipv6,
             engine: TraceEngine::Traceroute {
-                reason: MTR_NOT_ATTEMPTED.to_string(),
+                reason: reason.to_string(),
             },
         })
     }
@@ -672,55 +889,49 @@ impl Scanner for TracerouteScanner {
         );
 
         let scan_start = Instant::now();
-        let mut result = TracerouteResult::new();
+        let mut engine = self.engine.lock().await;
 
-        let (ipv4_outcome, ipv6_outcome) = match protocol {
-            Protocol::Ipv4 => (Some(self.traceroute_protocol(target, Protocol::Ipv4).await), None),
-            Protocol::Ipv6 => (None, Some(self.traceroute_protocol(target, Protocol::Ipv6).await)),
-            Protocol::Both => {
-                // Run both IPv4 and IPv6 traceroutes concurrently
-                let (ipv4, ipv6) = tokio::join!(
-                    self.traceroute_protocol(target, Protocol::Ipv4),
-                    self.traceroute_protocol(target, Protocol::Ipv6)
-                );
-                (Some(ipv4), Some(ipv6))
-            }
+        let restart = match &*engine {
+            EngineState::Untried => true,
+            EngineState::Mtr { protocol: started, .. } => *started != protocol,
+            EngineState::Traceroute { .. } => false,
         };
-        if let Some(outcome) = ipv4_outcome {
-            (result.ipv4_status, result.ipv4_result) = family_outcome(target, Family::Ipv4, outcome);
-        }
-        if let Some(outcome) = ipv6_outcome {
-            (result.ipv6_status, result.ipv6_result) = family_outcome(target, Family::Ipv6, outcome);
+        if restart {
+            *engine = self.start_mtr(target, protocol);
         }
 
-        result.total_duration = scan_start.elapsed();
-
-        // Return success if any protocol succeeded
-        if result.has_any_success() {
-            log::debug!(
-                "[scan::traceroute] scan_completed: target={} protocol={} duration={}ms ipv4_status={:?} ipv6_status={:?}",
-                target.display_name(),
-                protocol.as_str(),
-                result.total_duration.as_millis(),
-                result.ipv4_status,
-                result.ipv6_status
-            );
-            Ok(ScanResult::Traceroute(result))
-        } else {
-            let error = result.failure(protocol);
-            log::error!(
-                "[scan::traceroute] scan_failed: target={} protocol={} duration={}ms error={}",
-                target.display_name(),
-                protocol.as_str(),
-                result.total_duration.as_millis(),
-                error
-            );
-            Err(error)
+        if let EngineState::Mtr { ipv4, ipv6, .. } = &mut *engine {
+            match self.poll_mtr(target, ipv4, ipv6).await {
+                Ok(mut result) => {
+                    result.total_duration = scan_start.elapsed();
+                    let outcome = scan_outcome(result, protocol);
+                    log::trace!(
+                        "[scan::traceroute] mtr_snapshot: target={} protocol={} ok={}",
+                        target.display_name(),
+                        protocol.as_str(),
+                        outcome.is_ok()
+                    );
+                    return outcome;
+                }
+                Err(reason) => {
+                    log::warn!(
+                        "[scan::traceroute] mtr_fallback: target={} reason={} - using traceroute for the rest of the process",
+                        target.display_name(),
+                        reason
+                    );
+                    *engine = EngineState::Traceroute { reason, last_run: None };
+                }
+            }
         }
+
+        let EngineState::Traceroute { reason, last_run } = &mut *engine else {
+            unreachable!("the mtr branch returns or switches the engine to traceroute");
+        };
+        self.traceroute_engine(target, protocol, reason, last_run).await
     }
 
     fn interval(&self) -> Duration {
-        self.interval
+        Duration::from_secs(SCAN_INTERVAL_SECS)
     }
 
     fn name(&self) -> &'static str {
@@ -844,7 +1055,7 @@ mod tests {
             scan_duration: Duration::from_secs(1),
             ipv6: false,
             engine: TraceEngine::Traceroute {
-                reason: MTR_NOT_ATTEMPTED.to_string(),
+                reason: "mtr not installed".to_string(),
             },
         }
     }
@@ -887,6 +1098,247 @@ mod tests {
         assert!(!icmp_refused(""));
     }
 
+    /// A path no mtr lives at, so a scan falls back to `traceroute` with `mtr not installed`.
+    const MISSING_MTR: &str = "/nonexistent/scan-test/mtr";
+
+    #[cfg(unix)]
+    fn fast_mtr() -> MtrTimings {
+        MtrTimings {
+            startup_grace: Duration::from_secs(1),
+            respawn: Duration::from_millis(100),
+            stall: Duration::from_secs(2),
+        }
+    }
+
+    /// A fake mtr that appends its arguments to `args` per start, then runs `body`.
+    #[cfg(unix)]
+    fn fake_mtr(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let dir = crate::scan::testing::temp_dir(name);
+        let args = dir.join("args");
+        let script = dir.join("fake-mtr");
+        crate::scan::testing::write_executable_script(
+            &script,
+            &format!("#!/bin/sh\necho \"$*\" >> {}\n{body}\n", args.display()),
+        );
+        let program = script.to_string_lossy().into_owned();
+        (dir, args, program)
+    }
+
+    /// Streams one answered probe to hop 1 every 50ms, for up to 5s.
+    const STREAMING_MTR: &str = r#"i=0
+while [ $i -lt 100 ]; do
+  echo "x 0 $((33000 + i))"; echo 'h 0 192.0.2.1'; echo "p 0 500 $((33000 + i))"
+  i=$((i + 1))
+  sleep 0.05
+done"#;
+
+    fn lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Hop 1's settled probes in `family`'s data; 0 before the hop has any.
+    fn hop_one_sent(data: Option<&TracerouteData>) -> u32 {
+        data.and_then(|data| data.hops.iter().find(|hop| hop.hop_number == 1))
+            .map_or(0, |hop| hop.sent)
+    }
+
+    /// Scan every 10ms until `done` holds, for at most 3s.
+    #[cfg(unix)]
+    async fn scan_until(
+        scanner: &TracerouteScanner,
+        target: &Target,
+        protocol: Protocol,
+        done: impl Fn(&TracerouteResult) -> bool,
+    ) -> TracerouteResult {
+        let mut last = None;
+        for _ in 0..300 {
+            let outcome = scanner.scan(target, protocol).await;
+            let Ok(ScanResult::Traceroute(result)) = outcome else {
+                panic!("mtr scan failed: {outcome:?}");
+            };
+            if done(&result) {
+                return result;
+            }
+            last = Some(result);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not met within 3s; last result: {last:?}");
+    }
+
+    fn dual_stack() -> Target {
+        let mut target = Target::parse("192.0.2.1").unwrap();
+        target.add_resolved_ips(vec!["2001:db8::1".parse().unwrap()]);
+        target
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mtr_exit_after_output_respawns_and_keeps_counting() {
+        let (dir, args, program) = fake_mtr(
+            "mtr-respawn",
+            "echo 'x 0 33000'; echo 'h 0 192.0.2.1'; echo 'p 0 500 33000'\nsleep 0.2\necho 'x 0 33001'; echo 'p 0 600 33001'; echo 'x 0 33002'\nexit 0",
+        );
+        let scanner = TracerouteScanner::new()
+            .with_mtr_program(program)
+            .with_program(MISSING_MTR)
+            .with_mtr_timings(fast_mtr());
+        let target = Target::parse("192.0.2.1").unwrap();
+
+        let first = scan_until(&scanner, &target, Protocol::Ipv4, |r| {
+            hop_one_sent(r.ipv4_result.as_ref()) >= 1
+        })
+        .await;
+        let first_sent = hop_one_sent(first.ipv4_result.as_ref());
+        let grown = scan_until(&scanner, &target, Protocol::Ipv4, |r| {
+            hop_one_sent(r.ipv4_result.as_ref()) > first_sent
+        })
+        .await;
+        let respawned = scan_until(&scanner, &target, Protocol::Ipv4, |r| {
+            lines(&args).len() >= 2 && hop_one_sent(r.ipv4_result.as_ref()) >= 4
+        })
+        .await;
+        let starts = lines(&args);
+        drop(scanner);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(starts[0], "--raw -n -4 -m 30 -c 1000000 192.0.2.1");
+        assert_eq!(starts[1], starts[0], "a second start, not a fallback");
+        for result in [&first, &grown, &respawned] {
+            assert!(
+                matches!(result.ipv4_result.as_ref().unwrap().engine, TraceEngine::Mtr { .. }),
+                "{result:?}"
+            );
+        }
+        let hop_one = &respawned.ipv4_result.as_ref().unwrap().hops[0];
+        assert_eq!(
+            hop_one.packet_loss, 0.0,
+            "the first child's in-flight seq is forgotten, not settled as lost by the second: {hop_one:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_mtr_falls_back_and_throttles_traceroute() {
+        let (dir, runs, program) =
+            fake_traceroute("mtr-missing", r#"echo " 1  192.0.2.1  1.000 ms  1.100 ms  1.200 ms""#);
+        let scanner = TracerouteScanner::new()
+            .with_program(program)
+            .with_mtr_program(MISSING_MTR);
+        let target = Target::parse("192.0.2.1").unwrap();
+        let mut engines = Vec::new();
+        for _ in 0..3 {
+            let outcome = scanner.scan(&target, Protocol::Ipv4).await;
+            let Ok(ScanResult::Traceroute(result)) = outcome else {
+                panic!("the fallback traceroute succeeds: {outcome:?}");
+            };
+            engines.push(result.ipv4_result.unwrap().engine);
+        }
+        let runs = lines(&runs);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let fallback = TraceEngine::Traceroute {
+            reason: "mtr not installed".to_string(),
+        };
+        assert_eq!(engines, [fallback.clone(), fallback.clone(), fallback]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_traceroute_reruns_at_once_on_a_protocol_change() {
+        let (dir, runs, program) = fake_traceroute("mtr-missing-protocol", r#"echo " 1  192.0.2.1  1.000 ms""#);
+        let scanner = TracerouteScanner::new()
+            .with_program(program)
+            .with_mtr_program(MISSING_MTR);
+        let target = dual_stack();
+        for protocol in [Protocol::Ipv4, Protocol::Ipv4, Protocol::Ipv6, Protocol::Ipv6] {
+            let _ = scanner.scan(&target, protocol).await;
+        }
+        let runs = lines(&runs);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(runs.len(), 2, "one run per protocol: {runs:?}");
+        assert!(runs[1].ends_with("2001:db8::1"), "{runs:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ipv6_route_error_fails_only_ipv6_and_ipv4_keeps_streaming() {
+        let (dir, args, program) = fake_mtr(
+            "mtr-no-v6",
+            &format!(
+                "case \" $* \" in *\" -6 \"*) echo 'mtr: udp socket connect failed: Cannot assign requested address' >&2; exit 1 ;; esac\n{STREAMING_MTR}"
+            ),
+        );
+        let scanner = TracerouteScanner::new()
+            .with_mtr_program(program)
+            .with_program(MISSING_MTR)
+            .with_mtr_timings(fast_mtr());
+        let target = dual_stack();
+
+        let first = scan_until(&scanner, &target, Protocol::Both, |r| {
+            hop_one_sent(r.ipv4_result.as_ref()) >= 1 && matches!(r.ipv6_status, TracerouteStatus::Failed(_))
+        })
+        .await;
+        let first_sent = hop_one_sent(first.ipv4_result.as_ref());
+        let later = scan_until(&scanner, &target, Protocol::Both, |r| {
+            hop_one_sent(r.ipv4_result.as_ref()) > first_sent
+        })
+        .await;
+        let starts = lines(&args);
+        drop(scanner);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        for result in [&first, &later] {
+            assert!(
+                matches!(&result.ipv6_status, TracerouteStatus::Failed(text) if text == "no IPv6 route on this host"),
+                "{result:?}"
+            );
+            assert!(result.ipv6_result.is_none());
+            assert!(matches!(result.ipv4_status, TracerouteStatus::Success(_)), "{result:?}");
+            assert!(
+                matches!(result.ipv4_result.as_ref().unwrap().engine, TraceEngine::Mtr { .. }),
+                "the engine stays mtr: {result:?}"
+            );
+        }
+        assert!(starts.iter().any(|start| start.contains(" -6 ")), "{starts:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protocol_change_starts_a_fresh_mtr_session() {
+        let (dir, args, program) = fake_mtr("mtr-protocol", STREAMING_MTR);
+        let scanner = TracerouteScanner::new()
+            .with_mtr_program(program)
+            .with_program(MISSING_MTR)
+            .with_mtr_timings(fast_mtr());
+        let target = dual_stack();
+
+        let ipv4 = scan_until(&scanner, &target, Protocol::Ipv4, |r| {
+            hop_one_sent(r.ipv4_result.as_ref()) >= 3
+        })
+        .await;
+        let outcome = scanner.scan(&target, Protocol::Ipv6).await;
+        let starts = lines(&args);
+        drop(scanner);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let Ok(ScanResult::Traceroute(ipv6)) = outcome else {
+            panic!("the IPv6 session streams: {outcome:?}");
+        };
+        assert_eq!(starts.len(), 2, "{starts:?}");
+        assert_eq!(starts[1], "--raw -n -6 -m 30 -c 1000000 2001:db8::1");
+        assert!(ipv6.ipv4_result.is_none(), "{ipv6:?}");
+        assert!(matches!(ipv6.ipv4_status, TracerouteStatus::NotQueried));
+        assert!(
+            hop_one_sent(ipv6.ipv6_result.as_ref()) < hop_one_sent(ipv4.ipv4_result.as_ref()),
+            "sent restarted with the new session: {ipv6:?}"
+        );
+    }
+
     /// A fake traceroute that appends its arguments to `runs` per call, then runs `body`.
     #[cfg(unix)]
     fn fake_traceroute(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
@@ -908,6 +1360,7 @@ mod tests {
         let target = Target::parse("192.0.2.1").unwrap();
         let outcome = TracerouteScanner::new()
             .with_program(program)
+            .with_mtr_program(MISSING_MTR)
             .scan(&target, Protocol::Ipv4)
             .await;
         let lines = std::fs::read_to_string(&runs)
@@ -1038,7 +1491,7 @@ exit 0"#;
         let target = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         let out = "traceroute to 1.1.1.1 (1.1.1.1), 30 hops max\n 1  192.168.1.1  1.0 ms  1.1 ms  1.2 ms\n 2  *  1.1.1.1  12.3 ms  1.1.1.1  12.5 ms\n";
         let data = scanner
-            .parse_traceroute_output(out, target, false, Duration::from_secs(1))
+            .parse_traceroute_output(out, target, false, Duration::from_secs(1), "mtr not installed")
             .unwrap();
         assert!(data.destination_reached);
     }
@@ -1050,7 +1503,7 @@ exit 0"#;
         let out =
             "traceroute to 1.1.1.1 (1.1.1.1), 30 hops max\n 1  192.168.1.1  1.0 ms  1.1 ms  1.2 ms\n 2  *  *  *\n";
         let data = scanner
-            .parse_traceroute_output(out, target, false, Duration::from_secs(1))
+            .parse_traceroute_output(out, target, false, Duration::from_secs(1), "mtr not installed")
             .unwrap();
         assert!(!data.destination_reached);
     }
@@ -1157,7 +1610,7 @@ exit 0"#;
 
     #[tokio::test]
     async fn test_traceroute_scan_localhost() {
-        let scanner = TracerouteScanner::new();
+        let scanner = TracerouteScanner::new().with_mtr_program(MISSING_MTR);
         let mut target = Target::parse("127.0.0.1").unwrap();
         target.resolve().await.expect("Failed to resolve target");
 
@@ -1196,7 +1649,7 @@ exit 0"#;
             scan_duration: Duration::from_millis(500),
             ipv6: false,
             engine: TraceEngine::Traceroute {
-                reason: MTR_NOT_ATTEMPTED.to_string(),
+                reason: "mtr not installed".to_string(),
             },
         });
         result.ipv4_status = TracerouteStatus::Success(5);
@@ -1319,7 +1772,12 @@ exit 0"#;
     fn test_traceroute_scanner_custom_config() {
         let scanner = TracerouteScanner::new();
 
-        assert_eq!(scanner.interval(), Duration::from_secs(300)); // 5 minutes (updated value)
+        assert_eq!(scanner.interval(), Duration::from_secs(1), "mtr snapshots every second");
+        assert_eq!(
+            scanner.traceroute_interval,
+            Duration::from_secs(300),
+            "the fallback stays at 5 minutes"
+        );
         assert_eq!(scanner.max_hops, 30); // Updated constant value
         assert_eq!(scanner.probes_per_hop, 3);
     }
@@ -1400,12 +1858,14 @@ exit 0"#;
                 "192.0.2.1".parse().unwrap(),
                 false,
                 Duration::from_secs(1),
+                "mtr not installed",
             )
             .unwrap();
-        assert!(
-            matches!(data.engine, TraceEngine::Traceroute { .. }),
-            "{:?}",
-            data.engine
+        assert_eq!(
+            data.engine,
+            TraceEngine::Traceroute {
+                reason: "mtr not installed".to_string()
+            }
         );
         assert_eq!(data.destination_hop().map(|hop| hop.hop_number), Some(1));
     }
@@ -1471,7 +1931,7 @@ mod destination_hop_tests {
             scan_duration: Duration::from_millis(5),
             ipv6: false,
             engine: TraceEngine::Traceroute {
-                reason: MTR_NOT_ATTEMPTED.to_string(),
+                reason: "mtr not installed".to_string(),
             },
         }
     }
