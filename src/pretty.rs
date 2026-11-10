@@ -786,6 +786,9 @@ mod tests {
             target_ip: "192.0.2.1".parse().unwrap(),
             scan_duration: Duration::from_millis(5),
             ipv6: false,
+            engine: crate::scan::traceroute::TraceEngine::Traceroute {
+                reason: "mtr not installed".to_string(),
+            },
         });
         let out = format_scan_state(
             "traceroute",

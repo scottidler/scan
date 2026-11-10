@@ -319,28 +319,27 @@ mod tests {
     }
 
     fn ipv6_route(hop_ip: &str, reached: bool) -> crate::scan::traceroute::TracerouteData {
-        use crate::scan::traceroute::{HopResponse, TracerouteData, TracerouteHop};
+        use crate::scan::traceroute::{HopResponse, TraceEngine, TracerouteData, TracerouteHop};
         use std::time::Duration;
         let ip: std::net::IpAddr = hop_ip.parse().expect("ip");
         TracerouteData {
-            hops: vec![TracerouteHop {
-                hop_number: 1,
-                responses: vec![HopResponse {
+            hops: vec![TracerouteHop::from_probes(
+                1,
+                vec![HopResponse {
                     ip_address: Some(ip),
                     rtt: Some(Duration::from_millis(5)),
                     timeout: false,
                 }],
-                best_rtt: Some(Duration::from_millis(5)),
-                avg_rtt: Some(Duration::from_millis(5)),
-                worst_rtt: Some(Duration::from_millis(5)),
-                packet_loss: 0.0,
-            }],
+            )],
             destination_reached: reached,
             total_hops: 1,
             max_hops: 30,
             target_ip: ip,
             scan_duration: Duration::from_millis(100),
             ipv6: true,
+            engine: TraceEngine::Traceroute {
+                reason: "mtr not installed".to_string(),
+            },
         }
     }
 
@@ -374,19 +373,21 @@ mod tests {
         use crate::scan::traceroute::{HopResponse, TracerouteHop};
         use std::time::Duration;
         TracerouteHop {
-            hop_number: number,
-            responses: replies
-                .iter()
-                .map(|answered| HopResponse {
-                    ip_address: answered.then(|| "192.0.2.1".parse().expect("ip")),
-                    rtt: answered.then(|| Duration::from_millis(5)),
-                    timeout: !answered,
-                })
-                .collect(),
             best_rtt: None,
             avg_rtt: None,
             worst_rtt: None,
             packet_loss,
+            ..TracerouteHop::from_probes(
+                number,
+                replies
+                    .iter()
+                    .map(|answered| HopResponse {
+                        ip_address: answered.then(|| "192.0.2.1".parse().expect("ip")),
+                        rtt: answered.then(|| Duration::from_millis(5)),
+                        timeout: !answered,
+                    })
+                    .collect(),
+            )
         }
     }
 
@@ -423,16 +424,17 @@ mod tests {
         use crate::scan::traceroute::{HopResponse, TracerouteHop};
         use std::time::Duration;
         let answer = |number: u8, ip: &str, ms: u64| TracerouteHop {
-            hop_number: number,
-            responses: vec![HopResponse {
-                ip_address: Some(ip.parse().expect("ip")),
-                rtt: Some(Duration::from_millis(ms)),
-                timeout: false,
-            }],
             best_rtt: None,
             avg_rtt: None,
             worst_rtt: None,
-            packet_loss: 0.0,
+            ..TracerouteHop::from_probes(
+                number,
+                vec![HopResponse {
+                    ip_address: Some(ip.parse().expect("ip")),
+                    rtt: Some(Duration::from_millis(ms)),
+                    timeout: false,
+                }],
+            )
         };
         let mut hops = vec![answer(1, "192.168.1.1", 1), answer(2, "10.0.0.1", 2)];
         hops.extend((3..=9).map(|n| hop(n, &[false, false, false], 1.0)));

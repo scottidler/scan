@@ -9,6 +9,9 @@ use std::fmt;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+pub mod accumulator;
+pub mod raw;
+
 const TRACEROUTE_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes - traceroute is slow and noisy if too frequent
 const TRACEROUTE_TIMEOUT_SECS: u64 = 3; // 3 seconds per hop (much faster like your example)
 const MAX_TRACEROUTE_HOPS: u8 = 30;
@@ -19,6 +22,8 @@ const FULL_PACKET_LOSS: f32 = 1.0;
 /// What Linux `traceroute` prints when the host refuses it an unprivileged ICMP socket
 /// (`net.ipv4.ping_group_range` excludes the user).
 const ICMP_PRIVILEGE_ERROR: &str = "You do not have enough privileges to use this traceroute method";
+/// Fallback reason until engine selection exists: nothing tries mtr yet.
+const MTR_NOT_ATTEMPTED: &str = "mtr not attempted";
 
 #[derive(Debug, Clone)]
 pub struct TracerouteScanner {
@@ -84,13 +89,81 @@ pub struct TracerouteData {
     pub target_ip: IpAddr,
     pub scan_duration: Duration,
     pub ipv6: bool,
+    pub engine: TraceEngine,
+}
+
+/// Which prober produced a `TracerouteData`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceEngine {
+    /// Continuous: `cycles` probe rounds started since the session started.
+    Mtr { cycles: u32 },
+    /// Snapshot fallback; `reason` says why mtr is not in use.
+    Traceroute { reason: String },
 }
 
 impl TracerouteHop {
+    /// The hop for one `traceroute` line's probes, with every aggregate field filled from them.
+    pub fn from_probes(hop_number: u8, responses: Vec<HopResponse>) -> Self {
+        let answered: Vec<&HopResponse> = responses.iter().filter(|response| !response.timeout).collect();
+        let rtts: Vec<Duration> = responses.iter().filter_map(|r| r.rtt).collect();
+
+        let best_rtt = rtts.iter().min().copied();
+        let worst_rtt = rtts.iter().max().copied();
+        let avg_rtt = if !rtts.is_empty() {
+            let total_micros: u64 = rtts.iter().map(|d| d.as_micros() as u64).sum();
+            Some(Duration::from_micros(total_micros / rtts.len() as u64))
+        } else {
+            None
+        };
+        let sum_us: u128 = rtts.iter().map(Duration::as_micros).sum();
+        let sum_sq_us: u128 = rtts.iter().map(|d| d.as_micros() * d.as_micros()).sum();
+
+        let packet_loss = if responses.is_empty() {
+            FULL_PACKET_LOSS
+        } else {
+            responses.iter().filter(|r| r.timeout).count() as f32 / responses.len() as f32
+        };
+
+        let mut addresses: Vec<IpAddr> = Vec::new();
+        for ip in answered.iter().filter_map(|response| response.ip_address) {
+            if !addresses.contains(&ip) {
+                addresses.push(ip);
+            }
+        }
+
+        Self {
+            hop_number,
+            best_rtt,
+            avg_rtt,
+            worst_rtt,
+            packet_loss,
+            sent: responses.len() as u32,
+            replied: answered.len() as u32,
+            last_rtt: answered.iter().rev().find_map(|response| response.rtt),
+            stddev_rtt: sample_stddev(rtts.len() as u32, sum_us, sum_sq_us),
+            current_address: answered.iter().rev().find_map(|response| response.ip_address),
+            addresses,
+            responses,
+        }
+    }
+
     /// True when no probe to this hop was answered.
     pub fn is_silent(&self) -> bool {
-        self.responses.iter().all(|response| response.timeout)
+        self.replied == 0
     }
+}
+
+/// Sample standard deviation (n-1 denominator, as mtr reports) of `count` RTTs from their sum
+/// and sum of squares, in microseconds. `None` under 2 samples.
+pub(crate) fn sample_stddev(count: u32, sum_us: u128, sum_sq_us: u128) -> Option<Duration> {
+    if count < 2 {
+        return None;
+    }
+    let n = u128::from(count);
+    // n*sum_sq - sum^2 is exact in integers; it only goes to f64 for the division and root.
+    let spread = (n * sum_sq_us).saturating_sub(sum_us * sum_us);
+    let variance = spread as f64 / (n * (n - 1)) as f64;
+    Some(Duration::from_micros(variance.sqrt().round() as u64))
 }
 
 impl TracerouteData {
@@ -108,11 +181,10 @@ impl TracerouteData {
         if !self.destination_reached {
             return None;
         }
-        self.hops.iter().rev().find(|hop| {
-            hop.responses
-                .iter()
-                .any(|r| !r.timeout && r.ip_address == Some(self.target_ip))
-        })
+        self.hops
+            .iter()
+            .rev()
+            .find(|hop| hop.current_address == Some(self.target_ip))
     }
 
     /// How many hops had no probe answered. The one count the TUI and `--no-tui` share.
@@ -257,6 +329,15 @@ pub struct TracerouteHop {
     pub avg_rtt: Option<Duration>,
     pub worst_rtt: Option<Duration>,
     pub packet_loss: f32, // 0.0 to 1.0
+    /// Settled probes: replied + lost.
+    pub sent: u32,
+    pub replied: u32,
+    pub last_rtt: Option<Duration>,
+    pub stddev_rtt: Option<Duration>,
+    /// Every address seen at this hop, first-seen order.
+    pub addresses: Vec<IpAddr>,
+    /// The address of the latest reply.
+    pub current_address: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +581,9 @@ impl TracerouteScanner {
             target_ip,
             scan_duration,
             ipv6,
+            engine: TraceEngine::Traceroute {
+                reason: MTR_NOT_ATTEMPTED.to_string(),
+            },
         })
     }
 
@@ -574,32 +658,7 @@ impl TracerouteScanner {
             }
         }
 
-        // Calculate statistics
-        let rtts: Vec<Duration> = responses.iter().filter_map(|r| r.rtt).collect();
-
-        let best_rtt = rtts.iter().min().copied();
-        let worst_rtt = rtts.iter().max().copied();
-        let avg_rtt = if !rtts.is_empty() {
-            let total_micros: u64 = rtts.iter().map(|d| d.as_micros() as u64).sum();
-            Some(Duration::from_micros(total_micros / rtts.len() as u64))
-        } else {
-            None
-        };
-
-        let packet_loss = if responses.is_empty() {
-            FULL_PACKET_LOSS
-        } else {
-            responses.iter().filter(|r| r.timeout).count() as f32 / responses.len() as f32
-        };
-
-        Ok(Some(TracerouteHop {
-            hop_number,
-            responses,
-            best_rtt,
-            avg_rtt,
-            worst_rtt,
-            packet_loss,
-        }))
+        Ok(Some(TracerouteHop::from_probes(hop_number, responses)))
     }
 }
 
@@ -760,16 +819,18 @@ mod tests {
 
     fn hop(hop_number: u8, reply: Option<IpAddr>) -> TracerouteHop {
         TracerouteHop {
-            hop_number,
-            responses: vec![HopResponse {
-                ip_address: reply,
-                rtt: reply.map(|_| Duration::from_millis(5)),
-                timeout: reply.is_none(),
-            }],
             best_rtt: None,
             avg_rtt: None,
             worst_rtt: None,
             packet_loss: if reply.is_some() { 0.0 } else { FULL_PACKET_LOSS },
+            ..TracerouteHop::from_probes(
+                hop_number,
+                vec![HopResponse {
+                    ip_address: reply,
+                    rtt: reply.map(|_| Duration::from_millis(5)),
+                    timeout: reply.is_none(),
+                }],
+            )
         }
     }
 
@@ -782,6 +843,9 @@ mod tests {
             target_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             scan_duration: Duration::from_secs(1),
             ipv6: false,
+            engine: TraceEngine::Traceroute {
+                reason: MTR_NOT_ATTEMPTED.to_string(),
+            },
         }
     }
 
@@ -1131,6 +1195,9 @@ exit 0"#;
             target_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             scan_duration: Duration::from_millis(500),
             ipv6: false,
+            engine: TraceEngine::Traceroute {
+                reason: MTR_NOT_ATTEMPTED.to_string(),
+            },
         });
         result.ipv4_status = TracerouteStatus::Success(5);
         result.total_duration = Duration::from_millis(500);
@@ -1169,9 +1236,9 @@ exit 0"#;
 
     #[test]
     fn test_traceroute_hop_statistics() {
-        let hop = TracerouteHop {
-            hop_number: 3,
-            responses: vec![
+        let hop = TracerouteHop::from_probes(
+            3,
+            vec![
                 HopResponse {
                     ip_address: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
                     rtt: Some(Duration::from_millis(10)),
@@ -1188,11 +1255,7 @@ exit 0"#;
                     timeout: false,
                 },
             ],
-            best_rtt: Some(Duration::from_millis(10)),
-            avg_rtt: Some(Duration::from_millis(15)),
-            worst_rtt: Some(Duration::from_millis(20)),
-            packet_loss: 0.0,
-        };
+        );
 
         assert_eq!(hop.hop_number, 3);
         assert_eq!(hop.responses.len(), 3);
@@ -1286,6 +1349,81 @@ exit 0"#;
     }
 
     #[test]
+    fn parsed_hop_fills_the_aggregate_fields_from_its_probes() {
+        let scanner = TracerouteScanner::new();
+        let hop = scanner
+            .parse_hop_line(" 2  10.0.0.1  10.0 ms 10.0.0.2  30.0 ms *")
+            .unwrap()
+            .unwrap();
+        assert_eq!((hop.sent, hop.replied), (3, 2));
+        assert_eq!(hop.last_rtt, Some(Duration::from_millis(30)));
+        // sample stddev of {10, 30} ms: 20 / sqrt(2) = 14.142 ms
+        assert_eq!(hop.stddev_rtt, Some(Duration::from_micros(14142)));
+        assert_eq!(
+            hop.addresses,
+            ["10.0.0.1".parse::<IpAddr>().unwrap(), "10.0.0.2".parse().unwrap()]
+        );
+        assert_eq!(hop.current_address, Some("10.0.0.2".parse().unwrap()));
+        assert!(!hop.is_silent());
+    }
+
+    #[test]
+    fn parsed_silent_hop_has_no_replies_or_addresses() {
+        let scanner = TracerouteScanner::new();
+        let hop = scanner.parse_hop_line(" 4  * * *").unwrap().unwrap();
+        assert_eq!((hop.sent, hop.replied), (3, 0));
+        assert_eq!(hop.last_rtt, None);
+        assert_eq!(hop.stddev_rtt, None);
+        assert!(hop.addresses.is_empty());
+        assert_eq!(hop.current_address, None);
+        assert!(hop.is_silent());
+    }
+
+    #[test]
+    fn repeated_address_is_listed_once_and_one_reply_has_no_stddev() {
+        let scanner = TracerouteScanner::new();
+        let hop = scanner.parse_hop_line(" 1  192.168.1.1  2.0 ms  * *").unwrap().unwrap();
+        assert_eq!(hop.stddev_rtt, None);
+        let twice = scanner
+            .parse_hop_line(" 1  192.168.1.1  2.0 ms  3.0 ms  *")
+            .unwrap()
+            .unwrap();
+        assert_eq!(twice.addresses, ["192.168.1.1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn parsed_output_is_marked_as_the_traceroute_engine() {
+        let scanner = TracerouteScanner::new();
+        let data = scanner
+            .parse_traceroute_output(
+                " 1  192.0.2.1  1.0 ms  1.1 ms  1.2 ms\n",
+                "192.0.2.1".parse().unwrap(),
+                false,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(
+            matches!(data.engine, TraceEngine::Traceroute { .. }),
+            "{:?}",
+            data.engine
+        );
+        assert_eq!(data.destination_hop().map(|hop| hop.hop_number), Some(1));
+    }
+
+    #[test]
+    fn sample_stddev_matches_known_values() {
+        assert_eq!(sample_stddev(0, 0, 0), None);
+        assert_eq!(sample_stddev(1, 500, 250_000), None);
+        assert_eq!(sample_stddev(2, 1000, 500_000), Some(Duration::ZERO));
+        // {2, 4, 4, 4, 5, 5, 7, 9}: sample variance 32/7, stddev 2.138
+        assert_eq!(sample_stddev(8, 40, 232), Some(Duration::from_micros(2)));
+        assert_eq!(
+            sample_stddev(3, 60_000, 1_400_000_000),
+            Some(Duration::from_micros(10_000))
+        );
+    }
+
+    #[test]
     fn test_packet_loss_calculation() {
         let scanner = TracerouteScanner::new();
 
@@ -1312,16 +1450,17 @@ mod destination_hop_tests {
 
     fn data(reached: bool) -> TracerouteData {
         let answer = |n: u8, ip: &str| TracerouteHop {
-            hop_number: n,
-            responses: vec![HopResponse {
-                ip_address: Some(ip.parse().expect("ip")),
-                rtt: Some(Duration::from_millis(1)),
-                timeout: false,
-            }],
             best_rtt: None,
             avg_rtt: None,
             worst_rtt: None,
-            packet_loss: 0.0,
+            ..TracerouteHop::from_probes(
+                n,
+                vec![HopResponse {
+                    ip_address: Some(ip.parse().expect("ip")),
+                    rtt: Some(Duration::from_millis(1)),
+                    timeout: false,
+                }],
+            )
         };
         TracerouteData {
             hops: vec![answer(1, "10.0.0.1"), answer(2, "192.0.2.9")],
@@ -1331,6 +1470,9 @@ mod destination_hop_tests {
             target_ip: "192.0.2.9".parse().expect("ip"),
             scan_duration: Duration::from_millis(5),
             ipv6: false,
+            engine: TraceEngine::Traceroute {
+                reason: MTR_NOT_ATTEMPTED.to_string(),
+            },
         }
     }
 
