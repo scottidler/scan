@@ -382,6 +382,15 @@ fn header_line(state: &AppState) -> Line<'static> {
     ])
 }
 
+/// Whether the Status header wraps instead of being fitted to one row: with no route retained,
+/// the rows below it are free, and a failure's text is the only thing to read.
+fn header_wraps(state: &AppState) -> bool {
+    !state
+        .scanners
+        .get("traceroute")
+        .is_some_and(|traceroute_state| matches!(traceroute_state.result, Some(ScanResult::Traceroute(_))))
+}
+
 /// Why `traceroute` is in use: from a fallback failure when every family failed, else from the
 /// shown route's engine. `None` under mtr.
 fn fallback_reason(state: &AppState) -> Option<String> {
@@ -459,13 +468,14 @@ impl Pane for TraceroutePane {
             ]));
         }
 
-        crate::tui::text::to_rows(lines, width, detail, &[])
+        let wrapped: &[usize] = if header_wraps(state) { &[0] } else { &[] };
+        crate::tui::text::to_rows(lines, width, detail, wrapped)
     }
 
-    /// The fallback reason, when the Status header is too wide for the pane to show it.
+    /// The fallback reason, when the Status header is fitted to one row too narrow to show it.
     fn border_note(&self, state: &AppState, width: u16) -> Option<String> {
         let reason = fallback_reason(state)?;
-        (header_line(state).width() > usize::from(width)).then_some(reason)
+        (!header_wraps(state) && header_line(state).width() > usize::from(width)).then_some(reason)
     }
 
     fn title(&self) -> &'static str {
@@ -1125,11 +1135,52 @@ mod tests {
         );
         let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
         let narrow = crate::tui::testing::render_pane(&pane, &state, width, height, false);
-        assert!(bottom_border(&narrow).contains("┘mtr not installed└"), "{narrow}");
+        assert!(
+            unwrapped(&narrow).contains("(traceroute: mtr not installed)"),
+            "the wrapped header names the reason at 80x24: {narrow}"
+        );
+        assert!(
+            !bottom_border(&narrow).contains('┘'),
+            "the border repeats a reason the header already shows: {narrow}"
+        );
 
         let scan_state = state.scanners.get("traceroute").expect("traceroute state");
         let line = crate::pretty::format_scan_state("traceroute", &scan_state);
         assert!(line.contains("(traceroute: mtr not installed)"), "{line}");
+    }
+
+    /// The rendered pane's inner text with every row's border and padding stripped and the rows
+    /// joined, so wrapped text reads as one string.
+    fn unwrapped(rendered: &str) -> String {
+        let rows: Vec<&str> = rendered.lines().collect();
+        let inner = &rows[1..rows.len().saturating_sub(1)];
+        inner
+            .iter()
+            .map(|row| row.trim_start_matches('│').trim_end_matches('│').trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// With no route to render, the header wraps, so the whole failure is readable at 80x24.
+    #[test]
+    fn every_fallback_family_failing_shows_the_whole_failure_at_80x24() {
+        let state = fallback_failed_state();
+        let (width, height) = crate::tui::testing::dashboard_pane_size(2, 1, 80, 24);
+        let out = crate::tui::testing::render_pane(&TraceroutePane::new(), &state, width, height, false);
+        assert!(!out.contains('…'), "the failure is clipped: {out}");
+        assert!(
+            unwrapped(&out).contains("failed: IPv4: no IPv4 route on this host (traceroute: mtr not installed)"),
+            "{out}"
+        );
+    }
+
+    /// A retained route keeps the header to one row, so the route keeps its rows.
+    #[test]
+    fn header_with_a_route_stays_one_row() {
+        let state = state_of(tatari_fallback_route(), std::time::Duration::from_millis(3200));
+        assert!(!header_wraps(&state));
+        assert!(header_wraps(&fallback_failed_state()));
+        assert!(header_wraps(&AppState::new("www.tatari.tv".to_string())));
     }
 
     #[test]

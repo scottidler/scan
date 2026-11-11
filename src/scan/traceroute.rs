@@ -1,5 +1,5 @@
 use super::{Family, NoAddress, classify_route_error, family_failure};
-use crate::scanner::Scanner;
+use crate::scanner::{ScanKind, Scanner};
 use crate::target::{Protocol, Target};
 use crate::types::ScanResult;
 use async_trait::async_trait;
@@ -39,6 +39,9 @@ pub struct TracerouteScanner {
     mtr_program_override: Option<String>,
     mtr_timings: MtrTimings,
     engine: AsyncMutex<EngineState>,
+    /// What the last scan was: a throttled fallback replay is not a new measurement, and the scan
+    /// that switches to the fallback drops the mtr route it replaces.
+    last_scan_kind: std::sync::Mutex<ScanKind>,
 }
 
 /// Which prober the scanner uses; one for the whole scanner, so the pane never mixes modes.
@@ -500,6 +503,7 @@ impl TracerouteScanner {
             mtr_program_override: None,
             mtr_timings: MtrTimings::default(),
             engine: AsyncMutex::new(EngineState::Untried),
+            last_scan_kind: std::sync::Mutex::new(ScanKind::Measured),
         }
     }
 
@@ -586,8 +590,12 @@ impl TracerouteScanner {
         Ok(result)
     }
 
+    fn set_last_scan_kind(&self, kind: ScanKind) {
+        *self.last_scan_kind.lock().unwrap() = kind;
+    }
+
     /// The `traceroute` fallback, throttled: a run for the same protocol within the traceroute
-    /// interval returns the stored outcome instead of running again.
+    /// interval returns the stored outcome instead of running again, reported as a replay.
     async fn traceroute_engine(
         &self,
         target: &Target,
@@ -606,6 +614,7 @@ impl TracerouteScanner {
                 run.started.elapsed().as_millis(),
                 run.result.is_some()
             );
+            self.set_last_scan_kind(ScanKind::Replayed);
             let outcome = match &run.result {
                 Some(result) => scan_outcome(result.clone(), protocol),
                 None => Err(eyre::eyre!("timed out after {}s", self.deadline().as_secs())),
@@ -930,6 +939,9 @@ impl Scanner for TracerouteScanner {
             protocol.as_str()
         );
 
+        // Set before the first await, so a scan dropped at its deadline never reports the
+        // previous scan's kind.
+        self.set_last_scan_kind(ScanKind::Measured);
         let scan_start = Instant::now();
         let mut engine = self.engine.lock().await;
 
@@ -969,6 +981,9 @@ impl Scanner for TracerouteScanner {
                         reason: reason.clone(),
                     });
                     *engine = EngineState::Traceroute { reason, last_run: None };
+                    // The retained result is an mtr route; a failing fallback must not leave it
+                    // on screen under its error.
+                    self.set_last_scan_kind(ScanKind::MeasuredAfterReset);
                     if let Some(deferred) = deferred {
                         log::info!(
                             "[scan::traceroute] fallback_deferred: target={} spent={}ms reason={}",
@@ -995,12 +1010,17 @@ impl Scanner for TracerouteScanner {
     fn name(&self) -> &'static str {
         "traceroute"
     }
+
+    fn last_scan_kind(&self) -> ScanKind {
+        *self.last_scan_kind.lock().unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
 
     /// `2606:4700:4700::1111` on a host with no IPv6 route: IPv4 has no address and
     /// `traceroute6` exits with `connect: Cannot assign requested address`.
@@ -1503,6 +1523,158 @@ done"#;
         assert!(
             matches!(&engine, TraceEngine::Traceroute { reason } if reason.starts_with("mtr: Permission denied")),
             "{engine:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    /// A `TracerouteScanner` run by `Scanner::run` on 20ms ticks instead of 1s; it counts scans.
+    struct FastTicks {
+        inner: TracerouteScanner,
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Scanner for FastTicks {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_millis(20)
+        }
+        fn last_scan_kind(&self) -> ScanKind {
+            self.inner.last_scan_kind()
+        }
+        async fn scan(&self, target: &Target, protocol: Protocol) -> Result<ScanResult> {
+            let outcome = self.inner.scan(target, protocol).await;
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    #[cfg(unix)]
+    type RunningScanner = (
+        Arc<FastTicks>,
+        Arc<std::sync::Mutex<crate::types::AppState>>,
+        tokio::task::JoinHandle<()>,
+    );
+
+    #[cfg(unix)]
+    fn run_fast(inner: TracerouteScanner, target: Target) -> RunningScanner {
+        let scanner = Arc::new(FastTicks {
+            inner,
+            scans: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let state = Arc::new(std::sync::Mutex::new(crate::types::AppState::new(
+            "192.0.2.1".to_string(),
+        )));
+        let (_, protocol_rx) = tokio::sync::watch::channel(Protocol::Ipv4);
+        let handle = {
+            let (scanner, state) = (scanner.clone(), state.clone());
+            tokio::spawn(async move { scanner.run(target, protocol_rx, state).await })
+        };
+        (scanner, state, handle)
+    }
+
+    #[cfg(unix)]
+    /// Poll every 10ms until `done` holds of the traceroute state, for at most 5s.
+    async fn wait_for_state(
+        state: &Arc<std::sync::Mutex<crate::types::AppState>>,
+        done: impl Fn(&crate::types::ScanState) -> bool,
+    ) {
+        for _ in 0..500 {
+            if state
+                .lock()
+                .unwrap()
+                .scanners
+                .get("traceroute")
+                .is_some_and(|s| done(&s))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("traceroute state condition not met within 5s");
+    }
+
+    /// M1: the throttled fallback replays its stored outcome on every tick; only the run that
+    /// produced it is recorded, so `last_updated` keeps the run's age and history holds one entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn back_to_back_fallback_scans_record_once() {
+        let (dir, runs, program) = fake_traceroute("replay-recorded-once", r#"echo " 1  192.0.2.1  1.000 ms""#);
+        let inner = TracerouteScanner::new()
+            .with_program(program)
+            .with_mtr_program(MISSING_MTR);
+        let (scanner, state, handle) = run_fast(inner, Target::parse("192.0.2.1").unwrap());
+        wait_for_state(&state, |s| s.result.is_some()).await;
+        let first_stored = state.lock().unwrap().scanners.get("traceroute").unwrap().last_updated;
+        while scanner.scans.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        let runs = lines(&runs);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let guard = state.lock().unwrap();
+        let traceroute = guard.scanners.get("traceroute").unwrap();
+        assert_eq!(
+            traceroute.history.len(),
+            1,
+            "each replay was recorded as a new measurement"
+        );
+        assert_eq!(
+            traceroute.last_updated, first_stored,
+            "a replay re-stamped last_updated"
+        );
+        assert!(
+            matches!(traceroute.status, crate::types::ScanStatus::Complete),
+            "{:?}",
+            traceroute.status
+        );
+    }
+
+    /// D2: mtr streams a route, then cannot be started again, and the fallback traceroute fails.
+    /// The mtr route is dropped rather than left on screen under the fallback's error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_fallback_after_mtr_vanishes_drops_the_mtr_route() {
+        let (mtr_dir, _, mtr_program) = fake_mtr(
+            "mtr-vanishes-fallback-fails",
+            "echo 'x 0 33000'; echo 'h 0 192.0.2.1'; echo 'p 0 500 33000'; echo 'x 0 33001'\nsleep 0.2\nexit 0",
+        );
+        let (dir, _, program) = fake_traceroute(
+            "mtr-vanishes-fallback-fails",
+            r#"echo "connect: Network is unreachable" >&2; exit 1"#,
+        );
+        let inner = TracerouteScanner::new()
+            .with_program(program)
+            .with_mtr_program(mtr_program.clone())
+            .with_mtr_timings(fast_mtr());
+        let (_scanner, state, handle) = run_fast(inner, Target::parse("192.0.2.1").unwrap());
+        wait_for_state(&state, |s| s.result.is_some()).await;
+        std::fs::remove_file(&mtr_program).unwrap();
+        wait_for_state(&state, |s| s.error.is_some()).await;
+        handle.abort();
+        let _ = handle.await;
+        std::fs::remove_dir_all(&mtr_dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let guard = state.lock().unwrap();
+        let traceroute = guard.scanners.get("traceroute").unwrap();
+        assert!(
+            traceroute.result.is_none(),
+            "the mtr route stayed under the fallback error"
+        );
+        assert!(traceroute.history.is_empty(), "mtr snapshots stayed in history");
+        assert_eq!(
+            traceroute.error.as_ref().unwrap().downcast_ref::<FallbackFailure>(),
+            Some(&FallbackFailure {
+                failure: "IPv4: no IPv4 route on this host".to_string(),
+                reason: "mtr not installed".to_string(),
+            })
         );
     }
 

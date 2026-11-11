@@ -188,3 +188,37 @@ Findings from the round 1 implementation audit (M2, M3, C1, C2, C3, D1, D2, plus
 ### Open questions
 - D2 residue: when mtr vanishes mid-run and the fallback traceroute also fails, the Scanner keeps the last good result, as it does for every scanner. The pane body and the `--no-tui` line still show that mtr route, under an error that now names the fallback reason. Clearing it needs a Scanner seam (an outcome that drops the retained result). That is the same seam M1 is weighing, so it should be decided with M1.
 - Under a fallback failure, the 80x24 header row clips the failure text itself (`failed: IPv4:…`). The border shows the reason, but the failure is visible only in a wider pane or zoom. Wrapping the header row when there is no route (the `wrapped` index in `to_rows`) would show it. That was not in this round's list.
+
+## Audit fixes (round 2, owner decisions)
+
+Owner decisions of 2026-11-10: M1 option A (a replay signal on `Scanner`), the D2 residue from round 1's open questions, and the 80x24 header that clipped the failure text.
+
+### Design decisions
+- M1: `ScanKind { Measured, MeasuredAfterReset, Replayed }` and a default method `Scanner::last_scan_kind() -> ScanKind` (`src/scanner.rs`), returning `Measured`, so every other scanner is unchanged. `Scanner::run` reads it after each scan: `Replayed` skips `record_outcome` and puts back the status `mark_running` replaced (`mark_running` now returns it; `restore_status`), so status, `last_updated` and history stay as the run that produced the outcome left them, and a stored failure logs at ERROR once.
+- M1: `TracerouteScanner` keeps `last_scan_kind: std::sync::Mutex<ScanKind>` (`src/scan/traceroute.rs`). `scan()` sets `Measured` before its first await, so a scan dropped at its deadline never reports the previous scan's kind; `traceroute_engine`'s throttled branch sets `Replayed`.
+- M1: a scan that hits its deadline is recorded as timed out even if the scanner last reported `Replayed` (`run` maps `(timed out, Replayed)` to `Measured`). A replay with no prior state to restore (impossible today) is recorded, so the pane can never stay on Running.
+- D2: the same signal carries a third value. The scan that switches the engine from mtr to the fallback reports `MeasuredAfterReset`; `run` calls `clear_retained` (result, error, history; it shares `drop_retained` with `clear_for_protocol_change`) before recording. A failing fallback after mtr vanishes therefore shows only its error (which names the reason, round 1's C2), not the last mtr route; a succeeding one starts history over with no mtr snapshots in it. The deferred-first-run case (D1) is covered too, since it switches in the same place.
+- Header: `header_wraps(state)` (`src/tui/traceroute.rs`) is true when no `ScanResult::Traceroute` is retained; `content` then passes index 0 in `to_rows`' `wrapped`, so the Status header wraps over the free rows. At 80x24 the all-fail header reads in four rows: `🧭 Status: failed: IPv4: / no IPv4 route on this / host (traceroute: mtr / not installed)`. With a route retained the header stays one row, so every 80x24 fit test is unchanged and green.
+- Header: `border_note` returns `None` when the header wraps, since the wrapped header already shows the reason.
+- Doc: Overview's "No `Scanner` trait change" now describes the additive default method; Architecture lists `src/scanner.rs`; Scheduling gains the replay and reset bullets; the TUI section gains the wrapped header; Resolved Decisions gains the M1 entry in the owner's words.
+
+### Deviations
+- M1 signal shape: a three-valued `ScanKind` from `last_scan_kind()`, not the suggested `is_replay() -> bool`. The third value (`MeasuredAfterReset`) is what lets D2 fall out of the same seam instead of a second trait method. Same effect for M1.
+- `every_fallback_family_failing_still_says_why_traceroute_is_in_use` (round 1, C3): its 80x24 assertion inverted. It asserted the reason on the bottom border; the wrapped header now shows it, and the test asserts the header names the reason and the border carries no note.
+
+### Tradeoffs
+- The scanner reports its last scan's kind through a side method vs a new `scan()` return type: an additive default keeps every scanner and test stub compiling unchanged. The cost is a little state on the traceroute scanner, written and read by the one `run` loop that drives it.
+- Reset on every switch to the fallback vs only on a switch from a streaming mtr: on the first scan there is nothing retained, so the reset is a no-op, and one rule is simpler than two.
+- Wrap the header only with no route retained vs always: with a route, the fallback fit fixture fills all 8 inner rows, so a wrapped header would push Duration off (the round 1 C3 constraint). With no route the rows are free.
+
+### Bite checks (2026-11-10; each break applied by a script in the session scratchpad, full `cargo test --lib`, file restored from a backup and confirmed identical with `filecmp`)
+- Replay recorded as usual: 4 failed (`replayed_scans_are_not_recorded`, `replayed_failure_keeps_the_original_failure_and_its_time`, `a_measurement_after_replays_is_recorded`, `back_to_back_fallback_scans_record_once`).
+- Status not restored after a replay: 3 failed (`replayed_scans_are_not_recorded`, `replayed_failure_keeps_the_original_failure_and_its_time`, `back_to_back_fallback_scans_record_once`).
+- `MeasuredAfterReset` not cleared: 3 failed (`failure_measured_after_reset_drops_the_retained_result`, `success_measured_after_reset_starts_history_over`, `failing_fallback_after_mtr_vanishes_drops_the_mtr_route`).
+- Deadline guard removed: 1 failed (`a_timed_out_scan_is_recorded_even_when_reported_as_a_replay`).
+- Traceroute never reports `Replayed`: 1 failed (`back_to_back_fallback_scans_record_once`). Never reports the reset: 1 failed (`failing_fallback_after_mtr_vanishes_drops_the_mtr_route`).
+- Header never wraps: 2 failed (`every_fallback_family_failing_shows_the_whole_failure_at_80x24`, `every_fallback_family_failing_still_says_why_traceroute_is_in_use`). Header always wraps: 4 failed (`header_with_a_route_stays_one_row`, `fallback_route_fits_the_80x24_dashboard_with_destination_and_duration`, `fallback_reason_is_on_the_border_when_the_80x24_header_clips_it`, `a_long_fallback_reason_is_clipped_on_the_border`).
+- Border note ignores the wrap: 1 failed (`every_fallback_family_failing_still_says_why_traceroute_is_in_use`).
+
+### Open questions
+None.

@@ -63,7 +63,7 @@ scan's traceroute is a snapshot: one `traceroute` run every 5 minutes, 3 probes 
 3. The scanner's interval drops to 1s. Each `scan()` returns a snapshot of the accumulators as an ordinary `TracerouteResult`, so the default `Scanner::run` loop, `record_outcome`, the TUI and `pretty.rs` keep working unchanged in shape.
 4. If mtr cannot run, the scanner switches to the existing `traceroute` path and marks the result with the reason. The scanner throttles itself, so the 1s tick never reruns `traceroute` or respawns mtr every second.
 
-No `Scanner` trait change. No new crate.
+One additive `Scanner` change: a default method, `last_scan_kind()`, returning `ScanKind::Measured` for every other scanner. The traceroute scanner reports a throttled fallback replay as `Replayed`, which `Scanner::run` does not record, and the scan that switches to the fallback as `MeasuredAfterReset`, which drops the retained mtr route first (see Scheduling). No new crate.
 
 ### Phase 0 evidence (spike, run 2026-11-10 on ripr, Linux, mtr 0.95)
 
@@ -125,6 +125,7 @@ scan() ──first call──> MtrSession::start(family, ip)  ── spawn ─�
 - **`src/scan/traceroute/accumulator.rs`** (new, pure): `Accumulator` folds `RawRecord`s into per-hop counters and emits `TracerouteData`.
 - **`src/scan/traceroute/mtr.rs`** (new, I/O): `MtrSession` owns the child (`kill_on_drop_command`, `MTR_OPTIONS` removed from its environment so a user's mtr defaults cannot change the flags), the reader task, the shared `Accumulator`, the protocol it was started for, its last stderr line, and the time of the last stdout line.
 - **`src/scan/traceroute.rs`**: `TracerouteScanner` gains `engine: Mutex<EngineState>`; `scan()` picks the engine and throttles; `interval()` returns 1s.
+- **`src/scanner.rs`**: `ScanKind { Measured, MeasuredAfterReset, Replayed }` and the default `Scanner::last_scan_kind()`; `Scanner::run` records, resets then records, or skips by kind (Scheduling).
 
 State lives in the scan layer, not the TUI. This deviates from the ping/connectivity precedent on purpose: mtr's columns are cumulative counters defined by the stream, and G5 needs `--no-tui` to print the same numbers. One owner, no second copy.
 
@@ -215,11 +216,14 @@ Panel round 1: `next_delay` applies only to successful results, and the 1s ticke
 - **traceroute engine:** `scan()` runs `traceroute` only when `TRACEROUTE_INTERVAL_SECS` has passed since the last run (or none ran yet), and otherwise returns the last outcome, `Ok` or `Err`, as stored. A failing traceroute therefore runs at most once per 5 minutes, as today.
 - A long traceroute run (up to the 30s deadline) can leave tokio interval ticks missed; the burst that follows hits the throttle and returns the stored outcome, so it costs nothing.
 - `next_delay` is not used by this scanner.
+- **Replays are not recorded.** A stored outcome returned by the throttle is not a new measurement. `scan()` reports it through `Scanner::last_scan_kind()` as `ScanKind::Replayed`, and `Scanner::run` skips `record_outcome` for it: status (put back from before `mark_running`), `last_updated` and history stay as the run that produced the outcome left them, so the pane shows the run's true age and a stored failure logs once, not every second. A scan dropped at its deadline is recorded as timed out whatever kind was reported.
+- **The switch to the fallback resets.** The scan that switches the engine to `traceroute` reports `ScanKind::MeasuredAfterReset`, and `Scanner::run` drops the retained result, error and history before recording it. If mtr vanishes mid-run and the fallback then fails, the last mtr route does not stay on screen under the error.
 
 ### TUI
 
 - **Grid** (`src/tui/traceroute.rs`, pane is 33% wide): `Status: mtr · 42 cycles` (or `Status: traceroute (mtr not installed)` in WARN), reach line, then one row per hop: hop, `current_address` (`+N` when more than one address was seen), `Loss%`, `Avg`. The mtr destination row has the same `+N` and colored Loss%. Silent runs still collapse to `3-9: no reply (7 hops)`.
 - When the Status header clips the fallback reason (the 80x24 dashboard pane), the reason is drawn on the pane's bottom border, so G4 holds at any width. When every fallback family fails, the error names the reason too: `IPv4: no IPv4 route on this host (traceroute: mtr not installed)`.
+- When no route is retained (every fallback family failed, or the first scan has not finished), the Status header wraps instead of being fitted to one row, so the whole failure is readable at 80x24; the border then carries no reason, since the header shows it.
 - **Zoom:** per family, an mtr table: `Hop  Host  Loss%  Snt  Last  Avg  Best  Wrst  StDev`, then each extra ECMP address on its own indented row under its hop.
 - Loss% colored by `BAD_LOSS_PERCENT = 10` (`src/tui/traceroute.rs`): `GOOD` at 0, `WARN` under 10%, `BAD` at 10% and above. The connectivity pane has no loss thresholds to reuse.
 
@@ -281,6 +285,7 @@ Panel round 1: `next_delay` applies only to successful results, and the 1s ticke
 - 2026-11-10 (author): fallback is sticky for the process. A user who installs mtr restarts scan. Panel round 1 (architect) called this harsh; disposition: the harshness came from network errors falling back, which the failure table now keeps per family, so a sticky fallback only follows a broken or missing mtr.
 - 2026-11-10 (author): one engine for both families. Panel noted it; author keeps it so the pane never mixes modes.
 - 2026-11-10 (panel round 1, staff): the scanner throttles inside `scan()`; `next_delay` is not used.
+- 2026-11-10 (author, implementation audit M1): a replayed fallback result is not recorded; `Scanner` gains an additive default replay signal.
 
 ## Alternatives Considered
 

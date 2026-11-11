@@ -11,6 +11,21 @@ use crate::types::{AppState, ScanResult, ScanState, ScanStatus, TimestampedResul
 const DEFAULT_MAX_HISTORY_RESULTS: usize = 10;
 const DEFAULT_SCAN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// What the scan that just returned was, so `Scanner::run` knows how to store it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanKind {
+    /// A new measurement: recorded as usual.
+    #[default]
+    Measured,
+    /// A new measurement taken a different way than the retained data (the scanner switched how
+    /// it measures): the retained result, error and history are dropped before it is recorded, so
+    /// a failure does not leave the old result on screen under it.
+    MeasuredAfterReset,
+    /// An earlier scan's stored outcome returned again: not recorded. Status, `last_updated` and
+    /// history stay as that scan left them.
+    Replayed,
+}
+
 #[allow(clippy::double_must_use)] // async_trait expansion trips newer clippy
 #[async_trait]
 pub trait Scanner {
@@ -42,6 +57,12 @@ pub trait Scanner {
     /// `None` keeps the interval schedule. Called before the result is stored.
     fn next_delay(&self, _result: &ScanResult) -> Option<Duration> {
         None
+    }
+
+    /// What the scan that just returned was. Called by `run` after each scan that returned before
+    /// its deadline; a scanner that only ever measures keeps the default.
+    fn last_scan_kind(&self) -> ScanKind {
+        ScanKind::Measured
     }
 
     /// Default implementation of the scanner loop.
@@ -102,7 +123,7 @@ pub trait Scanner {
                     clear_for_protocol_change(self.name(), previous, protocol, &state);
                 }
                 last_protocol = Some(protocol);
-                mark_running(self.name(), &state);
+                let prior_status = mark_running(self.name(), &state);
 
                 let deadline = self.deadline();
                 let scan_start = Instant::now();
@@ -135,9 +156,26 @@ pub trait Scanner {
                     continue;
                 };
 
+                // A scan dropped at its deadline returned nothing to replay.
+                let kind = match (outcome.is_ok(), self.last_scan_kind()) {
+                    (false, ScanKind::Replayed) => ScanKind::Measured,
+                    (_, kind) => kind,
+                };
                 let result = outcome.unwrap_or_else(|_| Err(eyre::eyre!("timed out after {}s", deadline.as_secs())));
                 let next_delay = result.as_ref().ok().and_then(|result| self.next_delay(result));
-                record_outcome(self.name(), self.max_history(), protocol, scan_start, result, &state);
+                match (kind, prior_status) {
+                    (ScanKind::Replayed, Some(prior_status)) => {
+                        restore_status(self.name(), prior_status, &state);
+                    }
+                    (ScanKind::MeasuredAfterReset, _) => {
+                        clear_retained(self.name(), &state);
+                        record_outcome(self.name(), self.max_history(), protocol, scan_start, result, &state);
+                    }
+                    // A replay with no earlier state to keep is recorded, so the pane never stays Running.
+                    (ScanKind::Measured, _) | (ScanKind::Replayed, None) => {
+                        record_outcome(self.name(), self.max_history(), protocol, scan_start, result, &state);
+                    }
+                }
                 if let Some(delay) = next_delay {
                     ticker.reset_after(delay);
                 }
@@ -164,12 +202,7 @@ pub trait Scanner {
 /// Drop a scanner's result, error and history from `previous`: they describe the old protocol, not
 /// the one about to be scanned.
 fn clear_for_protocol_change(name: &str, previous: Protocol, protocol: Protocol, state: &Arc<Mutex<AppState>>) {
-    let state_guard = state.lock().unwrap();
-    if let Some(mut scan_state) = state_guard.scanners.get_mut(name) {
-        scan_state.result = None;
-        scan_state.error = None;
-        scan_state.history.clear();
-    }
+    drop_retained(name, state);
     log::debug!(
         "[scanner] protocol_reset: scanner={} old_protocol={} new_protocol={} - result, error and history cleared",
         name,
@@ -178,13 +211,37 @@ fn clear_for_protocol_change(name: &str, previous: Protocol, protocol: Protocol,
     );
 }
 
-/// Flip the scanner's state to Running in place: the previous result, error and history stay visible.
-fn mark_running(name: &str, state: &Arc<Mutex<AppState>>) {
+/// Drop a scanner's result, error and history before a `MeasuredAfterReset` scan is recorded: they
+/// were measured the old way.
+fn clear_retained(name: &str, state: &Arc<Mutex<AppState>>) {
+    drop_retained(name, state);
+    log::debug!("[scanner] measured_after_reset: scanner={name} - result, error and history cleared");
+}
+
+fn drop_retained(name: &str, state: &Arc<Mutex<AppState>>) {
     let state_guard = state.lock().unwrap();
-    match state_guard.scanners.get_mut(name) {
-        Some(mut scan_state) => {
-            scan_state.status = ScanStatus::Running;
-        }
+    if let Some(mut scan_state) = state_guard.scanners.get_mut(name) {
+        scan_state.result = None;
+        scan_state.error = None;
+        scan_state.history.clear();
+    }
+}
+
+/// Put back the status `mark_running` replaced, for a replayed scan that records nothing.
+fn restore_status(name: &str, status: ScanStatus, state: &Arc<Mutex<AppState>>) {
+    let state_guard = state.lock().unwrap();
+    if let Some(mut scan_state) = state_guard.scanners.get_mut(name) {
+        log::debug!("[scanner] scan_replayed: scanner={name} status={status:?} - not recorded");
+        scan_state.status = status;
+    }
+}
+
+/// Flip the scanner's state to Running in place: the previous result, error and history stay
+/// visible. Returns the status it replaced, `None` for a scanner with no state yet.
+fn mark_running(name: &str, state: &Arc<Mutex<AppState>>) -> Option<ScanStatus> {
+    let state_guard = state.lock().unwrap();
+    let prior_status = match state_guard.scanners.get_mut(name) {
+        Some(mut scan_state) => Some(std::mem::replace(&mut scan_state.status, ScanStatus::Running)),
         None => {
             state_guard.scanners.insert(
                 name.to_string(),
@@ -196,9 +253,11 @@ fn mark_running(name: &str, state: &Arc<Mutex<AppState>>) {
                     history: VecDeque::new(),
                 },
             );
+            None
         }
-    }
+    };
     log::debug!("[scanner] status_updated: scanner={} status=Running", name);
+    prior_status
 }
 
 /// Store a finished scan: a result is pushed to history (capped), an error keeps the last good result.
@@ -785,5 +844,195 @@ mod tests {
         let (scanner, _, _) = stub(None);
         assert_eq!(scanner.deadline(), Duration::from_secs(30));
         assert!(scanner.uses_protocol());
+        assert_eq!(scanner.last_scan_kind(), ScanKind::Measured);
+    }
+
+    /// Scan `n` (1-based) returns `script[n - 1]`: success or failure, and the kind it reports.
+    /// Past the end of the script, the last entry repeats. Interval 1s.
+    struct KindStub {
+        script: Vec<(bool, ScanKind)>,
+        calls: AtomicUsize,
+        kind: Mutex<ScanKind>,
+        scanned: tokio::sync::mpsc::UnboundedSender<usize>,
+    }
+
+    #[async_trait]
+    impl Scanner for KindStub {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn last_scan_kind(&self) -> ScanKind {
+            *self.kind.lock().unwrap()
+        }
+        async fn scan(&self, _target: &Target, _protocol: Protocol) -> Result<ScanResult, eyre::Error> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (ok, kind) = self.script[call.min(self.script.len() - 1)];
+            *self.kind.lock().unwrap() = kind;
+            self.scanned.send(call + 1).unwrap();
+            if ok {
+                Ok(ScanResult::Ping(PingResult::new()))
+            } else {
+                Err(eyre::eyre!("stub failure {}", call + 1))
+            }
+        }
+    }
+
+    /// Runs a `KindStub` for `scans` scans, then returns its state and the clock when the first
+    /// scan was stored.
+    async fn run_kind_stub(script: Vec<(bool, ScanKind)>, scans: usize) -> (Arc<Mutex<AppState>>, Instant) {
+        let (scanned_tx, mut scanned) = tokio::sync::mpsc::unbounded_channel();
+        let scanner = KindStub {
+            script,
+            calls: AtomicUsize::new(0),
+            kind: Mutex::new(ScanKind::Measured),
+            scanned: scanned_tx,
+        };
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        let target = Target::parse("example.com").unwrap();
+        let handle = {
+            let state = state.clone();
+            tokio::spawn(async move { scanner.run(target, fixed_protocol(), state).await })
+        };
+        scanned.recv().await.unwrap();
+        settle().await;
+        let first_stored = state.lock().unwrap().scanners.get("stub").unwrap().last_updated;
+        for _ in 1..scans {
+            scanned.recv().await.unwrap();
+            settle().await;
+        }
+        handle.abort();
+        (state, first_stored)
+    }
+
+    /// M1: a replayed result is not a new measurement: no history entry, no fresh `last_updated`,
+    /// and the pane is not left on Running.
+    #[tokio::test(start_paused = true)]
+    async fn replayed_scans_are_not_recorded() {
+        let (state, first_stored) =
+            run_kind_stub(vec![(true, ScanKind::Measured), (true, ScanKind::Replayed)], 3).await;
+        let guard = state.lock().unwrap();
+        let stub = guard.scanners.get("stub").unwrap();
+        assert_eq!(stub.history.len(), 1, "replays pushed history copies");
+        assert_eq!(stub.last_updated, first_stored, "a replay re-stamped last_updated");
+        assert!(matches!(stub.status, ScanStatus::Complete), "{:?}", stub.status);
+        assert!(stub.result.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replayed_failure_keeps_the_original_failure_and_its_time() {
+        let (state, first_stored) =
+            run_kind_stub(vec![(false, ScanKind::Measured), (false, ScanKind::Replayed)], 3).await;
+        let guard = state.lock().unwrap();
+        let stub = guard.scanners.get("stub").unwrap();
+        assert!(matches!(stub.status, ScanStatus::Failed), "{:?}", stub.status);
+        assert_eq!(stub.error.as_ref().unwrap().to_string(), "stub failure 1");
+        assert_eq!(
+            stub.last_updated, first_stored,
+            "a replayed failure re-stamped last_updated"
+        );
+    }
+
+    /// A scan after the replays measures again and is recorded as usual.
+    #[tokio::test(start_paused = true)]
+    async fn a_measurement_after_replays_is_recorded() {
+        let (state, first_stored) = run_kind_stub(
+            vec![
+                (true, ScanKind::Measured),
+                (true, ScanKind::Replayed),
+                (true, ScanKind::Measured),
+            ],
+            3,
+        )
+        .await;
+        let guard = state.lock().unwrap();
+        let stub = guard.scanners.get("stub").unwrap();
+        assert_eq!(stub.history.len(), 2);
+        assert!(stub.last_updated > first_stored);
+    }
+
+    /// D2: a failure measured a new way does not keep the old way's result on screen under it.
+    #[tokio::test(start_paused = true)]
+    async fn failure_measured_after_reset_drops_the_retained_result() {
+        let (state, _) = run_kind_stub(
+            vec![(true, ScanKind::Measured), (false, ScanKind::MeasuredAfterReset)],
+            2,
+        )
+        .await;
+        let guard = state.lock().unwrap();
+        let stub = guard.scanners.get("stub").unwrap();
+        assert!(matches!(stub.status, ScanStatus::Failed));
+        assert_eq!(stub.error.as_ref().unwrap().to_string(), "stub failure 2");
+        assert!(stub.result.is_none(), "the old result survived the reset");
+        assert!(stub.history.is_empty());
+    }
+
+    /// Reports every scan as a replay; the first returns at once, later ones never return.
+    struct HangingReplay {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Scanner for HangingReplay {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn last_scan_kind(&self) -> ScanKind {
+            ScanKind::Replayed
+        }
+        async fn scan(&self, _target: &Target, _protocol: Protocol) -> Result<ScanResult, eyre::Error> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                std::future::pending::<()>().await;
+            }
+            Ok(ScanResult::Ping(PingResult::new()))
+        }
+    }
+
+    /// A scan dropped at its deadline returned nothing, so it is recorded as timed out whatever
+    /// kind the scanner last reported.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_scan_is_recorded_even_when_reported_as_a_replay() {
+        let state = Arc::new(Mutex::new(AppState::new("example.com".to_string())));
+        let scanner = HangingReplay {
+            calls: AtomicUsize::new(0),
+        };
+        let target = Target::parse("example.com").unwrap();
+        let handle = {
+            let state = state.clone();
+            tokio::spawn(async move { scanner.run(target, fixed_protocol(), state).await })
+        };
+        tokio::time::sleep(Duration::from_secs(32)).await;
+        settle().await;
+        handle.abort();
+        let guard = state.lock().unwrap();
+        let stub = guard.scanners.get("stub").unwrap();
+        // The next scan has already started (and hangs), so the status reads Running again; the
+        // timeout's error stays until a scan finishes.
+        assert_eq!(
+            stub.error.as_ref().map(|error| error.to_string()),
+            Some("timed out after 30s".to_string())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_measured_after_reset_starts_history_over() {
+        let (state, _) = run_kind_stub(
+            vec![
+                (true, ScanKind::Measured),
+                (true, ScanKind::Measured),
+                (true, ScanKind::MeasuredAfterReset),
+            ],
+            3,
+        )
+        .await;
+        let guard = state.lock().unwrap();
+        let stub = guard.scanners.get("stub").unwrap();
+        assert!(matches!(stub.status, ScanStatus::Complete));
+        assert_eq!(stub.history.len(), 1, "history from before the reset survived");
     }
 }
